@@ -1162,9 +1162,9 @@ def verify_dev_stories(
     ``plan_halt`` verifies a spec_checkpoint story's plan-halt leg instead of an
     implementation: the expected status is ``ready-for-dev`` (the plan is done,
     not the code) and the proof-of-work gate is skipped — a plan writes only its
-    own spec, so requiring code changes would spuriously fail every plan leg. The
-    spec-resolution, id-prefix, workflow, and baseline gates still run, and
-    ``task.spec_file`` is still recorded.
+    own spec, which proof-of-work already excludes, so requiring code changes
+    would spuriously fail every plan leg. The spec-resolution, id-prefix, workflow,
+    and baseline gates still run, and ``task.spec_file`` is still recorded.
     """
     # Deferred to avoid a verify<->stories import cycle: stories imports
     # read_frontmatter/status_of from this module at top level, so verify must not
@@ -1219,19 +1219,37 @@ def verify_dev_stories(
                 f"orchestrator-recorded baseline {task.baseline_commit[:12]}"
             )
 
-    # A plan-halt leg produced only its own spec (the plan), so proof-of-work
-    # would spuriously fail; skip it and record the plan spec.
+    # A plan-halt leg produced only its own spec (the plan); proof-of-work would
+    # spuriously fail (the spec is excluded), so skip it and record the plan spec.
     if task.baseline_commit and not plan_halt:
+        # Proof-of-work must not count the story's own record (the id-keyed spec)
+        # or the human-authored stories.yaml as implementation work — a story that
+        # only wrote its spec did no real work. Artifact dirs are already excluded;
+        # add the spec folder's stories/ + stories.yaml for a spec folder that
+        # sits outside them (both are no-ops when it lives under output_folder).
+        exclude = artifact_relpaths(paths) + _stories_relpaths(paths.project, spec_folder)
         try:
-            if not has_changes_since(
-                paths.project, task.baseline_commit, exclude=artifact_relpaths(paths)
-            ):
+            if not has_changes_since(paths.project, task.baseline_commit, exclude=exclude):
                 return VerifyOutcome.retry("no changes in worktree since baseline commit")
         except GitError as e:
             return VerifyOutcome.escalate(str(e))
 
     task.spec_file = str(spec_path)
     return VerifyOutcome.passed()
+
+
+def _stories_relpaths(project: Path, spec_folder: Path) -> tuple[str, ...]:
+    """Proof-of-work exclude prefixes for the story record + manifest: the spec
+    folder's ``stories/`` subdir and its ``stories.yaml``, project-relative. Empty
+    when the spec folder is outside the project tree (nothing to exclude there)."""
+    from .stories import STORIES_FILENAME, STORIES_SUBDIR
+
+    try:
+        rel = spec_folder.resolve().relative_to(project.resolve()).as_posix()
+    except ValueError:
+        return ()
+    base = "" if rel == "." else f"{rel}/"
+    return (f"{base}{STORIES_SUBDIR}", f"{base}{STORIES_FILENAME}")
 
 
 @dataclass(frozen=True)
@@ -1289,6 +1307,19 @@ def verify_review(task: StoryTask, paths: ProjectPaths, policy: Policy) -> Verif
             f"sprint-status for {task.story_key} is {sprint!r}, expected 'done'"
         )
 
+    return verify_commands_outcome(policy, paths.project)
+
+
+def verify_review_stories(task: StoryTask, paths: ProjectPaths, policy: Policy) -> VerifyOutcome:
+    """verify_review for stories mode: same spec-done + verify-commands gates,
+    minus the sprint-status gate (stories mode has no sprint board — the story
+    spec's own frontmatter status is authoritative). ``task.spec_file`` is the
+    id-keyed story spec ``verify_dev_stories`` recorded on the dev pass."""
+    if not task.spec_file:
+        return VerifyOutcome.retry("no spec file recorded for task")
+    status = status_of(read_frontmatter(Path(task.spec_file)))
+    if status != "done":
+        return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
     return verify_commands_outcome(policy, paths.project)
 
 
