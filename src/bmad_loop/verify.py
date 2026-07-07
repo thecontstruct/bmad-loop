@@ -1224,10 +1224,18 @@ def verify_dev_stories(
     if task.baseline_commit and not plan_halt:
         # Proof-of-work must not count the story's own record (the id-keyed spec)
         # or the human-authored stories.yaml as implementation work — a story that
-        # only wrote its spec did no real work. Artifact dirs are already excluded;
-        # add the spec folder's stories/ + stories.yaml for a spec folder that
-        # sits outside them (both are no-ops when it lives under output_folder).
-        exclude = artifact_relpaths(paths) + _stories_relpaths(paths.project, spec_folder)
+        # only wrote its spec did no real work. Use the file-granular exclude
+        # (`verify_dev_exclude_relpaths`, matching verify_dev post-#79: only the
+        # session's own spec + the sprint-status ledger), NOT the whole-folder
+        # `artifact_relpaths` — otherwise a story whose entire authorized scope is
+        # ledger/spec reconciliation (e.g. deferred-work.md under implementation_
+        # artifacts) would keep registering as a permanent false "no changes". Then
+        # add the spec folder's stories/ subdir + stories.yaml, which hold only
+        # specs and the human-authored manifest (never implementation work), for a
+        # spec folder that sits outside the artifact dirs (both no-ops under output_folder).
+        exclude = verify_dev_exclude_relpaths(paths, spec_path) + _stories_relpaths(
+            paths.project, spec_folder
+        )
         try:
             if not has_changes_since(paths.project, task.baseline_commit, exclude=exclude):
                 return VerifyOutcome.retry("no changes in worktree since baseline commit")
