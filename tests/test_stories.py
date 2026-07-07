@@ -407,6 +407,15 @@ def test_resolve_prefix_isolation(tmp_path):
     assert stories.resolve_story_spec(tmp_path, "3").kind == stories.KIND_PENDING
 
 
+@pytest.mark.parametrize("bad_id", ["1*", "1?", "1[a", "a/b", "..", ".", "3 1"])
+def test_resolve_charset_invalid_id_is_pending_not_glob(tmp_path, bad_id):
+    # A non-charset-valid id must never reach glob(): "1*" would otherwise glob
+    # `1*-*.md` and wrongly match the real `1-x.md`. The ID_RE guard makes every
+    # such id a clean PENDING ("no resolvable spec") instead of an injected match.
+    write_story_spec(tmp_path, "1-x.md", status="done")
+    assert stories.resolve_story_spec(tmp_path, bad_id).kind == stories.KIND_PENDING
+
+
 # --------------------------------------------------- state_label / table projection
 
 
@@ -466,5 +475,5 @@ def test_story_rows_selector_and_limit(tmp_path):
 
 
 def test_story_rows_missing_manifest_raises(tmp_path):
-    with pytest.raises(stories.StoriesError, match="no stories.yaml found"):
+    with pytest.raises(stories.StoriesError, match=re.escape("no stories.yaml found")):
         stories.story_rows(tmp_path)
