@@ -29,7 +29,7 @@ dialect = "none"
 
 def test_builtin_profiles_load():
     profiles = load_profiles()
-    assert {"claude", "codex", "gemini", "opencode-http"} <= set(profiles)
+    assert {"claude", "codex", "gemini", "cursor", "opencode-http"} <= set(profiles)
     assert profiles["claude"].usage_parser == "claude-jsonl"
     assert profiles["codex"].hooks.dialect == "codex-hooks-json"
     assert "SessionEnd" not in profiles["codex"].hooks.events  # codex has no such hook
@@ -39,6 +39,12 @@ def test_builtin_profiles_load():
     assert profiles["claude"].skill_tree == ".claude/skills"
     assert profiles["codex"].skill_tree == ".agents/skills"
     assert profiles["gemini"].skill_tree == ".agents/skills"
+    cursor = profiles["cursor"]
+    assert cursor.binary == "cursor-agent"
+    assert cursor.skill_tree == ".cursor/skills"
+    assert cursor.hooks.dialect == "cursor-hooks-json"
+    assert cursor.hooks.events == {"sessionStart": "SessionStart", "stop": "Stop"}
+    assert cursor.seed_workspace_trust is True
     # each profile carries the gitignored configs a worktree checkout omits
     assert ".mcp.json" in profiles["claude"].seed_files
     assert ".claude/settings.json" in profiles["claude"].seed_files

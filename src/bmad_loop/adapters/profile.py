@@ -29,6 +29,7 @@ HOOK_DIALECTS = {
     "gemini-settings-json",
     "copilot-settings-json",
     "antigravity-hooks-json",
+    "cursor-hooks-json",
     # hookless: the adapter observes completion itself (HTTP/SSE transport) —
     # no hook config is ever written, so config_path/events must stay empty.
     "none",
@@ -109,6 +110,10 @@ class CLIProfile:
     # (an invalid regex is a profile error). Seeded only for `claude`; empty =
     # inert. Override/extend via a project profile in .bmad-loop/profiles/.
     env_fault_patterns: tuple[str, ...] = ()
+    # cursor-agent blocks interactive launches in an untrusted workspace.  The
+    # profile opts into seeding Cursor's workspace marker for the project and
+    # isolated worktrees before the session is spawned.
+    seed_workspace_trust: bool = False
 
     @property
     def hookless(self) -> bool:
@@ -228,6 +233,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         first_run_note=str(doc.get("first_run_note", "")),
         seed_files=seed_files,
         env_fault_patterns=env_fault_patterns,
+        seed_workspace_trust=bool(doc.get("seed_workspace_trust", False)),
     )
 
 
