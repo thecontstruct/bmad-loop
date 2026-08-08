@@ -56,6 +56,7 @@ from .install import (
     missing_stories_support,
     renderer_stub_resolved,
     resolve_review_layers,
+    seed_workspace_trust,
 )
 from .model import Phase
 from .process_host import get_process_host
@@ -671,6 +672,10 @@ def provision_worktree(
         config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
         if changed:
             config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+    for profile in profiles:
+        if profile.seed_workspace_trust:
+            seed_workspace_trust(worktree)
 
     # Shield exactly the paths we wrote (skill trees + hook configs + seeded
     # configs) from the unit's `git add -A`, in case a project doesn't gitignore
