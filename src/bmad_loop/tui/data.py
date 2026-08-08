@@ -22,16 +22,23 @@ from pathlib import Path
 from typing import Any
 
 import pyte
+from rich.color import ColorParseError
 from rich.style import Style
 from rich.text import Text
 
-from .. import bmadconfig, deferredwork, sprintstatus
-from ..adapters.multiplexer import MultiplexerError, get_multiplexer
+from .. import bmadconfig, deferredwork, policy, sprintstatus, stories
+from ..adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
 from ..gates import ATTENTION_FILE
 from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state
 from ..model import RunState
 from ..process_host import ProcessHostError
-from ..runs import list_run_dirs, probe_liveness, read_pid_identity, session_name
+from ..runs import (
+    STOP_REQUEST_FILE,
+    list_run_dirs,
+    probe_liveness,
+    read_pid_identity,
+    session_name,
+)
 
 # Run statuses shown by the dashboard.
 RUNNING = "running"
@@ -89,7 +96,7 @@ def _session_liveness(run_id: str) -> str:
     # An absent multiplexer / dead query proves nothing about a legacy run, so the
     # only positive signal is a live session; everything else is 'unknown'.
     mux = get_multiplexer()
-    if not mux.available():
+    if not mux_usable(mux):  # forced-aware, like every other observer gate
         return "unknown"
     try:
         return "alive" if mux.has_session(session_name(run_id)) else "unknown"
@@ -131,10 +138,13 @@ class RunInfo:
     run_type: str
     started_at: str
     status: str
+    paused_stage: str = ""  # RunState.paused_stage when PAUSED, else ""; drives the badge
+    stopping: bool = False  # a graceful stop is pending (control file present) while RUNNING
 
 
-# state.json path -> (stat sig, (run_type, started_at, finished, paused, stopped, crashed))
-_header_cache: dict[Path, tuple[_StatSig, tuple[str, str, bool, bool, bool, bool]]] = {}
+# state.json path -> (stat sig, header fields tuple)
+_HeaderFields = tuple[str, str, bool, bool, bool, bool, str]
+_header_cache: dict[Path, tuple[_StatSig, _HeaderFields]] = {}
 
 
 def discover_runs(project: Path) -> list[RunInfo]:
@@ -150,7 +160,7 @@ def discover_runs(project: Path) -> list[RunInfo]:
         sig = _stat_sig(state_path)
         cached = _header_cache.get(state_path)
         if sig is not None and cached is not None and cached[0] == sig:
-            run_type, started_at, finished, paused, stopped, crashed = cached[1]
+            run_type, started_at, finished, paused, stopped, crashed, paused_stage = cached[1]
         else:
             try:
                 doc = json.loads(state_path.read_text(encoding="utf-8"))
@@ -160,16 +170,26 @@ def discover_runs(project: Path) -> list[RunInfo]:
                 paused = doc.get("paused_reason") is not None
                 stopped = bool(doc.get("stopped", False))
                 crashed = bool(doc.get("crashed", False))
+                paused_stage = str(doc.get("paused_stage") or "")
             except (OSError, json.JSONDecodeError):
                 out.append(RunInfo(run_dir.name, run_dir, "?", "", UNKNOWN))
                 continue
             if sig is not None:
                 _header_cache[state_path] = (
                     sig,
-                    (run_type, started_at, finished, paused, stopped, crashed),
+                    (run_type, started_at, finished, paused, stopped, crashed, paused_stage),
                 )
         status = _classify(finished, paused, stopped, crashed, run_dir)
-        out.append(RunInfo(run_dir.name, run_dir, run_type, started_at, status))
+        # paused_stage is advisory: only meaningful while the run is actually PAUSED
+        # (a resumed run keeps the last stage in state until it re-pauses/finishes).
+        stage = paused_stage if status == PAUSED else ""
+        # A pending graceful stop is the control file's presence, but only while an
+        # engine is still around to honor it — RUNNING or UNKNOWN (an unverifiable
+        # pid still consumes the file). The engine discards the file at the stop
+        # boundary, so a lingering file on an already-concluded run is not "stopping":
+        # STOPPED/FINISHED/CRASHED classify before liveness, so they never read UNKNOWN.
+        stopping = status in (RUNNING, UNKNOWN) and (run_dir / STOP_REQUEST_FILE).is_file()
+        out.append(RunInfo(run_dir.name, run_dir, run_type, started_at, status, stage, stopping))
     return out
 
 
@@ -206,6 +226,13 @@ class RunWatcher:
         if state is None:
             return UNKNOWN
         return _classify(state.finished, state.paused, state.stopped, state.crashed, self.run_dir)
+
+    def stopping(self) -> bool:
+        """True when a graceful-stop request is pending for this run (its control
+        file is present) — a bare existence read for the run-header pending line,
+        mirroring runs.graceful_stop_requested. The caller gates on a RUNNING
+        status so a file lingering on a stopped run doesn't read as still-stopping."""
+        return (self.run_dir / STOP_REQUEST_FILE).is_file()
 
     def attention(self) -> str:
         path = self.run_dir / ATTENTION_FILE
@@ -269,8 +296,16 @@ _PANE_COLUMNS = 220
 _PANE_LINES = 50
 _HISTORY_LINES = 2000  # matches the dashboard RichLog max_lines
 
-# pyte names SGR 33 "brown"; aixterm brights carry no underscore.
-_PYTE_COLOR_FIX = {"brown": "yellow", "brightbrown": "bright_yellow"}
+# pyte names SGR 33 "brown"; aixterm brights carry no underscore. Values here
+# must stay in pyte's own (underscore-free) namespace: _rich_color re-applies
+# the "bright" -> "bright_" transform after this remap, so a "bright_"-prefixed
+# value would double up into "bright__yellow" (an invalid rich color).
+# "bfightmagenta" is pyte 0.8.2's own BG_AIXTERM[105] typo (SGR 105).
+_PYTE_COLOR_FIX = {
+    "brown": "yellow",
+    "brightbrown": "brightyellow",
+    "bfightmagenta": "brightmagenta",
+}
 _HEX_DIGITS = set("0123456789abcdef")
 
 
@@ -294,15 +329,21 @@ def _char_style(key: tuple) -> Style:
     style = _style_cache.get(key)
     if style is None:
         fg, bg, bold, italics, underscore, strikethrough, reverse = key
-        style = _style_cache[key] = Style(
-            color=_rich_color(fg),
-            bgcolor=_rich_color(bg),
+        attrs = dict(
             bold=bold or None,
             italic=italics or None,
             underline=underscore or None,
             strike=strikethrough or None,
             reverse=reverse or None,
         )
+        try:
+            style = Style(color=_rich_color(fg), bgcolor=_rich_color(bg), **attrs)
+        except ColorParseError:
+            # A color name rich can't parse (e.g. a new pyte table entry) must
+            # degrade to an uncolored run, not kill the poll worker — and with
+            # it the app (textual workers default to exit_on_error=True).
+            style = Style(**attrs)
+        _style_cache[key] = style
     return style
 
 
@@ -323,7 +364,8 @@ def _render_row(row: dict) -> Text:
         ch = row[x]
         key = (ch.fg, ch.bg, ch.bold, ch.italics, ch.underscore, ch.strikethrough, ch.reverse)
         if key != prev_key and run:
-            text.append("".join(run), _char_style(prev_key))
+            # prev_key is non-None whenever `run` is non-empty (a prior cell was buffered).
+            text.append("".join(run), _char_style(prev_key))  # pyright: ignore[reportArgumentType]
             run.clear()
         prev_key = key
         run.append(ch.data)
@@ -333,13 +375,18 @@ def _render_row(row: dict) -> Text:
 
 
 # CSI sequences with a private/secondary marker (< > = ?) are terminal capability
-# negotiation, never display SGR. pyte 0.8.2 ignores the marker and misdispatches
-# them to SGR anyway: e.g. XTMODKEYS `CSI > 4 ; 2 m` (modifyOtherKeys, emitted at
-# session start by Claude Code et al.) is read as SGR 4 = underline-on, leaving the
-# whole log underlined until an exit-time disable a live capture never contains.
-# Strip them before pyte sees them; a legitimate SGR carries no marker, so this can
-# only remove non-display sequences (never printable text or genuine styling).
-_PRIVATE_MARKER_SGR = re.compile(rb"\x1b\[[<>=?][0-9;:]*m")
+# negotiation, never display SGR. pyte 0.8.2 ignores a leading marker and
+# misdispatches them to SGR anyway: e.g. XTMODKEYS `CSI > 4 ; 2 m` (modifyOtherKeys,
+# emitted at session start by Claude Code et al.) is read as SGR 4 = underline-on,
+# leaving the whole log underlined until an exit-time disable a live capture never
+# contains. Worse, a marker byte *inside* the params — gemini's `CSI > 4 ; ? m`,
+# vim9's `CSI ? 4 m` — makes pyte dispatch with private=True to a handler that
+# rejects the kwarg, a TypeError that would kill the poll worker (#111; upstream
+# selectel/pyte#202, fixed in master but never released). Strip them before pyte
+# sees them, matching the marker anywhere in the param bytes; a legitimate SGR
+# carries no marker, so this can only remove non-display sequences (never printable
+# text or genuine styling).
+_PRIVATE_MARKER_SGR = re.compile(rb"\x1b\[[0-9;:<>=?]*[<>=?][0-9;:<>=?]*m")
 # Alternate-screen switch sequences (DECSET/DECRST 1049/1047/47). A CLI fullscreen
 # TUI (Claude Code's fullscreen renderer) switches here and repaints in place; pyte
 # has no altscreen buffer, so the capture collapses to the final frame. Detecting
@@ -377,6 +424,21 @@ def _strip_private_marker_sgr(chunk: bytes) -> tuple[bytes, int]:
     held = len(m.group()) if m else 0
     body = chunk[: len(chunk) - held] if held else chunk
     return _PRIVATE_MARKER_SGR.sub(b"", body), held
+
+
+class _TolerantByteStream(pyte.ByteStream):
+    """pyte 0.8.2 dispatches a private-marked CSI (marker byte in the params) with
+    private=True to handlers that don't accept it, raising TypeError (upstream
+    selectel/pyte#202; fixed in master Sep 2025, never released). Any parser
+    exception here would kill the poll worker — and with it the app — so drop the
+    unparseable sequence instead: the base method re-initializes the parser before
+    re-raising, leaving the stream usable for the bytes that follow."""
+
+    def _send_to_parser(self, data: str) -> bool | None:
+        try:
+            return super()._send_to_parser(data)
+        except Exception:
+            return None
 
 
 class _CountingDeque(deque):
@@ -480,7 +542,7 @@ class LogView:
         self._screen.history = self._screen.history._replace(
             top=_CountingDeque(maxlen=self._history)
         )
-        self._stream = pyte.ByteStream(self._screen)
+        self._stream = _TolerantByteStream(self._screen)
         self._row_cache.clear()
         self._checkpoints: list[tuple[int, int]] = []
         self._render_base = 0
@@ -561,7 +623,13 @@ class LogView:
             # marker bytes; the log_pos->line mapping is already approximate)
             end = start + len(piece)
             self._offset = base + (consumed if end >= total else round(end / total * consumed))
-            line = top.dropped + len(top) + self._screen.cursor.y
+            # pyte types history.top as base deque; bmad-loop installs a _CountingDeque
+            # (see class below) that adds `.dropped`.
+            line = (
+                top.dropped  # pyright: ignore[reportAttributeAccessIssue]
+                + len(top)
+                + self._screen.cursor.y
+            )
             self._checkpoints.append((self._offset, line))
         self._offset = base + consumed
         # When a chunk is entirely an unterminated trailing CSI, consumed == 0 and
@@ -572,7 +640,12 @@ class LogView:
         # only risk eating a legitimately split sequence by forcing it through).
         # drop checkpoints whose lines evicted past the history horizon;
         # their offsets would clamp to line 0 anyway
-        while len(self._checkpoints) > 1 and self._checkpoints[1][1] <= top.dropped:
+        # `.dropped` is on the _CountingDeque bmad-loop installs as history.top.
+        while (
+            len(self._checkpoints) > 1
+            and self._checkpoints[1][1]
+            <= top.dropped  # pyright: ignore[reportAttributeAccessIssue]
+        ):
             self._checkpoints.pop(0)
         return consumed > 0
 
@@ -602,24 +675,39 @@ class LogView:
             rows.pop()
         front_drop = max(0, len(rows) - self._history)
         del rows[:front_drop]
-        self._render_base = screen.history.top.dropped + front_drop
+        # `.dropped` is on the _CountingDeque bmad-loop installs as history.top.
+        self._render_base = (
+            screen.history.top.dropped + front_drop  # pyright: ignore[reportAttributeAccessIssue]
+        )
         self._render_len = len(rows)
         return Text("\n").join(rows)
+
+
+def _open_session_start(journal_entries: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The session-start entry whose agent session is currently open: the last
+    session-start with no later matching session-end. None when every started
+    session has ended (or none started). The task_id is tracked as a string so
+    the session-end match is byte-identical to what active_task_id compared."""
+    open_entry: dict[str, Any] | None = None
+    active: str | None = None
+    for entry in journal_entries:
+        kind = entry.get("kind")
+        if kind == "session-start" and entry.get("task_id") is not None:
+            active = str(entry["task_id"])
+            open_entry = entry
+        elif kind == "session-end" and str(entry.get("task_id")) == active:
+            active = None
+            open_entry = None
+    return open_entry
 
 
 def active_task_id(run_dir: Path, journal_entries: list[dict[str, Any]]) -> str | None:
     """Task whose agent session is currently open: the last session-start
     without a later session-end. Falls back to the newest file in logs/ —
     a tail attached mid-session has no start event in view."""
-    active: str | None = None
-    for entry in journal_entries:
-        kind = entry.get("kind")
-        if kind == "session-start" and entry.get("task_id") is not None:
-            active = str(entry["task_id"])
-        elif kind == "session-end" and str(entry.get("task_id")) == active:
-            active = None
-    if active is not None:
-        return active
+    entry = _open_session_start(journal_entries)
+    if entry is not None:
+        return str(entry["task_id"])
     try:
         logs = sorted(
             (run_dir / LOGS_DIR).glob("*.log"),
@@ -628,6 +716,70 @@ def active_task_id(run_dir: Path, journal_entries: list[dict[str, Any]]) -> str 
     except OSError:
         return None
     return logs[-1].stem if logs else None
+
+
+@dataclass(frozen=True)
+class ActiveAgent:
+    """Identity of the agent currently driving a run, derived from the open
+    session-start journal entry: the task/story it is working, the stage role,
+    and the resolved adapter name + model."""
+
+    task_id: str
+    story_key: str
+    role: str
+    name: str
+    model: str
+
+
+def _story_key_from_task_id(task_id: str, role: str) -> str:
+    """Recover the story key from a session task_id when the journal entry
+    predates story-key stamping (#153 phase 1). The id is
+    ``safe_segment(f"{story_key}-{part}-{seq}")`` where ``part`` is the role, or
+    a workflow label for labeled plugin sessions — so peel the trailing
+    ``-{part}-{seq}``: drop the numeric seq, then the recorded role when it
+    matches (the common case), else one more ``-`` group (best-effort, since a
+    label is not recoverable from the entry)."""
+    head, sep, seq = task_id.rpartition("-")
+    if not sep or not seq.isdigit():
+        return task_id  # not the expected shape — best we can do
+    if role and head.endswith(f"-{role}"):
+        return head[: -(len(role) + 1)]
+    parent = head.rpartition("-")[0]
+    return parent or head
+
+
+def active_agent(
+    journal_entries: list[dict[str, Any]], policy_snapshot: dict[str, Any] | None
+) -> ActiveAgent | None:
+    """The agent currently driving the run, or None when no session is open.
+
+    Journal-only: unlike :func:`active_task_id` there is no logs/ fallback — a
+    tail attached mid-session carries no adapter identity. A session-start
+    stamped since #153 phase 1 supplies the adapter name/model (and story_key)
+    directly. For an older, unstamped entry the run's persisted
+    ``policy_snapshot`` is rebuilt and resolved for the entry's role; when that
+    yields nothing trustworthy (no/empty snapshot) the agent is unknown -> None.
+    Never raises on a malformed entry."""
+    try:
+        entry = _open_session_start(journal_entries)
+        if entry is None:
+            return None
+        task_id = str(entry.get("task_id", ""))
+        role = str(entry.get("role") or "")
+        if "adapter" in entry:
+            name = str(entry.get("adapter", ""))
+            model = str(entry.get("model", ""))
+        else:
+            rebuilt = policy.adapter_policy_from_snapshot(policy_snapshot)
+            if rebuilt is None:
+                return None
+            resolved = rebuilt.resolved(role)
+            name, model = resolved.name, resolved.model
+        story_raw = entry.get("story_key")
+        story_key = str(story_raw) if story_raw else _story_key_from_task_id(task_id, role)
+        return ActiveAgent(task_id=task_id, story_key=story_key, role=role, name=name, model=model)
+    except Exception:
+        return None
 
 
 def pending_decision(journal_entries: list[dict[str, Any]]) -> tuple[str, str] | None:
@@ -693,6 +845,26 @@ def sprint_overview(project: Path) -> sprintstatus.SprintStatus | None:
             overview = None
     _sprint_cache[sprint_path] = (sig, overview)
     return overview
+
+
+def stories_overview(project: Path, spec_folder: str) -> list[stories.StoryRow] | None:
+    """The stories-mode board for a run's pinned spec folder: one StoryRow per
+    ``stories.yaml`` entry joined with the live on-disk state of its id-keyed
+    story spec. None when unavailable (no spec folder, or a missing/invalid
+    ``stories.yaml``).
+
+    Unlike :func:`sprint_overview` this is per-run (keyed by the run's
+    ``spec_folder``) and is re-derived on every call rather than stat-gated: the
+    per-story spec files under ``stories/`` change independently, so there is no
+    single file to gate on. It reads a handful of small files, called on the
+    dashboard's rescan cadence."""
+    if not spec_folder:
+        return None
+    folder = stories.resolve_spec_folder(project, spec_folder)
+    try:
+        return stories.story_rows(folder)
+    except stories.StoriesError:
+        return None
 
 
 @dataclass(frozen=True)

@@ -21,17 +21,25 @@ from bmad_loop.policy import (
     MERGE_STRATEGIES,
     POLICY_TEMPLATE,
     RETRO_MODES,
+    REVIEW_ON_STATUS_CONTRADICTION_MODES,
     REVIEW_TRIGGER_MODES,
+    SESSION_BUDGET_MODES,
+    STORIES_SOURCES,
     SWEEP_AUTO_MODES,
     AdapterPolicy,
     CleanupPolicy,
+    DevPolicy,
     GatesPolicy,
     LimitsPolicy,
+    MuxPolicy,
     NotifyPolicy,
+    OperatorPolicy,
+    PluginsPolicy,
     Policy,
     ReviewPolicy,
     ScmPolicy,
     StageAdapterPolicy,
+    StoriesPolicy,
     SweepPolicy,
     TuiPolicy,
     VerifyPolicy,
@@ -44,6 +52,7 @@ from bmad_loop.settings_schema import build_registry, load_core_schema
 SECTION_DC = {
     "gates": GatesPolicy,
     "review": ReviewPolicy,
+    "stories": StoriesPolicy,
     "limits": LimitsPolicy,
     "verify": VerifyPolicy,
     "notify": NotifyPolicy,
@@ -55,13 +64,24 @@ SECTION_DC = {
     "scm": ScmPolicy,
     "cleanup": CleanupPolicy,
     "tui": TuiPolicy,
+    "operator": OperatorPolicy,
+    "mux": MuxPolicy,
+    "dev": DevPolicy,
 }
+
+# Policy dataclasses that are deliberately NOT a settings section. Plugins render
+# dynamically from their own manifests; Policy is the composed root. Every other
+# *Policy dataclass must appear in SECTION_DC (see test_every_policy_dataclass_is_classified).
+NON_SECTION_DC = {PluginsPolicy, Policy}
 
 # select fields whose options are an enum set.
 OPTIONS_ENUM = {
     ("gates", "mode"): GATE_MODES,
     ("gates", "retrospective"): RETRO_MODES,
     ("review", "trigger"): REVIEW_TRIGGER_MODES,
+    ("review", "on_status_contradiction"): REVIEW_ON_STATUS_CONTRADICTION_MODES,
+    ("stories", "source"): STORIES_SOURCES,
+    ("limits", "session_budget_mode"): SESSION_BUDGET_MODES,
     ("sweep", "auto"): SWEEP_AUTO_MODES,
     ("scm", "isolation"): ISOLATION_MODES,
     ("scm", "branch_per"): BRANCH_PER_MODES,
@@ -77,6 +97,13 @@ HIDDEN = {
     ("adapter", "dev"),  # rendered as the adapter.dev section
     ("adapter", "review"),  # rendered as the adapter.review section
     ("adapter", "triage"),  # rendered as the adapter.triage section
+    ("dev", "skill"),  # internal dev-skill seam; DEV_SKILLS has one legal value, no UI knob
+    # Dashboard pane geometry — set by mouse-drag / the Ctrl+W resize mode, not a
+    # form field, so no settings-screen control.
+    ("tui", "left_width"),
+    ("tui", "runs_height"),
+    ("tui", "deferred_height"),
+    ("tui", "tasks_height"),
 }
 
 
@@ -107,6 +134,27 @@ def test_select_options_match_enum_sets():
             assert f.options == expected, f"{f.section}.{f.key}"
 
 
+def test_mux_backend_is_a_dynamic_select():
+    """mux.backend is a dropdown populated at build time from the registered
+    backends (not an enum set, so it stays out of OPTIONS_ENUM). tmux is always
+    registered, and the default stays empty (== MuxPolicy.backend) so the blank
+    auto-select choice is intact and the defaults-sync test still holds."""
+    field = next(f for f in core_fields() if (f.section, f.key) == ("mux", "backend"))
+    assert field.kind == "select"
+    assert "tmux" in field.options
+    assert field.default == MuxPolicy.backend == ""
+
+
+def test_mux_backend_options_preserve_a_forced_value():
+    """A backend forced in policy that isn't registered on this host is still
+    offered, so an untouched save can't blank-and-delete it (a blank Select
+    collects to None = delete the key)."""
+    reg = build_registry(None, policy_mod.loads('[mux]\nbackend = "psmux"\n'))
+    field = next(f for f in reg.fields() if (f.section, f.key) == ("mux", "backend"))
+    assert "psmux" in field.options  # foreign forced value preserved
+    assert "tmux" in field.options  # plus the registered backend
+
+
 def test_every_core_spec_maps_to_a_real_policy_field():
     for f in core_fields():
         assert hasattr(SECTION_DC[f.section], f.key), f"{f.section}.{f.key} is not a policy field"
@@ -123,6 +171,20 @@ def test_every_policy_field_is_covered_by_exactly_one_spec():
             if key in HIDDEN:
                 continue
             assert key in covered, f"uncovered policy field {section}.{fld.name}"
+
+
+def test_every_policy_dataclass_is_classified():
+    """No policy dataclass can silently escape the editor contract: every *Policy
+    dataclass (and the composed root Policy) is either a settings section or
+    explicitly not one, so adding a new policy table forces a conscious editor
+    decision instead of leaving it unreachable and unchecked (as [dev] once was)."""
+    policy_dcs = {
+        obj
+        for name, obj in vars(policy_mod).items()
+        if isinstance(obj, type) and dataclasses.is_dataclass(obj) and name.endswith("Policy")
+    }
+    classified = set(SECTION_DC.values()) | NON_SECTION_DC
+    assert policy_dcs <= classified, f"unclassified policy dataclasses: {policy_dcs - classified}"
 
 
 # --------------------------------------------------------------- packaging
@@ -234,7 +296,20 @@ def test_unity_plugin_is_trust_gated_and_renders_settings():
     assert unity.trust_needed is True  # has [python] -> enabling grants trust
     assert unity.enabled is False
     keys = [f.key for f in unity.fields]
-    assert keys == ["editor_mode", "mcp", "unity_path", "ready_timeout_sec", "ready_grace_sec"]
+    assert keys == [
+        "editor_mode",
+        "mcp",
+        "unity_path",
+        "ready_timeout_sec",
+        "ready_grace_sec",
+        "install_scene_guard",
+        "scene_guard_dir",
+        "quiesce_on_rollback",
+        "quiesce_timeout_sec",
+        "dialog_probe",
+        "dialog_probe_interval_sec",
+        "dialog_probe_notify",
+    ]
     editor_mode = next(f for f in unity.fields if f.key == "editor_mode")
     assert editor_mode.kind == "select"
     assert editor_mode.options == ("shared", "per_worktree")

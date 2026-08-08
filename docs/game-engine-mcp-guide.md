@@ -111,7 +111,7 @@ These compose with the `[scm]` worktree seeds (`seed_adapter_defaults`,
 
 ## Full env-var reference (Unity plugin)
 
-The five `[plugins.unity]` keys are the operator-facing settings (editable in the TUI
+The twelve `[plugins.unity]` keys are the operator-facing settings (editable in the TUI
 under the Unity plugin's section). Everything below is a **script-level knob** with a
 built-in default. The plugin builds the helper scripts' environment from `os.environ`
 (then overlays the identity + settings vars below), so **override a knob by exporting it
@@ -124,11 +124,15 @@ export BMAD_LOOP_UNITY_LIBRARY_SEED_MODE="copy"   # e.g. force a deep copy off-C
 bmad-loop run …
 ```
 
-**Always injected by the plugin** (identity from the run context + the five settings; do
-not set by hand): `BMAD_LOOP_REPO_ROOT`, `BMAD_LOOP_WORKTREE`, `BMAD_LOOP_RUN_DIR`,
-`BMAD_LOOP_STORY_KEY`, `BMAD_LOOP_ENGINE_MCP`, `BMAD_LOOP_ENGINE_EDITOR_MODE`,
-`BMAD_LOOP_ENGINE_READY_TIMEOUT`, `BMAD_LOOP_ENGINE_READY_GRACE`, `BMAD_LOOP_UNITY_PATH`,
-and `BMAD_LOOP_ENGINE_AGENTS` (the dev + review CLI ids, for per-worktree MCP routing).
+**Always injected by the plugin** (identity from the run context + the resolved
+settings; do not set by hand): `BMAD_LOOP_REPO_ROOT`, `BMAD_LOOP_WORKTREE`,
+`BMAD_LOOP_RUN_DIR`, `BMAD_LOOP_STORY_KEY`, `BMAD_LOOP_ENGINE_MCP`,
+`BMAD_LOOP_ENGINE_EDITOR_MODE`, `BMAD_LOOP_ENGINE_READY_TIMEOUT`,
+`BMAD_LOOP_ENGINE_READY_GRACE`, `BMAD_LOOP_UNITY_PATH`, `BMAD_LOOP_CLEAN_TMP`,
+`BMAD_LOOP_UNITY_INSTALL_SCENE_GUARD`, `BMAD_LOOP_UNITY_SCENE_GUARD_DIR`,
+`BMAD_LOOP_UNITY_DIALOG_PROBE`, `BMAD_LOOP_UNITY_DIALOG_PROBE_INTERVAL_SEC`,
+`BMAD_LOOP_UNITY_DIALOG_PROBE_NOTIFY`, and `BMAD_LOOP_ENGINE_AGENTS` (the dev + review
+CLI ids, for per-worktree MCP routing).
 
 ### Readiness gate (`unity_ready.py`)
 
@@ -183,6 +187,48 @@ IvanMurzak MCP downloads per-project, so CoplayDev is skipped.
 | ---------------------------- | ------- | --------------------------------------------------- |
 | `BMAD_LOOP_CLEAN_TMP`        | `1`     | `0` disables the post-run /tmp + log cleanup.       |
 | `BMAD_LOOP_UNITY_LOG_CAP_MB` | `5`     | Truncate `ai-editor-logs.txt` once it exceeds this. |
+
+### Scene-guard seeding (`unity_seed_assets.py`)
+
+Copies the `SceneAutoSaveGuard` editor script into the project so a chronically-dirty
+scene never raises the run-stalling modal dialogs (see the plugin guide's
+[modal-dialog section](game-engine-plugin-guide.md#preventing-editor-modal-dialog-stalls-unity)).
+Seeded before the Editor's first import (at `pre_worktree_setup` in `per_worktree`
+mode, at `pre_ready_gate` in shared mode); the seeded guard is committed into the
+consumer project by story-finalize's `git add -A`.
+
+| Variable                              | Default                  | Effect                                                              |
+| ------------------------------------- | ------------------------ | ------------------------------------------------------------------- |
+| `BMAD_LOOP_UNITY_INSTALL_SCENE_GUARD` | `1`                      | `0` skips seeding entirely (mirrors `install_scene_guard = false`). |
+| `BMAD_LOOP_UNITY_SCENE_GUARD_DIR`     | `Assets/BmadLoop/Editor` | Project-relative install dir; must live under the asset root.       |
+
+### Rollback quiesce (`unity_quiesce.py`)
+
+Saves + closes open scenes before a failed-attempt rollback's `git reset --hard`
+(`pre` phase) and refreshes assets after (`post` phase), so the reset can't leave a
+tracked `.unity` open under the Editor. IvanMurzak-only; best-effort, never blocks the
+rollback (per-call `--timeout` + a subprocess kill + the plugin's overall
+`quiesce_timeout_sec`).
+
+| Variable                               | Default         | Effect                                                      |
+| -------------------------------------- | --------------- | ----------------------------------------------------------- |
+| `BMAD_LOOP_QUIESCE_PHASE`              | `pre`           | `pre` \| `post` — set by the plugin per hook.               |
+| `BMAD_LOOP_UNITY_QUIESCE_CALL_TIMEOUT` | `15000`         | Per-CLI-call budget, ms (assets-refresh floors at `45000`). |
+| `UNITY_MCP_CLI`                        | `unity-mcp-cli` | IvanMurzak CLI binary.                                      |
+
+### Detect-only dialog probe (`unity_dialog_probe.py`)
+
+Opt-in (`dialog_probe = true`), X11/Linux-only. Watches xdotool for a visible Unity
+modal dialog and **reports** it (JSONL + `ATTENTION` + `notify-send`) — it never clicks
+or keys anything. No-op where `DISPLAY` is unset or `xdotool`/`notify-send` is absent;
+self-reaps when the engine pid dies.
+
+| Variable                                    | Default | Effect                                                           |
+| ------------------------------------------- | ------- | ---------------------------------------------------------------- |
+| `BMAD_LOOP_UNITY_DIALOG_PROBE`              | `0`     | `1` enables the launch (mirrors `dialog_probe = true`).          |
+| `BMAD_LOOP_UNITY_DIALOG_PROBE_INTERVAL_SEC` | `5`     | Poll interval seconds (min 1).                                   |
+| `BMAD_LOOP_UNITY_DIALOG_PROBE_NOTIFY`       | `1`     | `0` suppresses the desktop `notify-send` (JSONL/ATTENTION stay). |
+| `BMAD_LOOP_UNITY_DIALOG_PROBE_CLASS`        | `Unity` | xdotool WM_CLASS regex for the Editor's windows.                 |
 
 ## Dev-control HTTP bridge (upstream, dev-only — not wired)
 

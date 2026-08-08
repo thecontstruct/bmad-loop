@@ -22,12 +22,14 @@ from typing import Any
 
 from .adapters.base import SessionSpec
 from .model import RunState
+from .platform_util import safe_segment
+from .runs import validate_restore_latch
 
 RESOLVE_DIR = "resolve"
 
 
 def _story_dir(run_dir: Path, story_key: str) -> Path:
-    return run_dir / RESOLVE_DIR / story_key
+    return run_dir / RESOLVE_DIR / safe_segment(story_key)
 
 
 def context_path(run_dir: Path, story_key: str) -> Path:
@@ -36,6 +38,35 @@ def context_path(run_dir: Path, story_key: str) -> Path:
 
 def resolution_path(run_dir: Path, story_key: str) -> Path:
     return _story_dir(run_dir, story_key) / "resolution.json"
+
+
+class ResolutionError(Exception):
+    """resolution.json exists but cannot be used (unreadable / not a JSON object)."""
+
+
+def read_resolution(run_dir: Path, story_key: str) -> dict[str, Any] | None:
+    """Parse the resolve agent's ``resolution.json`` marker. Returns None ONLY
+    when the marker is absent; a present-but-unusable marker (unreadable, bad
+    JSON, non-object top level) raises ResolutionError instead. The file is the
+    agent's recorded decision — possibly including a ``restore_patch`` (the
+    intent-gap patch-restore path, BMAD-METHOD #2564) — and a re-arm consumes
+    the escalation, so collapsing corruption into "nothing recorded" would
+    silently downgrade a confirmed restore to an unrecoverable from-scratch
+    re-drive. The caller validates the ``restore_patch`` path itself before
+    acting on it."""
+    path = resolution_path(run_dir, story_key)
+    if not path.is_file():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        # UnicodeDecodeError is a ValueError, not an OSError — a non-UTF-8 marker
+        # must raise the clean ResolutionError, not crash (same class as the
+        # read_frontmatter / stories read-path hardening).
+        raise ResolutionError(f"resolution marker {path} is unreadable ({e})") from e
+    if not isinstance(doc, dict):
+        raise ResolutionError(f"resolution marker {path} is not a JSON object")
+    return doc
 
 
 def _gather_escalations(run_dir: Path, state: RunState, story_key: str) -> list[dict[str, Any]]:
@@ -63,9 +94,19 @@ def _gather_escalations(run_dir: Path, state: RunState, story_key: str) -> list[
     return found
 
 
-def build_context(state: RunState, run_dir: Path, story_key: str) -> Path:
+def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: str = "") -> Path:
     """Write resolve/<story_key>/context.json for the resolve skill to read."""
     task = state.tasks.get(story_key)
+    # Patch-restore availability (#2564): the shared `validate_restore_latch`
+    # verdict, not a local copy of one leg. Any of them — worktree isolation (the
+    # re-drive discards and re-mounts the unit's worktree), a spec-less escalation,
+    # a pre-planning sentinel wedge — means the orchestrator would reject a
+    # `restore_patch` after the session; told to the agent up front so it never
+    # negotiates a restore it can't honor.
+    restore_supported = task is not None and (
+        validate_restore_latch(state, task, story_key, worktree_isolation=isolation == "worktree")
+        is None
+    )
     context = {
         "story_key": story_key,
         "run_id": state.run_id,
@@ -76,11 +117,61 @@ def build_context(state: RunState, run_dir: Path, story_key: str) -> Path:
         # as_posix so the context contract is the same string on every OS (the
         # path is consumed by the agent, and Python/tools accept '/' on Windows).
         "resolution_path": resolution_path(run_dir, story_key).as_posix(),
+        "restore_supported": restore_supported,
     }
+    # Stories mode: hand the resolver the manifest intent (the story entry) and a
+    # sentinel indicator, so it sees WHAT the story is meant to do and WHETHER the
+    # frozen spec even exists yet (a sentinel has no plan to edit — resolve the
+    # underlying ambiguity instead). Sprint mode leaves the context unchanged.
+    if state.source == "stories":
+        stories_ctx = _stories_context(state, story_key)
+        if stories_ctx:
+            context["stories"] = stories_ctx
     path = context_path(run_dir, story_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(context, indent=2), encoding="utf-8")
     return path
+
+
+def _stories_context(state: RunState, story_key: str) -> dict[str, Any]:
+    """The stories-mode extension of the resolve context: the spec folder, the
+    manifest entry for the story (title/description/checkpoint flags/invoke_dev_with),
+    and — when the escalated spec is a fixed-slug pre-planning-halt sentinel — a
+    sentinel indicator with its kind and recorded blocking condition. Best-effort:
+    an unreadable manifest just yields the folder (resolve still runs)."""
+    from . import stories
+
+    project = Path(state.project)
+    folder = stories.resolve_spec_folder(project, state.spec_folder)
+    ctx: dict[str, Any] = {"spec_folder": state.spec_folder}
+    try:
+        entry = stories.load_stories(folder).get(story_key)
+    except (stories.StoriesError, OSError, UnicodeDecodeError):
+        entry = None
+    if entry is not None:
+        ctx["story"] = {
+            "id": entry.id,
+            "title": entry.title,
+            "description": entry.description,
+            "spec_checkpoint": entry.spec_checkpoint,
+            "done_checkpoint": entry.done_checkpoint,
+            "invoke_dev_with": entry.invoke_dev_with,
+        }
+    try:
+        st = stories.resolve_story_spec(folder, story_key)
+    except (OSError, UnicodeDecodeError):
+        st = None
+    if st is not None and st.kind == stories.KIND_SENTINEL and st.path is not None:
+        try:
+            condition = stories.recorded_blocking_condition(st.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            condition = ""
+        ctx["sentinel"] = {
+            "kind": st.sentinel_kind,
+            "path": st.path.as_posix(),
+            "blocking_condition": condition,
+        }
+    return ctx
 
 
 def run_session(adapter, project: Path, run_dir: Path, story_key: str, *, model: str = "") -> bool:
@@ -90,7 +181,7 @@ def run_session(adapter, project: Path, run_dir: Path, story_key: str, *, model:
     resolution marker. The context file must already be written (build_context).
     """
     spec = SessionSpec(
-        task_id=f"{story_key}-resolve-1",
+        task_id=f"{safe_segment(story_key)}-resolve-1",
         role="dev",
         prompt=f"/bmad-loop-resolve {story_key}",
         cwd=project,
@@ -110,5 +201,5 @@ def run_session(adapter, project: Path, run_dir: Path, story_key: str, *, model:
     marker.unlink(missing_ok=True)
     argv = adapter.interactive_argv(spec)
     env = {**os.environ, **adapter.interactive_env(spec)}
-    subprocess.run(argv, cwd=str(project), env=env)  # noqa: S603 - attached, inherited stdio
+    subprocess.run(argv, cwd=str(project), env=env)  # attached, inherited stdio
     return marker.is_file()

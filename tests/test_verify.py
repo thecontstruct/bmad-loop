@@ -1,14 +1,25 @@
 import dataclasses
+import io
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
-from conftest import git, spec_path, write_spec, write_sprint
+from conftest import (
+    _FAIL,
+    _OK,
+    MISSING_TOOL_CMD,
+    fault_read_text,
+    git,
+    spec_path,
+    write_spec,
+    write_sprint,
+)
 
 from bmad_loop import verify
 from bmad_loop.model import StoryTask
-from bmad_loop.policy import Policy, VerifyPolicy
+from bmad_loop.policy import Policy, ReviewPolicy, VerifyPolicy
 
 
 def make_task(paths, story_key="1-1-a"):
@@ -19,6 +30,37 @@ def make_task(paths, story_key="1-1-a"):
 
 def dev_result(sp):
     return {"workflow": "auto-dev", "spec_file": str(sp)}
+
+
+def _codec_rejects_bad_byte() -> bool:
+    """Whether byte 0xff is undecodable in the codec ``text=True`` will use.
+
+    Probes ``TextIOWrapper`` with ``encoding=None`` rather than naming a codec,
+    because that is the very default ``subprocess``'s text mode resolves for the
+    child's streams — asking the machinery beats predicting it from the locale.
+    """
+    try:
+        io.TextIOWrapper(io.BytesIO(b"\xff")).read()
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+# Guard for every test whose subject is a STRICT DECODE of subprocess output —
+# the #378 verify-command pair below and the #377 git-chokepoint test above them.
+# Byte 0xff is undecodable only in UTF-8/ASCII; every ISO-8859-x and cp125x codec
+# maps all 256 byte values, so under such a locale the strict decode never raises
+# and those tests pass *with the bug restored* — a silent vacuity rather than a
+# failure (verified: under LC_ALL=et_EE.iso885915 the #378 ablation passes). No
+# single byte is undecodable everywhere, so this skips instead, leaving each test
+# either exercising the fault or saying plainly that it did not. CI is always on
+# the exercising side: the Linux legs run UTF-8 and the Windows legs set
+# PYTHONUTF8=1 (.github/workflows/ci.yml).
+needs_strict_codec = pytest.mark.skipif(
+    not _codec_rejects_bad_byte(),
+    reason="host codec decodes 0xff (e.g. an ISO-8859-x locale), so nothing here "
+    "would exercise the strict decode this fix is about",
+)
 
 
 def test_attempt_dirty_clean_tree(project):
@@ -60,6 +102,33 @@ def test_attempt_dirty_none_snapshot_ignores_untracked(project):
     assert verify.attempt_dirty(project.project, baseline, None) is True
 
 
+def test_path_changed_since_detects_one_tracked_path(project):
+    baseline = verify.rev_parse_head(project.project)
+
+    assert verify.path_changed_since(project.project, baseline, "src.txt") is False
+
+    (project.project / "src.txt").write_text("changed\n", encoding="utf-8")
+    assert verify.path_changed_since(project.project, baseline, "src.txt") is True
+
+
+def test_path_changed_since_respects_the_untracked_baseline(project):
+    baseline = verify.rev_parse_head(project.project)
+    (project.project / "ledger[1].md").write_text("finding\n", encoding="utf-8")
+
+    assert verify.path_changed_since(
+        project.project,
+        baseline,
+        "ledger[1].md",
+        baseline_untracked=[],
+    )
+    assert not verify.path_changed_since(
+        project.project,
+        baseline,
+        "ledger[1].md",
+        baseline_untracked=["ledger[1].md"],
+    )
+
+
 def test_attempt_dirty_excludes_untracked_artifact(project):
     """A new untracked spec under an orchestrator-owned artifact folder is not the
     dev attempt's dirtiness when that folder is excluded — but counts otherwise."""
@@ -89,19 +158,239 @@ def test_attempt_dirty_excludes_tracked_artifact(project):
     assert verify.attempt_dirty(repo, baseline, [], exclude=(artifact_rel,)) is True
 
 
+def _timing_out_run(cmd, **kwargs):
+    raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 0))
+
+
+def test_git_timeout_becomes_git_error(project, monkeypatch):
+    """#156: a git call exceeding the timeout must surface as GitError — the type
+    every guard already handles — never as a raw TimeoutExpired, which bypassed
+    them all and crashed the run from the rollback path."""
+    baseline = verify.rev_parse_head(project.project)
+    monkeypatch.setattr(verify.subprocess, "run", _timing_out_run)
+    with pytest.raises(verify.GitError, match=r"git diff timed out after \d+s"):
+        verify.attempt_dirty(project.project, baseline, [])
+
+
+def test_capture_diff_timeout_becomes_git_error(project, monkeypatch):
+    """capture_diff's inline git spawns (verbatim-stdout diff) share the same
+    translation as the `_git` helpers."""
+    baseline = verify.rev_parse_head(project.project)
+    monkeypatch.setattr(verify.subprocess, "run", _timing_out_run)
+    with pytest.raises(verify.GitError, match="timed out"):
+        verify.capture_diff(project.project, baseline)
+
+
 @pytest.mark.parametrize(
-    "raw,expected",
+    "make_exc",
     [
-        ("in-review", "in-review"),
-        ("  in-review  ", "in-review"),
-        ("In-Review", "in-review"),
-        ("DONE", "done"),
-        (None, ""),
-        (123, "123"),
+        lambda: FileNotFoundError(2, "No such file or directory"),
+        lambda: OSError(24, "Too many open files"),
+        lambda: OSError(12, "Cannot allocate memory"),
+    ],
+    ids=["enoent", "emfile", "enomem"],
+)
+def test_git_spawn_oserror_becomes_git_spawn_error(project, monkeypatch, make_exc):
+    """#343: a spawn-level OSError (EMFILE/ENOMEM, git gone from PATH) is raised
+    by `subprocess.run` before any return code exists, so left untranslated it
+    bypassed every `except GitError` guard and crashed the run. It must surface
+    as GitSpawnError — a GitError to every existing guard, a distinct type for
+    the callers that must tell an environment fault from git refusing.
+
+    Ablation target: delete the `except OSError` arm in `_run_git` and this
+    fails with the raw OSError."""
+    exc = make_exc()
+
+    def failing_run(cmd, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(verify.subprocess, "run", failing_run)
+    with pytest.raises(verify.GitError, match="git rev-parse failed to spawn") as excinfo:
+        verify.rev_parse_head(project.project)
+    assert isinstance(excinfo.value, verify.GitSpawnError)
+    assert excinfo.value.__cause__ is exc  # errno stays reachable for callers
+
+
+def test_configure_git_timeout_overrides_bound(project, monkeypatch):
+    """The engine-applied `limits.git_timeout_s` value is what reaches
+    subprocess.run; the module default stays GIT_TIMEOUT_S for standalone users."""
+    seen: dict[str, object] = {}
+    real_run = subprocess.run
+
+    def spying_run(cmd, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", spying_run)
+    verify.configure_git_timeout(7)
+    try:
+        verify.rev_parse_head(project.project)
+    finally:
+        verify.configure_git_timeout(verify.GIT_TIMEOUT_S)
+    assert seen["timeout"] == 7
+
+
+def test_run_git_forces_c_locale(project, monkeypatch):
+    """Every git child runs with LC_ALL=C so message text stays stable English —
+    the chokepoint fix for #236 (safe_rollback's "did not match" tolerance must not
+    be translated out from under it by a localized parent git). Spy on the actual
+    subprocess env rather than the parent LANG, so the guarantee is pinned even on a
+    CI box with no non-English locale catalogs installed (where a plain LANG=it_IT
+    test would emit English anyway and pass without the fix)."""
+    seen: dict[str, object] = {}
+    real_run = subprocess.run
+
+    def spying_run(cmd, **kwargs):
+        seen["env"] = kwargs.get("env")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", spying_run)
+    verify.rev_parse_head(project.project)
+    assert seen["env"] is not None
+    assert seen["env"]["LC_ALL"] == "C"
+
+
+def test_run_git_locale_merge_preserves_explicit_env(project, monkeypatch):
+    """The LC_ALL=C merge must not clobber a caller-supplied env — the `_git_env`
+    callers pass a throwaway GIT_INDEX_FILE / synthetic commit identity that has to
+    survive (else snapshot_worktree breaks). Assert both the forced LC_ALL and the
+    caller's own key reach subprocess.run together."""
+    seen: dict[str, object] = {}
+    real_run = subprocess.run
+
+    def spying_run(cmd, **kwargs):
+        seen["env"] = kwargs.get("env")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", spying_run)
+    verify._git_env(project.project, "status", env={**os.environ, "SENTINEL_X": "1"})
+    assert seen["env"] is not None
+    assert seen["env"]["LC_ALL"] == "C"
+    assert seen["env"]["SENTINEL_X"] == "1"  # caller's env preserved
+
+
+# ---- the chokepoint's third pre-returncode fault, and its bytes mode (#377)
+
+
+@needs_strict_codec
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows filenames are UTF-16; no undecodable path exists"
+)
+def test_z_output_undecodable_path_becomes_git_error(project):
+    """#377: a filename carrying bytes invalid in the run's codec makes `_run_git`'s
+    strict decode raise UnicodeDecodeError — a third fault raised before any return
+    code exists, and the one the taxonomy missed. Being a ValueError it matched
+    neither `except` arm, so it sailed past every `except GitError` guard: here
+    `dirty_paths`, reached from `clean_incoming_collisions`' merge pre-flight, whose
+    callers guard exactly that type.
+
+    The file is real and so is git. Monkeypatching `subprocess.run` would hand the
+    code str objects and never run the stdlib's decoding at all, so that version
+    passes identically with the fix ablated (tests/test_install.py:1996 documents
+    the same trap).
+
+    Ablation: delete the `except UnicodeDecodeError` arm in `_run_git` and this
+    fails with the raw UnicodeDecodeError."""
+    repo = project.project
+    # POSIX filenames are arbitrary bytes, so build the path as bytes — a str path
+    # would have to carry the byte as a surrogate and re-encode on the way out.
+    with open(os.fsencode(repo) + b"/weird-\xff-name.txt", "wb") as fh:
+        fh.write(b"content\n")
+
+    with pytest.raises(verify.GitError, match="git status returned undecodable output"):
+        verify.dirty_paths(repo)
+
+    # Why only the `-z` (and raw-diff) sites were ever exposed: plain porcelain
+    # C-quotes the same path down to ASCII. This pins git's `core.quotePath`
+    # default, not our fix — adding `-z` to one of the safe callers would
+    # reintroduce the fault silently, and this is what would notice.
+    rc, out = verify._git(repo, "status", "--porcelain")
+    assert rc == 0 and r"weird-\377-name.txt" in out
+
+
+def test_git_bytes_returns_bytes_and_reads_rc_as_an_answer(project):
+    """`git_bytes` hands back the CompletedProcess whatever the rc, with stdout as
+    raw bytes. Both halves are load-bearing for the bytes-mode callers: `git config
+    --get` of an unset key exits 1 and that non-zero rc *is* the reply (it is what
+    tells the git-add shield to enable the extension), so a chokepoint that raised
+    on it could not serve them; and bytes are what let a path invalid in the locale
+    codec through to an `os.fsdecode` at the point of use.
+
+    Ablation: drop `binary=True` from `git_bytes` and the bytes assertions fail
+    against str."""
+    unset = verify.git_bytes(project.project, "config", "--get", "bmadloop.definitelyunset")
+    assert unset.returncode == 1  # an answer, not a fault — and not raised
+    assert unset.stdout == b""
+
+    answered = verify.git_bytes(project.project, "rev-parse", "--abbrev-ref", "HEAD")
+    assert answered.returncode == 0
+    assert answered.stdout.strip() == b"main"  # bytes, not str
+
+
+def test_git_bytes_inherits_locale_pin_and_timeout(project, monkeypatch):
+    """What standing inside the chokepoint buys the bytes callers, asserted rather
+    than assumed: the LC_ALL=C pin (#236) and the engine-set `limits.git_timeout_s`
+    bound (#156) reach subprocess.run unchanged, with text mode off."""
+    seen: dict[str, object] = {}
+    real_run = subprocess.run
+
+    def spying_run(cmd, **kwargs):
+        seen.update(kwargs)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", spying_run)
+    verify.configure_git_timeout(9)
+    try:
+        verify.git_bytes(project.project, "rev-parse", "HEAD")
+    finally:
+        verify.configure_git_timeout(verify.GIT_TIMEOUT_S)
+
+    assert not seen["text"]
+    assert seen["timeout"] == 9
+    assert seen["env"]["LC_ALL"] == "C"
+
+
+def test_git_bytes_timeout_still_becomes_git_error(project, monkeypatch):
+    """Bytes mode skips the decode, not the taxonomy: a timeout has no return code
+    to hand back, so it still raises rather than becoming a CompletedProcess.
+
+    Ablation: delete the `except subprocess.TimeoutExpired` arm and this fails with
+    the raw TimeoutExpired."""
+    monkeypatch.setattr(verify.subprocess, "run", _timing_out_run)
+    with pytest.raises(verify.GitError, match=r"git config timed out after \d+s"):
+        verify.git_bytes(project.project, "config", "--get", "core.excludesFile")
+
+
+def test_git_bytes_spawn_oserror_still_becomes_git_spawn_error(project, monkeypatch):
+    """Same for a spawn-level OSError — GitSpawnError, errno still reachable.
+
+    Ablation: delete the `except OSError` arm and this fails with the raw OSError."""
+    exc = OSError(24, "Too many open files")
+
+    def failing_run(cmd, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(verify.subprocess, "run", failing_run)
+    with pytest.raises(verify.GitSpawnError, match="git config failed to spawn") as excinfo:
+        verify.git_bytes(project.project, "config", "--get", "core.excludesFile")
+    assert excinfo.value.__cause__ is exc
+
+
+@pytest.mark.parametrize(
+    "fm,expected",
+    [
+        ({"status": "in-review"}, "in-review"),
+        ({"status": "  in-review  "}, "in-review"),
+        ({"status": "In-Review"}, "in-review"),
+        ({"status": "DONE"}, "done"),
+        ({}, ""),  # missing key
+        ({"status": None}, ""),  # YAML-null (bare `status:`) reads like a missing key
+        ({"status": "none"}, "none"),  # a literal token stays itself
+        ({"status": 123}, "123"),
     ],
 )
-def test_status_of_normalizes(raw, expected):
-    assert verify.status_of({"status": raw} if raw is not None else {}) == expected
+def test_status_of_normalizes(fm, expected):
+    assert verify.status_of(fm) == expected
 
 
 def test_verify_dev_happy(project):
@@ -114,6 +403,32 @@ def test_verify_dev_happy(project):
     out = verify.verify_dev(task, project, dev_result(sp))
     assert out.ok
     assert task.spec_file == str(sp)
+
+
+def test_verify_dev_spawn_fault_escalates(project, monkeypatch):
+    """#343 acceptance, escalate class: with the OSError injected at
+    `subprocess.run` itself, the shared change-gate's `except GitError` guard
+    catches the translated GitSpawnError and escalates (CRITICAL, not
+    retryable) instead of crashing. Everything on the path before
+    `has_changes_since` is filesystem-only, so the blanket injection's first
+    git spawn is exactly the guarded call.
+
+    Ablation target: delete the `except OSError` arm in `verify._run_git` and
+    this fails with the raw OSError."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    (project.project / "src.txt").write_text("changed\n")
+
+    def cannot_spawn(cmd, **kwargs):
+        raise OSError(12, "Cannot allocate memory")
+
+    monkeypatch.setattr(verify.subprocess, "run", cannot_spawn)
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL"
+    assert "failed to spawn" in out.reason
 
 
 def test_verify_dev_status_is_case_insensitive(project):
@@ -175,6 +490,141 @@ def test_verify_dev_review_disabled_expects_done(project):
     write_spec(sp, "in-review", task.baseline_commit)
     out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False)
     assert not out.ok and "expected 'done'" in out.reason
+
+
+# ------------------------------------------- awaiting-operator pair (#335)
+
+
+def _park(project, *, sprint="awaiting-operator", actions=("publish the TXT record",)):
+    """A dev session that finished its agent-doable work and parked the rest."""
+    write_sprint(project, {"1-1-a": sprint})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "awaiting-operator", task.baseline_commit, operator_actions=list(actions))
+    (project.project / "src.txt").write_text("changed\n")
+    return task, sp
+
+
+def test_verify_dev_accepts_the_park_pair(project):
+    """The third accepted pair, selected by the OBSERVED spec status: the skill
+    decides whether it parked, and the gate then holds it to the matching board
+    state. `review_enabled` is irrelevant here — a park short-circuits both the
+    in-review handoff and the straight-to-done finish."""
+    task, sp = _park(project)
+
+    out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False, operator_park=True)
+
+    assert out.ok
+    assert task.spec_file == str(sp)
+
+
+def test_verify_dev_park_needs_the_matching_board(project):
+    """Pair, not either half: a parked spec over a board the orchestrator never
+    advanced is a sync that did not land, and committing on the spec's word alone
+    would leave `bmad-loop confirm` advancing a board that never reached the
+    token."""
+    task, sp = _park(project, sprint="in-progress")
+
+    out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False, operator_park=True)
+
+    assert not out.ok and out.retryable
+    assert "expected 'awaiting-operator'" in out.reason
+
+
+@pytest.mark.parametrize(
+    "actions, why",
+    [
+        ([], "an empty list declares nothing"),
+        (["", "   "], "blanks are not actions"),
+        ("buy the domain", "a bare string is the wrong container"),
+    ],
+)
+def test_verify_dev_park_without_usable_actions_retries_fixable(project, actions, why):
+    """A park is DEFINED by owing at least one action, so a spec at the status
+    with nothing readable under `operator_actions:` is refused — confirming it
+    later would be a human acknowledging a blank.
+
+    `fixable=True` is the load-bearing half: the tree is real work and the defect
+    is one frontmatter block, so the reason goes to a repair session as feedback
+    instead of throwing the attempt away. This is the ablation detector for the
+    non-empty gate — delete it and the malformed park verifies green."""
+    write_sprint(project, {"1-1-a": "awaiting-operator"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "awaiting-operator", task.baseline_commit, operator_actions=actions)
+    (project.project / "src.txt").write_text("changed\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False, operator_park=True)
+
+    assert not out.ok and out.retryable, why
+    assert out.fixable is True
+    assert "operator_actions" in out.reason and "YAML list of strings" in out.reason
+
+
+def test_verify_dev_park_unknown_when_the_policy_is_off(project):
+    """`[operator] enabled = false` does not make the token mean something else —
+    it makes it mean nothing. The ordinary status gate then rejects it, and the
+    session is retried with that mismatch as feedback rather than committing."""
+    task, sp = _park(project)
+
+    out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False)
+
+    assert not out.ok and out.retryable
+    assert "'awaiting-operator'" in out.reason and "expected 'done'" in out.reason
+
+
+def test_verify_review_accepts_the_park_pair(project):
+    """The gate the park path runs before committing: parked work clears the same
+    deterministic checks `done` work clears."""
+    task, sp = _park(project)
+    task.spec_file = str(sp)
+
+    out = verify.verify_review(task, project, Policy(), operator_park=True)
+
+    assert out.ok
+
+
+def test_verify_review_park_refused_without_the_engine_flag(project):
+    """The flag is the SAME one `verify_dev` takes, not a second reading of
+    `policy.operator.enabled`, so the two gates cannot disagree about whether
+    this run parks — `Engine._operator_park_enabled` is an override seam, and a
+    mode that opts out (stories, sweep) while still reaching this gate would
+    otherwise find it accepting a park the engine itself refuses to take.
+
+    Conservative default, like `sprint_reached_done`: a caller that says nothing
+    gets the pre-#335 behavior."""
+    task, sp = _park(project)
+    task.spec_file = str(sp)
+
+    out = verify.verify_review(task, project, Policy())  # operator_park defaults False
+
+    assert not out.ok and out.retryable
+    assert "'awaiting-operator'" in out.reason and "expected 'done'" in out.reason
+
+
+def test_verify_review_park_requires_actions(project):
+    task, sp = _park(project, actions=[])
+    task.spec_file = str(sp)
+
+    out = verify.verify_review(task, project, Policy(), operator_park=True)
+
+    assert not out.ok and out.retryable and out.fixable is True
+    assert "operator_actions" in out.reason
+
+
+def test_verify_review_park_board_short_is_a_plain_retry_not_a_contradiction(project):
+    """The sign-off-regression arm (#334) stays scoped to the `done` pair. A board
+    short of `awaiting-operator` is a stage never reached — escalating it would
+    halt a run over a sync that simply has not landed."""
+    task, sp = _park(project, sprint="in-progress")
+    task.spec_file = str(sp)
+
+    out = verify.verify_review(
+        task, project, Policy(), sprint_reached_done=True, operator_park=True
+    )
+
+    assert not out.ok and out.retryable and out.contradiction is False
+    assert out.reason == "sprint-status for 1-1-a is 'in-progress', expected 'awaiting-operator'"
 
 
 def test_verify_dev_review_disabled_rejects_review_sprint(project):
@@ -241,10 +691,12 @@ def test_verify_review_happy_and_commands(project):
     write_spec(sp, "done", task.baseline_commit)
     task.spec_file = str(sp)
 
-    ok_policy = Policy(verify=VerifyPolicy(commands=("true",)))
+    # The host-shell verbs, not POSIX `true`/`false`: cmd has neither, so those
+    # read as a broken environment on Windows rather than pass/fail (#302).
+    ok_policy = Policy(verify=VerifyPolicy(commands=(_OK,)))
     assert verify.verify_review(task, project, ok_policy).ok
 
-    fail_policy = Policy(verify=VerifyPolicy(commands=("true", "false")))
+    fail_policy = Policy(verify=VerifyPolicy(commands=(_OK, _FAIL)))
     out = verify.verify_review(task, project, fail_policy)
     assert not out.ok and "verify command failed" in out.reason
 
@@ -267,6 +719,394 @@ def test_verify_review_sprint_not_done(project):
     task.spec_file = str(sp)
     out = verify.verify_review(task, project, Policy())
     assert not out.ok and "sprint-status" in out.reason
+
+
+# ------------------------------------- review revokes the sprint sign-off (#334)
+
+
+def _signoff_regression_task(project, sprint_status="in-progress"):
+    """A story the orchestrator advanced to `done` whose board a review then
+    wrote back, leaving the spec frontmatter at `done`."""
+    write_sprint(project, {"1-1-a": sprint_status})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "done", task.baseline_commit)
+    task.spec_file = str(sp)
+    return task
+
+
+def test_verify_review_signoff_regression_escalates(project):
+    """The default knob turns a review's board regression into a CRITICAL pause
+    that names both sides, instead of a retry no later cycle can satisfy."""
+    task = _signoff_regression_task(project)
+    out = verify.verify_review(task, project, Policy(), sprint_reached_done=True)
+
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL" and out.contradiction is True
+    assert not out.fixable  # no repair session can reconcile a disagreement
+    # both sides are named, plus the two ways out and the opt-out knob
+    assert "'in-progress'" in out.reason and "'done'" in out.reason
+    assert "1-1-a" in out.reason
+    assert 'review.on_status_contradiction = "retry"' in out.reason
+
+
+def test_verify_review_signoff_regression_retry_mode_is_legacy(project):
+    """`retry` restores the pre-#334 routing verbatim: an ordinary retryable
+    sprint-status failure that burns review cycles and ends in a defer."""
+    task = _signoff_regression_task(project)
+    pol = Policy(review=ReviewPolicy(on_status_contradiction="retry"))
+    out = verify.verify_review(task, project, pol, sprint_reached_done=True)
+
+    assert not out.ok and out.retryable and out.contradiction is False
+    assert out.reason == "sprint-status for 1-1-a is 'in-progress', expected 'done'"
+
+
+def test_verify_review_signoff_regression_needs_the_launch_flag(project):
+    """Without the caller's guarantee that the board actually reached `done`, an
+    earlier status is a stage never reached — the gate must not escalate. Sweep
+    and stories callers never pass the flag."""
+    task = _signoff_regression_task(project)
+    out = verify.verify_review(task, project, Policy())  # sprint_reached_done defaults False
+
+    assert not out.ok and out.retryable and out.contradiction is False
+    assert "sprint-status" in out.reason
+
+
+@pytest.mark.parametrize(
+    "board, why",
+    [
+        ({"1-2-b": "done"}, "story absent from the board -> story_status returns None"),
+        ({"1-1-a": "needs-signoff"}, "token outside STATUS_ORDER (hand-edited board)"),
+    ],
+)
+def test_verify_review_unrecognized_sprint_status_retries(project, board, why):
+    """Conservative on every uncertainty: a status the lifecycle does not know
+    cannot be *ordered* against `done`, so it is never called a regression — a
+    wrong escalation halts an otherwise healthy run."""
+    write_sprint(project, board)
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "done", task.baseline_commit)
+    task.spec_file = str(sp)
+
+    out = verify.verify_review(task, project, Policy(), sprint_reached_done=True)
+
+    assert not out.ok and out.retryable and out.contradiction is False, why
+
+
+def test_verify_review_awaiting_operator_board_is_a_regression(project):
+    """`awaiting-operator` joined STATUS_ORDER below `done`, so a review writing
+    it onto a board the orchestrator had already signed off is now ORDERED, and
+    therefore a deliberate regression — not the unknown token it used to be.
+
+    This is the one behavior the vocabulary PR changes, and it is the intended
+    one: until the park path exists, nothing legitimately writes this token, so a
+    review that writes it has revoked a sign-off the same way `in-progress` does.
+    When the park path lands, `operator.on_review_demotion` is what re-routes it.
+    """
+    task = _signoff_regression_task(project, sprint_status="awaiting-operator")
+
+    out = verify.verify_review(task, project, Policy(), sprint_reached_done=True)
+
+    assert not out.ok and not out.retryable
+    assert out.contradiction is True and out.severity == "CRITICAL"
+    assert "'awaiting-operator'" in out.reason
+
+
+# --------------------------------------------------- verify command exit codes (issue #126)
+
+
+@pytest.mark.parametrize("rc", [126, 127])
+def test_verify_commands_env_fault_rc_escalates(tmp_path, rc):
+    """The shell's environment faults (126 = not executable, 127 = not found)
+    escalate instead of retrying: a repair session cannot fix the environment,
+    so they must never charge the story's attempt budget.
+
+    Runs on both platforms: 126/127 are sh's *convention*, but the rc arm is
+    checked ahead of the per-shell branch, so `cmd /c "exit 126"` classifies
+    the same way — nothing about the win32 arm narrows it (issue #302)."""
+    policy = Policy(verify=VerifyPolicy(commands=(f"exit {rc}",)))
+    out = verify.verify_commands_outcome(policy, tmp_path)
+    assert not out.ok
+    assert out.severity == "CRITICAL"
+    assert out.env_fault
+    assert not out.retryable and not out.fixable
+    assert f"rc={rc}" in out.reason
+
+
+def test_verify_commands_missing_binary_is_env_fault(tmp_path):
+    """Realism check on the host shell: a command no host has is an env fault on
+    both — sh exits 127, cmd exits 1 and says "is not recognized" (issue #302)."""
+    policy = Policy(verify=VerifyPolicy(commands=(MISSING_TOOL_CMD,)))
+    out = verify.verify_commands_outcome(policy, tmp_path)
+    assert out.env_fault and not out.fixable
+    assert MISSING_TOOL_CMD in out.reason
+
+
+# --------------------------------------------------- cmd env-fault signals (issue #302)
+#
+# cmd has no 126/127 convention, so the win32 arm classifies on three other
+# signals. These drive verify.env_fault_reason directly with synthetic results:
+# actually executing an unrunnable path on Windows would hand it to the file
+# association (see #292) — an interactive picker mid-suite, not a test.
+
+WIN32_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="cmd-specific classification")
+NOT_RECOGNIZED = (
+    "'ruff' is not recognized as an internal or external command,\noperable program or batch file."
+)
+
+
+@WIN32_ONLY
+@pytest.mark.parametrize(
+    "rc, tail",
+    [
+        (9009, ""),  # a .cmd/.bat wrapper propagating %ERRORLEVEL%
+        (1, NOT_RECOGNIZED),  # cmd's own message, alone in the tail
+        # The shape production actually builds: run_verify_commands concatenates
+        # stdout + stderr, and cmd's message is on stderr — so a compound command
+        # whose earlier half printed to stdout still puts the message last.
+        (1, f"1 failed, 3 passed\n{NOT_RECOGNIZED}"),
+    ],
+)
+def test_win32_shell_signals_are_env_faults(tmp_path, rc, tail):
+    result = verify.CommandResult("ruff check", rc, tail)
+    assert verify.env_fault_reason(result, tmp_path) is not None
+
+
+@WIN32_ONLY
+def test_win32_unresolvable_token_is_env_fault_without_the_message(tmp_path):
+    """The localized-Windows path: cmd's message is not English, so the leading
+    token is probed against PATH instead."""
+    result = verify.CommandResult(f"{MISSING_TOOL_CMD} -q", 1, "nije prepoznat kao naredba")
+    assert "not found on PATH" in (verify.env_fault_reason(result, tmp_path) or "")
+
+
+@WIN32_ONLY
+def test_win32_unexecutable_file_is_env_fault_despite_rc_zero(tmp_path):
+    """cmd hands a file whose extension is not in PATHEXT to the file association
+    and returns 0 without running it — a silent false pass, not a green verify."""
+    script = tmp_path / "check.sh"
+    script.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    result = verify.CommandResult(f'"{script}"', 0, "")
+    assert "not executable by cmd" in (verify.env_fault_reason(result, tmp_path) or "")
+
+
+@WIN32_ONLY
+def test_win32_file_named_after_a_builtin_is_not_a_false_fault(tmp_path):
+    """cmd answers an unqualified internal name internally, before searching any
+    directory, so a file that merely shares the name is never what runs. Without
+    the builtin guard on the file probe this escalates at rc 0 — verify could
+    then never pass in a repo that happens to carry such a file."""
+    (tmp_path / "echo").write_text("not a program\n", encoding="utf-8")
+    passing = verify.CommandResult("echo verifying", 0, "")
+    assert verify.env_fault_reason(passing, tmp_path) is None
+    failing = verify.CommandResult("echo verifying", 1, "checks failed")
+    assert verify.env_fault_reason(failing, tmp_path) is None
+    # The exemption is the bare name only: a qualified reference to that same file
+    # is something cmd does try to run, so it must still classify.
+    qualified = verify.CommandResult(str(tmp_path / "echo"), 0, "")
+    assert "not executable by cmd" in (verify.env_fault_reason(qualified, tmp_path) or "")
+
+
+@WIN32_ONLY
+@pytest.mark.parametrize(
+    "command, rc, tail",
+    [
+        ('if exist "x" (exit 1)', 1, ""),  # a cmd builtin: which cannot resolve it
+        ("pytest -q", 1, "1 failed, 3 passed"),  # the tool exists; the tests failed
+        ('pytest "unbalanced', 1, ""),  # untokenizable: probe skipped, not raised
+        # Pins the window, not a production shape: cmd's message rides on stderr,
+        # which is appended last, so it cannot be pushed out of the closing lines
+        # by a real run — only by a command echoing the phrase itself.
+        ("ruff check", 1, f"{NOT_RECOGNIZED}\n1 file reformatted"),
+        ("pytest -q", 1, "Access is denied\n1 test failed"),
+        ("2>nul pytest -q", 1, ""),
+        ("(pytest)", 1, "1 failed"),  # grouping parens on both ends, no argument
+        ("(pytest -q) && (ruff check)", 1, "1 failed"),
+        ("pytest|findstr FAIL", 1, "1 failed"),  # shlex leaves the pipe attached
+        ("pytest -q&&ruff check", 1, "1 failed"),
+        ("& pytest -q", 1, "1 failed"),  # a leading operator is not a tool name
+    ],
+)
+def test_win32_ordinary_failures_are_not_env_faults(tmp_path, command, rc, tail, monkeypatch):
+    # Pin PATH resolution to a host that has exactly pytest and ruff: otherwise
+    # every row here silently asserts this interpreter's PATH layout (a
+    # `python -m pytest` from an env whose Scripts\ dir is not on PATH reports
+    # "pytest not found on PATH" and fails for the wrong reason). Resolving only
+    # those two keeps each row load-bearing — `(pytest)` still proves the parens
+    # are stripped, `if exist` still proves the builtin allowlist.
+    monkeypatch.setattr(
+        verify.shutil,
+        "which",
+        lambda name: rf"C:\tools\{name}.exe" if name in {"pytest", "ruff"} else None,
+    )
+    assert verify.env_fault_reason(verify.CommandResult(command, rc, tail), tmp_path) is None
+
+
+@WIN32_ONLY
+def test_win32_passing_command_is_never_an_env_fault(tmp_path):
+    """rc 0 classifies only via the file probe — a token that is not a file on
+    disk must never escalate a green run."""
+    assert verify.env_fault_reason(verify.CommandResult("pytest -q", 0, ""), tmp_path) is None
+
+
+@WIN32_ONLY
+@pytest.mark.parametrize(
+    "command",
+    [
+        "%TOOLCHAIN%\\pytest.exe -q",  # cmd expands it; the literal never resolves
+        "!DELAYED!\\pytest.exe -q",
+    ],
+)
+def test_win32_expandable_token_skips_the_probe(tmp_path, command):
+    """A token cmd expands before running is unprobeable: resolving the literal
+    would report "not found" for a tool that is right there."""
+    assert verify.env_fault_reason(verify.CommandResult(command, 1, ""), tmp_path) is None
+
+
+@WIN32_ONLY
+def test_win32_failing_script_in_the_run_dir_is_not_a_false_fault(tmp_path, monkeypatch):
+    """cmd searches the run's own directory before PATH, so a runnable check that
+    simply *fails* there keeps the fixable-retry classification — `which` would
+    miss it, since it searches this process's directory instead."""
+    (tmp_path / "check.cmd").write_text("@exit /b 1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path.parent)
+    failing = verify.CommandResult("check.cmd", 1, "checks failed")
+    assert verify.env_fault_reason(failing, tmp_path) is None
+    assert (
+        verify.env_fault_reason(verify.CommandResult("check", 1, "checks failed"), tmp_path) is None
+    )
+
+
+@WIN32_ONLY
+def test_win32_relative_script_under_a_foreign_cwd_is_not_a_false_fault(tmp_path, monkeypatch):
+    """The run's cwd is not the process cwd under worktree isolation, so
+    executability is decided by PATHEXT rather than by resolving the relative
+    path against whatever directory this process happens to sit in."""
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "check.cmd").write_text("@exit /b 0\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path.parent)
+    passing = verify.CommandResult("scripts\\check.cmd", 0, "")
+    assert verify.env_fault_reason(passing, tmp_path) is None
+
+
+@WIN32_ONLY
+def test_win32_timeout_is_never_an_env_fault(tmp_path):
+    """A timed-out command (rc sentinel -1) ran and hung, so it was found and
+    runnable — it keeps the charged fixable-retry classification even when its
+    tool happens to be unresolvable from this process."""
+    timed_out = verify.CommandResult(f"{MISSING_TOOL_CMD} -q", -1, "timed out")
+    assert verify.env_fault_reason(timed_out, tmp_path) is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="win32 has its own classifier")
+def test_posix_ignores_the_cmd_signals(tmp_path):
+    """The cmd signals stay win32-only: on sh, 9009 is an ordinary exit code."""
+    assert verify.env_fault_reason(verify.CommandResult("ruff", 9009, ""), tmp_path) is None
+    assert (
+        verify.env_fault_reason(verify.CommandResult("ruff", 1, NOT_RECOGNIZED), tmp_path) is None
+    )
+
+
+def test_env_fault_takes_precedence_over_earlier_ordinary_failure(tmp_path):
+    """A mixed run must not classify by the first failure it sees: an env
+    fault later in the command list still escalates — a repair session
+    dispatched for the earlier rc=1 would run in the broken environment."""
+    policy = Policy(verify=VerifyPolicy(commands=(_FAIL, "exit 127")))
+    out = verify.verify_commands_outcome(policy, tmp_path)
+    assert not out.ok
+    assert out.env_fault
+    assert not out.retryable and not out.fixable
+    assert "rc=127" in out.reason
+
+
+def test_verify_commands_rc1_stays_fixable_retry(tmp_path):
+    """Ordinary failures (tests failing) keep the fixable-retry classification."""
+    policy = Policy(verify=VerifyPolicy(commands=(_FAIL,)))
+    out = verify.verify_commands_outcome(policy, tmp_path)
+    assert not out.ok and out.fixable and out.retryable and not out.env_fault
+
+
+def test_verify_commands_timeout_stays_charged(tmp_path, monkeypatch):
+    """A timeout is plausibly the story's own tests hanging — it keeps the
+    fixable-retry classification, not the env-fault escalate."""
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        lambda policy, cwd: [verify.CommandResult("pytest", -1, "timed out")],
+    )
+    out = verify.verify_commands_outcome(Policy(), tmp_path)
+    assert not out.ok and out.fixable and not out.env_fault
+
+
+# ---- undecodable verify output (issue #378)
+#
+# Both tests drive a REAL child process. Monkeypatching subprocess.run hands the
+# code str objects directly and never runs the stdlib's decoding at all, so such
+# a test passes identically with the bug restored — see the #374 regression
+# test's docstring (tests/test_install.py) for the same distinction.
+#
+# They are also codec-conditional, which is the subtler way they could go quiet;
+# `needs_strict_codec` (top of file) is what keeps them honest about it.
+
+
+def _undecodable_cmd(tmp_path: Path, rc: int) -> str:
+    """A shell string running a child that emits byte 0xff on stdout and exits
+    with `rc`. Interpreter is `sys.executable`, never a bare `python`: the tests
+    run under uv, where no `python` need be on PATH. The double quotes are
+    honored by both sh and cmd."""
+    script = tmp_path / "emit378.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stdout.buffer.write(b'before \\xff after\\n')\n"
+        "sys.stdout.buffer.flush()\n"
+        f"sys.exit({rc})\n",
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{script}"'
+
+
+@needs_strict_codec
+def test_verify_commands_undecodable_output_keeps_every_result(tmp_path):
+    """A child emitting a byte invalid in the run's encoding is decoded with
+    replacement, not strictly: the strict decode raised UnicodeDecodeError
+    *before* any result was appended, so the offender's exit code AND every
+    later command's result were lost, and the dev phase crashed instead of
+    classifying a failure.
+
+    U+FFFD is asserted, not merely "did not raise": under `needs_strict_codec`
+    the codec provably cannot decode the byte, so `errors="replace"` must have
+    produced exactly that character. Its *count* stays unasserted — that is what
+    varies by codec — and the text on both sides pins the rest of the tail.
+
+    Ablation: remove `errors="replace"` from run_verify_commands and this fails
+    with UnicodeDecodeError."""
+    policy = Policy(verify=VerifyPolicy(commands=(_undecodable_cmd(tmp_path, 5), _OK)))
+
+    results = verify.run_verify_commands(policy, tmp_path)
+
+    assert [r.returncode for r in results] == [5, 0]
+    assert "before" in results[0].output_tail and "after" in results[0].output_tail
+    assert "\ufffd" in results[0].output_tail  # the replacement, not a survivor
+
+
+@needs_strict_codec
+def test_verify_commands_undecodable_failure_stays_fixable_retry(tmp_path):
+    """Through the outcome path: an undecodable tail still classifies as an
+    ordinary fixable failure and still reaches the repair session's feedback.
+
+    What the env-fault probe contributes is platform-split, so this does not
+    claim more than it runs: on POSIX `verify.env_fault_reason` returns at its
+    `sys.platform != "win32"` guard without ever reading the tail, and only the
+    Windows leg takes `_win32_env_fault_reason` over the replaced text. The
+    classification asserted here holds on both."""
+    policy = Policy(verify=VerifyPolicy(commands=(_undecodable_cmd(tmp_path, 1),)))
+
+    out = verify.verify_commands_outcome(policy, tmp_path)
+
+    assert not out.ok and out.fixable and out.retryable and not out.env_fault
+    assert "rc=1" in out.reason
+    assert "after" in out.reason
 
 
 def make_bundle_task(paths, dw_ids=("DW-1", "DW-2")):
@@ -327,6 +1167,75 @@ def test_verify_dev_bundle_absent_dw_ids_passes(project, claim):
     out = verify.verify_dev_bundle(task, project, rj)
     assert out.ok
     assert task.spec_file == str(sp)
+
+
+def test_verify_dev_bundle_ancestor_baseline_passes(project):
+    """#161: a bundle that adopts a pre-existing story spec (bmad-dev-auto
+    routes a "follow-up review of story X" bundle into that story's done spec)
+    carries the story's original baseline — an *ancestor* of the unit baseline,
+    never equal to it. The bundle gate accepts the ancestor instead of failing
+    the whole attempt after the work is done."""
+    ancestor = verify.rev_parse_head(project.project)
+    (project.project / "story-work.txt").write_text("stories 1.1-1.3\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story work")
+    task = make_bundle_task(project, dw_ids=("DW-1",))  # baseline = new HEAD
+    sp = project.implementation_artifacts / "spec-1-1-a.md"
+    write_spec(sp, "in-review", ancestor)  # adopted spec: the older baseline
+    (project.project / "src.txt").write_text("review fixes\n")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
+    out = verify.verify_dev_bundle(task, project, rj)
+    assert out.ok
+    assert task.spec_file == str(sp)
+
+
+def test_verify_dev_bundle_foreign_baseline_still_fails(project):
+    """The bundle relaxation is ancestor-only: a baseline unknown to (or
+    diverged from) the unit's history still fails the gate."""
+    task = make_bundle_task(project, dw_ids=("DW-1",))
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", "0" * 40)
+    (project.project / "src.txt").write_text("changed\n")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
+    out = verify.verify_dev_bundle(task, project, rj)
+    assert not out.ok and "baseline" in out.reason
+
+
+def test_verify_dev_bundle_ancestor_probe_git_failure_stays_strict(project, monkeypatch):
+    """A git failure inside the ancestor probe (e.g. a timeout, which surfaces
+    as GitError since #156's `_run_git` translation) must read as
+    not-an-ancestor and fail the gate closed — never propagate out of
+    `_verify_shared_gates` and crash the run."""
+    ancestor = verify.rev_parse_head(project.project)
+    (project.project / "story-work.txt").write_text("stories 1.1-1.3\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story work")
+    task = make_bundle_task(project, dw_ids=("DW-1",))
+    sp = project.implementation_artifacts / "spec-1-1-a.md"
+    write_spec(sp, "in-review", ancestor)
+    (project.project / "src.txt").write_text("review fixes\n")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
+    monkeypatch.setattr(verify.subprocess, "run", _timing_out_run)
+    assert verify.is_ancestor(project.project, ancestor, task.baseline_commit) is False
+    out = verify.verify_dev_bundle(task, project, rj)
+    assert not out.ok and "baseline" in out.reason
+
+
+def test_verify_dev_sprint_ancestor_baseline_still_fails(project):
+    """The ancestor relaxation is bundle-only: a sprint-mode dev spec is
+    authored by this session, so its baseline must match the orchestrator's
+    exactly — an older ancestor means the session planned from a stale tree."""
+    ancestor = verify.rev_parse_head(project.project)
+    (project.project / "story-work.txt").write_text("advance\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "advance")
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)  # baseline = new HEAD
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", ancestor)
+    (project.project / "src.txt").write_text("changed\n")
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "baseline" in out.reason
 
 
 def test_verify_dev_bundle_ledger_only_counts_as_real_work(project):
@@ -486,6 +1395,47 @@ def test_verify_dev_stories_whitespace_story_key(project):
     assert out.ok and task.spec_file == str(sp)
 
 
+def test_verify_dev_stories_ledger_only_counts_as_real_work(project):
+    """T3 regression: a stories-mode story whose entire authorized diff is
+    ledger/spec reconciliation under implementation_artifacts (e.g. deferred-work.md)
+    must pass proof-of-work, not false-negative "no changes". Guards the file-granular
+    exclude port off #79 — the old whole-folder `artifact_relpaths` exclusion
+    swallowed the ledger, re-introducing KNOWN-BUG-ledger-only-story-false-no-
+    changes.md in stories mode (verify_dev_exclude_relpaths excludes only the
+    session's own spec + sprint-status, so sibling ledger content counts)."""
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    # The ONLY real change since baseline is the ledger under implementation_artifacts;
+    # the story's own spec (under the spec folder's stories/) is excluded either way.
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("### DW-1: reconciled\n\nstatus: done\n")
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert out.ok
+
+
+def test_verify_dev_stories_spec_only_change_outside_artifacts_is_not_work(project):
+    # spec folder OUTSIDE the artifact dirs: the story record + stories.yaml must
+    # still not count as implementation work (the _stories_relpaths exclusion),
+    # so a story that only wrote its spec fails proof-of-work.
+    spec_folder = project.project / "docs" / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    (spec_folder / "stories.yaml").write_text("- id: '1'\n  title: t\n  description: d\n")
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert not out.ok and "no changes" in out.reason
+    # real code alongside the spec -> proof-of-work passes
+    (project.project / "src.txt").write_text("real work\n")
+    out2 = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert out2.ok
+
+
 def test_verify_dev_stories_plan_halt_expects_ready_for_dev(project):
     # plan-halt leg: the spec is at ready-for-dev (the plan), not done, and there
     # is NO code change — proof-of-work is skipped and the plan spec is recorded.
@@ -545,6 +1495,37 @@ def test_plan_halt_status_matches_devcontract():
     assert verify.PLAN_HALT_STATUS == devcontract.PLAN_HALT_STATUS
 
 
+def test_verify_review_stories_no_sprint_gate(project):
+    # verify_review_stories checks spec == done + verify commands, no sprint gate.
+    assert not project.sprint_status.is_file()
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    task.spec_file = str(sp)
+    assert verify.verify_review_stories(task, project, Policy()).ok
+
+
+def test_verify_review_stories_non_done_retries(project):
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "in-review", task.baseline_commit)
+    task.spec_file = str(sp)
+    out = verify.verify_review_stories(task, project, Policy())
+    assert not out.ok and "expected 'done'" in out.reason
+
+
+def test_verify_review_stories_non_utf8_spec_retries(project):
+    """A spec that became undecodable mid-run must produce a clean retry (status
+    reads as ""), not a UnicodeDecodeError crash of review verification."""
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    sp.write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\x81")
+    task.spec_file = str(sp)
+    out = verify.verify_review_stories(task, project, Policy())
+    assert not out.ok and "expected 'done'" in out.reason
+
+
 def test_verify_review_bundle_ledger_gate(project):
     task = make_bundle_task(project)
     sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
@@ -567,6 +1548,71 @@ def test_verify_review_bundle_missing_entry_fails(project):
     bundle_ledger(project, {"DW-1": "done 2026-06-11"})  # DW-2 absent entirely
     out = verify.verify_review_bundle(task, project, Policy())
     assert not out.ok and out.fixable and "DW-2" in out.reason
+
+
+def test_verify_shared_gates_oserror_degrades_to_retry(project, monkeypatch):
+    """An unreadable spec at the dev gate is a retryable outcome, not a whole-run
+    crash: the dev skill is still rewriting the spec this gate reads back, so a
+    transient OSError has a designed producer. The reason must name the read fault
+    — degrading to frontmatter {} would read as status "" and send a repair
+    session after a status bug that does not exist."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    (project.project / "src.txt").write_text("changed\n")
+    fault_read_text(monkeypatch, sp)
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and out.retryable and not out.fixable
+    assert "spec unreadable" in out.reason and "PermissionError" in out.reason
+    assert "spec status is" not in out.reason  # never masquerades as a status mismatch
+
+
+@pytest.mark.parametrize("mode", ["review", "review_stories", "review_bundle"])
+def test_verify_review_gates_oserror_degrades_to_retry(project, monkeypatch, mode):
+    """Same degrade at all three review gates."""
+    if mode == "review":
+        write_sprint(project, {"1-1-a": "done"})
+        task = make_task(project)
+        sp = spec_path(project, "1-1-a")
+        write_spec(sp, "done", task.baseline_commit)
+        gate = verify.verify_review
+    elif mode == "review_stories":
+        task = make_stories_task(project, "1")
+        sp = write_story(
+            project.planning_artifacts / "epic-a", "1", "x", "done", task.baseline_commit
+        )
+        gate = verify.verify_review_stories
+    else:
+        task = make_bundle_task(project)
+        sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+        write_spec(sp, "done", task.baseline_commit)
+        bundle_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
+        gate = verify.verify_review_bundle
+    task.spec_file = str(sp)
+    fault_read_text(monkeypatch, sp)
+
+    out = gate(task, project, Policy())
+    assert not out.ok and out.retryable
+    assert "spec unreadable" in out.reason and "PermissionError" in out.reason
+    assert "expected 'done'" not in out.reason
+
+
+def test_verify_review_bundle_ledger_oserror_degrades_to_retry(project, monkeypatch):
+    """The ledger read is the same TOCTOU class as the spec read beside it — the
+    orchestrator's own `mark_done` rewrites it between the dev and review gates."""
+    task = make_bundle_task(project)
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "done", task.baseline_commit)
+    task.spec_file = str(sp)
+    bundle_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
+    fault_read_text(monkeypatch, project.deferred_work)  # spec reads fine
+
+    out = verify.verify_review_bundle(task, project, Policy())
+    assert not out.ok and out.retryable and not out.fixable
+    assert "deferred-work ledger unreadable" in out.reason and "PermissionError" in out.reason
+    assert "DW-1" not in out.reason  # not the "entries not marked done" verdict
 
 
 def test_safe_rollback_reverts_tracked_and_removes_run_created(project):
@@ -697,6 +1743,68 @@ def test_safe_rollback_raises_on_genuine_restore_failure(project, monkeypatch):
         )
 
 
+def test_safe_rollback_raises_when_the_preserve_snapshot_cannot_be_taken(project, monkeypatch):
+    """A failed `git stash create` used to be swallowed into an empty snapshot, which
+    silently disabled the whole restore — so the reset reverted exactly the paths
+    `preserve` names (a resolved re-drive's corrected spec) with no error anywhere.
+    Raise before the reset instead.
+
+    Ablation target: drop the `if rc != 0 and preserve: raise` from safe_rollback
+    and this fails — the spec comes back reverted, quietly."""
+    repo = project.project
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text("frozen: original\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "spec")
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    artifact_rel = project.implementation_artifacts.relative_to(repo).as_posix()
+    spec.write_text("frozen: corrected\n")
+
+    real_git = verify._git
+
+    def fake_git(r, *args):
+        if args[:2] == ("stash", "create"):
+            return 1, "fatal: unable to write temporary index"
+        return real_git(r, *args)
+
+    monkeypatch.setattr(verify, "_git", fake_git)
+    with pytest.raises(verify.GitError, match="git stash create"):
+        verify.safe_rollback(
+            repo,
+            baseline,
+            baseline_untracked=snap,
+            keep=(".bmad-loop", artifact_rel),
+            preserve=(artifact_rel,),
+        )
+    # raised BEFORE the reset, so the correction is still on disk to be re-tried
+    assert spec.read_text() == "frozen: corrected\n"
+
+
+def test_safe_rollback_degrades_stash_failure_when_nothing_to_preserve(project, monkeypatch):
+    """The raise is scoped to callers that asked for a restore. With no `preserve`
+    the snapshot is unused, so a `stash create` failure stays a non-event — both
+    sweep call sites reset with no preserve and must not start failing.
+
+    INVERSE ablation: drop the `and preserve` guard and this fails."""
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    (repo / "src.txt").write_text("dev attempt\n")
+
+    real_git = verify._git
+
+    def fake_git(r, *args):
+        if args[:2] == ("stash", "create"):
+            return 1, "fatal: unable to write temporary index"
+        return real_git(r, *args)
+
+    monkeypatch.setattr(verify, "_git", fake_git)
+    verify.safe_rollback(repo, baseline, baseline_untracked=snap)  # no preserve
+
+    assert (repo / "src.txt").read_text() == "original\n"  # reset still happened
+
+
 def test_safe_rollback_tolerates_empty_preserve_dir(project):
     """A `preserve` dir with no tracked content in the snapshot makes checkout exit
     non-zero ('did not match') — benign, must NOT raise."""
@@ -817,6 +1925,310 @@ def test_worktree_clean_flags_untracked_non_policy(project):
     assert not verify.worktree_clean(project.project)
 
 
+# ------------------------------------------------- git pathspec hardening (#423)
+#
+# Every fixture below is built in PYTHON, never through a shell: fish and zsh
+# glob-expand `docs[a]` / `a*b` / `q?r` into non-existence, and `git rm --cached
+# '<glob>'` takes its argument as a pathspec too — both produced void fixtures
+# (a test that passes because it tested nothing) on the 0.9.1 hotfix.
+#
+# `*`, `?` and `:` are all reserved in Windows FILENAMES (`:` is the drive
+# separator), so a fixture that must CREATE a directory carrying one is
+# Linux-only — `mkdir` raises WinError 123 before the test can assert anything.
+# `[` and `]` are legal everywhere, and per #423's reachability analysis they are
+# also the realistic carrier since `implementation_artifacts` comes out of the
+# operator's config, so the bracket rows stay unmarked and cover both CI
+# platforms. Note this constrains only fixture FILENAMES: a pathspec STRING
+# containing `*` is just a string, so the rows that merely pass `doc*` as a
+# configured prefix run everywhere.
+RESERVED_IN_WINDOWS_FILENAMES = pytest.mark.skipif(
+    sys.platform == "win32", reason="`*`, `?` and `:` are reserved in Windows filenames"
+)
+
+
+def _metachar_pair(repo, meta: str, victim: str):
+    """A metachar dir and the sibling its glob collides with, both committed.
+
+    Returns the two `f.md` paths. `doc*` is the shape that matters most: `*`
+    crosses `/`, so it is the only one that reaches a sibling DIRECTORY's
+    contents — `[…]`/`?` are same-length and reach a sibling FILE only.
+    """
+    for d in (meta, victim):
+        (repo / d).mkdir(parents=True, exist_ok=True)
+        (repo / d / "f.md").write_text("v1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "metachar fixture")
+    return repo / meta / "f.md", repo / victim / "f.md"
+
+
+def test_path_tracked_reports_index_membership(project):
+    """The basic contract: an index entry is True, an untracked file is False."""
+    repo = project.project
+    assert verify.path_tracked(repo, "src.txt")
+    (repo / "stray.txt").write_text("untracked\n")
+    assert not verify.path_tracked(repo, "stray.txt")
+    assert not verify.path_tracked(repo, "never_existed.txt")
+
+
+@pytest.mark.parametrize(
+    ("meta", "neighbour"),
+    [
+        ("docs[a]", "docsa"),
+        pytest.param("a*b", "axb", marks=RESERVED_IN_WINDOWS_FILENAMES),
+        pytest.param("q?r", "qxr", marks=RESERVED_IN_WINDOWS_FILENAMES),
+    ],
+)
+def test_path_tracked_refuses_a_glob_match_from_a_neighbour(project, meta, neighbour):
+    """An ABSENT path whose name carries pathspec metacharacters must not read as
+    tracked just because some OTHER tracked path matches it as a glob.
+
+    This is the inverted, silent failure: `_ledger_is_gits_to_restore` answers
+    "git owns it" for a ledger git has never seen, so the harvest revert skips
+    its `unlink()` and a finding about discarded code stays open. Ablating the
+    `:(literal)` prefix flips the first assertion to True."""
+    repo = project.project
+    _metachar_pair(repo, meta, neighbour)
+    # Untrack ONLY the metachar path; its glob-colliding neighbour stays tracked.
+    git(repo, "rm", "-r", "-q", "--cached", "--", f":(literal){meta}")
+    assert not verify.path_tracked(repo, f"{meta}/f.md")
+    assert verify.path_tracked(repo, f"{neighbour}/f.md")
+
+
+def test_path_tracked_still_matches_a_directory_prefix(project):
+    """`:(literal)` must not cost the callers the prefix match they rely on —
+    `cmd_validate`'s render-tracked warning probes a DIRECTORY, not a file."""
+    repo = project.project
+    (repo / "_bmad" / "render").mkdir(parents=True, exist_ok=True)
+    (repo / "_bmad" / "render" / "render_skill.py").write_text("# renderer\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "render")
+    assert verify.path_tracked(repo, "_bmad/render")
+
+
+def test_path_tracked_file_separates_a_file_from_a_directory_prefix(project):
+    """The whole reason this predicate exists next to its sibling: `path_tracked`
+    answers True for BOTH a tracked file and a tracked directory, and the worktree
+    shield needs opposite behaviour for the two (#392).
+
+    Ablation: return `bool(entries)` instead of comparing the set and the directory
+    assertion flips to True — i.e. the shield would start dropping a tracked skill
+    tree's pattern, which measurably DOES shield new children."""
+    repo = project.project
+    (repo / "_bmad" / "render").mkdir(parents=True, exist_ok=True)
+    (repo / "_bmad" / "render" / "render_skill.py").write_text("# renderer\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "render")
+
+    # The sibling cannot tell these apart; this one must.
+    assert verify.path_tracked(repo, "src.txt")
+    assert verify.path_tracked(repo, "_bmad/render")
+    assert verify.path_tracked_file(repo, "src.txt")
+    assert not verify.path_tracked_file(repo, "_bmad/render")
+    assert verify.path_tracked_file(repo, "_bmad/render/render_skill.py")
+
+
+def test_path_tracked_file_is_false_for_untracked_and_absent(project):
+    """An untracked file and a path git has never seen both answer False — the
+    shield keeps their patterns, which is the whole point of the shield."""
+    repo = project.project
+    (repo / "stray.txt").write_text("untracked\n")
+    assert not verify.path_tracked_file(repo, "stray.txt")
+    assert not verify.path_tracked_file(repo, "never_existed.txt")
+
+
+def test_path_tracked_file_reads_a_metachar_name_past_its_glob_neighbour(project):
+    """The literal-pathspec hazard, in the ONE direction this function can get wrong.
+
+    ⚠️ Written first as the sibling's assertion — an ABSENT metachar path must not read
+    as tracked — and that ablated GREEN, because the set comparison already refuses it
+    for a different reason: a glob match answers with the NEIGHBOUR'S name, which is not
+    the name asked for, so the set differs and the result is False regardless of the
+    pathspec. Emptiness-reading `path_tracked` needs `:(literal)` for that direction;
+    this one does not.
+
+    What it does need it for is the opposite direction. When the metachar path IS a
+    tracked file and its glob neighbour is tracked too, the bare pathspec returns BOTH
+    names, the set comparison fails, and a genuine tracked file reads False — the shield
+    then keeps an inert pattern and the #392 hygiene failure survives for any project
+    whose hook config or skill tree carries `[`, `*` or `?`.
+
+    Ablation: drop the `:(literal)` prefix and the first assertion flips to False."""
+    repo = project.project
+    _metachar_pair(repo, "docs[a]", "docsa")  # both committed, and the glob collides
+    assert verify.path_tracked_file(repo, "docs[a]/f.md")
+    assert verify.path_tracked_file(repo, "docsa/f.md")
+    # The absent-path direction still holds; it is just not what pins the pathspec.
+    git(repo, "rm", "-r", "-q", "--cached", "--", ":(literal)docs[a]")
+    assert not verify.path_tracked_file(repo, "docs[a]/f.md")
+
+
+def test_path_tracked_file_raises_on_git_failure(project, monkeypatch):
+    """Contracted to raise like every other probe here, so the shield's caller can
+    make its own keep-the-pattern decision rather than inherit a silent False —
+    which would drop a pattern on a fault and leak seeded files into a story commit."""
+    repo = project.project
+
+    def boom(_repo, *_args):
+        raise verify.GitError("ls-files exploded")
+
+    monkeypatch.setattr(verify, "git_bytes", boom)
+    with pytest.raises(verify.GitError):
+        verify.path_tracked_file(repo, "src.txt")
+
+
+@RESERVED_IN_WINDOWS_FILENAMES
+def test_path_tracked_reads_a_rel_beginning_with_a_colon(project):
+    """A leading `:` is pathspec magic. Bare, git parses it as an (unknown) magic
+    word and answers the empty set — i.e. "untracked", the direction that
+    authorizes a delete. The literal prefix disarms it."""
+    repo = project.project
+    odd = repo / ":weird"
+    odd.mkdir(exist_ok=True)
+    (odd / "f.md").write_text("v1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "colon dir")
+    assert verify.path_tracked(repo, ":weird/f.md")
+
+
+def test_path_tracked_keeps_a_tracked_but_deleted_path(project):
+    """The index entry outlives the file, and that is exactly the state a caller
+    must not mistake for "not git's" — `reset --hard` will bring it back."""
+    repo = project.project
+    (repo / "src.txt").unlink()
+    assert verify.path_tracked(repo, "src.txt")
+
+
+def test_path_tracked_ignores_stderr_chatter_on_success(project, monkeypatch):
+    """`ls-files` exits 0 while still writing to stderr (an unexecutable
+    `core.fsmonitor` hook, an unknown `core.fsyncMethod`). Read against `_git`'s
+    stdout+stderr MERGE that chatter is indistinguishable from an index entry, so
+    an untracked path answers "tracked" — silent and inverted. Only stdout counts."""
+    real = verify._run_git
+
+    def noisy(cmd, repo, **kw):
+        proc = real(cmd, repo, **kw)
+        if "ls-files" in cmd:
+            proc.stderr = "warning: unable to access '.git/hooks/fsmonitor': no such file\n"
+        return proc
+
+    monkeypatch.setattr(verify, "_run_git", noisy)
+    assert not verify.path_tracked(project.project, "never_existed.txt")
+
+
+def test_path_tracked_raises_on_git_failure(project):
+    """Raises GitError like every other probe here — callers inside a rollback
+    `finally` degrade toward leaving the file alone."""
+    with pytest.raises(verify.GitError, match="ls-files"):
+        verify.path_tracked(project.project / "not-a-repo", "src.txt")
+
+
+def test_worktree_clean_ignores_stderr_chatter_on_success(project, monkeypatch):
+    """A pristine tree must not read DIRTY because git wrote to stderr while
+    exiting 0. Seven callers gate on this and `cli.py`'s three refuse the command
+    outright, so the merged-stream read made a noisy git config unable to start a
+    run — with no file named in the message."""
+    real = verify._run_git
+
+    def noisy(cmd, repo, **kw):
+        proc = real(cmd, repo, **kw)
+        if "status" in cmd:
+            proc.stderr = "warning: core.fsyncMethod unknown value\n"
+        return proc
+
+    monkeypatch.setattr(verify, "_run_git", noisy)
+    assert verify.worktree_clean(project.project)
+    (project.project / "stray.txt").write_text("real change\n")
+    assert not verify.worktree_clean(project.project)  # a genuine change still shows
+
+
+def test_commit_paths_refuses_to_stage_a_glob_neighbour(project):
+    """`commit_paths` promises "exactly `paths` (and nothing else)". Unescaped, a
+    configured artifacts dir carrying `[` also stages the operator's unrelated
+    edit in the colliding sibling — committed under a story's name."""
+    repo = project.project
+    target, victim = _metachar_pair(repo, "docs[a]", "docsa")
+    target.write_text("the artifact this commit is for\n")
+    victim.write_text("the operator's own uncommitted work\n")
+
+    sha = verify.commit_paths(repo, "chore: artifact only", [target])
+
+    assert sha is not None
+    status = git(repo, "status", "--porcelain")
+    assert "docsa/f.md" in status  # the neighbour is STILL uncommitted
+    assert "docs[a]" not in status  # the named path did land
+    assert victim.read_text() == "the operator's own uncommitted work\n"
+
+
+def test_commit_paths_leaves_a_record_for_a_gitignored_path(project):
+    """With the ledger gitignored — the shape `_carry_harvested_deferrals` hits —
+    `git add` REFUSES an explicitly named ignored path (rc 1) but SKIPS a globbed
+    one. Bare, the call could exit rc 0 having staged nothing and report success
+    having committed no ledger; the literal operand raises instead, so the caller
+    still has a record."""
+    repo = project.project
+    gitignore = repo / ".gitignore"
+    gitignore.write_text(gitignore.read_text() + "ignored-dir/\n")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore")
+    (repo / "ignored-dir").mkdir(exist_ok=True)
+    ledger = repo / "ignored-dir" / "deferred-work.md"
+    ledger.write_text("# ledger\n")
+
+    with pytest.raises(verify.GitError, match="git add failed"):
+        verify.commit_paths(repo, "chore: ledger", [ledger])
+
+
+def test_exclude_specs_does_not_hide_a_siblings_diff(project):
+    """An artifacts dir whose name carries `*` must not also exclude the sibling
+    tree it glob-matches: `has_changes_since` would answer "no changes" for a dev
+    attempt that changed real code, the false-green direction (#423 item 3)."""
+    repo = project.project
+    _metachar_pair(repo, "doc-x", "doc-y")  # committed, both under the `doc*` glob
+    baseline = verify.rev_parse_head(repo)
+    (repo / "doc-y" / "f.md").write_text("a real change outside the artifacts dir\n")
+
+    assert verify.has_changes_since(repo, baseline, exclude=("doc*",))
+
+
+def test_exclude_specs_agrees_with_path_under_any(project):
+    """The two halves of ONE `has_changes_since` answer — the git exclusion over
+    tracked changes and `_path_under_any` over untracked ones — must not disagree
+    about what "under the artifact dir" means (#423 item 4)."""
+    for prefix, path in (("docs[a]", "docsa"), ("q?r", "qxr"), ("doc*", "docsa/f.md")):
+        git_excludes = verify._exclude_specs((prefix,)) == [f":(exclude,literal){prefix}"]
+        python_under = verify._path_under_any(path, (prefix,))
+        assert git_excludes and not python_under, f"{prefix} vs {path}"
+
+
+def test_safe_rollback_preserve_does_not_restore_a_glob_neighbour(project):
+    """`preserve` restores operator-configured dirs from the snapshot, and this leg
+    WRITES. Bare, `checkout <snap> -- 'doc*'` also restores every sibling the glob
+    reaches — and because the snapshot is a `stash create` of the DIRTY tree, that
+    hands the dev attempt's change back after the reset was supposed to discard it.
+    The rollback silently under-reverts, and the next preflight sees a tree the
+    engine believes it rolled back (#423 item 5)."""
+    repo = project.project
+    # Only the NEIGHBOUR exists on disk; `doc*` is the operator's configured
+    # preserve dir, which the literal reading matches nothing for (a benign
+    # "pathspec did not match"). Keeping it absent is what makes the assertion
+    # discriminating AND lets the row run on Windows, where `*` cannot be a
+    # filename: bare, the glob reaches `docsa` and hands its change back.
+    (repo / "docsa").mkdir(parents=True, exist_ok=True)
+    neighbour = repo / "docsa" / "f.md"
+    neighbour.write_text("v1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "neighbour")
+    baseline = verify.rev_parse_head(repo)
+    snap = sorted(verify.untracked_files(repo))
+    neighbour.write_text("the dev attempt's change\n")  # outside preserve — must revert
+
+    verify.safe_rollback(
+        repo, baseline, baseline_untracked=snap, keep=(".bmad-loop",), preserve=("doc*",)
+    )
+
+    assert neighbour.read_text() == "v1\n"  # reverted, not resurrected by the glob
+
+
 def test_commit_story(project):
     task = make_task(project)
     (project.project / "src.txt").write_text("done work\n")
@@ -897,6 +2309,29 @@ def test_finalize_commit_only_uncommitted_bookkeeping(project):
     assert log.splitlines() == ["story: via bmad-loop"]
 
 
+def test_finalize_commit_rerun_is_content_idempotent(project):
+    """The #115 resume re-drive may run finalize_commit on a post-squash tree
+    (the first finalize completed just before a host death). The re-run must
+    converge on exactly ONE commit above baseline with an identical tree —
+    never stack a second squash or raise. (No sha1 != sha2 assertion: same
+    tree/parent/message within one second re-mints the same sha.)"""
+    baseline = verify.rev_parse_head(project.project)
+    (project.project / "src.txt").write_text("dev work\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "skill: implement")
+
+    sha1 = verify.finalize_commit(project.project, baseline, "story 1-1-a: via bmad-loop")
+    sha2 = verify.finalize_commit(project.project, baseline, "story 1-1-a: via bmad-loop")
+
+    assert sha1 is not None and sha2 is not None
+    tree1 = git(project.project, "rev-parse", f"{sha1}^{{tree}}")
+    tree2 = git(project.project, "rev-parse", f"{sha2}^{{tree}}")
+    assert tree1 == tree2
+    assert verify.worktree_clean(project.project)
+    log = git(project.project, "log", "--format=%s", f"{baseline}..HEAD")
+    assert log.splitlines() == ["story 1-1-a: via bmad-loop"]
+
+
 def test_commit_paths_commits_only_listed(project):
     base = verify.rev_parse_head(project.project)
     (project.project / "src.txt").write_text("ledger-ish edit\n")  # the "tracked" target
@@ -916,12 +2351,218 @@ def test_commit_paths_noop_when_unchanged(project):
     assert verify.commit_paths(project.project, "noop", [project.project.parent / "x"]) is None
 
 
+def test_apply_patch_replays_saved_diff(project):
+    """A patch saved off the baseline re-applies cleanly onto that same baseline —
+    tracked edits AND new (untracked) files — reproducing the reverted attempt."""
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    # the "attempt": edit a tracked file + add a new file, then capture the diff
+    (repo / "src.txt").write_text("original\nattempted change\n")
+    (repo / "new_module.py").write_text("print('hi')\n")
+    patch = project.implementation_artifacts / "attempt.patch"
+    # git diff HEAD includes new files with --binary-safe text; -N stages intent so
+    # untracked files appear in the diff (mirrors how the skill saves the attempt)
+    git(repo, "add", "-N", "new_module.py")
+    patch.write_text(git(repo, "diff", "HEAD") + "\n", encoding="utf-8")
+    # revert the attempt back to baseline (as the skill does before halting)
+    git(repo, "reset", "-q", "--hard", baseline)
+    (repo / "new_module.py").unlink(missing_ok=True)
+    assert (repo / "src.txt").read_text() == "original\n"
+
+    verify.apply_patch(repo, patch)
+
+    assert (repo / "src.txt").read_text() == "original\nattempted change\n"
+    assert (repo / "new_module.py").read_text() == "print('hi')\n"
+
+
+def test_apply_patch_missing_file_raises(project):
+    with pytest.raises(verify.GitError, match="restore patch not found"):
+        verify.apply_patch(project.project, project.implementation_artifacts / "nope.patch")
+
+
+def test_apply_patch_conflict_raises(project):
+    """A patch that does not apply against the current tree raises GitError with
+    git's output — the caller escalates rather than dispatch onto a broken tree."""
+    repo = project.project
+    patch = project.implementation_artifacts / "bad.patch"
+    # a diff against content the tree does not have
+    patch.write_text(
+        "--- a/src.txt\n+++ b/src.txt\n@@ -1 +1 @@\n-something-else\n+patched\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(verify.GitError, match="git apply"):
+        verify.apply_patch(repo, patch)
+
+
+def _saved_patch(project, name="attempt.patch"):
+    """Capture the working tree as a restore patch, the way the skill saves one."""
+    repo = project.project
+    git(repo, "add", "-AN")  # intent-to-add so new files appear in `git diff HEAD`
+    patch = project.implementation_artifacts / name
+    patch.write_text(git(repo, "diff", "HEAD") + "\n", encoding="utf-8")
+    return patch
+
+
+def test_patch_new_files_names_created_files(project):
+    repo = project.project
+    (repo / "new_module.py").write_text("print('hi')\n")
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "deep.txt").write_text("nested\n")
+    assert verify.patch_new_files(_saved_patch(project)) == {"new_module.py", "pkg/deep.txt"}
+
+
+def test_patch_new_files_ignores_modifications(project):
+    repo = project.project
+    (repo / "src.txt").write_text("original\nedited\n")
+    assert verify.patch_new_files(_saved_patch(project)) == set()
+
+
+def test_patch_new_files_never_returns_deletions(project):
+    """A deleted file must not land in the exclusion set: the human may re-create
+    that path, and excluding it would make the next rollback delete their copy."""
+    repo = project.project
+    git(repo, "rm", "-q", "src.txt")
+    assert verify.patch_new_files(_saved_patch(project)) == set()
+
+
+def test_patch_new_files_multi_file_patch(project):
+    """One patch carrying a creation, a modification and a deletion — only the
+    creation comes back."""
+    repo = project.project
+    (repo / "created.txt").write_text("new\n")
+    (repo / ".gitignore").write_text("*.log\n")
+    git(repo, "rm", "-q", "src.txt")
+    assert verify.patch_new_files(_saved_patch(project)) == {"created.txt"}
+
+
+def test_patch_new_files_ignores_header_lookalikes_in_hunk_bodies(project):
+    """Hunk *content* that reads like a file header (a removed `-- /dev/null` line
+    renders as `--- /dev/null`) must not be mistaken for a creation."""
+    patch = project.implementation_artifacts / "tricky.patch"
+    patch.write_text(
+        "diff --git a/real.txt b/real.txt\n"
+        "new file mode 100644\n"
+        "index 0000000..1111111\n"
+        "--- /dev/null\n"
+        "+++ b/real.txt\n"
+        "@@ -0,0 +1 @@\n"
+        "+hello\n"
+        "diff --git a/mod.txt b/mod.txt\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/mod.txt\n"
+        "+++ b/mod.txt\n"
+        "@@ -1 +1 @@\n"
+        "--- /dev/null\n"  # a removed line whose content is `-- /dev/null`
+        "+++ b/evil.txt\n"  # an added line whose content is `++ b/evil.txt`
+        "\\ No newline at end of file\n",
+        encoding="utf-8",
+    )
+    assert verify.patch_new_files(patch) == {"real.txt"}
+
+
+def test_patch_new_files_skips_quoted_paths(project):
+    """core.quotePath output is skipped rather than guessed — under-reporting is
+    safe, a wrong path would get a user file deleted."""
+    patch = project.implementation_artifacts / "quoted.patch"
+    patch.write_text(
+        'diff --git "a/w\\303\\251ird.txt" "b/w\\303\\251ird.txt"\n'
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        '+++ "b/w\\303\\251ird.txt"\n'
+        "@@ -0,0 +1 @@\n"
+        "+x\n",
+        encoding="utf-8",
+    )
+    assert verify.patch_new_files(patch) == set()
+
+
+def test_patch_new_files_strips_mnemonic_prefixes(project):
+    """`diff.mnemonicPrefix=true` in the user's config makes `git diff HEAD` emit
+    `c/`/`w/` instead of `a/`/`b/`. `apply_patch`'s plain `git apply` (-p1) strips
+    the first component whatever it is, so the parser must mirror that or the
+    recorded residue is `w/<path>` and the exclusion silently no-ops."""
+    repo = project.project
+    (repo / "new_module.py").write_text("print('hi')\n")
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "deep.txt").write_text("nested\n")
+    git(repo, "add", "-AN")
+    patch = project.implementation_artifacts / "mnemonic.patch"
+    patch.write_text(
+        git(repo, "-c", "diff.mnemonicPrefix=true", "diff", "HEAD") + "\n", encoding="utf-8"
+    )
+    assert "+++ w/new_module.py" in patch.read_text(encoding="utf-8")  # fixture sanity
+    assert verify.patch_new_files(patch) == {"new_module.py", "pkg/deep.txt"}
+
+
+def test_patch_new_files_skips_unstrippable_targets(project):
+    """A prefixless single-component target (`git diff --no-prefix`) cannot survive
+    `git apply`'s -p1 strip — the apply would have failed, so no residue can exist.
+    Recording it verbatim could exclude (and later delete) a same-named file the
+    human created; skip it instead."""
+    patch = project.implementation_artifacts / "noprefix.patch"
+    patch.write_text(
+        "diff --git newfile.txt newfile.txt\n"
+        "new file mode 100644\n"
+        "index 0000000..1111111\n"
+        "--- /dev/null\n"
+        "+++ newfile.txt\n"
+        "@@ -0,0 +1 @@\n"
+        "+x\n",
+        encoding="utf-8",
+    )
+    assert verify.patch_new_files(patch) == set()
+
+
+def test_patch_new_files_missing_patch_raises_oserror(project):
+    """The caller (rearm) turns this into a journaled best-effort degrade."""
+    with pytest.raises(OSError):
+        verify.patch_new_files(project.implementation_artifacts / "gone.patch")
+
+
 def test_read_frontmatter_tolerates_garbage(project):
     p = project.project / "x.md"
     p.write_text("no frontmatter here")
     assert verify.read_frontmatter(p) == {}
     p.write_text("---\n: : :\nbroken yaml [\n---\nbody")
     assert verify.read_frontmatter(p) == {}
+
+
+def test_read_frontmatter_tolerates_non_utf8(project):
+    """UnicodeDecodeError is a ValueError, so it slipped past every caller's
+    except-OSError guard. An undecodable file now degrades exactly like
+    unparseable YAML — {} → status "" → the status gates return a clean retry
+    instead of crashing verify (stories dev/review gates and the pre-existing
+    sprint/bundle paths alike)."""
+    p = project.project / "x.md"
+    p.write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\x81")
+    assert verify.read_frontmatter(p) == {}
+
+
+def test_read_frontmatter_oserror_still_raises(project, monkeypatch):
+    """`read_frontmatter` degrades a *decode* fault to {} but must keep RAISING on
+    OSError. Repair callers (`reset_spec_status`, `mark_done`) read through it and
+    depend on the raise: silently skipping a rewrite leaves the spec in a state the
+    caller believes it fixed. The observation callers wrap it instead —
+    `verify._gate_frontmatter`, `Engine._observed_frontmatter`,
+    `devcontract.synthesize_result`. Widening the except here would erase that
+    distinction everywhere at once."""
+    p = project.project / "x.md"
+    p.write_text("---\nstatus: done\n---\n")
+    fault_read_text(monkeypatch, p)
+    with pytest.raises(PermissionError):
+        verify.read_frontmatter(p)
+
+
+def test_read_frontmatter_ignores_triple_dash_in_value(project):
+    """A `---` inside a scalar value must NOT be read as the closing delimiter.
+    A plain `split("---", 2)` truncates the block at the first substring match →
+    YAMLError → {}, silently zeroing status; the closing boundary is a standalone
+    `---` line only."""
+    p = project.project / "x.md"
+    p.write_text("---\ntitle: 'restore --- review'\nstatus: done\n---\nbody\n")
+    fm = verify.read_frontmatter(p)
+    assert fm["status"] == "done"
+    assert fm["title"] == "restore --- review"
 
 
 def test_artifact_relpaths_returns_in_repo_folders(project):
@@ -966,6 +2607,36 @@ def test_has_changes_since_excludes_artifact_only_edit(project):
     )
 
 
+def test_has_changes_since_subtracts_baseline_untracked(project):
+    """Untracked files already on disk when the baseline snapshot was taken are
+    not this session's work. `None` deliberately keeps counting all of them —
+    the opposite of `attempt_dirty`'s ignore-all — so a pre-snapshot run's
+    proof-of-work gate is never silently weakened."""
+    baseline = verify.rev_parse_head(project.project)
+    (project.project / "residue.txt").write_text("left by an earlier halt\n")
+
+    assert verify.has_changes_since(project.project, baseline) is True
+    assert verify.has_changes_since(project.project, baseline, baseline_untracked=None) is True
+    assert (
+        verify.has_changes_since(project.project, baseline, baseline_untracked=["residue.txt"])
+        is False
+    )
+
+    # a file created after the snapshot is this session's
+    (project.project / "fresh.txt").write_text("this session\n")
+    assert (
+        verify.has_changes_since(project.project, baseline, baseline_untracked=["residue.txt"])
+        is True
+    )
+    # and a tracked edit counts regardless of how complete the snapshot is
+    (project.project / "fresh.txt").unlink()
+    (project.project / "src.txt").write_text("real\n")
+    assert (
+        verify.has_changes_since(project.project, baseline, baseline_untracked=["residue.txt"])
+        is True
+    )
+
+
 def test_verify_dev_exclude_relpaths_is_file_granular(project):
     """Unlike artifact_relpaths (whole-folder), this excludes only the
     sprint-status ledger and the session's own claimed spec file — sibling
@@ -981,6 +2652,138 @@ def test_verify_dev_exclude_relpaths_is_file_granular(project):
     # prefix would swallow the artifact dirs' content right back out of view.
     assert "_bmad-output" not in rels
     assert "_bmad-output/implementation-artifacts/deferred-work.md" not in rels
+
+
+def test_verify_dev_exclude_relpaths_includes_latched_restore_patch(project):
+    """T4 (patch-restore x #79): a latched intent-gap patch file joins the
+    file-granular excludes — absolute or project-relative, both derive the same
+    repo-relative entry; no latch leaves the excludes unchanged."""
+    sp = spec_path(project, "1-1-a")
+    patch = project.implementation_artifacts / "attempt.patch"
+    rel = "_bmad-output/implementation-artifacts/attempt.patch"
+    assert rel in verify.verify_dev_exclude_relpaths(project, sp, str(patch))
+    assert rel in verify.verify_dev_exclude_relpaths(project, sp, rel)
+    assert rel not in verify.verify_dev_exclude_relpaths(project, sp)
+
+
+def test_verify_dev_latched_restore_patch_is_not_proof_of_work(project):
+    """T4 (patch-restore x #79): the latched patch file is untracked halt residue
+    under the protected artifact dirs — it survives every reset, so counting it
+    would let a restore re-drive whose session produced nothing pass the
+    proof-of-work gate on the patch's mere presence. The gate must key on the
+    APPLIED work (tracked diff from baseline), not the patch that carried it."""
+    write_sprint(project, {"1-1-a": "review"})
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", "NO_VCS")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "baseline")
+    task = make_task(project)
+    patch = project.implementation_artifacts / "attempt.patch"
+    patch.write_text("stale attempt diff\n", encoding="utf-8")  # untracked residue
+
+    # control: unlatched, the residue is indistinguishable from session work and
+    # passes the gate — exactly the vacuous pass the latch exclusion prevents
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+
+    task.restore_patch = str(patch)
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "no changes" in out.reason
+
+
+def test_verify_dev_stories_latched_restore_patch_is_not_proof_of_work(project):
+    """The same T4 exclusion, reached through the stories gate. `_verify_shared_gates`
+    derives it from `task.restore_patch` for every mode, so a mode that forgets to
+    thread the latch through can no longer regress silently (#91)."""
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "done", "NO_VCS")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "baseline")
+    task.baseline_commit = verify.rev_parse_head(project.project)
+    patch = project.implementation_artifacts / "attempt.patch"
+    patch.write_text("stale attempt diff\n", encoding="utf-8")  # untracked residue
+
+    # control: unlatched, the residue passes for real session work
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert out.ok
+
+    task.restore_patch = str(patch)
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert not out.ok and "no changes" in out.reason
+
+
+def test_resolve_restore_path_joins_only_relative_latches(tmp_path):
+    """The one normalizer behind engine/verify/cli/runs (#91): absolute latches pass
+    through untouched, relative ones anchor on the caller's root, and nothing is
+    `.resolve()`d (the CLI adds that itself, for its containment check)."""
+    absolute = tmp_path / "sub" / "attempt.patch"
+    assert verify.resolve_restore_path(str(absolute), tmp_path / "other") == absolute
+    assert verify.resolve_restore_path("art/attempt.patch", tmp_path) == tmp_path / "art" / (
+        "attempt.patch"
+    )
+    # no normalization: the `..` survives, so a containment check still sees it
+    assert ".." in str(verify.resolve_restore_path("../escape.patch", tmp_path))
+
+
+def test_verify_dev_baseline_era_untracked_is_not_proof_of_work(project):
+    """#88: the from-scratch case the T4 latch exclusion cannot reach. After an
+    intent-gap halt the saved patch is untracked residue under the protected
+    artifact dirs, and a from-scratch re-arm (`restore_patch=None`) never learns
+    its path — but the re-arm's snapshot captured it. Subtracting
+    `baseline_untracked` is the only mechanical close: a re-driven session that
+    produced nothing but a status flip must not pass the gate on that residue."""
+    write_sprint(project, {"1-1-a": "review"})
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", "NO_VCS")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "baseline")
+    task = make_task(project)
+    residue = project.implementation_artifacts / "attempt.patch"
+    residue.write_text("stale intent-gap diff\n", encoding="utf-8")
+    rel = residue.relative_to(project.project).as_posix()
+
+    # no latch (from-scratch re-arm) — only the snapshot can rule the residue out
+    assert task.restore_patch is None
+    task.baseline_untracked = [rel]
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "no changes" in out.reason
+
+    # None (a pre-snapshot run) still counts every untracked file: the gate fails
+    # open toward "work happened", never toward a silently disabled gate
+    task.baseline_untracked = None
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+
+    # real work passes with the snapshot in place
+    task.baseline_untracked = [rel]
+    (project.project / "src.txt").write_text("real work\n")
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+
+
+def test_verify_dev_baseline_gate_reads_the_skills_baseline_revision_key(project):
+    """#89: the generic bmad-dev-auto skill's step-03 stamps `baseline_revision`;
+    `baseline_commit` exists only in the orchestrator's synthesized result.json.
+    Reading just the latter made the baseline-match gate dead code in production
+    (an absent key skips the check), so a spec claiming a foreign baseline sailed
+    through. Masked for years by fixtures that stamped the key the skill never
+    writes."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+
+    write_spec(sp, "in-review", "0" * 40)  # a foreign baseline, skill-style key
+    body = sp.read_text()
+    assert "baseline_revision:" in body and "baseline_commit:" not in body
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+    # matching baseline + real work → the gate passes
+    write_spec(sp, "in-review", task.baseline_commit)
+    (project.project / "src.txt").write_text("real work\n")
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
 
 
 def test_verify_dev_exclude_relpaths_normalizes_dotdot_segments(project):
@@ -1485,3 +3288,13 @@ def test_snapshot_worktree_unknown_baseline_skips_untracked(project):
     tree = git(repo, "ls-tree", "-r", "--name-only", ref)
     assert "src.txt" in tree  # tracked edit captured
     assert "user_untracked.txt" not in tree  # unknown-baseline untracked left untouched
+
+
+def test_engine_written_is_keyword_only_on_all_dev_verifiers():
+    """The three mode gates share one call contract; stories was positional in 0.9.x."""
+    import inspect
+
+    for fn in (verify.verify_dev, verify.verify_dev_bundle, verify.verify_dev_stories):
+        parameter = inspect.signature(fn).parameters["engine_written"]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert "operator_park" in inspect.signature(verify.verify_dev).parameters

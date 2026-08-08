@@ -9,13 +9,13 @@ POLICY_TEMPLATE so the first save carries the full inline documentation.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
 import tomlkit
 
 from .. import policy as policy_mod
+from ..platform_util import atomic_replace
 
 STAGES = ("dev", "review", "triage")
 
@@ -28,8 +28,15 @@ class PolicyDoc:
         self._doc = doc
 
     @classmethod
-    def load(cls, path: Path) -> PolicyDoc:
-        text = path.read_text(encoding="utf-8") if path.is_file() else policy_mod.POLICY_TEMPLATE
+    def load(cls, path: Path, *, template_when_missing: bool = True) -> PolicyDoc:
+        """``template_when_missing=False`` starts a missing file from an empty
+        document instead of POLICY_TEMPLATE — for callers that write a single
+        section (e.g. dashboard geometry) and must not materialise every
+        default setting into a fresh policy.toml."""
+        if path.is_file():
+            text = path.read_text(encoding="utf-8")
+        else:
+            text = policy_mod.POLICY_TEMPLATE if template_when_missing else ""
         return cls(tomlkit.parse(text))
 
     def _table(self, section: str, create: bool) -> Any | None:
@@ -60,7 +67,9 @@ class PolicyDoc:
             if stage and table is not None and len(table) == 0:
                 del self._doc[parent][stage]
             return
-        self._table(section, create=True)[key] = value
+        # _table(create=True) never returns None (it creates missing tables), but
+        # its return type is Any | None.
+        self._table(section, create=True)[key] = value  # pyright: ignore[reportOptionalSubscript]
 
     def validate(
         self,
@@ -98,4 +107,4 @@ class PolicyDoc:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".toml.tmp")
         tmp.write_text(self.dumps(), encoding="utf-8")
-        os.replace(tmp, path)
+        atomic_replace(tmp, path)

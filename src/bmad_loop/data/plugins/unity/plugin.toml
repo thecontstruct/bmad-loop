@@ -15,6 +15,15 @@
 #
 # Override per project by copying this dir to .bmad-loop/plugins/unity/ and
 # editing it (the project-local copy wins, and its dir becomes {scripts}).
+#
+# Scene auto-save guard: Unity-MCP GameObject tools mark scenes dirty but never
+# save, so a shared editor's scene sits chronically dirty — and that dirty state
+# is what raises the two run-stalling modal dialogs (scene-changed-on-disk reload,
+# and save-before-quit), which freeze the MCP dispatch loop. This plugin seeds an
+# editor-only auto-save guard (Assets/BmadLoop/Editor/, from unity_assets/) into
+# the project so no such modal ever appears. The seeded guard is committed into
+# the consumer project by story-finalize's `git add -A` — that is intended (the
+# guard travels with the repo). Disable with install_scene_guard = false.
 
 [plugin]
 name = "unity"
@@ -30,7 +39,13 @@ seed_globs = [".claude/skills/*"]
 # Editor setup/teardown, MCP agent routing, Library priming, and the
 # editor_mode<->scm.isolation coupling validation. It hooks the engine's
 # lifecycle stages (pre_ready_gate / pre_worktree_setup / pre_worktree_teardown)
-# and vetoes (defers) the unit when the Editor can't be made ready.
+# and vetoes (defers) the unit when the Editor can't be made ready. It also
+# quiesces the Editor around a failed-attempt rollback (pre_rollback /
+# post_rollback) so a git reset --hard can't leave a shared Editor showing a
+# run-freezing scene-changed-on-disk modal — best effort, never blocks the reset.
+# On pre_session it appends the scene-save discipline (unity_facts.md) to every
+# dev/review prompt, and (when dialog_probe is on) it launches + reaps a detached,
+# DETECT-ONLY modal-dialog probe (pre_run / post_run / pre_worktree_setup).
 [python]
 module = "unity_plugin.py"
 class = "UnityPlugin"
@@ -72,3 +87,54 @@ type = "int"
 default = -1
 label = "Readiness grace (sec)"
 help = "seconds to wait before the first readiness probe (-1 = auto: per_worktree waits for a cold Editor, shared does not)"
+
+[[settings]]
+key = "install_scene_guard"
+type = "bool"
+default = true
+label = "Install scene auto-save guard"
+help = "seed an editor-only auto-save guard into the project so chronically-dirty scenes never raise the run-stalling scene-changed-on-disk / save-before-quit modal dialogs. The seeded guard is committed into the consumer project by story-finalize's git add -A (intended). false disables seeding."
+
+[[settings]]
+key = "scene_guard_dir"
+type = "str"
+default = "Assets/BmadLoop/Editor"
+label = "Scene guard install dir"
+help = "project-relative dir the scene auto-save guard is seeded into (must live under the project's asset root, e.g. Assets/)"
+
+[[settings]]
+key = "quiesce_on_rollback"
+type = "bool"
+default = true
+label = "Quiesce Editor before rollback"
+help = "save open scenes + open an empty untitled scene via the MCP CLI before git reset, refresh assets after; best-effort, never blocks the rollback"
+
+[[settings]]
+key = "quiesce_timeout_sec"
+type = "int"
+default = 60
+min = 1
+label = "Rollback quiesce timeout (sec)"
+help = "overall budget for the pre/post-rollback quiesce helper; the loop hard-kills it past this so a wedged Editor can never stall a rollback"
+
+[[settings]]
+key = "dialog_probe"
+type = "bool"
+default = false
+label = "Detect-only modal-dialog probe"
+help = "launch a detached, DETECT-ONLY probe (unity_dialog_probe.py) that watches — via xdotool, X11/Linux only — for the run-freezing Unity modal dialogs and REPORTS them (JSONL + ATTENTION + notify-send). It never clicks or keys anything; it is the last-resort observability net for a modal the scene guard + prompt facts did not prevent. No-op where DISPLAY is unset or xdotool is absent (Windows/macOS out of scope). Off by default."
+
+[[settings]]
+key = "dialog_probe_interval_sec"
+type = "int"
+default = 5
+min = 1
+label = "Dialog probe poll interval (sec)"
+help = "how often the dialog probe polls xdotool for a visible Unity modal dialog"
+
+[[settings]]
+key = "dialog_probe_notify"
+type = "bool"
+default = true
+label = "Dialog probe desktop notification"
+help = "on a fresh detection, also fire a best-effort notify-send desktop notification (guarded by shutil.which); the JSONL + ATTENTION records are written regardless"

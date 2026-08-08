@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, release/*]
   pull_request:
 
 # Cancel superseded runs for the same ref.
@@ -28,7 +28,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.3.0
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -73,7 +73,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.3.0
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -92,7 +92,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.3.0
+        uses: astral-sh/setup-uv@v9.0.0
 
       - name: Check every version field agrees
         run: uv run --no-project python scripts/sync_version.py --check
@@ -110,3 +110,33 @@ jobs:
 
       - name: Trunk Check
         uses: trunk-io/trunk-action@v1
+
+  typecheck:
+    # Pyright in basic mode over src/bmad_loop (see [tool.pyright] in pyproject.toml).
+    # Basic-mode adoption (#245, assessment F-4): fences annotation drift the wider
+    # refactor program relies on. The pinned version keeps the gate reproducible.
+    name: typecheck (pyright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          python-version: '3.11'
+
+      - name: Install the project
+        # Populates .venv (venvPath/venv in the pyright config) so third-party and
+        # optional-extra imports (textual, pyte, httpx, …) resolve instead of being
+        # flagged as missing. Also installs pyright itself, which is pinned in the
+        # `dev` dependency group rather than named here — one pin, in the lock.
+        run: uv sync --locked --all-extras
+
+      - name: Pyright (basic mode)
+        # `uv run`, not `uvx pyright@<version>`: the same command a contributor
+        # runs locally, resolving the same pinned version from uv.lock.
+        run: uv run pyright

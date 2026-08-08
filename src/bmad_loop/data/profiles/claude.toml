@@ -16,14 +16,37 @@ seed_files = [
   ".claude/settings.local.json",
 ]
 
+# Transport-failure classification (#194): regexes matched line-by-line against
+# the ANSI-stripped tail of a non-completed (timeout/stalled/crashed) session's
+# pane log. A match reclassifies the session as an environment fault so the
+# orchestrator can PAUSE (and re-arm with a fresh budget) instead of charging a
+# dev attempt for a session that never reached the API. The pattern requires an
+# "API Error" line AND a connection-level cause on the SAME line, so ordinary
+# story test output that merely mentions "API Error" in prose does not trip it.
+# To disable or extend, copy this profile into .bmad-loop/profiles/ and edit.
+env_fault_patterns = [
+  "API Error.*(Unable to connect|Connection ?(error|refused|reset|timed ?out)|ConnectionRefused|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN)",
+]
+
 # Force Claude Code's classic (inline/scrollback) renderer. The fullscreen TUI
 # (research preview, alt-screen ?1049h like vim/htop) repaints in place, so the
 # tmux pane capture only ever holds the final frame and the Log tab shows a single
 # page. The classic renderer keeps output in native scrollback, so the capture
 # scrolls normally and the Log tab reconstructs the whole session. This env var
 # overrides any `tui` setting (user/project/local/seeded) per Claude Code docs.
+#
+# Disable background tasks (issue #109): Claude Code can bias a session toward
+# backgrounding Agent/bash work (run_in_background) despite the bmad-dev-auto
+# prompt ban on it. A session that ends its turn to await a background sub-agent
+# yields a result-less Stop — and if the CLI then exits, the in-process sub-agent
+# is stranded mid-implementation with the story stuck in-progress. The var forces
+# every subagent and bash call to run synchronously, which is the behavior the
+# skill contract already requires; bmad-loop has no background-completion
+# re-invocation, so nothing sanctioned is lost. To opt out, copy this profile
+# into .bmad-loop/profiles/ and drop the var.
 [env]
 CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN = "1"
+CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1"
 
 [hooks]
 dialect = "claude-settings-json"

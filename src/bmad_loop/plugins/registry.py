@@ -56,7 +56,21 @@ def _instantiate(manifest: PluginManifest, settings: dict) -> Plugin:
     ``exec_module``. Kept tiny so the registry's try/except wraps exactly the
     import + construct surface.
     """
-    module_path = Path(manifest.scripts_dir) / manifest.python.module  # type: ignore[union-attr]
+    scripts_dir = Path(manifest.scripts_dir)
+    module_path = scripts_dir / manifest.python.module  # type: ignore[union-attr]
+    # `_parse_python` rejects an absolute, parent-climbing or root-naming module at
+    # manifest load, but lexically: a project-relative name that is a symlink out of
+    # the plugin resolves fine and would be exec'd. Re-check after resolution, since
+    # what happens below is arbitrary code execution, not a copy.
+    # Strictly below, not merely inside: `is_relative_to` is true for equal paths,
+    # so a module resolving to the plugin dir itself would pass an inside-check.
+    try:
+        resolved, base = module_path.resolve(), scripts_dir.resolve()
+        contained = resolved != base and resolved.is_relative_to(base)
+    except (OSError, RuntimeError):
+        contained = False
+    if not contained:
+        raise ImportError(f"plugin module escapes its plugin directory: {module_path}")
     if not module_path.is_file():
         raise FileNotFoundError(f"plugin module not found: {module_path}")
     spec = importlib.util.spec_from_file_location(f"bmad_loop_plugin_{manifest.name}", module_path)
@@ -67,7 +81,11 @@ def _instantiate(manifest: PluginManifest, settings: dict) -> Plugin:
     cls_name = manifest.python.cls  # type: ignore[union-attr]
     cls = getattr(module, cls_name, None)
     if cls is None:
-        raise AttributeError(f"plugin module {manifest.python.module!r} has no {cls_name!r}")
+        # manifest.python is validated non-None before this loader runs (mirrors
+        # the manifest.python.cls access above).
+        raise AttributeError(
+            f"plugin module {manifest.python.module!r} has no {cls_name!r}"  # pyright: ignore[reportOptionalMemberAccess]
+        )
     if not (isinstance(cls, type) and issubclass(cls, Plugin)):
         raise TypeError(f"{cls_name!r} must subclass plugins.Plugin")
     return cls(manifest, settings)
@@ -91,7 +109,7 @@ def _resolve(manifest: PluginManifest, policy, journal) -> LoadedPlugin:
 
     try:
         instance = _instantiate(manifest, settings)
-    except Exception as e:  # noqa: BLE001 - isolate plugin failures; never BaseException
+    except Exception as e:  # isolate plugin failures; never BaseException
         if journal is not None:
             journal.append("plugin-error", plugin=manifest.name, error=f"{type(e).__name__}: {e}")
         return LoadedPlugin(manifest=manifest, disabled=True, error=str(e), settings=settings)

@@ -26,11 +26,13 @@ These are independent and abstracted separately:
 - **Transport axis** — `TerminalMultiplexer` (`adapters/multiplexer.py`): how
   sessions, windows, and panes are created, observed, and torn down. The generic
   adapter never shells out itself — it goes through `self.mux`, obtained from
-  `get_multiplexer()`. The one backend today is tmux: argv construction and the
-  single spawn primitive live in `BaseTmuxBackend` (`adapters/tmux_base.py`), with
-  the thin POSIX leaf `TmuxMultiplexer` (`adapters/tmux_backend.py`); together they
-  are the **only** files allowed to invoke `tmux` (and the only place POSIX-shell
-  trailers live). A future non-POSIX backend (e.g. a native-Windows "psmux")
+  `get_multiplexer()`. The bundled family is tmux-shaped: argv construction and
+  the single spawn primitive live in `BaseTmuxBackend` (`adapters/tmux_base.py`),
+  with the thin POSIX leaf `TmuxMultiplexer` (`adapters/tmux_backend.py`) and the
+  native-Windows leaf `PsmuxMultiplexer` (`adapters/psmux_backend.py`), which
+  points the same spawn seam at psmux's own binary via the `_BINARY` class
+  attribute; the base and its POSIX leaf are the **only** files allowed to invoke
+  `tmux` (and the only place POSIX-shell trailers live). Any other backend
   registers itself via `register_multiplexer(...)` and slots in behind
   `get_multiplexer()` with no change to the adapters. A backend author reads
   `multiplexer.py` for the contract and `tmux_backend.py` / `tmux_base.py` for the
@@ -50,10 +52,20 @@ only `shutil.which("tmux")` presence checks, never an invocation.
 
 To add a backend, build a `TerminalMultiplexer` (`adapters/multiplexer.py`) and
 **register** it — `register_multiplexer(name, matches, factory)`, where
-`matches(sys.platform)` decides automatic selection and `name` is the key the
-`BMAD_LOOP_MUX_BACKEND` env var forces (for tests / overrides). `get_multiplexer()`
-returns the first backend whose `matches` is true, with tmux as the default
-fallback. There are two build paths: extend `BaseTmuxBackend` (`adapters/tmux_base.py`)
+`matches(sys.platform)` decides automatic selection and `name` is the key both
+the `BMAD_LOOP_MUX_BACKEND` env var and the persisted `[mux] backend` policy key
+force. `get_multiplexer()` resolves by precedence: env var → `[mux] backend`
+(set with `bmad-loop mux set <name>`, machine-scoped — policy.toml is
+gitignored) → the platform default when registered and `available()` → the
+first available platform match → the historical tmux fallback. `bmad-loop mux`
+lists every registered backend and the selection; same-platform backends need
+discriminating `available()` probes (see the
+[porting guide](porting-to-a-new-os.md#availability-discriminators-same-platform-backends)).
+An out-of-tree backend package makes its registration run by advertising the
+module under the `bmad_loop.mux_backends` entry-point group — core imports it
+before every selection, so co-installing the package is the whole setup (see
+[the porting guide](porting-to-a-new-os.md#shipping-out-of-tree-the-bmad_loopmux_backends-entry-point);
+a broken package degrades to a `bmad-loop mux` warning, never a selection failure). There are two build paths: extend `BaseTmuxBackend` (`adapters/tmux_base.py`)
 for a tmux-family backend — overriding only its single spawn primitive `_run()`
 plus the shell-dialect hooks (`_shell_wrap`, `_join_argv`, `_parked_trailer`,
 `_source_prefix`, `_window_launch` and the `_EXIT_CAPTURE`/`_ECHO`/`_PARK`
@@ -70,14 +82,71 @@ seams of a full OS port are in
   (run a command, then _park_ on a keypress so the exit status stays inspectable,
   then return any attached client to its origin — the POSIX `sh -c` recipe is
   composed from the base's overridable shell-dialect hooks, so a non-POSIX
-  backend swaps the dialect fragments, not the method body), `list_window_ids`, `list_windows` (selected fields per window),
+  backend swaps the dialect fragments, not the method body), `list_window_ids`
+  (which MUST emit the same id form your `new_window` returns — `window_alive` is
+  a membership test over it, so qualifying one side and not the other reads every
+  live window as dead), `list_windows` (selected fields per window),
   `window_alive`, `kill_window`, `select_window`, `set_window_option`,
   `unset_window_option`, `show_window_option`, `pipe_pane` (tee a pane to a log),
   `send_text`.
 - **Client / attach** — `attach_target_argv` (argv that reaches a target, nesting-
   aware), `current_pane_id` / `current_window_id` / `current_session`,
-  `detach_client`, `switch_client` (with an optional last-client fallback),
-  `available` (is this backend usable on the current host).
+  `current_return_target` (the value an interactive attach records for the
+  parked-window return hop, replayed opaquely by `switch_client` and the parked
+  trailer; concrete default = the native pane id, so most backends inherit it —
+  override only when your ids do not resolve from another session's context,
+  as psmux does to emit `=session:%N`), `detach_client` / `switch_client` (with
+  an optional last-client fallback — see the rule below),
+  `available` (is this backend usable on the current host), `version` (the
+  binary's version string or `None` — **one bounded line**, folded with
+  `fold_version()`; see [the porting guide](porting-to-a-new-os.md)).
+
+  **Both client verbs report effect, not dispatch.** They answer a bool the
+  parked-window return path trusts, so a backend with no real detach (herdr —
+  only a manual chord releases its client) answers `False`. If your CLI's exit
+  code already means "a client moved" you are done (tmux: `detach-client` fails
+  with _no current client_); if it does not, **measure** what the verb is meant
+  to change — psmux counts the session's attached clients across the call and
+  answers on the drop — and record what the measure cannot see in your
+  degradation ledger (psmux's `Residue:` note: a switch _within_ one session
+  moves no client count, so it reads as no effect). Where no measure is
+  available, answer `False` and record that gap in the ledger too.
+  `tui.launch.return_attached_client` reads a failed `switch_client` as
+  `ATTENDED` — the client never left this window, so an attended sweep keeps
+  prompting — and a failed `detach_client` as `UNREACHABLE`, which is evidence of
+  nothing, so the sweep goes unattended and defers this cycle's decisions to
+  `bmad-loop decisions`. `False` is the safe answer either way; a vacuous `True`
+  is the one answer no backend may give — it announces a hand-back that never
+  happened and sends the sweep unattended with the human still sitting there
+  (#227).
+
+**Window targets.** The target-taking methods (`kill_window`, `select_window`,
+the window-option trio, `attach_target_argv`, `switch_client`) receive one of two
+families: the **seam-canonical target token** `=session[:window]` — formatted by
+the concrete `TerminalMultiplexer.target(session, window=None)`, decoded by the
+module-level `parse_target()` — or the backend's own **native id** (whatever your
+`new_window` returned). Core never hand-assembles the grammar; it calls
+`target()`. (Two values are composed by the backend itself rather than by
+`target()`, precisely so the seam grammar never has to carry a pane or window
+id: the parked-window return target — `current_return_target`, above — and the
+native window id, which psmux qualifies to `session:@N` because its ids are
+per-server (falling back to the bare id where that grammar would not survive —
+the backend owns those conditions, and applies them uniformly, so the
+`new_window`/`list_window_ids` symmetry rule holds under the fallback too).
+Both are replayed opaquely; neither is parsed by core. psmux applies the same
+qualification to `new_parked_window`, the `window_id` columns of `list_windows`
+and `current_window_id`; the latter two must agree, since the ctl-window prune
+compares them to skip its own window.) tmux consumes the token natively (it coincides with tmux exact-match
+syntax), so `BaseTmuxBackend` passes it straight through. A native-id backend
+calls `parse_target()` first — `None` means "already a native id, use as-is",
+otherwise resolve `(session, window)` yourself; the herdr adapter's
+`_parse_target`
+([backend.py](https://github.com/pbean/bmad-loop-adapter-herdr/blob/main/src/bmad_loop_adapter_herdr/backend.py))
+is the worked example (workspace-by-label → tab-by-name → root pane, resolved
+lazily at use time). You MAY override `target()` to emit native ids, but the token must
+stay a stable _by-name_ reference: core formats targets ahead of use (a parked
+window's return target, for one), so eager resolution to a live id goes stale —
+inheriting the default and resolving lazily is almost always right.
 
 Operations that can race a window dying (`pipe_pane`) or a session already being
 gone (`kill_session`) must tolerate it rather than raise; everything else raises a
@@ -89,6 +158,33 @@ backend. `window_alive` uses `list-windows` membership, not `display-message`, b
 `tmux_backend.py` is the reference implementation; reading it alongside the ABC is
 the fastest way to see exactly what a `new_parked_window` or `session_options` must
 produce.
+
+For the **implement-fresh** path, the external herdr adapter
+([pbean/bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr),
+`src/bmad_loop_adapter_herdr/backend.py`) is the reference worked example — a
+backend over [herdr](https://herdr.dev), a cross-platform, agent-aware workspace
+manager whose CLI is a different binary family from tmux. Its
+mapping: a bmad-loop **session** is a herdr **workspace** (label == session name), a
+**window** is a **tab** (one shell pane, whose `root_pane.pane_id` is the native
+window id handed back), and the launched command runs via a typed `exec <argv>`
+(`pane run` = type + Enter) so process-exit == pane-close == tab-close ==
+tmux-identical window death. Where herdr has no analogue, the backend degrades
+honestly rather than faking it: session/window **options** (which herdr lacks
+entirely) live in a cross-process JSON **sidecar** (atomic swaps for readers, an OS
+advisory lock around each read-modify-write so concurrent writers never lose
+updates), and `pipe_pane` — herdr has no
+tee — runs a per-window **poller** thread that snapshots `pane read` into the log
+whenever the content changes, which is exactly enough to drive the two log consumers
+a tmux tee would (`generic._log_activity_key`'s stall re-arm and `probe`'s marker
+discovery). Its module docstring is a **degradation ledger** of every such
+divergence (sidecar options, poller `pipe_pane`, the no-op `detach_client` —
+which the widened seam now requires to answer `False`, not `None`, so the
+parked-return path reads it as `UNREACHABLE` and an attended sweep stops
+prompting into a window whose client only a manual chord can release — the attach
+argv, the advisory geometry, the protocol-version policy) — the reference for what
+"implement fresh" costs when the host has no tmux-shaped CLI. The operator-facing
+view — what a herdr _user_ notices and does — is
+[the adapter's operator guide](https://github.com/pbean/bmad-loop-adapter-herdr/blob/main/docs/adapter-multiplexer-herdr.md).
 
 The hard part of a new profile isn't the TOML — it's the **facts that live in no
 doc**: the CLI's exact hook payload shape (field names and casing, whether
@@ -110,8 +206,8 @@ bmad-loop probe-adapter <cli> --probe --project .  # opt-in live capture
 
 ## Two modes
 
-Both modes emit the **same single sanitized report** (markdown to stdout, or to a
-file with `--out`; add `--json` for a machine-readable block).
+Both modes emit the **same single sanitized finding** (markdown to stdout, or to a
+file with `--out`; `--json` emits it as a machine-readable JSON document instead).
 
 ### SCAN (default — no process launch)
 
@@ -119,7 +215,7 @@ Runs `<binary> --version` / `--help`, locates the newest **already-existing**
 session transcript by convention, reads the declared hook config, and infers the
 token schema from the transcript. Works whenever you've used the CLI before, with
 zero execution risk. This is the right first step for any CLI that already has a
-profile (claude/codex/gemini/copilot) or that you've run by hand.
+profile (claude/codex/gemini/copilot/antigravity) or that you've run by hand.
 
 ### PROBE (`--probe` — opt-in live capture)
 
@@ -140,15 +236,23 @@ If `tmux` or the binary is missing, probe degrades gracefully to a scan.
 The report is built to be **safe to paste into an issue or PR**. A single audited
 sanitizer (`src/bmad_loop/sanitize.py`) is the only chokepoint:
 
-- **numbers, booleans, and `null` pass through** — token _counts_ are not PII;
-- **dict keys are kept verbatim** — field names and casing are the whole point of
-  a payload probe;
-- every **leaf string** is `$HOME`→`~` redacted and then kept **only if** it looks
-  like a short machine identifier (e.g. `claude-opus-4-8`, `session-abc_123`);
-  anything else — prose, code, paths, emails — becomes `<redacted:str>`;
-- **list lengths are preserved**, contents are scrubbed element by element;
+- **captured hook payloads ship as a schema, never as values** — per event you
+  get the field names and the dotted key paths with leaf _types_
+  (`tool_input.command:str`); no payload value of any kind reaches the report,
+  and a dynamic or credential-shaped key collapses to `<key>`;
+- **numbers, booleans, and `null` pass through** elsewhere — token _counts_ are
+  not PII;
+- **transcript locations are redacted per component** — home → `~`, anything
+  that isn't a plain machine identifier (or that embeds your username) →
+  `<redacted>`, and your project directory name → a salted alias
+  (`project-3f2a9c…`), the same pseudonymization `diagnose` uses;
 - `--help` / `--version` text and log tails have the home dir and any emails
-  redacted, with a line cap.
+  redacted, with a line cap;
+- **the rendered report re-scans itself before emitting** — the same
+  `sanitize.guard` egress backstop as `diagnose`. A stray occurrence of the
+  aliased project name is repaired and disclosed; an email / secret / home path /
+  username in the final bytes makes the command **refuse to emit** (message on
+  stderr, empty stdout, exit ≠ 0, no `--out` file) rather than ship it.
 
 In PROBE mode the raw capture exists **only transiently** inside the temp dir,
 which is `rmtree`'d in a `finally` (even on exception or Ctrl-C). The CLI's own
@@ -193,9 +297,9 @@ bmad-loop probe-adapter <cli> --probe --project /tmp/scratch
 ```
 
 The **Hook payload shape** section now shows, per captured event, the native→
-canonical pairing, the payload keys, and the scrubbed payload — so you can confirm
-`session_id` / `transcript_path` casing and that the CLI accepted the hook config
-for your dialect. If the CLI rejects the config or never fires a hook, the report
+canonical pairing, the payload keys, and the payload **schema** (key paths + leaf
+types, never values) — so you can confirm `session_id` / `transcript_path` casing
+and that the CLI accepted the hook config for your dialect. If the CLI rejects the config or never fires a hook, the report
 says so (with a scrubbed log tail) instead of silently producing nothing.
 
 ### 4. Write the `usage_parser`
@@ -207,6 +311,23 @@ registering it in `read_usage`. The report flags **per-call vs cumulative** as a
 human call — a `token_count`-style event that carries running totals (codex) is
 read differently from per-message blocks that are summed (claude/gemini). Re-run
 scan after wiring the parser: the **parsed counts** self-check should now appear.
+
+**`none` is a legitimate final answer, not only a placeholder.** If the report
+comes back with no `token_field_candidates`, the CLI may simply not expose usage
+anywhere a parser can reach — `antigravity` is the worked example: it counts
+tokens (its TUI displays them) but writes them only into an internal SQLite
+protobuf blob, never into the transcript. Leave `usage_parser = "none"`, and
+record _why_ in the profile so nobody re-litigates it. Do not reach outside the
+`(transcript_path) -> TokenUsage | None` contract to scrape a vendor's internal
+store: it is undocumented, unversioned, and will break.
+
+**Trust the payload over the docs.** A CLI that reports its own transcript path
+in the hook payload is telling you the truth; a path in its documentation may be
+illustrative. agy's `hooks.md` shows a workspace-relative
+`<workspace>/.gemini/antigravity/transcript.jsonl`, but the live payload's
+`transcriptPath` is home-rooted under `brain/<conversationId>/` — and named
+`transcript_full.jsonl`. `--probe` prefers the captured path for exactly this
+reason; the convention glob is the fallback.
 
 ---
 
@@ -220,8 +341,8 @@ scan after wiring the parser: the **parsed counts** self-check should now appear
 | `--binary NAME`     | Binary to probe for a CLI that has no profile yet (enables a reduced report).    |
 | `--model NAME`      | Model passed to the probe turn (PROBE mode).                                     |
 | `--timeout SECONDS` | Probe turn timeout (default 90).                                                 |
-| `--out FILE`        | Write the report to a file instead of stdout (the only file the command writes). |
-| `--json`            | Append a machine-readable JSON block to the report.                              |
+| `--out FILE`        | Write the output to a file instead of stdout (the only file the command writes). |
+| `--json`            | Emit a machine-readable JSON document _instead of_ the report (honours `--out`). |
 | `--keep-temp`       | (hidden, debug) keep the raw probe temp dir — prints a "do not share" warning.   |
 
 Exit codes mirror `validate`: `0` whenever a report is produced (warnings are
@@ -270,23 +391,24 @@ resolves to `claude`.
 
 ### `CLIProfile`
 
-| Field                              | Required | Default            | Meaning                                                                                                                                                                                                                                                                                                                                                 |
-| ---------------------------------- | -------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`                             | ✅       | —                  | Profile id, also the `--cli` value and override key.                                                                                                                                                                                                                                                                                                    |
-| `binary`                           | ✅       | —                  | Executable to launch (resolved on `PATH`).                                                                                                                                                                                                                                                                                                              |
-| `[hooks]`                          | ✅       | —                  | The `HookSpec` table (see below).                                                                                                                                                                                                                                                                                                                       |
-| `skill_tree`                       |          | `.claude/skills`   | Project-relative tree this CLI reads skills from (`.agents/skills` for codex/gemini); `bmad-loop init` installs the `bmad-loop-*` skills here. Must be relative.                                                                                                                                                                                        |
-| `prompt_template`                  |          | `{prompt}`         | How the canonical `/skill args` prompt is rendered. Placeholders: `{prompt}` (whole string), `{skill}` (leading slash-command name, no `/`), `{args}` (the remainder).                                                                                                                                                                                  |
-| `launch_args`                      |          | `()`               | Extra argv passed at launch, e.g. `["-i"]` to stay interactive (gemini/copilot).                                                                                                                                                                                                                                                                        |
-| `bypass_args`                      |          | `()`               | Flags that bypass permission/approval prompts for unattended runs (e.g. `--allow-all-tools`).                                                                                                                                                                                                                                                           |
-| `model_flag`                       |          | `--model`          | Flag used to pass the model name when one is configured.                                                                                                                                                                                                                                                                                                |
-| `env`                              |          | `{}`               | Extra environment variables for the session.                                                                                                                                                                                                                                                                                                            |
-| `usage_parser`                     |          | `none`             | Which transcript token parser to use — one of `claude-jsonl`, `codex-rollout`, `gemini-chat`, `copilot-events`, `none`.                                                                                                                                                                                                                                 |
-| `usage_grace_s`                    |          | `0.0`              | Seconds to keep polling the transcript for token totals after the session ends. `0` = read once. Raise it for CLIs that flush totals only on shutdown (copilot writes `modelMetrics` ~1s after the turn-end hook). Must be ≥ 0.                                                                                                                         |
-| `stop_without_result_nudges`       |          | unset (use global) | Per-adapter floor for Stop-without-result nudges. Leave unset to inherit `limits.stop_without_result_nudges`. Raise it for CLIs that fire a turn-end hook _per response turn_ (copilot's `agentStop`), where the global default of 1 declares them stalled too early. Must be ≥ 0 if set.                                                               |
-| `subagent_stop_without_transcript` |          | `false`            | Set `true` for CLIs that fire the turn-end hook for _subagent_ turns too, with an empty `transcriptPath` and a tool-use session id (copilot's `agentStop`). A `Stop` carrying no transcript is then treated as a subagent stop and ignored, so the main session's real turn-end drives completion. Leave `false` and every `Stop` is the main turn-end. |
-| `first_run_note`                   |          | `""`               | Human note printed by `init` about a manual first-run/auth step this CLI needs.                                                                                                                                                                                                                                                                         |
-| `seed_files`                       |          | `()`               | Project-relative gitignored configs (MCP/CLI settings) a `git worktree add` checkout omits; `provision_worktree` copies them into isolated dev/review worktrees. Must be relative.                                                                                                                                                                      |
+| Field                              | Required | Default            | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ---------------------------------- | -------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                             | ✅       | —                  | Profile id, also the `--cli` value and override key.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `binary`                           | ✅       | —                  | Executable to launch (resolved on `PATH`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `[hooks]`                          | ✅       | —                  | The `HookSpec` table (see below).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `skill_tree`                       |          | `.claude/skills`   | Project-relative tree this CLI reads skills from (`.agents/skills` for codex/gemini); `bmad-loop init` installs the `bmad-loop-*` skills here. Must be relative.                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `prompt_template`                  |          | `{prompt}`         | How the canonical `/skill args` prompt is rendered. Placeholders: `{prompt}` (whole string), `{skill}` (leading slash-command name, no `/`), `{args}` (the remainder).                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `launch_args`                      |          | `()`               | Extra argv passed at launch, e.g. `["-i"]` to stay interactive (gemini/copilot).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `bypass_args`                      |          | `()`               | Flags that bypass permission/approval prompts for unattended runs (e.g. `--allow-all-tools`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `model_flag`                       |          | `--model`          | Flag used to pass the model name when one is configured.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `env`                              |          | `{}`               | Extra environment variables for the session.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `usage_parser`                     |          | `none`             | Which transcript token parser to use — one of `claude-jsonl`, `codex-rollout`, `gemini-chat`, `copilot-events`, `none`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `usage_grace_s`                    |          | `0.0`              | Seconds to keep polling the transcript for token totals after the session ends. `0` = read once. Raise it for CLIs that flush totals only on shutdown (copilot writes `modelMetrics` ~1s after the turn-end hook). Must be ≥ 0.                                                                                                                                                                                                                                                                                                                                                          |
+| `stop_without_result_nudges`       |          | unset (use global) | Per-adapter floor for Stop-without-result nudges. Leave unset to inherit `limits.stop_without_result_nudges`. Raise it for CLIs that fire a turn-end hook _per response turn_ (copilot's `agentStop`), where the global default of 1 declares them stalled too early. Must be ≥ 0 if set.                                                                                                                                                                                                                                                                                                |
+| `subagent_stop_without_transcript` |          | `false`            | Set `true` for CLIs that fire the turn-end hook for _subagent_ turns too, with an empty `transcriptPath` and a tool-use session id (copilot's `agentStop`). A `Stop` carrying no transcript is then treated as a subagent stop and ignored, so the main session's real turn-end drives completion. Leave `false` and every `Stop` is the main turn-end.                                                                                                                                                                                                                                  |
+| `first_run_note`                   |          | `""`               | Human note printed by `init` about a manual first-run/auth step this CLI needs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `seed_files`                       |          | `()`               | Project-relative gitignored configs (MCP/CLI settings) a `git worktree add` checkout omits; `provision_worktree` copies them into isolated dev/review worktrees. Must be relative.                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `env_fault_patterns`               |          | `()`               | Regex patterns matched line-by-line against the ANSI-stripped tail of a **non-completed** (`timeout`/`stalled`/`crashed`) session's pane log to classify a transport/API **environment fault** (#194); a match stamps `env_fault` / `env_fault_evidence` on the `SessionResult`. Must be a **list of strings**; compiled and validated at parse time (an invalid regex is a profile error). Matched with the `regex` module under a per-pattern timeout (`ENV_FAULT_MATCH_TIMEOUT_S`), so a pathological pattern can't hang a session teardown. Seeded only for `claude`; empty = inert. |
 
 ### `HookSpec` (the `[hooks]` table)
 
@@ -358,8 +480,11 @@ Three frozen dataclasses cross the seam:
   window id, HTTP session id, …), `launched_ns` (wall-clock ns just before launch;
   the floor for hook events).
 - **`SessionResult`** (returned by `wait_for_completion`) — `status` (one of
-  `completed`, `stalled`, `timeout`, `crashed`), `result_json`, `session_id`,
-  `transcript_path`.
+  `completed`, `stalled`, `timeout`, `crashed`, `over_budget`), `result_json`,
+  `session_id`, `transcript_path`, and the optional post-mortem forensics
+  `env_fault` / `env_fault_evidence` (set by `_classify_env_fault` when a
+  non-completed session is matched as a transport/API **environment fault** —
+  see the `env_fault_patterns` profile key).
 
 ### Methods
 
@@ -373,6 +498,20 @@ The base class provides `run(spec)`, the template that chains
 `start_session` → `wait_for_completion` → `kill` (the kill runs in a `finally`).
 You normally don't override it.
 
+`run(spec)` then chains two post-processing template hooks over the returned
+`SessionResult` (both identity no-ops on the base class, so an adapter that needs
+neither leaves them alone):
+
+- `_post_kill_reconcile(handle, spec, result)` — runs right after the
+  `finally`-kill. A session that finished but lost its final `Stop` can be
+  rescued to `completed` here, once window death has settled the liveness the
+  live-window verdict had to leave open (see `GenericDevAdapter`).
+- `_classify_env_fault(handle, spec, result)` — runs **last**, and only for a
+  non-`completed` result with `result_json is None`. An adapter may re-inspect
+  its post-mortem log tail and stamp `env_fault` / `env_fault_evidence` on the
+  result (see the `env_fault_patterns` profile key). Because it runs after the
+  reconcile, a rescue-to-`completed` is never re-classified.
+
 Optional capabilities (default to "unsupported" / no-op):
 
 - `send_text(handle, text)` — nudge a running session. Raises `NotImplementedError`
@@ -385,11 +524,77 @@ Optional capabilities (default to "unsupported" / no-op):
 - `read_usage(result) -> TokenUsage | None` — parse token usage from the result
   (returns `None` by default).
 
+### Worked example: the opencode adapter
+
+[`adapters/opencode_http.py`](../src/bmad_loop/adapters/opencode_http.py) is the
+shipped non-tmux adapter: it drives [OpenCode](https://opencode.ai) entirely over
+`opencode serve`'s HTTP API + SSE event stream (`injection = "http"`,
+`observation = "sse"`, `state = "remote"`). Every API fact it relies on was
+pinned live against a real 1.18.2 binary and is recorded in the module's
+API-contract docstring — start there when the upstream API drifts. The design
+decisions worth stealing:
+
+- **One server per session.** The API has no per-session env, but the engine's
+  `BMAD_LOOP_*` contract must reach tool subprocesses — so each session gets its
+  own `opencode serve` spawned with `cwd = spec.cwd` and `env ⊇ spec.env`.
+  Permissions, the model, and a hermetic skills path are injected via the
+  `OPENCODE_CONFIG_CONTENT` env var (zero worktree pollution), and each server
+  gets its own `OPENCODE_SERVER_PASSWORD` so a foreign process on a recycled
+  port can never impersonate it.
+- **Map the transport onto the hook-signal semantics** instead of inventing new
+  ones: the SSE `session.idle` event ≙ the Stop hook, server-process death ≙
+  window death (`crashed`, landed artifact honored), and a poll fallback
+  (`GET /session/status` + message `time.completed` proof-of-work) covers SSE
+  loss. Completion evidence is gated by a forward-advancing floor so an idle
+  event without proof of new work never completes a session — the same
+  artifact-distrust invariant the tmux adapters enforce.
+- **A transport with no pane still owes the operator a transcript.** The tmux
+  adapters get `logs/<task-id>.log` for free by replaying the pane; over HTTP that
+  file would hold nothing but `opencode serve`'s own INFO stdout, leaving finished
+  runs unreadable. So the transcript is _curated_ off the SSE stream the adapter
+  already consumes for control — a second consumer on the same
+  `sessionID`-filtered dispatch, costing one `write()` per interesting frame.
+  Three sinks, one per audience: `<task-id>.log` is the readable transcript
+  (role-prefixed prose plus `[bmad]`-marked `tool:` / `cmd:` / `file:` /
+  `perm ask:` / `perm reply:` / `error:` lines), `<task-id>.server.out` takes the
+  server's own stdout so it cannot drown that transcript, and
+  `<task-id>.sse.jsonl` keeps the raw frames for post-hoc debugging (behind the
+  `sse_trace` module knob, per-token deltas excluded). The catch of curating:
+  what you render is only as good as the event names you pinned — check every
+  branch against the running binary, not against the names that read plausibly.
+- **Hookless profile.** The profile sets `[hooks] dialect = "none"`: no hook
+  registration, no hook-config merge into worktrees; `init`, `validate` and
+  worktree provisioning all understand `profile.hookless`. Skills still install
+  and copy normally — opencode discovers `.claude/skills/<name>/SKILL.md`
+  natively.
+- **Reuse the synthesis mixins, never fork them.** `_ResultFileMixin`
+  (`result.json` read-back) and `_DevSynthesisMixin` (the whole bmad-dev-auto
+  dev/review synthesis machinery) live in
+  [`adapters/generic.py`](../src/bmad_loop/adapters/generic.py).
+  `OpencodeDevAdapter(_DevSynthesisMixin, OpencodeHttpAdapter)` plugs into two
+  seams: `_probe_alive(handle) -> bool | None` (post-kill liveness; `None` =
+  unknown ⇒ the verdict stands) and `_configure_dev_knobs()` (stall-nudge
+  budgets). A new adapter class that should run dev/review sessions composes
+  the same way.
+- **Usage before teardown, kill in `finally`.** Token usage only exists inside
+  the server (`state = "remote"`), so it is captured over HTTP before every
+  return path; `kill()` is idempotent, sweeps via `atexit`, and force-kills the
+  process tree first on Windows (the npm shim is a `.cmd` wrapper — a polite
+  kill orphans the real server).
+
+The test story mirrors the transport split:
+[`tests/test_opencode_http.py`](../tests/test_opencode_http.py) runs the full
+adapter against a scripted stdlib FakeOpencode (no binary, no network beyond
+127.0.0.1), and [`tests/test_opencode_live.py`](../tests/test_opencode_live.py)
+smoke-checks the pinned HTTP contract against a real local binary — skipped
+when absent, zero tokens spent.
+
 ### References
 
 - [`adapters/opencode_http.py`](../src/bmad_loop/adapters/opencode_http.py) — the
-  worked **design stub** for a non-tmux (HTTP/SSE) transport.
+  worked example above: a real non-tmux (HTTP/SSE) transport.
 - [`adapters/mock.py`](../src/bmad_loop/adapters/mock.py) — the test-only reference
   implementation.
 - [`adapters/generic.py`](../src/bmad_loop/adapters/generic.py) — the tmux +
-  hook-signal adapter to reuse with a profile rather than subclass.
+  hook-signal adapter to reuse with a profile rather than subclass; also home of
+  the `_ResultFileMixin` / `_DevSynthesisMixin` seams.

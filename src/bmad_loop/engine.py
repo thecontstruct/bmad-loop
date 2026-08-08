@@ -9,26 +9,33 @@ verify. All creative work happens inside disposable adapter sessions.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import functools
+import hashlib
 import shutil
 import signal
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable, NoReturn, Sequence
 
-from . import deferredwork, devcontract, gates, verify
-from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec
+from . import deferredwork, devcontract, envvars, gates, operatoractions, verify
+from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec, SpecSnapshot
 from .bmadconfig import ProjectPaths
 from .escalation import (
     Action,
+    Decision,
     critical_escalations,
     decide_dev,
     decide_review_session,
+    env_fault_pause_reason,
     preference_escalations,
+    review_exhausted,
+    review_retry_or_exhaust,
 )
-from .install import provision_worktree
+from .install import dev_primitive_or_default
 from .journal import Journal, save_state
 from .model import (
     PAUSE_EPIC_BOUNDARY,
@@ -38,22 +45,42 @@ from .model import (
     RunState,
     SessionRecord,
     StoryTask,
+    VerifyOutcome,
 )
+from .platform_util import atomic_replace, atomic_write_text, retrying_unlink, safe_segment
 from .plugins import HookBus, HookContext, PluginRegistry
 from .policy import Policy
-from .runs import kill_session
+from .recovery_flow import RecoveryFlow
+from .runs import clear_graceful_stop, graceful_stop_requested, kill_session
+from .sprintstatus import ACTIONABLE_STATUSES
 from .sprintstatus import advance as sprint_advance
 from .sprintstatus import load as load_sprint_status
 from .sprintstatus import next_actionable, parse_selector
 from .statemachine import advance
-from .workspace import (
-    UnitWorkspace,
-    Workspace,
-    close_unit_workspace,
-    discard_worktree,
-    open_unit_workspace,
-    unit_worktrees_dir,
-)
+from .workspace import UnitWorkspace, Workspace, discard_worktree, open_unit_workspace
+from .worktree_flow import WorktreeFlow
+from .worktree_flow import _setup_mcp_agent_id as _setup_mcp_agent_id  # re-export for tests
+
+if TYPE_CHECKING:
+    # Type-only: the worktree-provisioning helpers speak in CLI profiles.
+    from .adapters.profile import CLIProfile
+
+
+# `origin:` marker prefix for ledger entries harvested out of a spec's
+# frontmatter `deferred:` list (BMAD-METHOD #2640). The full marker is
+# `<prefix> <fingerprint>` — matched verbatim on every later harvest, so it is
+# the dedup key and must never be reworded; `<prefix>-malformed <fingerprint>`
+# marks the aggregated unparseable-items meta-entry.
+HARVEST_ORIGIN = "spec-deferred"
+# A completed session owns the spec bytes it just wrote. Give a transient repair
+# read one immediate retry, but never dispatch another session over an unread
+# source: that later pass is allowed to replace the frontmatter list.
+HARVEST_REPAIR_READ_ATTEMPTS = 2
+
+
+def _digest_of(text: str | None) -> str:
+    """Hash ledger text for attribution; absent and empty are equivalent."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
 class RunPaused(Exception):
@@ -65,9 +92,24 @@ class RunPaused(Exception):
 
 
 class RunStopped(Exception):
-    """Raised from the SIGTERM/SIGINT handler to unwind the loop cleanly so the
-    engine can mark the run `stopped` (a deliberate stop, distinct from a
-    crash) and tear down its in-flight agent session."""
+    """Raised to unwind the loop cleanly so the engine can mark the run `stopped`
+    (a deliberate stop, distinct from a crash).
+
+    Two flavors, distinguished by ``graceful``:
+
+    - ``graceful=False`` (default) — a *hard* stop from the SIGTERM/SIGINT handler.
+      The loop is interrupted mid-session, so the in-flight agent window is still
+      live and must be torn down unconditionally.
+    - ``graceful=True`` — a stop requested via the ``stop-request.json`` control
+      file and detected at an item boundary (:meth:`Engine._check_graceful_stop`).
+      The in-flight item already completed through commit, so ``run()`` runs the
+      wanted subset of the clean-finish path (worktree GC + ``post_run`` +
+      policy-gated session teardown) rather than a hard kill, and the run stays
+      resumable."""
+
+    def __init__(self, graceful: bool = False):
+        super().__init__("graceful stop" if graceful else "stopped")
+        self.graceful = graceful
 
 
 @dataclass(frozen=True)
@@ -78,14 +120,43 @@ class RunSummary:
     escalated: int
     paused: bool
     paused_reason: str
+    # Raw: cache reads at full weight. Kept as the historical field name.
     total_tokens: int
+    # Cost-proportional: cache reads discounted by limits.cache_read_weight, the
+    # same total every budget judges (#129). Deliberately has NO default — a 0
+    # would render "0 weighted tokens (716M raw)", silently wrong in exactly the
+    # direction this field exists to fix. There is one construction site; a
+    # TypeError beats a plausible zero.
+    weighted_tokens: int
+    # stories that committed but owe human-only external actions (Phase
+    # AWAITING_OPERATOR). Defaulted, unlike weighted_tokens: a miscounted 0 here
+    # is a count that is genuinely 0 on every run that never parks a story, so
+    # the default is honest rather than silently wrong.
+    awaiting_operator: int = 0
     crashed: bool = False
     crash_error: str | None = None
 
     def render(self) -> str:
+        # Lead with weighted (what spend actually costs) and name both units:
+        # raw is 5-8x higher on agentic workloads, where cache reads are 80-95%
+        # of the count, and an unlabeled raw figure reads as a cost overrun.
+        if self.total_tokens:
+            tokens = (
+                f"{self.weighted_tokens:,} weighted tokens "
+                f"({self.total_tokens:,} raw incl. cache reads)"
+            )
+        else:
+            # No usage tracked at all (usage_parser = "none", or Copilot's
+            # shutdown-only flush). Splitting this into "0 weighted (0 raw)"
+            # would assert free work twice over; one plain zero is honest.
+            tokens = "0 tokens"
+        # Appended only when non-zero: a run that parks nothing is the norm, and
+        # a standing ", 0 awaiting operator" would train readers to skip the very
+        # clause that matters on the run where it is not zero.
+        parked = f", {self.awaiting_operator} awaiting operator" if self.awaiting_operator else ""
         lines = [
             f"run {self.run_id}: {self.done} done, {self.deferred} deferred, "
-            f"{self.escalated} escalated, {self.total_tokens:,} tokens"
+            f"{self.escalated} escalated{parked}, {tokens}"
         ]
         if self.crashed:
             lines.append(f"CRASHED: {self.crash_error}")
@@ -94,10 +165,35 @@ class RunSummary:
         return "\n".join(lines)
 
 
-# CLI profile name -> the agent id the Unity-MCP CLI's `setup-mcp` expects (see
-# `unity-mcp-cli setup-mcp --list`). All but claude differ only by claude's
-# "-code" suffix; codex/gemini/cursor and any custom profile pass through as-is.
-_SETUP_MCP_AGENT_IDS = {"claude": "claude-code"}
+# Appended to an injected plugin-workflow session prompt AHEAD of the completion
+# contract below, whenever the run has a sprint board (`_sprint_board_instruction`
+# non-empty; StoriesEngine empties it and this section disappears with it). Same
+# words as the dev/review seams inject, so the three surfaces cannot drift apart —
+# `{clause}` is that method's return value verbatim, not a second copy of it.
+#
+# A workflow session is dispatched in exactly the window `_sprint_board_instruction`
+# describes: post_dev_phase and post_review_result run after `_post_dev_state_sync`
+# has advanced sprint-status.yaml, pre_commit_gate runs before `finalize_commit`
+# lands the story's single commit — so all three open on the same uncommitted,
+# unattributed board change that #437's review session reverted.
+#
+# Carries the prohibition ONLY. The `blocked` hand-back redirect stays review-only
+# for the reason its own docstring gives: it synthesizes a CRITICAL that halts the
+# whole run, which is the wrong trade for a session that is not the sign-off
+# authority. A workflow that genuinely cannot proceed already has a channel — the
+# completion contract's own `status: blocked` marker, which the orchestrator reads
+# as a non-completion and routes through the blocking/advisory decision instead.
+#
+# A section rather than a bare sentence because a workflow prompt is plugin-authored
+# markdown of unknown shape; a trailing sentence would read as a clause of whatever
+# it happens to land after. The heading names the owner, matching the clause's
+# opening words.
+WORKFLOW_BOARD_CONTRACT = """
+
+## Sprint board (orchestrator-owned)
+
+{clause}"""
+
 
 # Appended to every injected plugin-workflow session prompt. The dev/review
 # skills carry their own result conventions, but a workflow prompt is arbitrary
@@ -105,8 +201,9 @@ _SETUP_MCP_AGENT_IDS = {"claude": "claude-code"}
 # *infer* the completion-marker convention, and one that finishes its work but
 # never writes the marker leaves the orchestrator waiting (a completion-signal
 # livelock, bounded only by session_timeout_min). The orchestrator's adapter
-# discovers the marker by its `bmad-dev-auto-result-` filename prefix and
-# mtime, not by exact name.
+# discovers the marker by its `<dev primitive>-result-` filename prefix and
+# mtime, not by exact name (devcontract.FALLBACK_RESULT_PREFIXES accepts both
+# the pre- and post-rename spellings, so either resolution reads back).
 WORKFLOW_COMPLETION_CONTRACT = """
 
 ## Completion signal (required)
@@ -129,14 +226,26 @@ produces. If you end your turn without it, the session is eventually declared
 stalled and its work may be discarded."""
 
 
-def _setup_mcp_agent_id(profile_name: str) -> str:
-    """Map a CLI profile name to its Unity-MCP `setup-mcp` agent id."""
-    return _SETUP_MCP_AGENT_IDS.get(profile_name, profile_name)
+def _session_task_id(story_key: str, part: str, seq: int) -> str:
+    """Single composition point for session task ids. Sanitize the whole
+    composition, not the parts: two individually capped parts can still compose
+    past a Windows filename segment limit, and ``safe_segment``'s digest suffix
+    differs between the two orders. ``_resumable_session``'s resume match must
+    be byte-identical to what ``_run_session`` stored, so both MUST call this."""
+    return safe_segment(f"{story_key}-{part}-{seq}")
+
+
+# Call-stack nesting depth for engine runs. A nested auto-sweep runs synchronously
+# in the same thread as its parent (see _maybe_auto_sweep), so a ContextVar carries
+# the parent's depth into the child. Tracked independently of signal ownership so an
+# off-main-thread top-level run (which cannot own signals) is still seen as depth-0.
+_run_depth: contextvars.ContextVar[int] = contextvars.ContextVar("bmad_loop_run_depth", default=0)
 
 
 class Engine:
-    # The engine that installed the process-wide stop handlers; nested
-    # auto-sweep runs (same process) see it set and let RunStopped propagate up.
+    # The engine that installed the process-wide stop handlers. Signal handling is
+    # single-owner per process; only this engine reinstalls/restores them. Run
+    # nesting is tracked separately via _run_depth (see run()).
     _stop_signals_owner: "Engine | None" = None
 
     def __init__(
@@ -159,6 +268,7 @@ class Engine:
         # only mode) → the repo root in place; Phase 3 swaps in per-unit worktrees.
         self.workspace = Workspace.default(paths)
         self.policy = policy
+        verify.configure_git_timeout(policy.limits.git_timeout_s)
         self.adapters = {
             "dev": adapter,
             "review": review_adapter if review_adapter is not None else adapter,
@@ -198,25 +308,132 @@ class Engine:
             self.journal.append("plugins-active", plugins=self._bus.active_plugins())
         # stop-signal bookkeeping (see run())
         self._owns_signals = False
-        # True iff an outer engine already owned the stop handlers when this one
-        # started — i.e. this is a nested auto-sweep run. Distinct from
-        # _owns_signals, which is also False for a top-level engine that simply
-        # could not install handlers (e.g. off the main thread).
+        # Set authoritatively at run() entry from the _run_depth call-stack counter:
+        # True iff this engine runs nested inside another engine's run() (a nested
+        # auto-sweep). Independent of _owns_signals — a top-level run off the main
+        # thread owns no signals yet is still non-nested. Defaults False pre-run.
         self._is_nested = False
         self._stopping = False
         self._prev_handlers: dict[int, object] = {}
+        # Set by run()'s graceful-stop arm so the trailing notify (which fires for
+        # every exit path) can word itself for a graceful stop and quote how many
+        # stories a resume would still have to run. _graceful_remaining is a
+        # best-effort hint (None when the estimate could not be computed).
+        self._graceful_stopped = False
+        self._graceful_remaining: int | None = None
+        # dev-primitive name resolved from disk, memoized per (workspace project
+        # root, skill tree) — see _dev_skill. By tree because one run can mix them
+        # (dev=claude reads .claude/skills, review=codex reads .agents/skills), with
+        # None for an adapter that carries no profile at all; by project root
+        # because under isolation each unit resolves against its OWN worktree and
+        # one Engine drives every unit of a run.
+        self._dev_skill_cache: dict[tuple[Path, str | None], str] = {}
+        # Per-unit worktree isolation + integration flow (issue #244 F-3/F-9a).
+        # Built from narrow deps + engine callbacks; the same-name Engine._* worktree
+        # methods below delegate to it. `emit` is late-bound (a lambda, not the bound
+        # method) so a test's monkeypatched `_emit` still wins; workspace get/set read
+        # and swap the engine's live `self.workspace`; `_escalation_pause` raises
+        # RunPaused for it (injected so worktree_flow need not import engine).
+        self._worktree_flow = WorktreeFlow(
+            paths=self.paths,
+            policy=self.policy,
+            state=self.state,
+            journal=self.journal,
+            run_dir=self.run_dir,
+            registry=self._registry,
+            adapters_get=lambda: self.adapters,
+            open_unit_workspace=lambda *a, **k: open_unit_workspace(*a, **k),
+            emit=lambda *a, **k: self._emit(*a, **k),
+            save=self._save,
+            gate_unit=self._gate_unit,
+            carry_isolated_ledger_writes=lambda task: self._carry_isolated_ledger_writes(task),
+            escalation_pause=self._escalation_pause,
+            workspace_get=lambda: self.workspace,
+            workspace_set=lambda ws: setattr(self, "workspace", ws),
+        )
+        # Attempt rollback + recovery-ref preservation flow (issue #244 PR 2/2).
+        # Same narrow-deps + engine-callbacks pattern as _worktree_flow: `emit` is
+        # late-bound (a lambda, not the bound method) so a test's monkeypatched
+        # `_emit` still wins; `workspace_get` reads the engine's worktree-swappable
+        # active workspace; `escalate` routes an intent-gap restore failure through
+        # the engine's escalation; `escalation_pause` raises RunPaused for it
+        # (injected so recovery_flow need not import engine — that would reintroduce
+        # a runtime<->engine cycle).
+        self._recovery_flow = RecoveryFlow(
+            paths=self.paths,
+            policy=self.policy,
+            state=self.state,
+            journal=self.journal,
+            run_dir=self.run_dir,
+            workspace_get=lambda: self.workspace,
+            emit=lambda *a, **k: self._emit(*a, **k),
+            save=self._save,
+            escalate=self._escalate,
+            escalation_pause=self._escalation_pause,
+        )
+
+    def _escalation_pause(
+        self, reason: str, story_key: str = "", *, cause: BaseException | None = None
+    ) -> NoReturn:
+        """Raise the engine's ``RunPaused`` (PAUSE_ESCALATION) on behalf of the
+        worktree collaborator. Injected as a callable so ``worktree_flow`` need not
+        import ``RunPaused`` — that would reintroduce a runtime<->engine cycle."""
+        raise RunPaused(reason, PAUSE_ESCALATION, story_key) from cause
 
     # ------------------------------------------------------------- top level
 
+    def _warn_desktop_notifier_inert(self) -> None:
+        """One-time run-start alert for #231: ``notify.desktop`` is requested but
+        this platform has no notifier, so every ``gates.notify`` desktop sink is a
+        silent no-op. Journalled + stderr so an unattended launch that skips
+        ``validate`` still surfaces it."""
+        if not (self.policy.notify.desktop and gates.desktop_notifier_kind() is None):
+            return
+        self.journal.append("notify-desktop-unavailable", platform=sys.platform)
+        # The ATTENTION file only exists as a fallback when notify.file is on; with
+        # it off there is no human channel left, so point at that rather than a file
+        # that is never written.
+        channel = (
+            f"watch the ATTENTION file in {self.run_dir}"
+            if self.policy.notify.file
+            else "notify.file is also off, so no alert channel is configured"
+        )
+        print(
+            f"warning: notify.desktop is set but no desktop notifier is available "
+            f"on {sys.platform}; desktop alerts are silently skipped — {channel}.",
+            file=sys.stderr,
+        )
+
     def run(self) -> RunSummary:
+        # Establish call-stack nesting depth before anything else: _is_nested is read
+        # by the warning gate and the stop/crash re-raise arms below. Reset in the
+        # outermost finally so a nested child's re-raise still decrements the depth.
+        depth = _run_depth.get()
+        self._is_nested = depth > 0
+        token = _run_depth.set(depth + 1)
+        try:
+            return self._run_inner()
+        finally:
+            _run_depth.reset(token)
+
+    def _run_inner(self) -> RunSummary:
         self._install_stop_signals()
         try:
             try:
+                # Warn once per top-level run before pre_run: a plugin `pause` veto in
+                # _emit_run_boundary("pre_run") raises RunPaused, which would otherwise
+                # skip the promised inert-notifier warning + journal event. Gated on
+                # `not _is_nested` (call-stack depth), not `_owns_signals`: a top-level
+                # run that could not install signal handlers (off the main thread) owns
+                # no signals yet is not nested, and must still surface the warning.
+                if not self._is_nested:
+                    self._warn_desktop_notifier_inert()
                 # target-branch setup can raise RunPaused (detached HEAD, unborn
                 # repo), so it must sit inside the pause handler, not before it.
                 self._emit_run_boundary("pre_run")
                 self._ensure_target_branch()
                 self._prune_preserve_refs()
+                self._replay_unlatched_ledger_carries()
                 self._loop()
                 self.state.finished = True
                 self._gc_run_worktrees()
@@ -238,14 +455,43 @@ class Engine:
                     stage=pause.stage,
                     story_key=pause.story_key,
                 )
-            except RunStopped:
-                # the loop was interrupted inside adapter.run(), so the agent
-                # window is still live — tear the whole run session down.
-                kill_session(self.state.run_id)
-                if self._is_nested:
-                    raise  # nested auto-sweep: let the owner record the stop
-                self.state.stopped = True
-                self.journal.append("run-stop")
+            except RunStopped as stop:
+                if stop.graceful:
+                    # Graceful stop: the request was consumed at an item boundary
+                    # (_check_graceful_stop), so the in-flight item already ran to
+                    # completion through commit — nothing mid-session to kill. Run
+                    # the wanted subset of the clean-finish path so a resumable
+                    # `stopped` run is finalized as tidily as a finished one.
+                    self.state.stopped = True
+                    self._graceful_stopped = True
+                    try:
+                        # These run plugin code (post_run) + git worktree admin;
+                        # an exception raised inside an except arm escapes run()
+                        # uncaught, so guard them inline and journal the failure
+                        # rather than let it mask the stop.
+                        self._gc_run_worktrees()
+                        self._emit("post_run")
+                    except Exception as finalize_exc:  # see comment above
+                        self.journal.append("run-stop-finalize-error", error=str(finalize_exc))
+                    remaining = self._remaining_estimate()
+                    self._graceful_remaining = remaining
+                    self.journal.append("run-stop", graceful=True, remaining=remaining)
+                    # Session teardown follows the same policy gate the clean-finish
+                    # path uses (mirrors the finished-run branch), NOT the hard
+                    # stop's unconditional kill. Deliberately NO _is_nested re-raise:
+                    # a gracefully stopped child sweep is a clean completion from the
+                    # parent's perspective (the parent journals sweep-auto-finished).
+                    if self._owns_signals and self.policy.adapter.cleanup_session_on_finish:
+                        kill_session(self.state.run_id)
+                else:
+                    # Hard stop: the loop was interrupted inside adapter.run(), so
+                    # the agent window is still live — tear the whole run session
+                    # down.
+                    kill_session(self.state.run_id)
+                    if self._is_nested:
+                        raise  # nested auto-sweep: let the owner record the stop
+                    self.state.stopped = True
+                    self.journal.append("run-stop")
             except KeyboardInterrupt:
                 # Some Windows console/control events can still surface as a raw
                 # KeyboardInterrupt without routing through the installed signal
@@ -256,7 +502,7 @@ class Engine:
                     kill_session(self.state.run_id)
                 except (
                     BaseException
-                ):  # noqa: BLE001  # nosec B110 - best-effort teardown; the stop must still record
+                ):  # nosec B110 - best-effort teardown; the stop must still record
                     pass
                 if self._is_nested:
                     raise
@@ -282,7 +528,7 @@ class Engine:
                     kill_session(self.state.run_id)
                 except (
                     Exception
-                ):  # noqa: BLE001  # nosec B110 - best-effort teardown; a crashing run must still record
+                ):  # nosec B110 - best-effort teardown; a crashing run must still record
                     pass
                 if self._is_nested:
                     raise  # nested auto-sweep: let the owner record the failure
@@ -301,14 +547,35 @@ class Engine:
                     )
                 except (
                     Exception
-                ):  # noqa: BLE001  # nosec B110 - journal write is best-effort; crash.txt + state flag already persisted
+                ):  # nosec B110 - journal write is best-effort; crash.txt + state flag already persisted
                     pass
             finally:
+                # Any pending stop-request control file that outlived this run
+                # (the run finished/paused/crashed, or a hard stop superseded it,
+                # before an item boundary consumed it) is discarded here so a later
+                # resume does not re-honor a stale request. The graceful arm already
+                # consumed its own file, so this only fires for a superseded one.
+                if clear_graceful_stop(self.run_dir):
+                    with contextlib.suppress(Exception):
+                        self.journal.append("stop-request-discarded")
                 self._save()
         finally:
             self._restore_stop_signals()
         summary = self.summary()
-        gates.notify(self.policy, self.run_dir, "bmad-loop run finished", summary.render())
+        if self._graceful_stopped:
+            body = [summary.render()]
+            if self._graceful_remaining is not None:
+                stories_word = "story" if self._graceful_remaining == 1 else "stories"
+                body.append(f"{self._graceful_remaining} {stories_word} remaining")
+            body.append(f"resume with `bmad-loop resume {self.state.run_id}`")
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                "bmad-loop run stopped gracefully",
+                "\n".join(body),
+            )
+        else:
+            gates.notify(self.policy, self.run_dir, "bmad-loop run finished", summary.render())
         return summary
 
     # ---------------------------------------------------------- stop signals
@@ -318,9 +585,9 @@ class Engine:
         outermost engine in the process owns the handlers (nested auto-sweep
         runs let the exception propagate up to it); install is best-effort and
         silently skipped off the main thread (signal.signal raises there)."""
-        # capture nesting before the early return: a non-None owner here means an
-        # outer engine already installed the handlers, so we are nested.
-        self._is_nested = Engine._stop_signals_owner is not None
+        # Signal ownership is process-global and independent of run nesting (tracked
+        # via _run_depth in run()): a non-None owner means an outer engine already
+        # installed the handlers, so this engine must not reinstall them.
         if Engine._stop_signals_owner is not None:
             return
 
@@ -329,7 +596,7 @@ class Engine:
         if sigbreak is not None:
             windows_ctrl_signals.add(sigbreak)
 
-        def handler(signum, frame):  # noqa: ANN001 - stdlib signal signature
+        def handler(signum, frame):  # stdlib signal signature
             if sys.platform == "win32" and signum in windows_ctrl_signals:
                 # best-effort: a journal error must never escape a signal handler.
                 with contextlib.suppress(Exception):
@@ -356,7 +623,9 @@ class Engine:
     def _restore_stop_signals(self) -> None:
         for sig, prev in self._prev_handlers.items():
             try:
-                signal.signal(sig, prev)
+                # prev is a prior OS handler from signal.signal(); the dict is
+                # object-typed to avoid importing the private stdlib _HANDLER alias.
+                signal.signal(sig, prev)  # pyright: ignore[reportArgumentType]
             except (ValueError, TypeError):
                 pass
         self._prev_handlers.clear()
@@ -366,364 +635,137 @@ class Engine:
 
     # ----------------------------------------------------- worktree isolation
 
+    # Same-name delegators onto the WorktreeFlow collaborator (issue #244 F-3):
+    # the isolation/integration cluster moved to worktree_flow.py; these keep the
+    # Engine surface (and its tests + SweepEngine/StoriesEngine subclasses)
+    # byte-compatible, so `self._<method>` monkeypatches and calls still resolve here.
+
     @property
     def _isolated(self) -> bool:
-        return self.policy.scm.isolation == "worktree"
+        return self._worktree_flow.isolated
 
     def _ensure_target_branch(self) -> None:
-        """Resolve (once, at run start) the branch every unit merges back into.
+        self._worktree_flow.ensure_target_branch()
 
-        No-op unless isolation=worktree. Default target is the branch checked out
-        now; a configured target is created if missing and checked out in the
-        main repo (merges land on whatever the main repo has checked out, and a
-        unit worktree must never check out the target itself). Pinned in state so
-        resume keeps targeting the same branch."""
-        if not self._isolated or self.state.target_branch:
-            return
-        if self.policy.scm.failed_diff_unlimited:
-            # the safety cap is off; make sure the operator knows a failed unit
-            # could write a very large forensic patch.
-            self.journal.append(
-                "scm-failed-diff-unlimited",
-                note="failed-unit diff capture is uncapped (scm.failed_diff_unlimited); "
-                "changes.patch may be very large",
-            )
-        repo = self.paths.repo_root
-        configured = self.policy.scm.target_branch.strip()
-        if configured:
-            if not verify.branch_exists(repo, configured):
-                try:
-                    verify.create_branch(repo, configured, "HEAD")
-                except verify.GitError as e:
-                    # e.g. an unborn repo (no commit to base a branch on).
-                    raise RunPaused(
-                        f"cannot create target branch {configured!r}: {e}",
-                        PAUSE_ESCALATION,
-                        "",
-                    ) from e
-                self.journal.append("target-branch-created", branch=configured)
-            if verify.current_branch(repo) != configured:
-                verify.checkout_branch(repo, configured)
-                self.journal.append("target-branch-checkout", branch=configured)
-            self.state.target_branch = configured
-        else:
-            current = verify.current_branch(repo)
-            if current == "HEAD":
-                # detached HEAD has no branch to merge into; merges would land on
-                # an unreferenced commit. Require a real branch (or a configured
-                # target) before isolating work into worktrees.
-                raise RunPaused(
-                    "isolation=worktree on a detached HEAD: check out a branch or "
-                    "set scm.target_branch before running",
-                    PAUSE_ESCALATION,
-                    "",
-                )
-            self.state.target_branch = current
-        self.journal.append("target-branch", branch=self.state.target_branch)
-        self._save()
-
-    def _worktree_profiles(self):
-        """The distinct CLI profiles of the dev + review adapters, for provisioning
-        their skills/hooks into a worktree. Adapters without a `profile` (e.g. test
-        fakes) contribute nothing, so provisioning is a no-op for them."""
-        seen: dict[str, object] = {}
-        for adapter in (self.adapters["dev"], self.adapters["review"]):
-            profile = getattr(adapter, "profile", None)
-            if profile is not None and profile.name not in seen:
-                seen[profile.name] = profile
-        return list(seen.values())
+    def _worktree_profiles(self) -> list[CLIProfile]:
+        return self._worktree_flow.worktree_profiles()
 
     def _engine_agent_ids(self) -> list[str]:
-        """The Unity-MCP `setup-mcp` agent ids for every CLI that runs in a
-        worktree (dev + review). A worktree can host more than one agent — e.g.
-        dev=claude, review=codex — and each reads its own MCP config file, so the
-        per_worktree setup must point every one of them at the worktree's Editor,
-        not just the dev agent. Deduped, order-preserving; empty for test fakes."""
-        ids: list[str] = []
-        for profile in self._worktree_profiles():
-            agent = _setup_mcp_agent_id(profile.name)
-            if agent not in ids:
-                ids.append(agent)
-        return ids
+        return self._worktree_flow.engine_agent_ids()
 
     def _run_isolated(self, task: StoryTask, drive: Callable[[StoryTask], None]) -> None:
-        """Run one unit's `drive` body in a fresh per-unit worktree, then merge
-        it back into the target branch. `drive` either returns (DONE/DEFERRED →
-        integrate) or raises RunPaused (spec-approval gate / escalation → leave
-        the worktree mounted for resume/inspection, integration skipped)."""
-        try:
-            unit = open_unit_workspace(
-                self.paths.repo_root,
-                self.paths,
-                self.state.run_id,
-                task.story_key,
-                self.state.target_branch,
-                self.policy.scm.branch_per,
-                self.run_dir,
-            )
-        except verify.GitError as e:
-            # could not mount a worktree (e.g. branch_per=run with a kept-failed
-            # unit still holding the shared branch). Defer this unit rather than
-            # crash the whole run; the operator can free the branch and re-run.
-            task.defer_reason = f"could not open worktree: {e}"
-            task.phase = Phase.DEFERRED  # deliberate: no legal move from PENDING
-            self.journal.append("worktree-open-failed", story_key=task.story_key, error=str(e))
-            gates.notify(
-                self.policy, self.run_dir, f"worktree open failed: {task.story_key}", str(e)
-            )
-            self._save()
-            return
-        task.worktree_path = str(unit.path)
-        task.branch = unit.branch
-        # A worktree checks out tracked files only, but the bmad-loop-* skill
-        # trees + signal-hook config are typically gitignored, so they are absent
-        # from the fresh checkout. Re-lay them into the worktree so the bundled
-        # bmad-loop-* skills are present and the Stop-signal hook fires. Also seed the loaded
-        # adapters' gitignored MCP/CLI configs so isolated sessions can reach their
-        # MCP server (seed_adapter_defaults) plus any extra project-listed paths.
-        profiles = self._worktree_profiles()
-        scm = self.policy.scm
-        seeds: list[str] = []
-        if scm.seed_adapter_defaults:
-            for profile in profiles:
-                seeds.extend(profile.seed_files)
-        seeds.extend(scm.worktree_seed)
-        # plugins (e.g. the Unity engine) may prime an isolated checkout with
-        # gitignored paths they need — e.g. an MCP-generated skill tree + client
-        # config so the worktree's Editor MCP is reachable. Aggregate every loaded
-        # plugin's declared seeds.
-        seeds.extend(self._registry.seed_files())
-        provision_worktree(
-            unit.path,
-            profiles,
-            self.paths.repo_root,
-            seed_files=list(dict.fromkeys(seeds)),  # dedupe, preserve order
-            seed_globs=self._registry.seed_globs(),
-        )
-        self.journal.append(
-            "worktree-opened", story_key=task.story_key, branch=unit.branch, path=str(unit.path)
-        )
-        self._save()
-        prev = self.workspace
-        self.workspace = unit.workspace
-        try:
-            # A plugin (e.g. the Unity engine) may launch the unit's managed Editor
-            # at pre_worktree_setup + wait for its MCP at pre_ready_gate before
-            # driving. A veto (defer) at either stage leaves the task DEFERRED and
-            # skips drive(); both fall through to _integrate_unit, which tears the
-            # (empty) worktree down via the DEFERRED path.
-            if self._gate_unit(task):
-                self._emit("post_worktree_setup", task)
-                drive(task)
-        finally:
-            # always run teardown — on success, on a deferral, and on a RunPaused
-            # (spec gate / escalation) propagating through — before the workspace is
-            # restored, so a managed Editor never outlives its worktree. Teardown
-            # stages are observe-only (a veto here cannot un-tear-down).
-            self._emit("pre_worktree_teardown", task)
-            self._emit("post_worktree_teardown", task)
-            self.workspace = prev
-        # reached only on a normal return (DONE or DEFERRED); a RunPaused from the
-        # spec gate or an escalation propagates past here, leaving the worktree up.
-        self._integrate_unit(task, unit)
+        self._worktree_flow.run_isolated(task, drive)
 
     def _failed_diff_max_bytes(self) -> int | None:
-        """Per-untracked-file size cap for a failed unit's forensic patch, in
-        bytes — or None when the operator lifted the cap (scm.failed_diff_unlimited)."""
-        scm = self.policy.scm
-        if scm.failed_diff_unlimited:
-            return None
-        return scm.failed_diff_max_mb * 1_048_576
+        return self._worktree_flow.failed_diff_max_bytes()
 
     def _integrate_unit(self, task: StoryTask, unit: UnitWorkspace) -> None:
-        self._emit("pre_integrate", task)
-        scm = self.policy.scm
-        if task.phase == Phase.DONE:
-            # Merge the unit branch into the target branch locally. We open PRs
-            # ourselves by hand once the branch has landed; the orchestrator only
-            # commits the worktree onto the selected target.
-            self._merge_local(task, unit)
-        else:  # DEFERRED — capture the diff, keep or drop per keep_failed
-            patch = close_unit_workspace(
-                unit,
-                success=False,
-                keep_failed=scm.keep_failed,
-                run_dir=self.run_dir,
-                unit_key=task.story_key,
-                delete_branch=scm.delete_branch,
-                diff_max_file_bytes=self._failed_diff_max_bytes(),
-            )
-            self.journal.append(
-                "unit-closed",
-                story_key=task.story_key,
-                branch=unit.branch,
-                kept=scm.keep_failed,
-                patch=str(patch) if patch else None,
-            )
+        self._worktree_flow.integrate_unit(task, unit)
 
-    def _merge_local(self, task: StoryTask, unit: UnitWorkspace) -> None:
-        """Merge a DONE unit's branch into the target branch from the main repo."""
-        self._emit("pre_merge", task)
-        scm = self.policy.scm
-        repo = self.paths.repo_root
-        target = self.state.target_branch
-        # A per_worktree Unity Editor can leak asset writes into the *main*
-        # checkout (see the unity plugin's worktree setup), dirtying the target with the very
-        # files this branch already committed. Reconcile that first: clean only
-        # the leaked copies of incoming files; refuse (escalate) if anything dirty
-        # falls outside this branch's path set — that may be real operator work.
-        try:
-            cleaned = verify.clean_incoming_collisions(repo, target, unit.branch)
-        except verify.GitError as e:
-            reason = (
-                f"merge of {unit.branch} into {target} blocked: the target checkout has "
-                f"uncommitted changes that are not part of this branch (likely a Unity "
-                f"Editor wrote into the main project) — clean them, then "
-                f"`bmad-loop resume {self.state.run_id}`. {e}"
-            )
-            self._keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
-            return
-        if cleaned:
-            self.journal.append(
-                "merge-target-cleaned",
-                story_key=task.story_key,
-                branch=unit.branch,
-                paths=cleaned,
-            )
-        try:
-            verify.merge_branch(
-                repo,
-                unit.branch,
-                strategy=scm.merge_strategy,
-                message=self._merge_message(task),
-            )
-        except verify.GitError as e:
-            # genuine content conflict against the target: keep the branch for
-            # manual merge. The unit committed cleanly (phase is already DONE,
-            # which has no legal transition), so escalate directly.
-            reason = (
-                f"merge of {unit.branch} into {target} failed "
-                f"(content conflict against the target): {e}"
-            )
-            self._keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
-            return  # defensive: never fall through to the success teardown below
-        self.journal.append(
-            "unit-merged",
-            story_key=task.story_key,
-            branch=unit.branch,
-            target=self.state.target_branch,
-        )
-        self._emit("post_merge", task)
-        close_unit_workspace(
+    def _merge_local(
+        self,
+        task: StoryTask,
+        unit: UnitWorkspace,
+        *,
+        replay: bool = False,
+        replay_strategy: str | None = None,
+    ) -> None:
+        self._worktree_flow.merge_local(
+            task,
             unit,
-            success=True,
-            keep_failed=scm.keep_failed,
-            run_dir=self.run_dir,
-            unit_key=task.story_key,
-            delete_branch=scm.delete_branch,
+            replay=replay,
+            replay_strategy=replay_strategy,
         )
 
     def _keep_branch_and_escalate(self, task: StoryTask, unit: UnitWorkspace, reason: str) -> None:
-        """Preserve a DONE unit's branch (no delete, kept for manual merge) and
-        escalate. Shared by the two merge-back failure paths: a target dirtied
-        with stray work, and a genuine content conflict."""
-        close_unit_workspace(
-            unit,
-            success=False,
-            keep_failed=True,
-            run_dir=self.run_dir,
-            unit_key=task.story_key,
-            delete_branch=False,
-            diff_max_file_bytes=self._failed_diff_max_bytes(),
-        )
-        self._escalate_unit(task, reason)  # always raises RunPaused
+        self._worktree_flow.keep_branch_and_escalate(task, unit, reason)
 
     def _escalate_unit(self, task: StoryTask, reason: str) -> None:
-        """Mark a DONE unit ESCALATED, notify, and pause the run. DONE has no
-        legal transition, so the phase is set directly rather than via advance()."""
-        task.phase = Phase.ESCALATED
-        self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
-        gates.notify(
-            self.policy,
-            self.run_dir,
-            f"CRITICAL escalation: {task.story_key}",
-            f"{reason} — resolve, then `bmad-loop resume {self.state.run_id}`",
-        )
-        self._save()
-        raise RunPaused(reason, PAUSE_ESCALATION, task.story_key)
+        self._worktree_flow.escalate_unit(task, reason)
 
     def _merge_message(self, task: StoryTask) -> str:
-        return f"Merge {task.branch} into {self.state.target_branch} (bmad-loop)"
+        return self._worktree_flow.merge_message(task)
 
     def _gc_run_worktrees(self) -> None:
-        """Reclaim this run's worktree scaffolding once it finishes cleanly.
-
-        DONE units drop their worktree at merge time; this is a safety net for a
-        worktree leaked by a crash between merge and teardown, plus it prunes
-        stale git admin entries and removes the now-empty run worktree dir.
-        Worktrees deliberately kept for inspection (a kept-failed/escalated unit)
-        are left in place and journaled so the operator can find them."""
-        if not self._isolated:
-            return
-        repo = self.paths.repo_root
-        for task in self.state.tasks.values():
-            if task.phase == Phase.DONE and task.worktree_path:
-                wt = Path(task.worktree_path)
-                if wt.is_dir():
-                    discard_worktree(repo, task.worktree_path, task.branch)
-            elif task.terminal and task.worktree_path and Path(task.worktree_path).is_dir():
-                # kept on purpose (keep_failed): leave it, but surface where.
-                self.journal.append(
-                    "worktree-kept", story_key=task.story_key, path=task.worktree_path
-                )
-        verify.worktree_prune(repo)
-        worktrees_parent = unit_worktrees_dir(self.run_dir)
-        if worktrees_parent.is_dir() and not any(worktrees_parent.iterdir()):
-            worktrees_parent.rmdir()
+        self._worktree_flow.gc_run_worktrees()
 
     def _reopen_unit(self, task: StoryTask) -> UnitWorkspace:
-        """Reconstruct the UnitWorkspace for an in-flight unit on resume, from
-        the worktree path + branch persisted on the task. The worktree must still
-        be mounted — if it was pruned out from under us we cannot safely reuse it,
-        so escalate rather than run a session in a missing directory."""
-        wt = Path(task.worktree_path)
-        if not wt.is_dir():
-            self._escalate_unit(
-                task,
-                f"worktree for {task.story_key} is gone ({wt}); cannot resume in place",
-            )
-        # spec_file is persisted relative to the worktree (model.to_dict) so the
-        # state stays portable; re-absolutize it against the reopened worktree.
-        if task.spec_file and not Path(task.spec_file).is_absolute():
-            task.spec_file = str(wt / task.spec_file)
-        return UnitWorkspace(
-            workspace=Workspace(root=wt, paths=self.paths.rebased(wt)),
-            repo_root=self.paths.repo_root,
-            branch=task.branch,
-            path=wt,
-            baseline=task.baseline_commit or "",
-        )
+        return self._worktree_flow.reopen_unit(task)
 
     def summary(self) -> RunSummary:
         tasks = self.state.tasks.values()
+        # Weight from the run's persisted snapshot, NOT self.policy — every
+        # display surface must be reproducible from state.json alone, which is
+        # all the TUI, `bmad-loop status` and `diagnose` can see; sourcing this
+        # from live policy would make them print different totals for the same
+        # run. Reading the snapshot is safe precisely because every engine start
+        # (run, sweep, resume) stamps it with the policy that process enforces
+        # (#189) — so it agrees with self.policy rather than substituting for it.
+        # Do not "unify" these.
+        weight = self.state.cache_read_weight()
         return RunSummary(
             run_id=self.state.run_id,
             done=sum(1 for t in tasks if t.phase == Phase.DONE),
             deferred=sum(1 for t in tasks if t.phase == Phase.DEFERRED),
             escalated=sum(1 for t in tasks if t.phase == Phase.ESCALATED),
+            awaiting_operator=sum(1 for t in tasks if t.phase == Phase.AWAITING_OPERATOR),
             paused=self.state.paused,
             paused_reason=self.state.paused_reason or "",
             total_tokens=sum(t.tokens.total for t in tasks),
+            # Sum PER TASK, not over one aggregated TokenUsage: weighted_total
+            # rounds internally, so sum-of-rounds != round-of-sum (they drift by
+            # a few tokens under banker's rounding). Per-task summation is what
+            # tui/widgets.py does, which is what makes the CLI and the TUI agree
+            # to the token. This is not a redundant loop — do not collapse it.
+            weighted_tokens=sum(t.tokens.weighted_total(weight) for t in tasks),
             crashed=self.state.crashed,
             crash_error=self.state.crash_error,
         )
 
+    def _remaining_estimate(self) -> int | None:
+        """Best-effort count of stories a resume would still have to run, for the
+        graceful-stop journal + notify. Sprint mode: actionable sprint-status
+        stories this run has not already picked up (mirrors ``cmd_status``'s sprint
+        backlog count, minus anything already in ``state.tasks``). It is a hint,
+        never a contract — the whole body is guarded so an unreadable/invalid
+        sprint-status file returns None rather than derailing a graceful stop.
+        StoriesEngine overrides this against the manifest scheduler."""
+        try:
+            ss = load_sprint_status(self.paths.sprint_status)
+            return sum(
+                1
+                for s in ss.stories
+                if s.status in ACTIONABLE_STATUSES and s.key not in self.state.tasks
+            )
+        except Exception:  # a hint must never break the stop
+            return None
+
+    def _check_graceful_stop(self) -> None:
+        """Honor a pending graceful-stop request at an item boundary.
+
+        Consumes (deletes) the ``stop-request.json`` control file and raises
+        :class:`RunStopped` with ``graceful=True`` so ``run()`` unwinds into the
+        clean-finalization arm. An exception, not a sentinel return, because the
+        sweep check fires two frames below ``_loop`` (inside ``_cycle``) where a
+        return could not stop the loop. Called as the first statement of the loop
+        body (and, in the sweep engine, before each bundle): by the time control
+        reaches here the in-flight item has already completed through commit, so
+        the stop takes effect cleanly at the next boundary and the run stays
+        resumable."""
+        if graceful_stop_requested(self.run_dir):
+            clear_graceful_stop(self.run_dir)
+            raise RunStopped(graceful=True)
+
     def _loop(self) -> None:
         self._finish_inflight()
-        started = 0
         while True:
-            if self.max_stories is not None and started >= self.max_stories:
-                self.journal.append("max-stories-reached", count=started)
+            # First statement of the loop body: one site covers every story
+            # boundary this base loop reaches — between stories, right after
+            # _finish_inflight on resume, and the epic boundary + run-end (the
+            # StoriesEngine has no _loop override, so it is covered here too).
+            self._check_graceful_stop()
+            if self.max_stories is not None and self._dispatched_count() >= self.max_stories:
+                self.journal.append("max-stories-reached", count=self._dispatched_count())
                 return
             self._emit("pre_pick_next")
             story = self._pick_next()
@@ -738,8 +780,19 @@ class Engine:
             self.state.tasks[story.key] = task
             self.journal.append("story-start", story_key=story.key)
             self._save()
-            started += 1
             self._run_story(task)
+            self._after_story(task)
+
+    def _dispatched_count(self) -> int:
+        """Stories this run has dispatched, counted durably from run state so the
+        ``--max-stories`` bound survives a pause/resume (a story checkpoint, an
+        escalation) — unlike a ``_loop``-local counter that resets to 0 on every
+        re-entry. Every picked story is recorded in ``state.tasks`` before its
+        session runs (and a wedge/selector pause records its task too), the same
+        "touched this run" set ``_pick_next`` keys ``base_skip`` on, so the task
+        count is the durable dispatch tally. Without this, a checkpoint pause then
+        resume would reset the counter and let the run dispatch past its cap."""
+        return len(self.state.tasks)
 
     def _pick_next(self):
         ss = load_sprint_status(self.paths.sprint_status)
@@ -770,275 +823,151 @@ class Engine:
                 return story
         return _first(None)
 
+    # --------------------------------------- attempt rollback / recovery refs
+
+    # Same-name delegators onto the RecoveryFlow collaborator (issue #244 PR 2/2):
+    # the rollback/preserve cluster moved to recovery_flow.py; these keep the
+    # Engine surface (its tests + the SweepEngine/StoriesEngine subclasses)
+    # byte-compatible, so `self._<method>` calls still resolve here.
+
     def _protected_relpaths(self) -> tuple[str, ...]:
-        """Repo-relative posix paths of the BMAD artifact folders. These are
-        orchestrator-owned: never counted as a dev attempt's dirtiness (the
-        resolve workflow corrects the frozen spec here) and preserved through
-        rollback. Folders configured outside the repo are skipped — nothing to
-        protect there."""
-        out: list[str] = []
-        for protected in (
-            self.workspace.paths.output_folder,
-            self.workspace.paths.implementation_artifacts,
-            self.workspace.paths.planning_artifacts,
-        ):
-            try:
-                rel = protected.relative_to(self.workspace.root).as_posix()
-            except ValueError:
-                continue  # configured outside the repo; nothing to protect here
-            # "." (folder == repo root) as an exclude/keep prefix would cover the
-            # whole tree — drop it so a misconfig can't disable the dirty check.
-            if rel and rel != ".":
-                out.append(rel)
-        return tuple(out)
+        return self._recovery_flow.protected_relpaths()
 
     def _rollback_or_pause(self, task: StoryTask, *, cause: str = "stopped") -> None:
-        """Recover from an in-place attempt that won't proceed.
-
-        No-op when the tree is already at the attempt's baseline (nothing this
-        attempt touched, ignoring orchestrator-owned artifact folders): neither a
-        reset nor a pause is needed. This is also what lets the manual-recovery
-        instructions terminate — after the operator resets and resumes, the
-        now-clean tree skips straight through instead of re-pausing on the
-        still-set ``baseline_commit``.
-
-        A ``cause="resolved"`` re-drive is human-initiated (the operator ran the
-        resolve workflow and re-armed the story), so it always auto-recovers and
-        never pauses, regardless of ``scm.rollback_on_failure``. For the entire
-        re-drive (``task.resolved_redrive``, latched at resume and cleared once the
-        correction is committed) the BMAD artifact folders are treated as
-        orchestrator-owned: excluded from the dirty check (the corrected spec must
-        not read as a failed attempt) and preserved through every reset — so a
-        later mid-re-drive retry/defer reset can't silently revert the correction.
-
-        Otherwise (a stopped/abandoned attempt) the flag governs: OFF (default)
-        leaves the working tree untouched and emits a bold manual-recovery notice
-        that pauses the run (stop-and-wait); ON does a clean reset to baseline.
-        Either way pre-existing untracked files are preserved; there is no blanket
-        ``git clean``."""
-        resolved = cause == "resolved"
-        # preserve the corrected spec for the whole re-drive, not just the first
-        # reset; the auto-recover (pause-vs-reset) decision below is unaffected.
-        redrive = resolved or task.resolved_redrive
-        protected = self._protected_relpaths() if redrive else ()
-        if task.baseline_commit and not verify.attempt_dirty(
-            self.workspace.root, task.baseline_commit, task.baseline_untracked, exclude=protected
-        ):
-            self.journal.append("rollback-skipped-clean", story_key=task.story_key)
-            return
-        if resolved or self.policy.scm.rollback_on_failure:
-            self.journal.append(
-                "rollback-auto",
-                story_key=task.story_key,
-                baseline=task.baseline_commit or "",
-                note="reverting tracked changes + run-created untracked files",
-            )
-            # A re-drive (resolved / mid-re-drive) is contractually pause-free, so it
-            # preserves best-effort but never blocks; a plain rollback pauses rather
-            # than reset past work it could not park.
-            self._preserve_attempt_commits(task, allow_pause=not redrive)
-            # Park the attempt's uncommitted diff too, so the reset below (and its
-            # untracked cleanup) can't silently destroy in-progress work. Runs only
-            # if _preserve_attempt_commits did not pause (plain-rollback preserve
-            # failure); best-effort, never blocks.
-            self._preserve_attempt_worktree(task)
-            self._safe_reset(task, preserve=protected)
-            return
-        self._pause_for_manual_recovery(task, task.baseline_commit or "")
-        return  # unreachable: _pause_for_manual_recovery always raises
+        self._recovery_flow.rollback_or_pause(task, cause=cause)
 
     def _safe_reset(self, task: StoryTask, *, preserve: tuple[str, ...] = ()) -> None:
-        """Revert tracked changes to the task baseline and remove only the
-        untracked files this run created — never a blanket `git clean`. Used by
-        the gated/resolved rollback and by internal ledger recovery (sweep
-        migration), which restores the orchestrator's own state and must not
-        pause. The BMAD artifact folders are always kept from untracked deletion;
-        ``preserve`` (set only on a resolved re-drive) additionally keeps their
-        *tracked* content alive through the reset, so a just-corrected spec is not
-        reverted. Sweep passes no ``preserve`` — it wants the broken ledger gone."""
-        verify.safe_rollback(
-            self.workspace.root,
-            task.baseline_commit or "",
-            baseline_untracked=task.baseline_untracked,
-            keep=(".bmad-loop", *self._protected_relpaths()),
-            preserve=preserve,
-        )
+        self._recovery_flow.safe_reset(task, preserve=preserve)
+
+    def _restore_patch(self, task: StoryTask) -> None:
+        self._recovery_flow.restore_patch(task)
 
     def _prune_preserve_refs(self) -> None:
-        """Bounded retention for both recovery-ref families at run start — the
-        attempt-preserve/* branches and the refs/attempt-preserve-dirty/*
-        worktree snapshots: keep the newest scm.preserve_keep of each by
-        committer date, delete the tail (mirrors the runs/cleanup retention
-        knobs — without it the refs grow unbounded on a long-lived project).
-        Best-effort: a git failure is journalled per family and never blocks or
-        pauses the run — the refs are a safety net, not run state — and a
-        failure in one family never skips the other. preserve_keep = 0 disables
-        pruning entirely."""
-        keep = self.policy.scm.preserve_keep
-        if keep <= 0:
-            return
-        for family, prune in (
-            ("attempt-preserve", verify.prune_preserve_refs),
-            ("attempt-preserve-dirty", verify.prune_preserve_dirty_refs),
-        ):
-            try:
-                deleted = prune(self.workspace.root, keep)
-            except Exception as exc:  # noqa: BLE001 - housekeeping must never crash the
-                # run: a git timeout/OSError here would otherwise escape to the crash
-                # handler, so anything beyond the expected GitError is journalled too
-                # A partial prune (PrunePreserveError) already deleted refs before one
-                # stuck — that destructive half must stay structurally auditable, not
-                # buried in the error string.
-                partial = getattr(exc, "deleted", [])
-                if partial:
-                    self.journal.append(f"{family}-pruned", count=len(partial), refs=partial)
-                failed = getattr(exc, "failed", [])
-                if failed:
-                    self.journal.append(f"{family}-prune-failed", error=str(exc), failed=failed)
-                else:
-                    self.journal.append(f"{family}-prune-failed", error=str(exc))
-                continue
-            if deleted:
-                self.journal.append(f"{family}-pruned", count=len(deleted), refs=deleted)
+        self._recovery_flow.prune_preserve_refs()
 
     def _preserve_attempt_commits(self, task: StoryTask, *, allow_pause: bool) -> None:
-        """Before an auto-rollback's hard reset, park any commits the attempt made
-        above its baseline under a named recovery ref, so `reset --hard baseline`
-        can't silently orphan committed work (it survives `git gc` and is
-        recoverable by name, not just the reflog). No-op when the attempt added no
-        commits — an uncommitted-only revert is the intended, non-destructive case.
+        self._recovery_flow.preserve_attempt_commits(task, allow_pause=allow_pause)
 
-        If commits exist but the ref cannot be created: with ``allow_pause`` (a
-        plain rollback) refuse to reset — pause for manual recovery rather than
-        destroy the work. On a re-drive (``allow_pause=False``) the caller's
-        contract forbids pausing, so journal the failure and let the reset proceed
-        (the re-drive is a human-directed discard of the failed attempt)."""
-        baseline = task.baseline_commit
-        if not baseline:
-            return
-        commits = verify.commits_above(self.workspace.root, baseline)
-        if not commits:
-            return
-        head = verify.rev_parse_head(self.workspace.root)  # the tip the recovery ref parks at
-        # run_id can be an arbitrary user `--run-id`; keep the ref component git-safe
-        # and length-bounded so an exotic/overlong id can't blow the ref-name limit,
-        # fail `git branch`, and drop the recovery ref (which on a re-drive would then
-        # reset past the work anyway).
-        slug = "".join(c if (c.isalnum() or c in "_-") else "-" for c in self.state.run_id)[:64]
-        try:
-            ref = verify.preserve_commits(
-                self.workspace.root,
-                baseline,
-                f"attempt-preserve/{slug}-{head[:8]}",
-                commits=commits,
-            )
-        except verify.GitError:
-            ref = None  # branch creation failed — treat as a preservation failure
-        if ref is None:
-            # commits exist (just enumerated) but the ref did not take.
-            self.journal.append("attempt-preserve-failed", story_key=task.story_key, head=head)
-            if allow_pause:
-                # the commits at HEAD could not be parked — the notice must NOT tell
-                # the operator to blindly `reset --hard` (that would discard them).
-                self._pause_for_manual_recovery(task, baseline, preserve_failed=True)
-            return  # re-drive: never pause — proceed to the (human-directed) reset
-        self.journal.append(
-            "attempt-commits-preserved", story_key=task.story_key, ref=ref, count=len(commits)
-        )
-
-    def _preserve_attempt_worktree(self, task: StoryTask) -> None:
-        """Before an auto-rollback's hard reset, park the attempt's *uncommitted*
-        working-tree changes (tracked edits + run-created untracked files) under a
-        named recovery ref, so `reset --hard baseline` and its untracked cleanup
-        can't silently destroy in-progress work. Complements
-        `_preserve_attempt_commits` (which parks *committed* work above baseline);
-        together they cover the whole attempt. No-op when the tree is clean vs HEAD
-        — the intended non-destructive uncommitted-revert case. Best-effort: a
-        capture failure is journaled but never blocks the (human-directed re-drive
-        or policy-gated) reset — the recovery ref is a safety net, not a gate."""
-        baseline = task.baseline_commit
-        if not baseline:
-            return
-        # Same git-safe, length-bounded slug as _preserve_attempt_commits so an
-        # exotic/overlong --run-id can't blow the ref-name limit and drop the ref.
-        slug = "".join(c if (c.isalnum() or c in "_-") else "-" for c in self.state.run_id)[:64]
-        # ``baseline_commit`` is fixed across the whole dev retry loop, so keying the
-        # ref on the baseline alone would make a 2nd dirty rollback reuse the name and
-        # orphan the 1st attempt's snapshot. ``task.attempt`` only ever increments
-        # (never resets), so it uniquely discriminates each retry's recovery ref.
-        ref = f"refs/attempt-preserve-dirty/{slug}-{baseline[:8]}-{task.attempt}"
-        try:
-            parked = verify.snapshot_worktree(
-                self.workspace.root, ref, baseline_untracked=task.baseline_untracked
-            )
-        except verify.GitError as exc:
-            # Keep the git failure detail (commit-tree/update-ref stderr): if the
-            # following reset destroys work, this is the only breadcrumb explaining
-            # why the safety-net snapshot couldn't be captured.
-            self.journal.append(
-                "attempt-worktree-preserve-failed", story_key=task.story_key, error=str(exc)
-            )
-            return
-        if parked:
-            self.journal.append("attempt-worktree-preserved", story_key=task.story_key, ref=parked)
+    def _preserve_attempt_worktree(self, task: StoryTask, *, allow_pause: bool) -> None:
+        self._recovery_flow.preserve_attempt_worktree(task, allow_pause=allow_pause)
 
     def _pause_for_manual_recovery(
-        self, task: StoryTask, baseline: str, *, preserve_failed: bool = False
+        self,
+        task: StoryTask,
+        baseline: str,
+        *,
+        preserve_failed: bool = False,
+        snapshot_failed: bool = False,
     ) -> None:
-        """Leave the tree untouched, surface bold manual-recovery instructions, and
-        pause the run. Always raises RunPaused. Reached either (a, default) the OFF
-        path for a stopped/abandoned in-place attempt, or (b, ``preserve_failed``)
-        rollback is ON/resolved but the attempt's commits above baseline could not be
-        parked on a recovery ref, so an automatic ``reset --hard`` would silently
-        discard them — a distinct notice that names the at-risk commits and never
-        tells the operator to blindly reset. A *resolved* escalation never reaches
-        here — `_rollback_or_pause` auto-recovers that human-initiated re-drive
-        regardless of `scm.rollback_on_failure`."""
-        short = baseline[:12] or "<baseline_commit>"
-        if preserve_failed:
-            notice = (
-                "**ACTION REQUIRED — commits could not be auto-preserved**\n"
-                f"Story **{task.story_key}**'s attempt committed work above its "
-                "baseline, but a recovery ref for those commits could not be created, "
-                "so the automatic rollback was refused rather than `reset --hard` "
-                "past (and discard) them. **Your commits are intact at the current "
-                "HEAD.**\n"
-                "  1. **Save them first** — e.g. `git branch my-rescue HEAD` (the "
-                f"commits are `{short}..HEAD`).\n"
-                "  2. Only once they are safe, discard the attempt if you want to: "
-                f"`git reset --hard {short}`, then review/remove leftover untracked "
-                "files.\n"
-                f"Then run `bmad-loop resume {self.state.run_id}`."
-            )
-        else:
-            why = (
-                f"Story **{task.story_key}**'s attempt was stopped and auto-rollback "
-                "is OFF, so the working tree was left exactly as-is for you to "
-                "inspect.\n"
-            )
-            notice = (
-                "**ACTION REQUIRED — manual rollback needed**\n"
-                f"{why}"
-                "To discard this attempt yourself:\n"
-                "  1. **BACK UP any untracked files you want to keep** — the reset "
-                "below deletes uncommitted work.\n"
-                f"  2. `git reset --hard {short}` then review/remove leftover "
-                "untracked files.\n"
-                "  3. **Restore the files you backed up in step 1.**\n"
-                f"Then run `bmad-loop resume {self.state.run_id}`. To let the "
-                "orchestrator do a safe automatic rollback next time, enable "
-                "`[scm] rollback_on_failure` (it discards the attempt's uncommitted "
-                "work but never deletes pre-existing untracked files)."
-            )
-        self.journal.append("rollback-manual-required", story_key=task.story_key, baseline=baseline)
-        gates.notify(
-            self.policy,
-            self.run_dir,
-            f"ACTION REQUIRED: manual rollback for {task.story_key}",
-            notice,
+        self._recovery_flow.pause_for_manual_recovery(
+            task,
+            baseline,
+            preserve_failed=preserve_failed,
+            snapshot_failed=snapshot_failed,
         )
-        self._save()
-        raise RunPaused(notice, PAUSE_ESCALATION, task.story_key)
+
+    def _replay_unlatched_ledger_carries(self) -> None:
+        """Replay a successful isolated unit's carry after merge-time host loss.
+
+        Called from ``run()`` and required to PRECEDE ``_loop``. ``SweepEngine``
+        replaces ``_loop`` wholesale and does not override ``run()``, so this frame
+        is the only one both engines share — and a replayed bundle close has to
+        leave the open set before ``_loop`` reads ``deferredwork.open_ids``, or the
+        resumed sweep re-triages and re-drives work that already landed.
+        """
+        entries = self.journal.entries()
+        merged_units = {
+            (
+                str(entry.get("story_key", "")),
+                str(entry.get("branch", "")),
+                str(entry.get("target", "")),
+            )
+            for entry in entries
+            if entry.get("kind") == "unit-merged"
+        }
+        started_units = {
+            (
+                str(entry.get("story_key", "")),
+                str(entry.get("branch", "")),
+                str(entry.get("target", "")),
+                str(entry.get("source", "")),
+            ): str(entry.get("strategy", ""))
+            for entry in entries
+            if entry.get("kind") == "unit-merge-started"
+        }
+        for task in list(self.state.tasks.values()):
+            if (
+                task.phase == Phase.DEFERRED
+                and task.worktree_path
+                and task.harvest_carry_commit_pending
+            ):
+                self.journal.append("resume-ledger-carry", story_key=task.story_key)
+                # The HARVEST alone, exactly as `_defer`'s isolated arm calls it.
+                # Replaying a defer through the composite hook would let a mode
+                # override carry writes the defer deliberately withheld — a sweep
+                # bundle's close names work whose code this defer discarded, and
+                # `open_ids` re-bundles only `open` entries, so a wrong `done` is
+                # invisible to every later sweep.
+                self._carry_harvested_deferrals(task)
+                continue
+            if task.isolated_ledger_carried or task.phase not in (
+                Phase.DONE,
+                Phase.AWAITING_OPERATOR,
+            ):
+                continue
+            merged_key = (task.story_key, task.branch, self.state.target_branch)
+            # `not task.worktree_path` is the in-place guard, and a truthiness test
+            # is the whole of it: an in-place task carries "", and `Path("")` is
+            # `PosixPath(".")` whose `is_dir()` is True, so any probe placed ahead of
+            # this one absorbs the in-place case and leaves it unfalsifiable. Merge
+            # evidence comes from the journal below, never from a mounted worktree.
+            # A close-only payload replays too: a sweep bundle whose ledger writes
+            # are all closures has an empty `harvested_deferrals`, and skipping it
+            # here would strand the close and re-triage resolved work for ever.
+            # Every payload the hook carries has to be named here — a story whose
+            # only ledger write was a damped review-budget follow-up, or a declared
+            # `closes_deferred:` flip, has every other list empty, and omitting it
+            # strands that write in a deleted worktree.
+            if not task.worktree_path or not (
+                task.harvested_deferrals
+                or task.bundle_closes_intended
+                or task.refiled_followups
+                or task.story_closes_intended
+            ):
+                continue
+            if merged_key not in merged_units:
+                source = task.commit_sha or ""
+                started_key = (*merged_key, source)
+                replay_strategy = started_units.get(started_key)
+                if not source or replay_strategy is None:
+                    continue
+                # The write-ahead record is intent, never merge proof. Re-run the
+                # exact merge and latch completion only after git confirms it;
+                # merge/ff are naturally idempotent, while squash enables its
+                # recovery-only clean-tree success arm.
+                self.journal.append(
+                    "resume-unit-merge",
+                    story_key=task.story_key,
+                    branch=task.branch,
+                    target=self.state.target_branch,
+                    strategy=replay_strategy,
+                    source=source,
+                )
+                unit = self._reopen_unit(task)
+                self._merge_local(
+                    task,
+                    unit,
+                    replay=True,
+                    replay_strategy=replay_strategy,
+                )
+                merged_units.add(merged_key)
+            self.journal.append("resume-ledger-carry", story_key=task.story_key)
+            self._carry_isolated_ledger_writes(task)
+            task.isolated_ledger_carried = True
+            self._save()
+            # The failed integration unwound before _run_story returned, so the
+            # loop never reached its normal post-integration continuation.
+            self._after_story(task)
 
     def _finish_inflight(self) -> None:
         """Complete or roll back tasks interrupted by a pause or crash."""
@@ -1046,20 +975,37 @@ class Engine:
             if task.terminal:
                 continue
             isolated = self._isolated and task.worktree_path
-            if task.phase == Phase.DEV_VERIFY and task.spec_file:
-                # paused at the spec-approval gate: dev verified, review pending
-                self.journal.append("resume-review", story_key=task.story_key)
+            if isolated and task.defer_reason is not None:
+                # _defer records its reason before carrying harvested findings.
+                # A read/commit fault (or host loss before the terminal advance)
+                # can therefore leave a rejected result in the same DEV_VERIFY +
+                # spec_file shape as a verified spec-approval pause. A persisted
+                # defer reason on a nonterminal isolated task is that interrupted
+                # decision's intent; finish it before any session-replay arm.
+                self.journal.append("resume-defer", story_key=task.story_key)
+                unit = self._reopen_unit(task)
+                prev = self.workspace
+                self.workspace = unit.workspace
+                try:
+                    self._defer(task, task.defer_reason)
+                finally:
+                    self.workspace = prev
+                self._integrate_unit(task, unit)
+            elif task.phase == Phase.DEV_VERIFY and task.spec_file:
+                # paused at the spec-approval gate (or, in stories mode, a
+                # plan-checkpoint awaiting implementation — _resume_after_dev_verify
+                # dispatches the right leg): dev verified on disk.
                 if isolated:
                     unit = self._reopen_unit(task)
                     prev = self.workspace
                     self.workspace = unit.workspace
                     try:
-                        self._review_and_commit(task)
+                        self._resume_after_dev_verify(task)
                     finally:
                         self.workspace = prev
                     self._integrate_unit(task, unit)
                 else:
-                    self._review_and_commit(task)
+                    self._resume_after_dev_verify(task)
             elif (resumable := self._resumable_session(task)) is not None:
                 # the host died inside the post-session window: the session
                 # itself completed and its recorded result is on disk, so
@@ -1090,13 +1036,36 @@ class Engine:
                     self._integrate_unit(task, unit)
                 else:
                     continuation()
+            elif task.phase == Phase.COMMITTING:
+                # the host died in the commit window: the gate+advance save
+                # landed (pre_commit_gate ran clean) but the DONE save that
+                # stamps commit_sha did not. Finish the commit instead of
+                # rolling verified work back — the gates are deliberately NOT
+                # re-run (see _finalize_commit_phase), the pre_commit hook IS
+                # re-emitted (message regenerated; pause veto still honored),
+                # and finalize_commit tolerates both the pre- and post-squash
+                # crash states (#115).
+                self.journal.append("resume-commit", story_key=task.story_key)
+                if isolated:
+                    unit = self._reopen_unit(task)
+                    prev = self.workspace
+                    self.workspace = unit.workspace
+                    try:
+                        self._finalize_commit_phase(task)
+                    finally:
+                        self.workspace = prev
+                    self._integrate_unit(task, unit)
+                else:
+                    self._finalize_commit_phase(task)
             else:
                 self.journal.append(
                     "resume-restart", story_key=task.story_key, phase=str(task.phase)
                 )
                 if isolated:
                     # drop the half-built worktree; _run_story mounts a fresh one
-                    discard_worktree(self.paths.repo_root, task.worktree_path, task.branch)
+                    discard_worktree(
+                        self.paths.repo_root, task.worktree_path, task.branch, run_dir=self.run_dir
+                    )
                     task.worktree_path = ""
                     task.branch = ""
                 elif task.baseline_commit:
@@ -1108,21 +1077,34 @@ class Engine:
                 task.phase = Phase.PENDING  # deliberate reset, not a normal transition
                 self._save()
                 self._run_story(task)
+            # a resumed story that just reached DONE gets the same post-story hook
+            # the _loop path fires (e.g. the stories-mode done_checkpoint pause),
+            # after any worktree integration above — no-op in the base engine.
+            self._after_story(task)
 
     def _resumable_session(self, task: StoryTask) -> tuple[str, SessionResult] | None:
         """The in-flight session's durably-recorded result, when complete enough
-        to act on: the task died mid-phase but its current attempt/cycle record
-        is ``completed`` and carries the parsed result. Consumes only evidence
-        the adapter vouched for at session end — no artifact re-scan, no
-        loosening of completion authority. Anything less returns None and the
-        caller falls through to resume-restart."""
-        if task.phase == Phase.DEV_RUNNING:
+        to act on: the task died mid-phase (``*_RUNNING``) or in the post-verify
+        decision window (``*_VERIFY`` — persisted by the save right after the
+        verify/decide pass, before the decision's action completed) but its
+        current attempt/cycle record is ``completed`` and carries the parsed
+        result. Consumes only evidence the adapter vouched for at session end —
+        no artifact re-scan, no loosening of completion authority. Anything less
+        returns None and the caller falls through to resume-restart (#100: that
+        restart used to discard a completed-``done`` attempt's commits).
+
+        DEV_VERIFY reaches this matcher only when no persisted defer identifies
+        an interrupted decision and ``task.spec_file`` is empty (verify did not
+        fully pass before the death): _finish_inflight checks the defer-replay
+        and spec-approval-gate arms first, so a DEV_VERIFY task WITH a verified
+        spec keeps its _resume_after_dev_verify recovery."""
+        if task.phase in (Phase.DEV_RUNNING, Phase.DEV_VERIFY):
             role, seq = "dev", task.attempt
-        elif task.phase == Phase.REVIEW_RUNNING:
+        elif task.phase in (Phase.REVIEW_RUNNING, Phase.REVIEW_VERIFY):
             role, seq = "review", task.review_cycle
         else:
             return None
-        task_id = f"{task.story_key}-{role}-{seq}"
+        task_id = _session_task_id(task.story_key, role, seq)
         for record in reversed(task.sessions):
             if record.task_id != task_id:
                 continue
@@ -1135,6 +1117,26 @@ class Engine:
                 transcript_path=record.transcript_path,
             )
         return None
+
+    def _current_dev_session_index(self, task: StoryTask) -> int | None:
+        """Index of the newest primary dev record for the current attempt."""
+        task_id = _session_task_id(task.story_key, "dev", task.attempt)
+        for index in range(len(task.sessions) - 1, -1, -1):
+            if task.sessions[index].task_id == task_id:
+                return index
+        return None
+
+    def _accept_current_dev_session(self, task: StoryTask) -> None:
+        """Latch the current dev or repair record as the accepted tree owner."""
+        accepted_index = self._current_dev_session_index(task)
+        if accepted_index is None:
+            raise RuntimeError(f"accepted dev decision for {task.story_key} has no session record")
+        task.accepted_dev_session_index = accepted_index
+
+    def _accepted_dev_session_matches(self, task: StoryTask) -> bool:
+        """Whether the current primary dev record owns the PROCEED receipt."""
+        accepted = task.accepted_dev_session_index
+        return accepted is not None and accepted == self._current_dev_session_index(task)
 
     # ------------------------------------------------------------- per story
 
@@ -1310,14 +1312,30 @@ class Engine:
                 session_stage="pre_workflow_session",
                 label=f"{lp.name}.{wf.name}",
             )
+            wf_extras: dict = {"env_fault": result.env_fault}
+            if result.env_fault_evidence:
+                wf_extras["env_fault_evidence"] = result.env_fault_evidence
             self.journal.append(
                 "workflow-end",
                 plugin=lp.name,
                 workflow=wf.name,
                 status=result.status,
                 story_key=task.story_key,
+                **wf_extras,
             )
             if wf.blocking and result.status != "completed":
+                if result.env_fault:
+                    # A blocking workflow session that lost its API connection (#194)
+                    # never ran — escalate (re-arm restores the budget) instead of
+                    # deferring the story on a transport failure. Non-blocking
+                    # workflows keep continuing (journaled only): the next story
+                    # session will classify and pause if the outage persists.
+                    self._escalate(
+                        task,
+                        env_fault_pause_reason(
+                            f"blocking workflow {wf.name!r} ({lp.name})", result
+                        ),
+                    )
                 self._defer(
                     task,
                     f"blocking workflow {wf.name!r} ({lp.name}) did not complete: {result.status}",
@@ -1361,6 +1379,10 @@ class Engine:
         self._review_and_commit(task)
 
     def _dev_phase(self, task: StoryTask, resume_result: SessionResult | None = None) -> bool:
+        if resume_result is None:
+            # A fresh invocation cannot consume a snapshot armed by an earlier,
+            # non-replayable invocation. Keep crash replay's snapshot intact.
+            self._disarm_ledger_snapshot(task)
         if self._vetoed(self._emit("pre_dev_phase", task), task):
             return False
         if resume_result is None:
@@ -1371,14 +1393,45 @@ class Engine:
             # would shift the rollback/squash reference onto the completed
             # session's own tree.
             task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
+            # Start the ledger attribution reference under the same fresh-entry
+            # rule. The harvest exclusion compares each attempt's pre-harvest
+            # ledger with this reference so a session-authored ledger edit is
+            # never hidden along with the orchestrator's own append. A fixable
+            # retry rebases it onto the tree that retry deliberately keeps.
+            task.baseline_ledger_digest = self._ledger_digest()
         feedback: Path | None = None
         while True:
+            replayed = resume_result is not None
             if resume_result is None:
                 # a resumed result replays the attempt it was recorded under, so
                 # the counter (and the session task_id derived from it) must not
                 # advance; a second host death then still finds the record and
                 # re-enters this continuation instead of falling back to restart.
                 task.attempt += 1
+                # A genuinely new attempt starts from a rolled-back tree and owes
+                # nothing to the rejected attempt's harvest. A fixable retry keeps
+                # that tree and ledger intentionally, so preserve its payload for a
+                # later isolated carry. Crash replay never enters this branch.
+                if feedback is None:
+                    task.harvested_deferrals = []
+                    # Same rule, and the abandoned attempt's ledger row is already
+                    # gone: an escalation leaves the unit worktree mounted and
+                    # unmerged, and the re-drive that reaches here discarded it
+                    # (`_finish_inflight`'s resume-restart arm), taking the only
+                    # copy of that row. Carrying the record anyway files a
+                    # follow-up against the attempt that COMMITTED, whose review
+                    # recommended none — and `append_entry` has nothing to dedupe
+                    # it against, so a tracked ledger commits the wrong row rather
+                    # than absorbing it (#457). `rearm_escalation` already
+                    # voids the history behind the record by resetting
+                    # `followup_reviews_spent` for a fresh damping budget.
+                    #
+                    # The fixable-retry exemption above is inherited, not reasoned:
+                    # this field's one producer fires on a finalized, verify-green
+                    # story immediately before `_commit`, and no path leads from
+                    # there back into a `feedback is not None` iteration, so such an
+                    # iteration can never hold a record to preserve.
+                    task.refiled_followups = []
             advance(task, Phase.DEV_RUNNING)
             self._save()
             if resume_result is not None:
@@ -1388,6 +1441,15 @@ class Engine:
                 result = resume_result
                 resume_result = None
             else:
+                # intent-gap patch-restore (#2564): re-lay the saved attempt onto
+                # the baseline before dispatch so the re-driven session resumes
+                # review on the restored diff. `feedback is None` ⇒ the tree is at
+                # baseline (fresh attempt or a non-fixable rollback below), NOT a
+                # fixable-feedback retry that kept the attempt's tree — so this
+                # never double-applies. No-op unless a restore is latched; escalates
+                # (never dispatches) if the patch fails to apply.
+                if feedback is None:
+                    self._restore_patch(task)
                 result = self._run_session(
                     task,
                     role="dev",
@@ -1397,23 +1459,84 @@ class Engine:
             advance(task, Phase.DEV_VERIFY)
             outcome = None
             if result.status == "completed":
+                # Everything below this point that appends to the ledger is the
+                # orchestrator, not the session. Preserve attribution on crash
+                # replay: the replayed harvest dedupes against the dead attempt's
+                # on-disk append.
+                # Before the first harvest write, a replay can still reconstruct
+                # session authorship from the persisted baseline digest. Once an
+                # engine write is latched, the current ledger includes that write
+                # and replay must preserve the attribution saved before harvest.
+                if not replayed and feedback is None:
+                    task.harvest_wrote_ledger = False
+                if (
+                    replayed
+                    and task.baseline_ledger_digest is None
+                    and not task.harvest_wrote_ledger
+                ):
+                    # A state written before ledger attribution has no digest to
+                    # compare, but it still has the attempt's Git baseline. Use
+                    # the pre-harvest path diff to preserve legitimate ledger-only
+                    # session work without letting the append below become its
+                    # own proof. A later replay with harvest_wrote_ledger already
+                    # latched preserves the attribution saved by this first one.
+                    task.ledger_changed_before_harvest = self._legacy_ledger_changed_before_harvest(
+                        task
+                    )
+                    self._save()
+                elif not replayed or not task.harvest_wrote_ledger:
+                    if task.baseline_ledger_digest is not None:
+                        task.ledger_changed_before_harvest = (
+                            self._ledger_digest() != task.baseline_ledger_digest
+                        )
+                    self._save()
+                # Snapshot after the session has finished, preserving any ledger
+                # edits it authored, and before reconcile/state-sync/harvest can
+                # write on the engine's behalf. The harvest is the engine-side
+                # ledger write this snapshot currently protects; the sweep bundle
+                # close lives below the acceptance gate instead. Keep the chain's
+                # first snapshot
+                # across fixable retries because a later non-fixable reset returns
+                # all the way to the phase baseline. An unarmed replay may safely
+                # arm from disk; an armed replay must retain the dead attempt's
+                # pre-harvest bytes.
+                if (not replayed and feedback is None) or not task.pre_harvest_ledger_captured:
+                    task.pre_harvest_ledger = self._ledger_text()
+                    task.pre_harvest_ledger_captured = True
+                    self._save()
                 # bmad-dev-auto sometimes finalizes the spec in prose (## Auto Run
                 # Result: Status done) but leaves the frontmatter status at the
                 # template default. Repair it BEFORE any frontmatter reader runs —
                 # the sync below, verify_dev, and the review-verify gate all key
                 # off the on-disk frontmatter status.
                 self._reconcile_generic_terminal_status(task, result.result_json)
-                # generic-path single-writer for the bookkeeping the decoupled
-                # skill never touches (sprint-status for stories, the deferred-work
-                # ledger for sweep bundles), before verify reads that state.
+                # Harvest the session's frontmatter `deferred:` findings into the
+                # ledger before the artifact gate so an accepted attempt carries
+                # them in its story commit. `_harvest_gate_exclude` keeps this
+                # engine-authored append from becoming proof of session work. This
+                # strict read can also finish a reconciliation whose preceding
+                # observation faulted, so state sync follows it and sees the
+                # repaired terminal status.
+                harvest_outcome = self._harvest_spec_deferrals(task, result.result_json)
+                # Generic-path single-writer for the sprint bookkeeping the
+                # decoupled skill never touches, before verify reads that state.
+                # Sweep bundles override this pre-gate seam to a no-op; their
+                # ledger close belongs to the accepted-only seam below.
                 self._post_dev_state_sync(task, result.result_json)
                 # carry the skill's follow-up-review recommendation (PR #2505)
                 # onto the task so _review_and_commit can gate the review loop.
-                task.followup_review_recommended = bool(
-                    (result.result_json or {}).get("followup_review_recommended", False)
-                )
-                outcome = self._verify_dev_artifacts(task, result.result_json)
-                if outcome.ok:
+                # A present key is authoritative (folded from the frontmatter, or
+                # the legacy skill's own result.json); an absent one is a resumed
+                # pre-reconcile snapshot whose re-fold may have been dropped by a
+                # spec read fault — re-derive from the spec instead of defaulting
+                # a recommended review away.
+                rj = result.result_json or {}
+                if "followup_review_recommended" in rj:
+                    task.followup_review_recommended = bool(rj["followup_review_recommended"])
+                else:
+                    task.followup_review_recommended = self._followup_from_spec(task, rj)
+                outcome = harvest_outcome or self._verify_dev_artifacts(task, result.result_json)
+                if outcome.ok and self._run_verify_commands_after_dev(task, result.result_json):
                     # deterministic gates run here too: a broken build must not
                     # reach the (far more expensive) review loop
                     outcome = verify.verify_commands_outcome(self.policy, self.workspace.root)
@@ -1432,9 +1555,20 @@ class Engine:
                 session_status=result.status,
                 action=str(decision.action),
                 reason=decision.reason,
+                # env_fault from EITHER the verify path (rc 126/127) or the
+                # session-transport classification (#194); decide_dev PAUSEs on
+                # the latter, so the fall-through below preserves the worktree.
+                env_fault=bool((outcome is not None and outcome.env_fault) or result.env_fault),
             )
+            if decision.action == Action.PROCEED:
+                # DEV_VERIFY + spec_file is not itself proof of acceptance: this
+                # save also precedes every rejecting decision branch. Persist an
+                # explicit transaction latch so recovery may replay accepted-only
+                # bookkeeping without closing work from a PAUSE/RETRY/DEFER.
+                self._accept_current_dev_session(task)
             self._save()
             if decision.action == Action.PROCEED:
+                self._finish_post_dev_accepted_sync(task, result.result_json)
                 self._emit("post_dev_phase", task)
                 if self._run_workflows("post_dev_phase", task, task.attempt):
                     return False
@@ -1444,10 +1578,68 @@ class Engine:
                     # work exists and the failure is concrete: keep the tree,
                     # hand the failing output to a repair session
                     feedback = self._write_feedback(task, decision.reason)
+                    # The repair session is judged against the kept chain. Move
+                    # the ledger reference onto that tree so the retained harvest
+                    # is accounted for, while a new session-authored ledger edit
+                    # still makes `ledger_changed_before_harvest` true.
+                    task.baseline_ledger_digest = self._ledger_digest()
                 else:
                     feedback = None
-                    self._rollback_or_pause(task)
+                    try:
+                        self._rollback_or_pause(task)
+                    finally:
+                        # An exception from rollback means this attempt is leaving
+                        # the decision pipeline just as surely as a returned
+                        # rollback. Detect the active unwind without limiting it to
+                        # RunPaused: reset/preserve failures are the #420 gap.
+                        unwinding = sys.exc_info()[0] is not None
+                        restore_error: OSError | None = None
+                        # Recovery resets code/spec state but protects artifact
+                        # directories through `_safe_reset`'s
+                        # keep=(".bmad-loop", *self._protected_relpaths()) shield.
+                        # Consequently an ordinary untracked harvest-created ledger
+                        # survives unless restored explicitly; `git reset --hard`
+                        # performs the ledger revert only when the ledger is tracked.
+                        # Run this for stop-and-wait too: the operator's eventual
+                        # reset would not remove an untracked or ignored file either.
+                        try:
+                            self._restore_persisted_ledger(task, replayed=replayed)
+                        except OSError as e:
+                            # Preserve an exception already in flight; replacing a
+                            # RunPaused/reset fault would misclassify the run and
+                            # skip the stale-arm cleanup below. The journal keeps
+                            # this secondary repair failure visible.
+                            restore_error = e
+                            self.journal.append(
+                                "ledger-restore-failed",
+                                story_key=task.story_key,
+                                error=f"{type(e).__name__}: {e}",
+                            )
+                        # Rebase from the snapshot already in hand so a filesystem
+                        # fault cannot replace a RunPaused while unwinding.
+                        if task.pre_harvest_ledger_captured:
+                            task.baseline_ledger_digest = _digest_of(task.pre_harvest_ledger)
+                        # Leaving this attempt spends the chain snapshot even when
+                        # its repair failed: retaining stale bytes across a pause or
+                        # crash would let resume overwrite later operator work. A
+                        # fixable retry never enters this branch and keeps its arm.
+                        self._disarm_ledger_snapshot(task)
+                        if unwinding or restore_error is not None:
+                            # A pause or rollback failure skips the next loop/save;
+                            # persist before it can ride a human window or #420's
+                            # crash path. A restore failure must likewise persist
+                            # the disarm before it is raised. On a cleanly returned
+                            # rollback the next attempt's ordinary save supplies
+                            # durability.
+                            self._save()
+                        if restore_error is not None and not unwinding:
+                            # Repair writes fail loud when there is no earlier
+                            # exception whose identity must be preserved.
+                            raise restore_error
                 continue
+            # DEFER and escalation preserve their current tree/knowledge rather
+            # than rejecting the attempt, so neither may later consume this arm.
+            self._disarm_ledger_snapshot(task)
             if decision.action == Action.DEFER:
                 self._record_dev_spec(task, result.result_json)
                 self._defer(task, decision.reason)
@@ -1464,19 +1656,33 @@ class Engine:
         have no spec path to act on, so the re-drive HALTs on the stale ``blocked``
         status. The synthesized result names the spec even on a HALT
         (``devcontract.synthesize_result``). No-op once set or when the claimed
-        spec is absent."""
+        spec is absent.
+
+        The skill's no-spec fallback artifact (``bmad-build-auto-result-*``, or
+        ``bmad-dev-auto-result-*`` pre-rename — ``FALLBACK_RESULT_PREFIXES`` matches
+        both; written when intent was too unclear to even CREATE a spec) is refused:
+        it is not the story's spec, so every consumer here misreads it.
+        ``rearm_escalation`` would flip frontmatter on a marker no re-drive reads,
+        ``_reset_spec_for_repair`` would re-open it as if it were the frozen intent
+        contract, and the repair prompt would point the session at it — which the
+        #261 read-back then pins to, polling a stale marker while the re-drive's
+        real spec goes unread."""
         if task.spec_file:
             return
         spec_file = (result_json or {}).get("spec_file")
         if not spec_file:
             return
         spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
+        if spec_path.name.startswith(devcontract.FALLBACK_RESULT_PREFIXES):
+            return
         if spec_path.is_file():
             task.spec_file = str(spec_path)
 
     def _review_and_commit(
         self, task: StoryTask, resume_result: SessionResult | None = None
     ) -> None:
+        if self._park_awaiting_operator(task):
+            return
         if not self.policy.review.enabled:
             # review.enabled = false: the bmad-dev-auto session's own inline
             # review is the only review; verify the deterministic gates + commit.
@@ -1491,13 +1697,18 @@ class Engine:
         #
         # review.trigger = "recommended" (default) gates that loop per-story on the
         # bmad-dev-auto session's `followup_review_recommended` signal (PR #2505):
-        # the skill already self-reviews inline every story and only recommends an
-        # independent pass when its review-driven changes were significant. When it
-        # didn't, skip the separate session and let the deterministic gates +
-        # commit run (_skip_review_and_commit still validates them). "always"
-        # keeps the pre-#2505 behavior of reviewing every story. Either way the
-        # loop below is bounded by limits.max_review_cycles — the oscillation guard
-        # for orchestrator-applied follow-up review.
+        # the skill already self-reviews inline every story and recommends an
+        # independent pass from a severity-weighted score over its patched
+        # findings (upstream #2580). When it didn't, skip the separate session
+        # and let the deterministic gates + commit run (_skip_review_and_commit
+        # still validates them). "always" keeps the pre-#2505 behavior of
+        # reviewing every story. Either way the loop below is bounded by
+        # limits.max_review_cycles (the hard outer cap) and damped by
+        # limits.max_followup_reviews — the guard against a finalized round that
+        # keeps recommending its own follow-up (structural before upstream #2580
+        # scored the flag; kept as the orchestrator-side bound): once the damping
+        # grant is spent, such a round converges + refiles instead of burning
+        # cycles to the outer cap.
         if self.policy.review.trigger == "recommended" and not task.followup_review_recommended:
             self.journal.append("review-not-recommended", story_key=task.story_key)
             self._skip_review_and_commit(task)
@@ -1509,6 +1720,11 @@ class Engine:
         # (status: done) while still recommending an independent follow-up — the
         # only state the budget-exhaustion rescue below is allowed to commit.
         refileable_followup = False
+        # The last *completed* pass's parsed frontmatter status, so the exhaustion
+        # defer reason can name what actually happened instead of the fixed
+        # follow-up wording (issue #160). None until a pass reaches the parse below
+        # (a crash/stall that DEFERs never gets there).
+        last_status: str | None = None
         # A resumed result must enter the loop even when the crash landed in the
         # post-session window of the *final* allowed cycle (review_cycle already
         # == max_review_cycles): its recorded pass was already counted, and the
@@ -1531,11 +1747,19 @@ class Engine:
                 result = resume_result
                 resume_result = None
             else:
+                # Strip the prior pass's stale `## Auto Run Result` before launch:
+                # the review re-invokes bmad-dev-auto on the done spec, and the
+                # session's own entry write would otherwise lift that leftover
+                # marker past the adapter's launch-mtime floor and end the review
+                # on its first result-less Stop (issue #160). Non-replay branch
+                # only — the replay path above launches no session.
+                snapshot = self._reset_spec_for_review(task)
                 result = self._run_session(
                     task,
                     role="review",
                     prompt=self._review_prompt(task),
                     seq=task.review_cycle,
+                    spec_snapshot=snapshot,
                 )
             advance(task, Phase.REVIEW_VERIFY)
             self._save()
@@ -1557,6 +1781,27 @@ class Engine:
                     "review-retry", story_key=task.story_key, reason=decision.reason
                 )
                 continue
+            if decision.action == Action.SALVAGE:
+                # review.on_timeout = "salvage-if-done" (#271): the session hit a
+                # timeout-like verdict, but the dev product may already be
+                # finalized and verify-green — converge (commit + refile the
+                # outstanding follow-up) instead of burning another review cycle
+                # on an empty delta. When salvage is not applicable, fall back
+                # through the default retry/exhaust routing.
+                if self._salvage_review_timeout(task, result):
+                    return
+                fallback = review_retry_or_exhaust(
+                    task, self.policy, f"{decision.reason}; salvage not applicable"
+                )
+                if fallback.action == Action.PAUSE:
+                    self._escalate(task, fallback.reason)
+                if fallback.action == Action.DEFER:
+                    self._defer(task, fallback.reason)
+                    return
+                self.journal.append(
+                    "review-retry", story_key=task.story_key, reason=fallback.reason
+                )
+                continue
 
             rj = result.result_json or {}
             for pref in preference_escalations(rj):
@@ -1567,38 +1812,125 @@ class Engine:
             # Convergence = the pass finished `done` and no longer recommends an
             # independent follow-up. A blocked pass is already handled above
             # (decide_review_session PAUSEs on its synthesized CRITICAL).
+            # A review pass can die between writing terminal prose (## Auto Run
+            # Result: done) and flipping frontmatter off the transient `in-review`
+            # marker. Mirror the dev leg (engine.py:1541): repair the spec BEFORE
+            # reading status/followup below — otherwise the stale `in-review`
+            # frontmatter burns a review cycle re-reviewing already-finished work.
+            # On the generic path this advances `in-review`→`done` and re-folds the
+            # frontmatter's followup flag into `rj` (only when present), so the
+            # convergence/damping gate below sees the finalized state.
+            self._reconcile_generic_terminal_status(task, rj)
+            # A follow-up review is another full dev-primitive pass and may add
+            # findings to the same frontmatter list. Harvest after reconciliation
+            # makes a prose-finalized pass visible; the dev-leg entries dedupe.
+            harvest_outcome = None
+            for harvest_attempt in range(1, HARVEST_REPAIR_READ_ATTEMPTS + 1):
+                harvest_outcome = self._harvest_spec_deferrals(task, rj)
+                if harvest_outcome is None:
+                    break
+                self.journal.append(
+                    "review-verify-failed",
+                    story_key=task.story_key,
+                    reason=harvest_outcome.reason,
+                    env_fault=harvest_outcome.env_fault,
+                    contradiction=harvest_outcome.contradiction,
+                    harvest_attempt=harvest_attempt,
+                )
+                if not harvest_outcome.retryable:
+                    self._escalate(task, harvest_outcome.reason)
+            if harvest_outcome is not None:
+                # The bounded deterministic retry could not recover the source.
+                # Do not launch another reviewer: a new pass may replace the
+                # unread `deferred:` list and silently erase a finding. Route as
+                # exhausted without spending a session so a resolved CRITICAL
+                # re-drive re-escalates instead of being downgraded to a defer.
+                exhausted = review_exhausted(
+                    task,
+                    "review deferral harvest remained unreadable after "
+                    f"{HARVEST_REPAIR_READ_ATTEMPTS} attempts: {harvest_outcome.reason}",
+                )
+                if exhausted.action == Action.PAUSE:
+                    self._escalate(task, exhausted.reason)
+                self._defer(task, exhausted.reason)
+                return
             status = str(rj.get("status", "")).strip()
+            last_status = status  # remember the last completed pass for the defer reason
             followup = bool(rj.get("followup_review_recommended", False))
             task.followup_review_recommended = followup  # latest pass wins
             refileable_followup = status == "done" and followup
+            # Damping: a finalized round that still recommends its own follow-up is
+            # honored only while the story has damping grants left. Once
+            # followup_reviews_spent has reached limits.max_followup_reviews, such a
+            # round force-converges (verify → refile the recommendation → commit)
+            # instead of burning another cycle on a runaway recommendation
+            # (pre-#2580, every review pass patched findings and recommended
+            # another pass; the upstream severity-scored flag has since made
+            # that the exception). max_review_cycles stays the hard outer bound.
+            damped = refileable_followup and (
+                task.followup_reviews_spent >= self.policy.limits.max_followup_reviews
+            )
             self.journal.append(
                 "review-result",
                 story_key=task.story_key,
                 cycle=task.review_cycle,
                 status=status,
                 followup_review_recommended=followup,
+                followup_damped=damped,
             )
             self._emit("post_review_result", task, role="review", result_json=rj)
             if self._run_workflows("post_review_result", task, task.review_cycle):
                 return
-            if status == "done" and not followup:
+            if status == "done" and (not followup or damped):
                 outcome = self._verify_review(task)
                 if outcome.ok:
+                    if damped:
+                        # refile BEFORE break so the ledger edit squashes into the
+                        # same story commit (mirrors the exhaustion rescue ordering).
+                        # Verify-green here is the same authority as the converged /
+                        # rescue paths — never ships uncompleted work.
+                        self._record_review_budget_followup(task, damped=True)
                     clean = True
                     break
                 self.journal.append(
                     "review-verify-failed",
                     story_key=task.story_key,
                     reason=outcome.reason,
+                    env_fault=outcome.env_fault,
+                    contradiction=outcome.contradiction,
                 )
+                if not outcome.retryable:
+                    # escalate-grade failure (environment fault, git error, a
+                    # review revoking the sprint sign-off): a repair session
+                    # cannot fix it and another review cycle would replay it —
+                    # pause the run instead of burning budget
+                    self._escalate(task, outcome.reason)
                 if outcome.fixable and task.review_cycle < self.policy.limits.max_review_cycles:
                     # failing verify commands are dev work, not review work: a
                     # re-review of the same tree cannot make them pass. Repair
-                    # with the failing output as feedback, then re-review.
-                    if not self._fix_phase(task, outcome.reason):
-                        self._defer(task, "verify commands kept failing after clean review")
+                    # with the failing output as feedback, then re-review. This
+                    # verify-repair round never spends the damping cap.
+                    fix = self._fix_phase(task, outcome.reason)
+                    if fix.action == Action.PAUSE:
+                        self._escalate(task, fix.reason)
+                    if fix.action == Action.DEFER:
+                        self._defer(
+                            task,
+                            fix.reason or "verify commands kept failing after clean review",
+                        )
                         return
                 continue
+            if refileable_followup:
+                # Spend one damping grant for honoring this pass's own follow-up
+                # recommendation. Deliberately AFTER the
+                # _run_workflows("post_review_result") gate: the increment is
+                # persisted only by the NEXT cycle's _save(), by which point
+                # _resumable_session can no longer replay this result — so a
+                # crash-replay re-derives the spend exactly once instead of
+                # double-counting it. (A non-terminal status or a non-followup
+                # done — the two other ways to reach here — never sets
+                # refileable_followup, so neither spends the cap.)
+                task.followup_reviews_spent += 1
             # still recommends a follow-up (or a non-terminal status): loop runs a
             # fresh review pass on the newly-patched tree, bounded by max_review_cycles
 
@@ -1623,27 +1955,266 @@ class Engine:
             # the non-isolated path: in worktree isolation a defer already keeps the
             # unit's worktree + patch (no work is lost), so there is nothing to
             # rescue and committing into the main repo would be wrong.
-            if refileable_followup and not self._isolated and self._verify_review(task).ok:
-                self._record_review_budget_followup(task)
-                self._commit(task)
-                return
-            self._defer(
-                task, "review did not converge within budget (still recommending a follow-up pass)"
-            )
+            if refileable_followup and not self._isolated:
+                rescue = self._verify_review(task)
+                if rescue.ok:
+                    self._record_review_budget_followup(task)
+                    self._commit(task)
+                    return
+                if rescue.contradiction:
+                    # The rescue gate is the first place this story's sprint
+                    # sign-off was re-read (every in-loop cycle recommended its own
+                    # follow-up, so none of them verified). A defer here would roll
+                    # the work back under a "did not converge" reason that names
+                    # neither side of the disagreement — pause with both instead.
+                    # Journaled under the same kind as the two in-loop gates so a
+                    # consumer keying on `contradiction` sees all three escalating
+                    # paths. The non-contradiction arm keeps its existing silence:
+                    # its story is told by the defer reason below.
+                    self.journal.append(
+                        "review-verify-failed",
+                        story_key=task.story_key,
+                        reason=rescue.reason,
+                        env_fault=rescue.env_fault,
+                        contradiction=rescue.contradiction,
+                    )
+                    self._escalate(task, rescue.reason)
+            # Name the last completed pass's real outcome (issue #160): the fixed
+            # follow-up wording is only correct when a finalized pass actually left
+            # a refileable recommendation. "did not converge" stays in every variant
+            # (callers grep it).
+            if refileable_followup:
+                detail = "still recommending a follow-up pass"
+            elif last_status == "done":
+                detail = "last review pass finalized but its verification failed"
+            elif last_status is not None:
+                # A pass completed but its status is non-terminal — or "" when the
+                # observe-degrade paths left `rj` with no status (spec read fault,
+                # out-of-tree spec, or a result.json with no spec_file so the
+                # reconcile bailed). Render "" honestly rather than mislabeling it as
+                # "no pass ran" (which is what `last_status is None` below means).
+                detail = (
+                    f"last review pass ended at non-terminal status {(last_status or 'unknown')!r}"
+                )
+            else:
+                detail = "no review pass completed"
+            self._defer(task, f"review did not converge within budget ({detail})")
             return
 
         self._commit(task)
 
-    def _skip_review_and_commit(self, task: StoryTask) -> None:
+    def _salvage_review_timeout(self, task: StoryTask, result: SessionResult) -> bool:
+        """``review.on_timeout = "salvage-if-done"`` (#271): try to converge a
+        timed-out review by committing the already-finalized dev product instead
+        of burning another review cycle. Returns True when salvage either committed
+        or terminally routed an unreadable harvest; False means salvage was not
+        applicable and the caller falls back to the default retry/exhaust routing.
+        The cycle the timed-out session charged is deliberately not refunded —
+        salvage changes what the *next* cycle costs, not what this one did.
+
+        Applicability, all deterministic: not worktree-isolated (a defer there
+        already keeps the unit's worktree + diff, and committing into the main
+        repo would be wrong — same scoping as the budget-exhaustion rescue); a
+        spec is recorded and its frontmatter reads ``done`` (the review never got
+        far enough to touch it — rare once the adapter's missing-marker fallback
+        (#224) completes those sessions, but a review that never wrote the spec
+        at all still lands here) or ``in-review`` (the mid-review interrupt: the
+        dying pass flipped the transient marker and died — reset it forward,
+        stripping any partial terminal section so the next launch's mtime-floor
+        scan can't misread it). Anything else — ``blocked``, ``in-progress``, a
+        custom token — was set deliberately or means unfinished dev work: never
+        salvage over it. The commit is gated on the same authoritative
+        ``_verify_review`` as every other converge path, so salvage can never
+        ship unverified work; a timeout that produced no review result neither
+        re-arms ``followup_review_recommended`` nor spends a damping grant — the
+        outstanding recommendation is refiled to deferred work instead."""
+        if self._isolated or not task.spec_file:
+            return False
+        spec_path = Path(task.spec_file)
+        fm = self._observed_frontmatter(spec_path, task.story_key, "review-timeout-salvage")
+        if fm is None:
+            return False
+        fm_status = verify.status_of(fm)
+        if fm_status not in ("done", "in-review"):
+            return False
+        reset_from: str | None = None
+        if fm_status == "in-review":
+            # Repair-write doctrine: these raise on an unreadable spec rather
+            # than silently proceeding stale (see _reset_spec_for_repair).
+            reset_from = fm_status
+            devcontract.reset_spec_status(spec_path, "done")
+            devcontract.strip_auto_run_result(spec_path)
+        # A timed-out review can still have recorded new frontmatter findings.
+        # Normalize first so the success-status gate sees `done`, then mirror the
+        # normal review path before deterministic verification and commit.
+        harvest_outcome = None
+        for harvest_attempt in range(1, HARVEST_REPAIR_READ_ATTEMPTS + 1):
+            harvest_outcome = self._harvest_spec_deferrals(task, {"spec_file": str(spec_path)})
+            if harvest_outcome is None:
+                break
+            self.journal.append(
+                "review-timeout-salvage-failed",
+                story_key=task.story_key,
+                cycle=task.review_cycle,
+                reason=harvest_outcome.reason,
+                env_fault=harvest_outcome.env_fault,
+                harvest_attempt=harvest_attempt,
+            )
+            if not harvest_outcome.retryable:
+                self._escalate(task, harvest_outcome.reason)
+        if harvest_outcome is not None:
+            exhausted = review_exhausted(
+                task,
+                "review timeout deferral harvest remained unreadable after "
+                f"{HARVEST_REPAIR_READ_ATTEMPTS} attempts: {harvest_outcome.reason}",
+            )
+            if exhausted.action == Action.PAUSE:
+                self._escalate(task, exhausted.reason)
+            self._defer(task, exhausted.reason)
+            return True
+
+        outcome = self._verify_review(task)
+        if not outcome.ok:
+            self.journal.append(
+                "review-timeout-salvage-failed",
+                story_key=task.story_key,
+                cycle=task.review_cycle,
+                reason=outcome.reason,
+                env_fault=outcome.env_fault,
+            )
+            if not outcome.retryable:
+                # escalate-grade failure (environment fault, git error): another
+                # review cycle would replay it — pause the run (mirrors the
+                # review loop's own verify-failed routing).
+                self._escalate(task, outcome.reason)
+            return False
+        refiled: str | None = None
+        if task.followup_review_recommended:
+            # Refile BEFORE _commit so the ledger edit squashes into the story
+            # commit (mirrors _record_review_budget_followup's ordering). A new
+            # origin string: the review-budget-followup origin's wording and
+            # re-review cap are load-bearing for that path and must not blur.
+            refiled = deferredwork.append_entry(
+                self.workspace.paths.deferred_work,
+                title=(
+                    f"Follow-up review still outstanding for {task.story_key}"
+                    " after a review timeout"
+                ),
+                origin="review-timeout-salvage",
+                source_spec=spec_path.name if task.spec_file else task.story_key,
+                reason=(
+                    f"The review session ended {result.status} with the story already "
+                    f"finalized (status: done, verify green). Per review.on_timeout = "
+                    f"'salvage-if-done' the work was committed by bmad-loop run "
+                    f"{self.state.run_id} without another review pass; this entry "
+                    f"preserves the outstanding follow-up recommendation for a "
+                    f"deliberate later review."
+                ),
+                severity="low",
+            )
+            task.followup_review_recommended = False
+        self.journal.append(
+            "review-timeout-salvage",
+            story_key=task.story_key,
+            cycle=task.review_cycle,
+            session_status=result.status,
+            reset_from=reset_from,
+            refiled=refiled,
+        )
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"review timeout salvaged, work committed: {task.story_key}",
+            f"review session {result.status}; the finalized, verify-green dev product "
+            f"was committed and any outstanding follow-up refiled to deferred work.",
+        )
+        self._commit(task)
+        return True
+
+    def _park_awaiting_operator(self, task: StoryTask) -> bool:
+        """Take a dev-declared ``awaiting-operator`` park down the commit path,
+        skipping the review loop. Returns True when it did (the caller is done).
+
+        The review loop is skipped because there is nothing for it to converge
+        ON. A review pass is bmad-dev-auto re-invoked on the spec to second-guess
+        the diff and finalize `done`; a park's outstanding work is not in the diff
+        at all — it is outside the repo, in a human's hands — so every cycle would
+        either re-park (no progress, budget burned) or "fix" the park away by
+        finalizing `done`, which is the exact false-green the state exists to
+        prevent. What the loop DOES contribute, the deterministic gate, is kept:
+        this delegates to the same skip-review commit path, whose `_verify_review`
+        now holds the park to its (awaiting-operator, awaiting-operator) pair, a
+        non-empty action list, and the project's verify commands. Parked work
+        clears every check `done` work clears — no commit path skips verification.
+
+        No `_defer` machinery: a park is a SUCCESS that commits, so there is no
+        stash or rollback, and the ordinary path has no ledger snapshot to
+        unwind. A crash-resumed DEV_VERIFY park can inherit an arm from before
+        PROCEED's disarm; that exceptional snapshot is spent below. (A park that
+        fails verification is not a park yet; it defers like any other unverified
+        work, through the shared path below.)"""
+        if not self._operator_park_enabled():
+            return False
+        spec_path = Path(task.spec_file) if task.spec_file else None
+        if spec_path is None or not spec_path.is_file():
+            return False
+        fm = self._observed_frontmatter(spec_path, task.story_key, "operator-park")
+        if fm is None or verify.status_of(fm) != verify.AWAITING_OPERATOR:
+            return False
+        # A crash can resume a persisted DEV_VERIFY task directly into this
+        # main-only path, bypassing `_dev_phase`'s accepted-attempt disarm. Spend
+        # any inherited snapshot before the commit/awaiting-human window, and
+        # persist it now so a host loss inside that window cannot strand stale
+        # pre-harvest bytes on the terminal task.
+        if task.pre_harvest_ledger_captured:
+            self._disarm_ledger_snapshot(task)
+            self._save()
+        # Latched BEFORE _commit's advance(COMMITTING) + _save, so a host death
+        # anywhere in the commit window resumes into _finalize_commit_phase with
+        # the actions already on the persisted task — and that arm re-derives
+        # AWAITING_OPERATOR from them with no change of its own (#115).
+        task.operator_actions = list(verify.operator_actions_of(fm))
+        self._skip_review_and_commit(task, kind="review-skipped-awaiting-operator")
+        return True
+
+    def _skip_review_and_commit(self, task: StoryTask, *, kind: str = "review-skipped") -> None:
         """review.enabled = false: no separate review session runs. The
         bmad-dev-auto session ran its own inline review and finalized the
         story to done. Validate the deterministic gates (verify commands,
-        spec/sprint = done) and commit, repairing once if verify is fixable."""
-        self.journal.append("review-skipped", story_key=task.story_key)
+        spec/sprint = done) and commit, repairing once if verify is fixable.
+
+        Also the commit path for an ``awaiting-operator`` park, which reaches
+        here with ``kind="review-skipped-awaiting-operator"`` — same gates, same
+        repair-once, same commit; only the reason the review was skipped differs,
+        and the journal says which."""
+        self.journal.append(kind, story_key=task.story_key)
         outcome = self._verify_review(task)
-        if not outcome.ok and outcome.fixable and self._fix_phase(task, outcome.reason):
+        if not outcome.ok and outcome.fixable:
+            fix = self._fix_phase(task, outcome.reason)
+            if fix.action == Action.PAUSE:
+                self._escalate(task, fix.reason)
+            if fix.action == Action.DEFER:
+                self._defer(
+                    task,
+                    fix.reason or f"verify failed with review disabled: {outcome.reason}",
+                )
+                return
             outcome = self._verify_review(task)
         if not outcome.ok:
+            # same event kind as the review-enabled loop so journal consumers
+            # see the structured env_fault flag on this path too
+            self.journal.append(
+                "review-verify-failed",
+                story_key=task.story_key,
+                reason=outcome.reason,
+                env_fault=outcome.env_fault,
+                contradiction=outcome.contradiction,
+            )
+            if not outcome.retryable:
+                # escalate-grade failure (environment fault, git error, a review
+                # revoking the sprint sign-off): a defer would just replay it on
+                # the next story — pause the run
+                self._escalate(task, outcome.reason)
             self._defer(task, f"verify failed with review disabled: {outcome.reason}")
             return
         self._commit(task)
@@ -1662,6 +2233,32 @@ class Engine:
             return
         advance(task, Phase.COMMITTING)
         self._save()
+        self._finalize_commit_phase(task)
+
+    def _finalize_commit_phase(self, task: StoryTask) -> None:
+        """Drive an already-COMMITTING task to DONE: regenerate the message,
+        emit ``pre_commit`` (rewrite honored; a pause veto escalates —
+        COMMITTING→ESCALATED is legal), squash via ``finalize_commit``, stamp
+        ``commit_sha``, advance to DONE.
+
+        Precondition: ``task.phase == COMMITTING`` and that phase is PERSISTED
+        (the gate+advance+save in ``_commit``, or a resume that found it on
+        disk). The persisted phase is durable proof the ``pre_commit_gate``
+        workflows already ran and passed — the COMMITTING save lands only
+        after the gate loop returns clean — which is why the resume arm calls
+        this WITHOUT re-running them: a re-run would double-charge the session
+        budget, and a blocking failure would need an illegal
+        COMMITTING→DEFERRED move (#115).
+
+        Re-drive contract: safe to call again after a host death anywhere
+        inside it. ``finalize_commit`` is content-idempotent across both crash
+        states — pre-squash (skill commit chain above baseline) squashes
+        normally; post-squash (squashed commit at HEAD, clean tree)
+        re-squashes to an equivalent-content commit, orphaning the pre-crash
+        squash (harmless; "equivalent" rather than "identical" because a park
+        record regenerated across midnight carries a new ``parked_at``).
+        ``commit_sha`` is stamped only here and is write-only (never routing),
+        so the empty persisted value is harmless."""
         message = self._commit_message(task)
         # pre_commit: a plugin may rewrite the commit message or escalate (pause).
         # A defer/skip veto would have to unwind a COMMITTING task (no legal move
@@ -1674,7 +2271,20 @@ class Engine:
                 self._escalate(task, f"plugin {veto.plugin_id!r} vetoed pre_commit: {veto.reason}")
             if ctx.proposed_commit_message:
                 message = ctx.proposed_commit_message
+        # The success boundary for story-declared ledger closure (#234): every
+        # verify gate, checkpoint, review cycle and pre-commit workflow is behind
+        # us, and finalize_commit's `git add -A` is still ahead, so an in-repo
+        # annotation rides this story's own commit. `snapshot` is armed inside
+        # the close, before its write, so both failure arms below hold the
+        # pre-close text no matter where in the window a raise lands.
+        snapshot: list[tuple[Path, str]] = []
+        park_record: tuple[Path, str | None] | None = None
         try:
+            self._close_declared_deferred(task, snapshot)
+            # A parked story's record rides this same commit (#356): written into
+            # the workspace ahead of the `git add -A`, it reaches every clone the
+            # story's commit does — including through the worktree merge-back.
+            park_record = self._write_park_record(task)
             # bmad-dev-auto commits its own work each iteration; the orchestrator
             # squashes that chain plus its uncommitted bookkeeping back onto the
             # pre-dev baseline as one commit carrying `message`. None means there
@@ -1682,22 +2292,153 @@ class Engine:
             sha = verify.finalize_commit(self.workspace.root, task.baseline_commit, message)
             task.commit_sha = sha or task.baseline_commit
             # the corrected spec is now durable in HEAD; later attempts need no
-            # special preservation, so drop the re-drive latch.
+            # special preservation, so drop the re-drive latch. The restored diff
+            # is likewise committed, so clear its latch too — a subsequent re-arm
+            # (if any) decides afresh whether to restore again.
             task.resolved_redrive = False
+            task.restore_patch = None
         except verify.GitError as e:
+            self._restore_deferred_closes(task, snapshot)
+            self._restore_park_record(park_record)
             self._escalate(task, f"commit failed: {e}")
-        advance(task, Phase.DONE)
-        self.journal.append("story-done", story_key=task.story_key, commit=task.commit_sha)
+        except BaseException:
+            # A failed commit is not the only way out of this window: the signal
+            # handler `_run` installed raises RunStopped from wherever the main
+            # thread is standing, and an OSError raised outside `_run_git` (an
+            # FS fault; the spawn class arrives as GitSpawnError since #343 and
+            # takes the arm above) passes through as itself. Either leaves the
+            # ledger flipped — and the park record written — for a commit that
+            # does not exist. Restore, then re-raise untouched.
+            self._restore_deferred_closes(task, snapshot)
+            self._restore_park_record(park_record)
+            raise
+        # Final-phase rule: AWAITING_OPERATOR iff the task carries actions,
+        # otherwise DONE. Derived from PERSISTED task state, never from a local
+        # flag, so the crash-resume arm that re-enters this method reaches the
+        # same verdict the pre-crash run would have — the park latch is the only
+        # thing that has to survive, and it does.
+        if task.operator_actions:
+            advance(task, Phase.AWAITING_OPERATOR)
+            # The durable record of what a human owes: the actions themselves,
+            # not just a count, because the journal and the spec frontmatter are
+            # what survive the run.
+            self.journal.append(
+                "story-awaiting-operator",
+                story_key=task.story_key,
+                commit=task.commit_sha,
+                actions=list(task.operator_actions),
+            )
+            self._notify_park(task)
+        else:
+            advance(task, Phase.DONE)
+            self.journal.append("story-done", story_key=task.story_key, commit=task.commit_sha)
         self._emit("post_commit", task)
         self._save()
-        weighted = task.tokens.weighted_total(self.policy.limits.cache_read_weight)
-        if weighted > self.policy.limits.max_tokens_per_story:
-            self.journal.append(
-                "token-budget-exceeded",
-                story_key=task.story_key,
-                weighted=weighted,
-                total=task.tokens.total,
+
+    def _park_spec_relpath(self, task: StoryTask) -> str:
+        """The parked story's spec as a path relative to the WORKSPACE root, so
+        it re-roots onto the project when read back.
+
+        Under worktree isolation `task.spec_file` has been rewritten to an
+        absolute path inside the unit worktree, and that worktree is torn down
+        moments later — indexing it verbatim would record a path that is dead
+        before the human ever reads it. Relative-to-workspace is the same string
+        in both isolation modes, and `verify.resolve_spec_path` resolves it
+        against the project. A spec that somehow lies outside the workspace is
+        recorded as-is rather than dropped: a wrong path a human can see beats a
+        missing one they cannot.
+
+        `RuntimeError` joins the guard because `Path.resolve` reports a symlink
+        loop that way below 3.13 — the same non-OSError `_ledger_in_repo` already
+        catches, and `requires-python` is 3.11. Catching it HERE rather than only
+        around the call is what keeps the fallback: the park record is still
+        written, with `spec_file` recorded verbatim, and per #356 the record is
+        load-bearing (a story key does not yield a spec path)."""
+        spec_file = task.spec_file or ""
+        if not spec_file:
+            return ""
+        try:
+            return Path(spec_file).resolve().relative_to(self.workspace.root.resolve()).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return spec_file
+
+    def _write_park_record(self, task: StoryTask) -> tuple[Path, str | None] | None:
+        """Write the parked story's committed record — the store `bmad-loop
+        confirm` reads (#356) — returning ``(path, prior_text)`` for the restore
+        arm, or None when nothing was written (not a park, or the write failed).
+
+        Runs inside the commit window, into the WORKSPACE (the unit worktree
+        under isolation, like the sprint-status mirror and the deferred-close
+        annotations), so `finalize_commit`'s `git add -A` folds it into the
+        story's own commit and the merge-back carries it to the target. Rooted
+        at `self.workspace.paths.project`, NOT `self.paths.project`: the main
+        root is the wrong tree here — a record written there would sit
+        untracked beside the commit instead of inside it.
+
+        Best-effort by design, and the only write on this path that is. The
+        park itself is defined by the spec frontmatter and the board token;
+        raising here would abort a story that genuinely succeeded over its
+        bookkeeping, so an unwritable record degrades to a journal line — and
+        `validate` reports the board-parked-but-recordless drift. The kind
+        stays `operator-index-failed` so nothing greping journals re-learns a
+        name. `RuntimeError` stays in the guard for `_park_spec_relpath`'s
+        reason (symlink-loop `resolve` below 3.13) and as insurance: the cost
+        of degrading a non-OSError here is a missing record, the cost of NOT
+        catching it is an aborted commit for a finished story."""
+        if not task.operator_actions:
+            return None
+        path = operatoractions.record_path(self.workspace.paths.project, task.story_key)
+        try:
+            prior = path.read_text(encoding="utf-8") if path.is_file() else None
+            operatoractions.record_park(
+                self.workspace.paths.project,
+                task.story_key,
+                actions=list(task.operator_actions),
+                spec_file=self._park_spec_relpath(task),
+                run_id=self.state.run_id,
+                parked_at=self._today(),
             )
+        except (OSError, RuntimeError) as e:
+            self.journal.append("operator-index-failed", story_key=task.story_key, error=str(e))
+            return None
+        return (path, prior)
+
+    def _restore_park_record(self, record: tuple[Path, str | None] | None) -> None:
+        """Put the park record back the way `_write_park_record` found it, for
+        the failure arms of the commit window: a `GitError` escalation or a
+        pass-through raise must not leave a record — untracked, in a tree the
+        next story's `git add -A` would sweep — for a commit that does not
+        exist. Best-effort like `_restore_deferred_closes`: the restore runs
+        under an exception already in flight and must never replace it."""
+        if record is None:
+            return
+        path, prior = record
+        with contextlib.suppress(OSError):
+            if prior is None:
+                path.unlink(missing_ok=True)
+                parent = path.parent
+                if parent.is_dir() and not any(parent.iterdir()):
+                    parent.rmdir()
+            else:
+                path.write_text(prior, encoding="utf-8")
+
+    def _notify_park(self, task: StoryTask) -> None:
+        """Tell the human a story is waiting on them, and exactly what for.
+
+        Notify-only: a park is non-blocking by design, so unlike an escalation it
+        must not read as "the run stopped for you". The run has already moved on.
+        The actions are enumerated in the body rather than counted because this
+        notification is the one artifact that reaches someone who is not looking
+        at the repo."""
+        actions = "\n".join(f"  {i}. {a}" for i, a in enumerate(task.operator_actions, 1))
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"story awaiting operator: {task.story_key}",
+            f"committed, but {len(task.operator_actions)} action(s) are owed outside the repo:\n"
+            f"{actions}\n"
+            f"run `bmad-loop confirm {task.story_key}` once they are done.",
+        )
 
     # ----------------------------------------------------- override seams
     # SweepEngine reuses the dev/review pipeline for deferred-work bundles by
@@ -1710,6 +2451,52 @@ class Engine:
         a future alternative dev skill can re-introduce the legacy branch."""
         return self.policy.dev.skill == "bmad-dev-auto"
 
+    def _dev_skill(self, role: str = "dev") -> str:
+        """The dev-primitive skill NAME to spell in ``role``'s session prompt.
+
+        Upstream renamed the primitive ``bmad-dev-auto`` → ``bmad-build-auto``
+        (BMAD-METHOD #2651), so the invoked name is resolved from what is
+        actually on disk rather than hardcoded: a target project can be on
+        either era. This is NOT ``policy.dev.skill`` — that stays the adapter
+        discriminator ``_generic_dev`` reads; only the spelled name moves.
+
+        Resolution is per skill tree because one run can mix them (dev=claude →
+        ``.claude/skills``, review=codex → ``.agents/skills``), and memoized
+        because every prompt build would otherwise re-stat the tree. An adapter
+        with no ``profile`` (test fakes) yields tree None, which
+        ``dev_primitive_or_default`` maps to the legacy name.
+
+        Resolved against the WORKSPACE, never the main checkout: the session runs
+        with ``cwd=self.workspace.root``, so the tree deciding whether the spelled
+        name is a command at all is the worktree's. The two agree on a freshly
+        provisioned unit — ``provision_worktree`` copies the primitive in from the
+        main repo — but NOT on resume: ``reopen_unit`` re-mounts an existing
+        worktree without re-provisioning it, so a main checkout upgraded across the
+        pause would resolve the new name into a worktree carrying only the legacy
+        one, and the session HALTs on an unknown command having written nothing.
+        The cache is keyed on the workspace root for the same reason: one Engine
+        drives every unit of a run, so a resumed unit's worktree must not answer
+        for the fresh worktrees mounted after it."""
+        adapter = self.adapters.get(role)
+        tree = getattr(getattr(adapter, "profile", None), "skill_tree", None)
+        project = self.workspace.paths.project
+        if (project, tree) not in self._dev_skill_cache:
+            self._dev_skill_cache[project, tree] = dev_primitive_or_default(project, tree)
+        return self._dev_skill_cache[project, tree]
+
+    def _operator_park_enabled(self) -> bool:
+        """Whether a dev session may park a story at ``awaiting-operator`` (#335).
+
+        Sprint mode only. Stories mode has no sprint board, so the pair the
+        verify gates hold a park to does not exist there
+        (``verify_review_stories`` still demands ``done``); sweep bundles carry
+        no board entry either, and a deferred-work bundle owing a human action is
+        a different question from a story owing one. Both subclasses override
+        this to False rather than inheriting a path their verify tail cannot
+        gate — support for either is a follow-up, not an accident of where the
+        branch happens to sit."""
+        return self.policy.operator.enabled
+
     def _dev_review_enabled(self) -> bool:
         """Spec-status/sprint semantics for verify_dev and the sprint sync. The
         generic skill always self-finalizes to ``done`` (no in-review handoff), so
@@ -1720,13 +2507,82 @@ class Engine:
             return False
         return self.policy.review.enabled
 
+    # the date stamped into ledger edits; isolated for tests
+    def _today(self) -> str:
+        return time.strftime("%Y-%m-%d")
+
+    def _observed_frontmatter(self, spec_path: Path, story_key: str, site: str) -> dict | None:
+        """Read a spec's frontmatter on a *bookkeeping* path, degrading an
+        unreadable spec to ``None`` (journaled) instead of a whole-run crash.
+
+        These reads observe what the dev skill left behind so the orchestrator can
+        sync the sprint board / ledger. They race the skill's own writes, so an
+        OSError is a designed transient, not a broken orchestrator. Returning None
+        tells the caller to skip its bookkeeping pass entirely: skipping is safe
+        because everything a skipped pass would have derived is re-supplied later —
+        the spec *status* by the deterministic verify gate's own re-read (which
+        turns a still-unrepaired spec into a retry), and the review-routing flag by
+        ``_followup_from_spec`` at the point ``_dev_phase`` consumes it. Silent it
+        is not — every skip lands a ``spec-read-failed`` event in the journal.
+
+        Repair writes (``reset_spec_status``, ``mark_done``) deliberately do the
+        opposite and let OSError raise: silently skipping a rewrite would leave the
+        spec in a state the caller believes it fixed. Observation degrades, repair
+        raises."""
+        try:
+            return verify.read_frontmatter(spec_path)
+        except OSError as e:
+            self._journal_spec_read_failed(spec_path, story_key, site, e)
+            return None
+
+    def _journal_spec_read_failed(
+        self, spec_path: Path, story_key: str, site: str, e: OSError
+    ) -> None:
+        self.journal.append(
+            "spec-read-failed",
+            story_key=story_key,
+            spec=str(spec_path),
+            site=site,
+            error=f"{e.__class__.__name__}: {e}",
+        )
+
+    def _followup_from_spec(self, task: StoryTask, rj: dict) -> bool:
+        """Review-routing fallback for a result that carries no
+        ``followup_review_recommended`` key: re-derive it from the finalized spec
+        frontmatter — the source ``devcontract.synthesize_result`` and the
+        reconcile folds read it from, so a readable spec can never disagree.
+
+        The key is absent exactly when the result is a *resumed* pre-reconcile
+        snapshot (``synthesize_result`` only writes it on a ``done`` synth, and the
+        durable record is persisted before reconcile mutates the live dict). The
+        reconcile re-fold normally restores it on replay, but a spec read fault
+        skips that fold — and the verify gate only re-supplies *status*, not this
+        flag — so without this fallback a recommended follow-up review would be
+        silently skipped. Gates on the frontmatter's own status (mirroring the
+        fold): a faulted replay leaves ``rj["status"]`` at the stale snapshot
+        value, so the result status must not decide. Degrades to False on a read
+        fault (journaled) — the pre-existing absent-key default.
+        """
+        if not self._generic_dev():
+            return False
+        spec_file = rj.get("spec_file")
+        if not spec_file:
+            return False
+        spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
+        if not spec_path.is_file():
+            return False
+        fm = self._observed_frontmatter(spec_path, task.story_key, "followup-routing")
+        if fm is None:
+            return False
+        return verify.status_of(fm) == "done" and bool(fm.get("followup_review_recommended", False))
+
     def _reconcile_generic_terminal_status(self, task: StoryTask, result_json: dict | None) -> None:
         """Repair a generic-skill spec the session finalized in prose but not in
         frontmatter. ``bmad-dev-auto`` sometimes appends a terminal
         ``## Auto Run Result`` (``Status: done``) yet leaves the frontmatter
         ``status`` at the template default. The orchestrator reads ONLY
-        frontmatter, so without this the sprint/ledger sync no-ops and the verify
-        gate falsely defers completed, tested work.
+        frontmatter, so without this the sprint sync and accepted bundle close
+        no-op and the verify gate falsely defers completed, tested work.
 
         When (and only when) the prose terminal Status is ``done`` AND the
         frontmatter sits at a reconcilable non-terminal status, advance the
@@ -1737,8 +2593,9 @@ class Engine:
         an already-``done`` or unknown frontmatter status. Idempotent and
         never-regress: every deterministic verify gate still runs afterward against
         real on-disk/git state, so this repairs bookkeeping only — it cannot pass
-        uncompleted work. Runs ahead of ``_post_dev_state_sync`` so both the story
-        (sprint) and bundle (ledger) sync, then verify, read the reconciled spec."""
+        uncompleted work. Runs ahead of ``_post_dev_state_sync`` and the later
+        ``_post_dev_accepted_sync`` so the story board, bundle ledger, and verify
+        all read the reconciled spec."""
         if not self._generic_dev():
             return
         spec_file = (result_json or {}).get("spec_file")
@@ -1756,14 +2613,30 @@ class Engine:
                 spec=str(spec_path),
             )
             return
+        fm = self._observed_frontmatter(spec_path, task.story_key, "reconcile")
+        if fm is None:
+            return
+        self._reconcile_generic_terminal_frontmatter(task, result_json, spec_path, fm)
+
+    def _reconcile_generic_terminal_frontmatter(
+        self,
+        task: StoryTask,
+        result_json: dict | None,
+        spec_path: Path,
+        fm: dict,
+    ) -> str:
+        """Apply generic terminal reconciliation from an already-read mapping.
+
+        The bookkeeping path supplies an observed mapping; required deferral
+        harvesting supplies a strict one. Sharing the decision/write step lets a
+        recovered harvest read finish a reconciliation whose earlier observation
+        faulted, without trusting result JSON or launching a replacement session
+        over the first session's findings. Returns the effective status.
+        """
         success_status = "in-review" if self._dev_review_enabled() else "done"
-        # A YAML-null status (bare `status:` / `status: null`) reads as the string
-        # "none" through verify.status_of (str(None)), which would dodge the
-        # RECONCILABLE_FROM allowlist; normalize it (and a missing key) to "" so the
-        # blank-status case reconciles. A literal `status: none` stays "none".
-        fm = verify.read_frontmatter(spec_path)
-        raw_status = fm.get("status")
-        fm_status = "" if raw_status is None else str(raw_status).strip().lower()
+        # A blank `status:` reads "" here (status_of normalizes YAML-null), so the
+        # blank-status template shape reconciles like a missing key does.
+        fm_status = verify.status_of(fm)
         if fm_status == success_status:
             # Already finalized — idempotent for the spec. But a *resumed* result
             # is the pre-reconcile snapshot persisted before the original run's
@@ -1783,21 +2656,32 @@ class Engine:
                     result_json["followup_review_recommended"] = bool(
                         fm.get("followup_review_recommended")
                     )
-            return
+            return success_status
         if fm_status not in devcontract.RECONCILABLE_FROM:
-            return  # blocked / unknown custom status: never override a deliberate one
-        arr = devcontract.parse_auto_run_result(spec_path.read_text(encoding="utf-8"))
+            return fm_status  # blocked / unknown custom status: never override a deliberate one
+        try:
+            text = spec_path.read_text(encoding="utf-8")
+        except OSError as e:
+            self._journal_spec_read_failed(spec_path, task.story_key, "reconcile-prose", e)
+            return fm_status
+        arr = devcontract.parse_auto_run_result(text)
         if not arr.present or arr.status != devcontract.DONE:
-            return  # no terminal prose, or a blocked outcome: leave for the escalation path
+            return fm_status  # no terminal prose, or blocked: leave for escalation
+        # Repair-write doctrine: the False arm is "nothing to change" only. A status
+        # the reader can see but no line edit can move raises instead, and that raise
+        # is deliberately left uncaught (see _reset_spec_for_repair).
         if not devcontract.reset_spec_status(spec_path, success_status):
-            return
+            return fm_status
         # Keep the in-place result_json the rest of _dev_phase reads consistent with
         # the now-reconciled spec (the followup flag is only carried on a done exit).
+        # `reset_spec_status` rewrites only the status line, so `fm` (read above)
+        # still holds every other key — a re-read here could only return the same
+        # followup flag, at the cost of a second racy read that can now fail.
         if isinstance(result_json, dict):
             result_json["status"] = success_status
             if success_status == "done":
                 result_json["followup_review_recommended"] = bool(
-                    verify.read_frontmatter(spec_path).get("followup_review_recommended", False)
+                    fm.get("followup_review_recommended", False)
                 )
         self.journal.append(
             "spec-status-reconciled",
@@ -1806,6 +2690,100 @@ class Engine:
             frm=fm_status,
             to=success_status,
         )
+        return success_status
+
+    def _repair_spec_marker(self, task: StoryTask, rj: dict) -> None:
+        """Append the ``## Auto Run Result`` marker a missing-marker synthesis
+        (#224) proved the session owed but never wrote — #276 Mechanism 3, the
+        artifact-repair leg. Called at the ``session-synthesized-from-frontmatter``
+        journal site, which fires for live-Stop, crash-path, and post-kill
+        dead-window synthesis alike (all carry the ``synthesized_from_frontmatter``
+        flag), so this ONE call site covers every synthesis path. After the append
+        the spec leaves `find_frontmatter_candidates`' territory (zero real
+        markers) and enters `find_result_artifact`'s (>= 1), so a later re-read is
+        harvested on the normal marker path and the next review launch strips it
+        exactly like a skill-written marker.
+
+        Best-effort by doctrine: the result was already synthesized, so a failed
+        or skipped repair only leaves the spec non-compliant — it never loses work.
+        Guards mirror `_reconcile_generic_terminal_status`, the sibling
+        session-path spec writer: the generic path only; the session-supplied
+        ``spec_file`` must resolve to a real file inside the orchestrator-owned
+        roots (else `spec-marker-repair-skipped`, reason ``out-of-tree`` — this is
+        a write keyed off a session-reported path); and a FRESH frontmatter re-read
+        must be terminal (``done``/``blocked``) AND agree with the synthesized
+        ``rj["status"]`` (else reason ``fm-mismatch``). Never author a marker whose
+        ``Status:`` disagrees with the frontmatter the synthesis trusted — that
+        would trip `synthesize_result`'s consistency cross-check on the next read.
+
+        Non-interference: `_reconcile_generic_terminal_status` only acts when the
+        frontmatter LAGS the prose, so once this append lands (frontmatter already
+        terminal) reconcile hits its idempotent / refusal branches;
+        `_salvage_review_timeout` reads the frontmatter fresh and stays disjoint.
+        The append is engine-side ONLY — an adapter-side write would perturb the
+        adapter's own mtime/hash observation state (#276 M1/M2)."""
+        if not self._generic_dev():
+            return
+        spec_file = (rj or {}).get("spec_file")
+        if not spec_file:
+            return
+        spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
+        if not spec_path.is_file():
+            return
+        if not verify.spec_within_roots(spec_path, self.workspace.paths):
+            self.journal.append(
+                "spec-marker-repair-skipped",
+                story_key=task.story_key,
+                spec=str(spec_path),
+                reason="out-of-tree",
+            )
+            return
+        fm = self._observed_frontmatter(spec_path, task.story_key, "marker-repair")
+        if fm is None:
+            return
+        fm_status = verify.status_of(fm)
+        rj_status = str(rj.get("status", "")).strip().lower()
+        # Same terminal set `devcontract.is_frontmatter_candidate` scans for: that
+        # scan is what FINDS a marker-less finalized spec, and this repair is what
+        # brings it back into contract. A status accepted by one and refused by
+        # the other would leave a park harvested but permanently un-markered.
+        terminal = (devcontract.DONE, devcontract.BLOCKED, devcontract.AWAITING_OPERATOR)
+        if fm_status not in terminal or fm_status != rj_status:
+            self.journal.append(
+                "spec-marker-repair-skipped",
+                story_key=task.story_key,
+                spec=str(spec_path),
+                reason="fm-mismatch",
+            )
+            return
+        detail = (
+            f"Synthesized by the bmad-loop orchestrator from frontmatter status "
+            f"`{fm_status}` for story `{task.story_key}` (session finalized the spec "
+            f"without appending its marker)."
+        )
+        try:
+            repaired = devcontract.append_auto_run_result(spec_path, fm_status, detail=detail)
+        except (OSError, UnicodeDecodeError) as e:
+            # UnicodeDecodeError as well as OSError: the writer reads the spec's raw
+            # bytes and, by contract, raises on an undecodable spec (the same
+            # torn-mid-write hazard `_post_kill_reconcile` guards — a spec truncated
+            # through a multi-byte UTF-8 sequence between `_observed_frontmatter`'s
+            # read and this one). This repair is pure best-effort forensics; it must
+            # never turn a synthesized-and-recorded result into a run crash.
+            self.journal.append(
+                "spec-marker-repair-failed",
+                story_key=task.story_key,
+                spec=str(spec_path),
+                error=f"{e.__class__.__name__}: {e}",
+            )
+            return
+        if repaired:
+            self.journal.append(
+                "spec-marker-repaired",
+                story_key=task.story_key,
+                spec=str(spec_path),
+                status=fm_status,
+            )
 
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
         """Single-writer for the on-disk bookkeeping the generic skill never touches.
@@ -1816,9 +2794,12 @@ class Engine:
         before ``verify_dev`` checks the sprint stage. Mirrors ``verify_dev``:
         advance the story to the sprint stage matching the spec status the skill
         actually reached, so a failed or blocked session (spec not at the success
-        status) never advances the sprint. No-op for the legacy path; SweepEngine
-        overrides this to flip the deferred-work ledger instead (bundles carry no
-        sprint-status entry)."""
+        status) never advances the sprint. No-op for the legacy path.
+
+        This runs above the artifact gate because ``verify_dev`` reads the board it
+        writes. That ordering does not generalize to bookkeeping a gate does not
+        consume: ``SweepEngine`` makes this a no-op and closes bundle ledger entries
+        from ``_post_dev_accepted_sync`` instead."""
         if not self._generic_dev():
             return
         spec_file = (result_json or {}).get("spec_file")
@@ -1829,19 +2810,814 @@ class Engine:
             return
         review_enabled = self._dev_review_enabled()  # always False for the generic path
         success_status = "in-review" if review_enabled else "done"
-        status = verify.status_of(verify.read_frontmatter(spec_path))
+        fm = self._observed_frontmatter(spec_path, task.story_key, "post-dev-sync")
+        if fm is None:
+            return
+        status = verify.status_of(fm)
+        # A park is the other terminal a session can reach, so it gets the same
+        # mirror: the board moves to `awaiting-operator`, which sits immediately
+        # below `done` in STATUS_ORDER and is therefore an ordinary FORWARD
+        # advance through the sole writer — no exception to never-regress, and
+        # `bmad-loop confirm` later advances the same board the same way. Mirrored
+        # on the STATUS alone, before the actions are validated: verify_dev owns
+        # the "declared nothing" retry, and its feedback reads far better against
+        # a board that already agrees with the spec than against one two stages
+        # behind it.
+        if self._operator_park_enabled() and status == verify.AWAITING_OPERATOR:
+            sprint_advance(
+                self.workspace.paths.sprint_status, task.story_key, verify.AWAITING_OPERATOR
+            )
+            return
         if status != success_status:
             return
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
 
+    def _post_dev_accepted_sync(self, task: StoryTask, result_json: dict | None) -> None:
+        """Write bookkeeping that is valid only after a dev attempt is accepted.
+
+        This is the accepted-only counterpart to ``_post_dev_state_sync``. It is
+        called only after ``decide_dev`` returns PROCEED, not merely when
+        ``outcome.ok`` is true: CRITICAL escalations preempt a passing outcome, and
+        a failing verify command can replace the artifact outcome before the
+        decision. The base path has nothing to write; ``SweepEngine`` closes bundle
+        ledger entries here so a rejected attempt cannot leave resolved work hidden
+        from later sweeps.
+
+        Do not combine this seam with ``_close_declared_deferred``. That regular-
+        story mechanism already runs at the commit boundary and its caller takes a
+        snapshot and restores it on commit failure, so it already has the acceptance
+        property this seam supplies for sweep bundles through a different, correct
+        transaction boundary.
+        """
+        return
+
+    def _finish_post_dev_accepted_sync(
+        self, task: StoryTask, result_json: dict | None = None
+    ) -> None:
+        """Finish and durably acknowledge accepted-only bookkeeping.
+
+        ``accepted_dev_session_index`` is persisted only for a PROCEED decision. A
+        crash before or during the mode-owned write therefore replays this
+        transaction without mistaking an arbitrary DEV_VERIFY park for an accepted
+        attempt. The append-only record index prevents a reused attempt number from
+        authorizing a later re-arm. Mode writes must be idempotent; the sweep close
+        uses a stable run/task operation identity for exactly this replay.
+        """
+        if not self._accepted_dev_session_matches(task):
+            return
+        if result_json is None and task.spec_file:
+            result_json = {"spec_file": task.spec_file}
+        self._post_dev_accepted_sync(task, result_json)
+        # The attempt is accepted; no later path may restore its snapshot.
+        self._disarm_ledger_snapshot(task)
+        self._save()
+
+    def _harvest_spec_path(self, task: StoryTask, result_json: dict | None) -> Path | None:
+        """Resolve the spec whose frontmatter this mode may harvest."""
+        spec_file = (result_json or {}).get("spec_file")
+        if not spec_file:
+            return None
+        return verify.resolve_spec_path(str(spec_file), self.workspace.paths)
+
+    def _harvest_spec_deferrals(
+        self, task: StoryTask, result_json: dict | None
+    ) -> VerifyOutcome | None:
+        """Carry a successful dev primitive's ``deferred:`` findings into the ledger.
+
+        BMAD-METHOD #2640 moved defer-triaged review findings from
+        ``deferred-work.md`` into the spec frontmatter. The orchestrator owns the
+        follow-up policy, so without this bridge the recorded findings are
+        invisible to every sweep reader downstream.
+
+        This is era-agnostic: the gates are the generic-dev seam and the field's
+        presence, never the skill name resolved on disk. A pre-#2640 spec simply
+        takes the no-op path. The spec must also be at the current dev success
+        status, matching the append-on-success behavior of the former writer.
+
+        Replays are idempotent even after an entry is closed. ``append_entry``
+        intentionally dedupes open entries only, so the pre-scan checks the
+        fingerprinted ``origin:`` plus ``source_spec:`` across entries of every
+        status. The spec frontmatter is never mutated; the ledger watermark is
+        sufficient and avoids unsafe YAML block-scalar surgery.
+
+        Reading the finding source is part of this required repair. A transiently
+        missing or unreadable source returns a retry outcome rather than degrading
+        like optional bookkeeping observation: a later verify read must not accept
+        the session while silently dropping its recorded work. Ledger writes remain
+        unguarded so a failed repair write raises.
+        """
+        if not self._generic_dev():
+            return
+        spec_path = self._harvest_spec_path(task, result_json)
+        if spec_path is None:
+            return
+        # A session supplies `spec_file`; a mode may replace its untrusted value
+        # with a deterministic artifact path. Like reconcile, marker repair, and
+        # declared closes, harvesting must not let any readable path outside the
+        # orchestrator-owned roots steer a ledger write.
+        try:
+            within = verify.spec_within_roots(spec_path, self.workspace.paths)
+        except (OSError, RuntimeError):
+            # resolve() faulted (a symlink loop, an unreadable component):
+            # containment can vouch for nothing, so refuse the same way.
+            within = False
+        if not within:
+            self.journal.append(
+                "spec-deferrals-skipped-out-of-tree",
+                story_key=task.story_key,
+                spec=str(spec_path),
+            )
+            return
+        try:
+            is_file = spec_path.is_file()
+        except OSError as e:
+            self._journal_spec_read_failed(spec_path, task.story_key, "spec-deferrals", e)
+            return VerifyOutcome.retry(
+                "spec unreadable while harvesting deferrals "
+                f"({e.__class__.__name__}: {e}): {spec_path}"
+            )
+        if not is_file:
+            return VerifyOutcome.retry(f"spec missing while harvesting deferrals: {spec_path}")
+        try:
+            fm = verify.read_frontmatter(spec_path)
+        except OSError as e:
+            self._journal_spec_read_failed(spec_path, task.story_key, "spec-deferrals", e)
+            return VerifyOutcome.retry(
+                "spec unreadable while harvesting deferrals "
+                f"({e.__class__.__name__}: {e}): {spec_path}"
+            )
+        # The shared observation reader deliberately collapses a second missing-
+        # file probe, invalid UTF-8, malformed YAML, and a non-mapping document to
+        # `{}`. That is safe for status observation, whose verifier re-reads and
+        # retries, but not for this required repair input: a later clean verifier
+        # read could otherwise accept the session after the harvest silently
+        # skipped every recorded finding. A successful spec always has at least a
+        # status mapping, so this does not reject the valid pre-`deferred:` era.
+        if not fm:
+            self.journal.append(
+                "spec-read-failed",
+                story_key=task.story_key,
+                spec=str(spec_path),
+                site="spec-deferrals",
+                error="empty or invalid frontmatter",
+            )
+            return VerifyOutcome.retry(
+                "spec unreadable while harvesting deferrals "
+                f"(empty or invalid frontmatter): {spec_path}"
+            )
+        if devcontract.DEFERRED_FIELD not in fm:
+            return
+        status = verify.status_of(fm)
+        success_status = "in-review" if self._dev_review_enabled() else "done"
+        parked = self._operator_park_enabled() and status == verify.AWAITING_OPERATOR
+        if status != success_status and not parked:
+            # Stories mode's explicit plan checkpoint is a verified terminal for
+            # that leg, not a half-finalized implementation. Its deferred notes
+            # remain in the spec until the post-checkpoint implementation pass.
+            if (
+                status == devcontract.PLAN_HALT_STATUS
+                and (result_json or {}).get("plan_halt") is True
+            ):
+                return
+            if status not in devcontract.RECONCILABLE_FROM:
+                return
+            # Reconcile's preceding bookkeeping observation may have faulted even
+            # though this required read recovered. Reuse the strict mapping to
+            # finish the same session's terminal-prose repair before any later
+            # session can replace its `deferred:` list.
+            status = self._reconcile_generic_terminal_frontmatter(task, result_json, spec_path, fm)
+            parked = self._operator_park_enabled() and status == verify.AWAITING_OPERATOR
+            if status != success_status and not parked:
+                shown_status = status or "<blank>"
+                return VerifyOutcome.retry(
+                    "spec remained at reconcilable nonterminal status "
+                    f"{shown_status!r} while harvesting deferrals: {spec_path}"
+                )
+        findings, malformed = devcontract.parse_deferred_findings(fm)
+        if not findings and not malformed:
+            return
+
+        spec_name = spec_path.name
+        # (origin, title, reason, location, severity), one row per entry this
+        # harvest may file. The malformed loss is aggregated per spec so a bad
+        # sibling never suppresses a valid finding and never disappears silently.
+        pending: list[tuple[str, str, str, str | None, str | None]] = [
+            (
+                f"{HARVEST_ORIGIN} {finding.fingerprint}",
+                finding.summary,
+                finding.evidence or finding.summary,
+                finding.location or None,
+                finding.severity or None,
+            )
+            for finding in findings
+        ]
+        if malformed:
+            self.journal.append(
+                "spec-deferrals-malformed",
+                story_key=task.story_key,
+                spec=spec_name,
+                items=malformed,
+            )
+            pending.append(
+                (
+                    f"{HARVEST_ORIGIN}-malformed "
+                    f"{devcontract.harvest_fingerprint(spec_name, *malformed)}",
+                    f"Unreadable `deferred:` items in {spec_name}",
+                    "The dev session recorded deferred findings the orchestrator could not "
+                    "parse, so they were NOT filed as entries: "
+                    + "; ".join(malformed)
+                    + f". Read `{spec_name}`'s frontmatter and re-file them by hand.",
+                    None,
+                    "low",
+                )
+            )
+
+        # Persist the full intended set, not only newly-filed rows. A replay can
+        # dedupe every append while a later isolation carry still needs the data.
+        # Keep a stable union across a retained retry/review chain: a later pass
+        # may replace the frontmatter list, but every earlier accepted finding is
+        # still present in an ignored unit ledger and must survive final carry.
+        current_records = [
+            {
+                "origin": origin,
+                "title": title,
+                "reason": reason,
+                "location": location,
+                "severity": severity,
+                "source_spec": spec_name,
+            }
+            for origin, title, reason, location, severity in pending
+        ]
+        known = {
+            (str(item.get("origin", "")), str(item.get("source_spec", "")))
+            for item in task.harvested_deferrals
+        }
+        records_changed = False
+        for record in current_records:
+            key = (str(record["origin"]), str(record["source_spec"]))
+            if key not in known:
+                task.harvested_deferrals.append(record)
+                known.add(key)
+                records_changed = True
+        if records_changed:
+            # The isolation carry reads only persisted records after a hard
+            # loss. Checkpoint every stable-union expansion before a ledger
+            # append, including later passes where harvest_wrote_ledger is
+            # already latched and its separate pre-write save will be skipped.
+            self._save()
+
+        ledger = self.workspace.paths.deferred_work
+        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        seen = deferredwork.parse_ledger(text)
+        filed: list[str] = []
+        deduped = 0
+        for origin, title, reason, location, severity in pending:
+            if any(
+                deferredwork.field_line_present(entry.body, "origin", origin)
+                and deferredwork.field_line_present(entry.body, "source_spec", spec_name)
+                for entry in seen
+            ):
+                deduped += 1
+                continue
+            # Persist the provenance before the write. A hard host loss after
+            # append but before the later dev-decision save leaves the ledger on
+            # disk; replay then dedupes and cannot reconstruct authorship from a
+            # newly-filed id. Pre-latching is conservative if the append itself
+            # fails: excluding an unchanged path cannot create proof of work.
+            if not task.harvest_wrote_ledger:
+                task.harvest_wrote_ledger = True
+                self._save()
+            dw_id = deferredwork.append_entry(
+                ledger,
+                title=title,
+                origin=origin,
+                location=location or "n/a",
+                source_spec=spec_name,
+                reason=reason,
+                severity=severity,
+            )
+            # The writer's open-entry guard can catch two frontmatter items with
+            # the same clamped fingerprint inside this one pre-scan snapshot.
+            if dw_id is None:
+                deduped += 1
+            else:
+                filed.append(dw_id)
+        # The flag is set-only within an attempt and was latched durably before
+        # the first append. A crash replay dedupes to an empty `filed` list while
+        # the dead attempt's engine-authored ledger diff is still on disk, so it
+        # must never be cleared from the return values here.
+        self.journal.append(
+            "spec-deferrals-harvested",
+            story_key=task.story_key,
+            spec=spec_name,
+            dw_ids=filed,
+            deduped=deduped,
+            malformed=len(malformed),
+        )
+
+    def _manifest_closes_deferred(self, task: StoryTask) -> tuple[str, ...]:
+        """Deferred-work ids declared for this story by a *manifest* the
+        orchestrator reads, as opposed to the story spec's own frontmatter.
+
+        Empty here: sprint mode has no manifest, so frontmatter is its only
+        channel. ``StoriesEngine`` overrides this with its ``stories.yaml``
+        entry — the channel that matters for an unattended run, since the spec is
+        generated later by a dev skill that knows nothing of the ledger."""
+        return ()
+
+    def _declared_deferred_ids(self, task: StoryTask) -> tuple[str, ...]:
+        """The ids this story declares it closes, unioned across both channels
+        and order-preserving (a story that names the same id in the manifest and
+        in its spec must be marked once and reported once).
+
+        Both halves are read live here, at the commit boundary: what the spec
+        and the manifest say at the moment of the close is what the story
+        declares — a declaration edited after the dev artifacts verified must
+        not be closed against a stale snapshot, because the stale half of that
+        can close an entry the final spec no longer names.
+
+        Every degraded reading declares nothing, which is the safe direction
+        for an advisory annotation: the entries stay ``open`` — a miss the next
+        sweep or retro re-verifies — rather than closed on evidence nobody
+        could read. An unreadable spec is journaled by
+        ``_observed_frontmatter``; an unparseable one flattens to ``{}`` there
+        like every other status gate; and a session-supplied path outside the
+        orchestrator's roots is refused under the same containment rule the
+        frontmatter-status reconcile applies, so a surprising absolute path can
+        never steer a ledger write."""
+        ids: list[str] = list(self._manifest_closes_deferred(task))
+        spec_path = Path(task.spec_file) if task.spec_file else None
+        if spec_path is not None:
+            try:
+                within = verify.spec_within_roots(spec_path, self.workspace.paths)
+            except (OSError, RuntimeError):
+                # resolve() faulted (a symlink loop, an unreadable component):
+                # containment can vouch for nothing, so refuse the same way.
+                within = False
+            if not within:
+                self.journal.append(
+                    "deferred-close-skipped-out-of-tree",
+                    story_key=task.story_key,
+                    spec=str(spec_path),
+                )
+            else:
+                fm = self._observed_frontmatter(spec_path, task.story_key, "deferred-close")
+                declared, error = deferredwork.parse_declaration((fm or {}).get("closes_deferred"))
+                if error:
+                    self.journal.append(
+                        "deferred-close-malformed",
+                        story_key=task.story_key,
+                        spec=str(spec_path),
+                        error=f"closes_deferred {error}",
+                    )
+                ids += declared
+        return tuple(dict.fromkeys(ids))
+
+    def _close_declared_deferred(
+        self, task: StoryTask, snapshot: list[tuple[Path, str]] | None = None
+    ) -> None:
+        """At the commit boundary, flip every ledger entry the story declares
+        via ``closes_deferred:`` to ``status: done <date>`` + a ``resolution:``
+        note (#234) — the regular-story counterpart of the sweep bundle close
+        at ``SweepEngine._close_bundle_ledger_when_spec_status``.
+
+        Declaration is the only signal: closure is never inferred from a diff.
+
+        **Advisory by contract.** The annotation is traceability for the next
+        sweep or retro, never a gate: no reading of the spec, the manifest or
+        the ledger can fail the story, and every degraded reading leaves the
+        entries ``open`` — the direction a sweep re-verifies and a retro can
+        repair. That contract is the design: closure needs no transactional
+        coupling to git, because the ledger's consumers re-verify entries
+        against the codebase anyway.
+
+        **Placement.** Runs from ``_finalize_commit_phase`` — after artifact
+        verification, the verify commands, every checkpoint, the review loop,
+        the ``pre_commit_gate`` workflows and the ``pre_commit`` veto — and
+        still before ``finalize_commit``, whose ``git add -A`` stages an
+        in-repo annotation into the story's own commit. Marking at dev-sync
+        time instead let a story that later failed verification or review leave
+        the ledger permanently claiming its work resolved.
+
+        **In-repo is not stageable, and under isolation that is the difference
+        between a delivered close and a lost one (#458).** This paragraph used
+        to promise the opposite — "worktree isolation included: the unit's
+        ledger rides the unit commit and reaches the target branch with the
+        ordinary merge" — which holds only for a TRACKED ledger. A gitignored
+        one (the default shape, since the ledger lives under the BMAD artifacts
+        dir) is skipped by that ``git add -A`` in silence, brings nothing over
+        with the merge, and dies with the worktree, while this method has
+        already journaled ``story-deferred-closed``. ``story_closes_intended``
+        + ``_carry_story_deferred_closes`` is the delivery path; ``_ledger_in_repo``
+        below is a containment test and answers a different question.
+
+        A ledger outside the repo (``ProjectPaths.rebased`` deliberately
+        shares an external artifact dir between worktrees) is written at the
+        same moment; the annotation is simply part of no commit, which is
+        journaled (``deferred-close-external-ledger``). A merge that later
+        fails leaves that annotation standing — visible, journaled and
+        human-attended, the accepted advisory trade-off.
+
+        ``snapshot``, when given, receives ``(ledger, pre-close text)`` the
+        statement before the write, so the caller's failure arms can undo the
+        edit no matter where inside the window a raise lands — including a
+        journal append failing after the write published. Cleared again when
+        nothing was flipped: an empty close needs no restore.
+
+        Idempotent, so the COMMITTING resume arm may re-drive the commit phase
+        freely — ids are classified against the ledger text, and an entry
+        already ``done`` is a satisfied declaration, not an unmatched one."""
+        ids = self._declared_deferred_ids(task)
+        # Reset before the early return, never after it. This method is the sole
+        # producer of the record and runs unconditionally at every commit boundary,
+        # and DONE/AWAITING_OPERATOR are reachable only through the caller — so a
+        # re-drive that reaches the carry has always re-entered here first, and this
+        # assignment IS the staleness guard (a `_dev_phase` clear like
+        # `refiled_followups`' would be a second branch saying the same thing, which
+        # no test could redden). The live read is authoritative: a resolve session
+        # that WITHDREW `closes_deferred:` must not have the abandoned attempt's
+        # declaration carried on its behalf.
+        task.story_closes_intended = []
+        if not ids:
+            return
+        ledger = self.workspace.paths.deferred_work
+        try:
+            text = ledger.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            # Nothing at the path — but a dangling link IS something: the link
+            # names a ledger on a mount that is not answering, and blaming a
+            # typo (`unmatched`) would misreport an outage.
+            try:
+                dangling = ledger.is_symlink()
+            except OSError:
+                dangling = True
+            if dangling:
+                self._journal_ledger_unavailable(task, ids, ledger, "dangling symlink")
+                return
+            text = ""  # no ledger: classify reports every id unmatched; nothing is written
+        except (OSError, UnicodeDecodeError) as e:
+            # An unavailable or undecodable location is not an answer about the
+            # entries: close nothing and say so, rather than read an outage as
+            # "no such entries".
+            self._journal_ledger_unavailable(task, ids, ledger, f"{e.__class__.__name__}: {e}")
+            return
+        if snapshot is not None:
+            snapshot.append((ledger, text))
+        # The DECLARED set, never `marked` — the transposed lesson of `e88776a`. A
+        # host loss in this window resumes into `_finalize_commit_phase` again, and
+        # by then the worktree ledger already reads `done`, so `classify` returns
+        # every id as `already_done` and `marked` is EMPTY. A record derived from it
+        # would never be made on that replay, and the carry would find nothing while
+        # `close_unit_workspace` deletes the only copy. Recorded after the snapshot
+        # arm so the degraded read paths above, which write nothing, record nothing.
+        #
+        # No `_save()` here, unlike the follow-up producer: every crash path re-enters
+        # this method, which re-derives the ids from the spec and the manifest. A
+        # persisted record would instead SURVIVE a declaration edited across the
+        # crash, which is the stale snapshot `_declared_deferred_ids` reads live to
+        # avoid.
+        task.story_closes_intended = list(ids)
+        marked = self._apply_deferred_closes(task, ids, ledger, text)
+        if snapshot is not None and not marked:
+            # `mark_done_many` writes only when it marks: the ledger is
+            # byte-identical, so a restore would record a rollback of nothing.
+            snapshot.clear()
+        if marked and not self._ledger_in_repo(ledger):
+            self.journal.append(
+                "deferred-close-external-ledger",
+                story_key=task.story_key,
+                dw_ids=list(marked),
+                ledger=str(ledger),
+                note="ledger is outside the repo; the annotation is not part of any commit",
+            )
+
+    def _journal_ledger_unavailable(
+        self, task: StoryTask, ids: Sequence[str], ledger: Path, error: str
+    ) -> None:
+        self.journal.append(
+            "deferred-close-ledger-unavailable",
+            story_key=task.story_key,
+            dw_ids=list(ids),
+            ledger=str(ledger),
+            error=error,
+        )
+
+    def _ledger_in_repo(self, ledger: Path) -> bool:
+        """Whether the ledger's annotation rides the story's commit. Decided on
+        RESOLVED paths: an in-repo symlink to a shared external ledger must
+        count as external. A path that cannot be resolved reports as external —
+        the write has already happened either way, and "part of no commit" is
+        the claim that stays true when nothing else is known."""
+        try:
+            return ledger.resolve().is_relative_to(self.workspace.root.resolve())
+        except (OSError, RuntimeError):
+            return False
+
+    def _restore_deferred_closes(self, task: StoryTask, snapshot: list[tuple[Path, str]]) -> None:
+        """Put the ledger back the way ``_close_declared_deferred`` found it,
+        after the commit its closures were written for failed (#234): left
+        alone the entries read ``done`` for work that is in no commit, and the
+        likeliest recovery makes that permanent — a human-resolved re-drive
+        sets ``resolved_redrive``, which has ``safe_reset`` preserve the
+        artifact folders' tracked content through the rollback.
+
+        Whole-document, from the pre-close text. Within the commit window the
+        engine is the only writer this restore can know about; anything else
+        that edited the ledger inside it (a native pre-commit hook, say) is
+        restored away with the close — an accepted advisory trade-off, and the
+        escalation hands the tree to a human either way.
+
+        Advisory itself, twice over: a failed restore is journaled, never
+        raised, and the journaling is suppressed rather than allowed to become
+        the crash — this runs inside except arms whose exception must travel
+        unchanged. Skipping the `raise` would replace a `RunStopped` with a
+        symlink complaint; skipping the `GitError` arm's `_escalate` would
+        strand the story in COMMITTING with no diagnosis on the record.
+
+        The guard is type-agnostic on purpose, and `OSError` is not wide enough
+        to hold it: `atomic_write_text` resolves the path before its own try,
+        and below 3.13 `Path.resolve` reports a symlink loop as `RuntimeError`
+        — the same non-OSError `_ledger_in_repo` already catches for this very
+        path. Catching `Exception` and not `BaseException` is the other half:
+        `RunStopped` is an `Exception`, so a second stop signal landing inside
+        the restore is absorbed while the first still travels, and a genuine
+        KeyboardInterrupt still gets out."""
+        if not snapshot:
+            return
+        ledger, before = snapshot[-1]
+        try:
+            atomic_write_text(ledger, before)
+        except Exception as e:
+            with contextlib.suppress(Exception):
+                self.journal.append(
+                    "deferred-close-rollback-failed",
+                    story_key=task.story_key,
+                    ledger=str(ledger),
+                    # named, not bare `str(e)`: now that every type is admitted,
+                    # a message alone cannot say whether the disk or the path
+                    # was the fault. Matches `_journal_ledger_unavailable`.
+                    error=f"{e.__class__.__name__}: {e}",
+                )
+            return
+        with contextlib.suppress(Exception):
+            self.journal.append(
+                "deferred-close-rolled-back", story_key=task.story_key, ledger=str(ledger)
+            )
+
+    def _story_close_note(self, task: StoryTask) -> str:
+        """Resolution note shared by the commit-boundary close and its isolation
+        carry, so a carried row cannot drift from one the merge delivered."""
+        return f"resolved by story {task.story_key}"
+
+    def _apply_deferred_closes(
+        self, task: StoryTask, ids: Sequence[str], ledger: Path, text: str
+    ) -> list[str]:
+        """Write the closure for `ids`, journal exactly what landed, and return
+        the ids actually flipped.
+
+        ``text`` is the ledger snapshot the caller already read, never re-read
+        here: classification and the write have to describe the same document, and
+        a second read is a second chance for the location to have gone away
+        underneath them."""
+        declared = deferredwork.classify(text, ids)
+        marked = deferredwork.mark_done_many(
+            ledger, declared.open_ids, self._today(), self._story_close_note(task)
+        )
+        if marked:
+            self.journal.append("story-deferred-closed", story_key=task.story_key, dw_ids=marked)
+        if declared.unknown:
+            self.journal.append(
+                "deferred-close-unmatched", story_key=task.story_key, dw_ids=list(declared.unknown)
+            )
+        if declared.malformed:
+            # Present in the ledger but carrying neither an `open` nor a `done`
+            # status: nothing was marked, and staying quiet would read to the
+            # operator exactly like a successful close.
+            self.journal.append(
+                "deferred-close-malformed",
+                story_key=task.story_key,
+                dw_ids=list(declared.malformed),
+                error="ledger entry status is neither open nor done",
+            )
+        if declared.duplicates:
+            # One id, two entries: only the first was classified and only the
+            # first can be marked, so whatever the second says about this work is
+            # neither read nor written. A corrupt ledger (#286) must not close
+            # quietly — the operator has to know which id to go look at.
+            self.journal.append(
+                "deferred-close-duplicate-id",
+                story_key=task.story_key,
+                dw_ids=list(declared.duplicates),
+                error="the ledger carries more than one entry for this id; only the first was read",
+            )
+        return marked
+
+    def _extra_session_env(
+        self, task: StoryTask, role: str, label: str | None = None
+    ) -> dict[str, str]:
+        """Engine-variant additions to a session's environment. Base: none.
+        StoriesEngine overrides this to export BMAD_LOOP_SPEC_FOLDER for the
+        adapter's deterministic id-keyed read-back. ``label`` is None for the
+        primary dev/review session and set for an injected plugin-workflow session,
+        so a variant can scope its env to primary sessions only."""
+        return {}
+
+    def _run_verify_commands_after_dev(self, task: StoryTask, result_json: dict | None) -> bool:
+        """Whether the deterministic verify commands run after a completed dev
+        pass. Base: always. StoriesEngine skips them on a plan-halt leg — a plan
+        (spec at ready-for-dev) has no implementation to build/test, so a project
+        build/test gate would spuriously fail before the plan review."""
+        return True
+
+    def _resume_after_dev_verify(self, task: StoryTask) -> None:
+        """Resume a task the run paused at DEV_VERIFY (dev verified, spec on disk).
+        Base: the spec-approval-gate resume — run the review loop + commit.
+        StoriesEngine overrides this to re-drive the implement leg of a
+        plan-checkpoint-paused story (leg-2) instead."""
+        self.journal.append("resume-review", story_key=task.story_key)
+        self._finish_post_dev_accepted_sync(task)
+        self._review_and_commit(task)
+
+    def _after_story(self, task: StoryTask) -> None:
+        """Hook fired once a story is fully processed and (under isolation)
+        integrated — from _loop after _run_story and from _finish_inflight after a
+        resumed task completes. Base: no-op. StoriesEngine uses it for the
+        done_checkpoint pause, which must land after integration so a committed
+        unit is merged before the run stops."""
+        return
+
+    def _ledger_text(self) -> str | None:
+        """Return the active workspace ledger text, preserving absence."""
+        ledger = self.workspace.paths.deferred_work
+        return ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+
+    def _ledger_digest(self) -> str:
+        """Digest the current ledger text for proof-of-work attribution.
+
+        An absent ledger and an empty one intentionally hash alike: neither
+        carries an entry, and this comparison never restores or unlinks the file.
+        Reads stay fail-loud because guessing either equality answer can misjudge
+        the session's work.
+        """
+        return _digest_of(self._ledger_text())
+
+    def _legacy_ledger_changed_before_harvest(self, task: StoryTask) -> bool:
+        """Recover pre-feature ledger attribution from the attempt's Git baseline.
+
+        Old resumable state has no ``baseline_ledger_digest``. The completed
+        session can still have authored ledger-only work, and path-granular Git
+        evidence distinguishes that existing diff from the engine harvest about
+        to run. External ledgers cannot satisfy the project proof gate. An
+        attribution probe that raises keeps the path excluded, so uncertainty
+        never credits the engine's own append as session work.
+        """
+        if not task.baseline_commit:
+            return False
+        ledger = self.workspace.paths.deferred_work
+        root = self.workspace.root
+        try:
+            rel = ledger.resolve().relative_to(root.resolve()).as_posix()
+        except (OSError, RuntimeError):
+            try:
+                rel = ledger.relative_to(root).as_posix()
+            except ValueError:
+                return False
+        except ValueError:
+            return False
+        try:
+            return verify.path_changed_since(
+                root,
+                task.baseline_commit,
+                rel,
+                baseline_untracked=task.baseline_untracked,
+            )
+        except (verify.GitError, OSError, RuntimeError) as e:
+            self.journal.append(
+                "legacy-ledger-attribution-failed",
+                story_key=task.story_key,
+                error=str(e),
+            )
+            return False
+
+    def _ledger_is_gits_to_restore(self, task: StoryTask) -> bool:
+        """Whether git owns the active ledger and reset is responsible for it.
+
+        Probe failures degrade toward keeping the file: uncertainty must never
+        authorize deleting a tracked ledger that ``reset --hard`` restored.
+        """
+        ledger = self.workspace.paths.deferred_work
+        root = self.workspace.root
+        try:
+            rel = ledger.relative_to(root).as_posix()
+        except ValueError:
+            try:
+                rel = ledger.resolve().relative_to(root.resolve()).as_posix()
+            except (OSError, RuntimeError) as e:
+                self.journal.append(
+                    "ledger-scope-probe-failed",
+                    story_key=task.story_key,
+                    error=str(e),
+                )
+                return True
+            except ValueError:
+                # An external ledger was outside the reset's reach. A None
+                # snapshot means this harvest created it, so it remains ours to
+                # unlink.
+                return False
+        try:
+            return verify.path_tracked(root, rel)
+        except (verify.GitError, OSError, RuntimeError) as e:
+            self.journal.append(
+                "ledger-tracked-probe-failed",
+                story_key=task.story_key,
+                error=str(e),
+            )
+            return True
+
+    def _restore_ledger(self, task: StoryTask, snapshot: str | None) -> None:
+        """Restore the active ledger to a pre-harvest filesystem snapshot."""
+        ledger = self.workspace.paths.deferred_work
+        if self._ledger_text() == snapshot:
+            return
+        if snapshot is None:
+            # The harvest created an untracked/ignored ledger. A tracked ledger
+            # absent at snapshot time is different: reset restored its committed
+            # bytes, which must never be deleted here.
+            if not self._ledger_is_gits_to_restore(task):
+                ledger.unlink(missing_ok=True)
+            return
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(ledger, snapshot)
+
+    def _restore_persisted_ledger(self, task: StoryTask, *, replayed: bool) -> None:
+        """Restore the snapshot durably armed before this attempt's engine writes."""
+        if not task.pre_harvest_ledger_captured:
+            if replayed:
+                self.journal.append("ledger-snapshot-missing", story_key=task.story_key)
+            return
+        self._restore_ledger(task, task.pre_harvest_ledger)
+
+    def _disarm_ledger_snapshot(self, task: StoryTask) -> None:
+        """Drop the chain-scoped pre-harvest ledger snapshot."""
+        task.pre_harvest_ledger = None
+        task.pre_harvest_ledger_captured = False
+
+    def _harvest_gate_exclude(self, task: StoryTask) -> tuple[str, ...]:
+        """Exclude only this attempt's engine-authored ledger append from proof of work.
+
+        ``_harvest_spec_deferrals`` runs above the artifact gate. Without this
+        exclusion a session that wrote no code can pass because the orchestrator
+        itself changed the ledger. The persisted flag survives crash replay, when
+        the repeated harvest dedupes and reports no newly-filed ids.
+
+        The exclusion is path-granular, so it stands down when the ledger had
+        already changed from the current attribution reference before harvesting. That preserves
+        a session-authored ledger-only change as valid work even when the same
+        attempt also records a frontmatter deferral. Standing down exposes more
+        of the tree to the gate, which is the conservative direction.
+        """
+        if not task.harvest_wrote_ledger or task.ledger_changed_before_harvest:
+            return ()
+        paths = self.workspace.paths
+        try:
+            rel = paths.deferred_work.resolve().relative_to(paths.project.resolve())
+        except ValueError:
+            # The proof-of-work gate only sees the project tree, so an external
+            # ledger cannot satisfy it and needs no exclusion.
+            return ()
+        except (OSError, RuntimeError):
+            # ProjectPaths are normalized when loaded. If filesystem resolution
+            # nevertheless faults, keep a lexically in-project ledger excluded:
+            # uncertainty must not turn the engine's append into session proof.
+            try:
+                rel = paths.deferred_work.relative_to(paths.project)
+            except ValueError:
+                return ()
+        return (rel.as_posix(),)
+
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         return verify.verify_dev(
-            task, self.workspace.paths, result_json, review_enabled=self._dev_review_enabled()
+            task,
+            self.workspace.paths,
+            result_json,
+            review_enabled=self._dev_review_enabled(),
+            operator_park=self._operator_park_enabled(),
+            engine_written=self._harvest_gate_exclude(task),
         )
 
     def _verify_review(self, task: StoryTask):
-        return verify.verify_review(task, self.workspace.paths, self.policy)
+        # `not _dev_review_enabled()` is exactly the case where _post_dev_state_sync
+        # targeted "done" and verify_dev asserted the board got there, so a board
+        # now short of done is a review revoking that sign-off, not a stage never
+        # reached (#334).
+        return verify.verify_review(
+            task,
+            self.workspace.paths,
+            self.policy,
+            sprint_reached_done=not self._dev_review_enabled(),
+            operator_park=self._operator_park_enabled(),
+        )
 
     def _review_prompt(self, task: StoryTask) -> str:
         # Re-invoking bmad-dev-auto on a `done` spec resets review_loop_iteration
@@ -1850,15 +3626,30 @@ class Engine:
         # separate review skill. task.spec_file is set by verify_dev on success.
         # The ledger instruction is the prevention side of the reclose in
         # SweepEngine._verify_review: a review that rewrites deferred-work.md
-        # from a stale snapshot clobbers orchestrator-recorded closures. The
-        # ledger is append-only for sessions — new findings are fine, existing
-        # entries are orchestrator-owned.
+        # from a stale snapshot clobbers orchestrator-recorded closures.
+        # Existing entries are orchestrator-owned; new ones are simply not asked
+        # for. Post-BMAD-METHOD#2640 the primitive records its own `defer`
+        # findings in the spec frontmatter and `_harvest_spec_deferrals` files
+        # them. An affirmative append instruction would therefore file each
+        # finding twice. Keep this neutral for pre-#2640 skills, whose flat append
+        # may still be the only record. `tests/test_engine.py` pins the ban as
+        # `"append" not in prompt.lower()` over the WHOLE assembled prompt, board
+        # clauses included — nothing injected below may spell that substring.
+        #
+        # Two separators live here, both plain spaces because every clause ends in
+        # a full stop and the dev seam's em dash would render a `. — `: the
+        # caller-owned one at the ledger↔board seam, and the join at the
+        # board↔redirect seam. The `if tail else ""` guard is live, not defensive —
+        # `StoriesEngine` inherits this method and empties both clauses.
+        clauses = [
+            c for c in (self._sprint_board_instruction(), self._board_handback_redirect()) if c
+        ]
+        tail = " ".join(clauses)
         return (
-            f"/bmad-dev-auto {task.spec_file} — If this review defers new "
-            f"findings, append them to the deferred-work ledger as NEW entries "
-            f"only; do NOT modify, re-open, or rewrite existing ledger entries — "
-            f"the orchestrator owns their status and resolution."
-        )
+            f"/{self._dev_skill('review')} {task.spec_file} — do NOT modify, "
+            f"re-open, or rewrite existing deferred-work ledger entries; the "
+            f"orchestrator owns their status and resolution."
+        ) + (f" {tail}" if tail else "")
 
     def _render_commit_template(self, task: StoryTask) -> str | None:
         """The configured commit message template with {story_key}/{run_id}
@@ -1874,6 +3665,16 @@ class Engine:
         )
 
     def _commit_message(self, task: StoryTask) -> str:
+        # The park suffix is appended to a rendered template too. The template
+        # governs the message's SHAPE; whether the story is finished is a fact
+        # about the commit, and `git log` is where an operator looks for it long
+        # after the notification scrolled past. A plugin that wants the suffix
+        # gone can still rewrite the whole message at pre_commit.
+        return self._base_commit_message(task) + (
+            " (awaiting operator)" if task.operator_actions else ""
+        )
+
+    def _base_commit_message(self, task: StoryTask) -> str:
         rendered = self._render_commit_template(task)
         if rendered is not None:
             return rendered
@@ -1883,6 +3684,45 @@ class Engine:
 
     # ------------------------------------------------------------- helpers
 
+    def _session_end_extras(self, result: SessionResult) -> dict:
+        """Timeout forensics for the session-end entry (#157). ``teardown_s``
+        is the timeout-fire → journal gap — the window the incident showed
+        could silently stretch for hours. A tripped session-budget guard
+        (#158) adds its sample plus the cap/mode it was judged against."""
+        extras: dict = {}
+        if result.timeout_fired_at is not None:
+            extras.update(
+                fired_at=result.timeout_fired_at,
+                teardown_s=max(0.0, round(time.time() - result.timeout_fired_at, 3)),
+                expired_clock=result.timeout_expired_clock,
+            )
+        if result.budget_weighted is not None:
+            extras.update(
+                budget_weighted=result.budget_weighted,
+                budget=self.policy.limits.max_tokens_per_session,
+                budget_mode=self.policy.limits.session_budget_mode,
+            )
+        # transport-failure classification (#194): rides both session-end emit
+        # sites so the evidence line is on the record wherever the session ended.
+        if result.env_fault:
+            extras["env_fault"] = True
+            if result.env_fault_evidence:
+                extras["env_fault_evidence"] = result.env_fault_evidence
+        return extras
+
+    @staticmethod
+    def _session_timeout_s(default_s: float) -> float:
+        """Per-session wall-clock budget in seconds. Normally
+        ``limits.session_timeout_min * 60``; ``BMAD_LOOP_SESSION_TIMEOUT_S``
+        overrides it (test / override hook, à la ``BMAD_LOOP_PROCESS_HOST``).
+        The policy floor is 1 minute — too coarse to exercise the #157
+        timeout-teardown path in a deterministic sub-minute E2E, and a real
+        binary run can't be monkeypatched. A non-positive or unparseable
+        override is ignored, so a fat-fingered value can never silently shorten
+        a real run's budget."""
+        override = envvars.session_timeout_s()
+        return override if override is not None else default_s
+
     def _run_session(
         self,
         task: StoryTask,
@@ -1891,10 +3731,11 @@ class Engine:
         seq: int,
         session_stage: str | None = None,
         label: str | None = None,
+        spec_snapshot: SpecSnapshot | None = None,
     ) -> SessionResult:
         # ``label`` names a non-standard session (a plugin-provided workflow) so
         # its task_id stays distinct from the role's own dev/review attempts.
-        task_id = f"{task.story_key}-{label or role}-{seq}"
+        task_id = _session_task_id(task.story_key, label if label else role, seq)
         adapter = self.adapters[role]
         cfg = self.policy.adapter.resolved(role)
         env = {
@@ -1903,6 +3744,12 @@ class Engine:
             "BMAD_LOOP_TASK_ID": task_id,
             "BMAD_LOOP_STORY_KEY": task.story_key,
         }
+        # engine-variant env seam: StoriesEngine adds BMAD_LOOP_SPEC_FOLDER so the
+        # dev adapter resolves the story spec deterministically by id instead of
+        # mtime-scanning. Base returns {} — sprint/sweep runs stay byte-identical.
+        # ``label`` (set only for injected plugin-workflow sessions) is passed so the
+        # variant can withhold that env from non-primary sessions.
+        env.update(self._extra_session_env(task, role, label=label))
         if task.dw_ids:
             # Deferred-work bundle: the orchestrator owns the bundle→dw-id binding
             # (the generic bmad-dev-auto primitive knows nothing of dw ids). Export
@@ -1936,15 +3783,40 @@ class Engine:
                 )
                 return SessionResult(status="vetoed")
         if label is not None:
-            # Injected workflow session: spell out the completion-marker protocol
-            # and bound its stall nudges (see WORKFLOW_COMPLETION_CONTRACT).
-            # Appended after the session-gate hooks so a pre_workflow_session /
-            # pre_session prompt rewrite cannot strip it. The marker path lands in
-            # the same implementation-artifacts dir the dev adapter already
-            # searches — correct in place and under worktree isolation alike,
-            # because spec.cwd is self.workspace.root either way.
+            # Injected workflow session: name the sprint board's owner, then spell
+            # out the completion-marker protocol and bound its stall nudges (see
+            # WORKFLOW_BOARD_CONTRACT / WORKFLOW_COMPLETION_CONTRACT).
+            #
+            # Both are appended after the session-gate hooks so a
+            # pre_workflow_session / pre_session prompt rewrite cannot strip them —
+            # the property the dev/review seams do NOT have, because there the
+            # orchestrator authors the whole prompt and the plugin body is the
+            # rewrite. Here the prompt IS plugin text, so post-gate is the only
+            # place the orchestrator can say anything at all.
+            #
+            # Board first, completion contract LAST: the marker protocol is the
+            # load-bearing tail (a session that ends its turn without the marker
+            # livelocks the orchestrator until session_timeout_min), and nothing may
+            # come between its "end your turn" imperative and the end of the prompt.
+            board_clause = self._sprint_board_instruction()
+            if board_clause:
+                prompt += WORKFLOW_BOARD_CONTRACT.format(clause=board_clause)
+
+            # The marker path lands in the same implementation-artifacts dir the
+            # dev adapter already searches — correct in place and under worktree
+            # isolation alike, because spec.cwd is self.workspace.root either way.
+            # This is the PRODUCER of the marker name. ``role``, not the default:
+            # a workflow declares its own role (WORKFLOW_ROLES = dev | review) and
+            # runs on THAT adapter, whose skill tree can be a different one at a
+            # different era — dev=claude on .claude/skills post-rename, review=codex
+            # on .agents/skills pre-rename. Resolving off the dev tree would name
+            # the session a primitive its own tree does not carry. The reader still
+            # accepts the legacy spelling because devcontract.FALLBACK_RESULT_PREFIXES
+            # matches both eras unconditionally, so discovery survives either
+            # resolution — the two halves agreeing, not a broken read-back.
             marker_path = (
-                self.workspace.paths.implementation_artifacts / f"bmad-dev-auto-result-{task_id}.md"
+                self.workspace.paths.implementation_artifacts
+                / f"{self._dev_skill(role)}-result-{task_id}.md"
             )
             prompt += WORKFLOW_COMPLETION_CONTRACT.format(marker_path=marker_path)
         spec = SessionSpec(
@@ -1954,61 +3826,297 @@ class Engine:
             cwd=self.workspace.root,
             env=env,
             model=cfg.model,
-            timeout_s=self.policy.limits.session_timeout_min * 60,
+            timeout_s=self._session_timeout_s(self.policy.limits.session_timeout_min * 60),
             stall_nudges_cap=(
-                self.policy.limits.workflow_stall_nudges_cap if label is not None else None
+                self.policy.limits.workflow_stall_nudges_cap
+                if label is not None
+                else self.policy.limits.dev_stall_nudges_cap
+            ),
+            # mid-session token-budget guard (#158): every session the engine
+            # drives (dev/review/labeled workflow) gets the same policy caps.
+            token_budget=self.policy.limits.max_tokens_per_session,
+            token_budget_mode=self.policy.limits.session_budget_mode,
+            token_budget_grace_s=float(self.policy.limits.session_budget_grace_s),
+            cache_read_weight=self.policy.limits.cache_read_weight,
+            # Launch-state snapshot of a review session's spec (#276 M1); None for
+            # every other session and on a crash-resume (process-transient).
+            spec_snapshot=spec_snapshot,
+            # The spec this session is required to write, when already known (#261),
+            # so the adapter reads THAT path back instead of mtime-scanning a
+            # directory shared with every concurrent run. Same `_generic_dev()` guard
+            # as the snapshot above, so the two can never disagree about whether the
+            # devcontract read-back is in play.
+            #
+            # Pinned ONLY when the dispatched prompt NAMES that path — the read-back
+            # may demand a file back solely because the session was told to write it.
+            # Knowing a spec exists is not the same as having pointed a session at it:
+            # a from-scratch re-drive after an escalation/deferral has `task.spec_file`
+            # recorded (`_record_dev_spec`) but dispatches a bare story key, a sweep
+            # bundle dispatches `intent.md`, and StoriesEngine dispatches folder+id.
+            # Pinning those would poll a path the session never promised to rewrite
+            # and score its real output as "wrote nothing" — trading #261's unsafe
+            # failure for a work-LOSING one, the exact trade this fix exists to avoid.
+            # Testing the prompt keeps the pin and the contract that justifies it in
+            # one place across all three engines (each builds its own prompt), and
+            # reads the post-gate text, so a plugin rewrite cannot desynchronize them.
+            # A miss simply falls back to the scan — the pre-#261 behavior.
+            #
+            # Withheld from an injected plugin-workflow session (`label` set — e.g. a
+            # TEA pre_commit_gate): it runs the generic adapter but owes the
+            # WORKFLOW_COMPLETION_CONTRACT marker above, not the story spec, so
+            # pinning it to task.spec_file would point the read-back at the wrong
+            # file. Same doctrine as StoriesEngine withholding BMAD_LOOP_SPEC_FOLDER
+            # from labeled sessions.
+            expected_spec=(
+                task.spec_file
+                if (
+                    label is None
+                    and self._generic_dev()
+                    and task.spec_file
+                    and str(task.spec_file) in prompt
+                )
+                else None
             ),
         )
         self.journal.set_active_log(task_id)
-        self.journal.append("session-start", task_id=task_id, role=role, prompt=prompt)
-        result = adapter.run(spec)
-        # Only dev/review sessions are resumable — `_resumable_session` matches
-        # exactly those task ids under DEV_RUNNING/REVIEW_RUNNING. For everything
-        # else (triage/sweep, labeled plugin-workflow sessions) the payload is
-        # never consumed on resume, so persisting it is pure state.json bloat.
-        # For resumable sessions, store a defensive copy: `result.result_json`
-        # is mutated in place downstream (`_reconcile_generic_terminal_status`),
-        # and the durable record must stay a stable snapshot of what the adapter
-        # returned rather than aliasing a later, half-mutated dict. Shallow is
-        # enough — reconcile only touches top-level keys.
-        resumable = label is None and role in ("dev", "review")
-        task.record_session(
-            SessionRecord(
-                task_id=task_id,
-                role=role,
-                status=result.status,
-                session_id=result.session_id,
-                transcript_path=result.transcript_path,
-                result_json=(
-                    dict(result.result_json)
-                    if resumable and result.result_json is not None
-                    else None
-                ),
-            )
-        )
-        # Make the completed session durable before the usage read, post-session
-        # hooks, and follow-up verification. If the host kills the process in
-        # that window, the resume path can see the session instead of a stale
-        # dev-running task with no evidence; usage stays best-effort metadata,
-        # not a durability gate.
-        self._save()
-        usage = adapter.read_usage(result)
-        task.attach_session_usage(task_id, usage)
         self.journal.append(
-            "session-end",
+            "session-start",
             task_id=task_id,
-            status=result.status,
-            tokens=usage.total if usage else None,
+            role=role,
+            adapter=cfg.name,
+            model=cfg.model,
+            story_key=task.story_key,
+            prompt=prompt,
         )
+        # Every session-start must be paired with a session-end, whatever path
+        # leaves this method: on an abort (RunStopped / KeyboardInterrupt / a
+        # transport error out of adapter.run) the top-level handlers record
+        # run-stop/run-crash but know nothing of the open session, and the
+        # journal would show it running forever (#157).
+        result: SessionResult | None = None
+        ended = False
+        try:
+            result = adapter.run(spec)
+            # A post-kill rescue (#61) is otherwise indistinguishable from a normal
+            # completion in the journal; leave a breadcrumb for forensics.
+            if result.result_json is not None and result.result_json.get("post_kill_reconciled"):
+                self.journal.append("session-rescued-post-kill", task_id=task_id, role=role)
+            # Same forensics need for a missing-marker synthesis (#224): the
+            # result is real, but the marker-append the skill owes was skipped.
+            if result.result_json is not None and result.result_json.get(
+                "synthesized_from_frontmatter"
+            ):
+                self.journal.append(
+                    "session-synthesized-from-frontmatter", task_id=task_id, role=role
+                )
+                # #276 M3: the marker the skill owed was never appended. Repair the
+                # on-disk spec (best-effort) so the next re-read is harvested on the
+                # normal marker path. Covers live-Stop, crash-path, and post-kill
+                # dead-window synthesis — every path that sets this flag.
+                self._repair_spec_marker(task, result.result_json)
+            # Only dev/review sessions are resumable — `_resumable_session` matches
+            # exactly those task ids under DEV_RUNNING/REVIEW_RUNNING. For everything
+            # else (triage/sweep, labeled plugin-workflow sessions) the payload is
+            # never consumed on resume, so persisting it is pure state.json bloat.
+            # For resumable sessions, store a defensive copy: `result.result_json`
+            # is mutated in place downstream (`_reconcile_generic_terminal_status`),
+            # and the durable record must stay a stable snapshot of what the adapter
+            # returned rather than aliasing a later, half-mutated dict. Shallow is
+            # enough — reconcile only touches top-level keys.
+            resumable = label is None and role in ("dev", "review")
+            # Make a completed dev result and its proof-of-work attribution
+            # durable in the same state save. A host death after this save makes
+            # the result replayable, so leaving the comparison until _dev_phase
+            # resumes would lose attempt identity when a prior retry already
+            # latched harvest_wrote_ledger. The ordinary-path comparison remains
+            # after post_session so later hook-side changes are still observed.
+            if (
+                resumable
+                and role == "dev"
+                and result.status == "completed"
+                and result.result_json is not None
+                and task.baseline_ledger_digest is not None
+            ):
+                task.ledger_changed_before_harvest = (
+                    self._ledger_digest() != task.baseline_ledger_digest
+                )
+            task.record_session(
+                SessionRecord(
+                    task_id=task_id,
+                    role=role,
+                    status=result.status,
+                    adapter=cfg.name,
+                    model=cfg.model,
+                    session_id=result.session_id,
+                    transcript_path=result.transcript_path,
+                    result_json=(
+                        dict(result.result_json)
+                        if resumable and result.result_json is not None
+                        else None
+                    ),
+                )
+            )
+            # Make the completed session durable before the usage read, post-session
+            # hooks, and follow-up verification. If the host kills the process in
+            # that window, the resume path can see the session instead of a stale
+            # dev-running task with no evidence; usage stays best-effort metadata,
+            # not a durability gate.
+            self._save()
+            usage = adapter.read_usage(result)
+            task.attach_session_usage(task_id, usage)
+            self.journal.append(
+                "session-end",
+                task_id=task_id,
+                status=result.status,
+                tokens=usage.total if usage else None,
+                # Weighted rides every usage-bearing session-end, not just
+                # budget-tripped ones (#129): `tokens` alone is a bare scalar
+                # from which the weighted figure cannot be recovered, so
+                # per-session spend was unreconstructible after the fact.
+                # `None`, never 0, when usage is untracked — a zeroed
+                # TokenUsage weighs 0, and untracked != free (see tokens.py).
+                # Distinct from `budget_weighted`, which the extras add only on
+                # a trip and which means the guard's mid-session sample.
+                tokens_weighted=(
+                    usage.weighted_total(self.state.cache_read_weight()) if usage else None
+                ),
+                **self._session_end_extras(result),
+            )
+            ended = True
+        finally:
+            if not ended:
+                # Best-effort: a journal IO error here must never mask the
+                # exception that is unwinding this frame.
+                try:
+                    if result is not None:
+                        # A post-run step raised (e.g. read_usage): the session
+                        # itself finished — journal its real status, sans usage.
+                        # Both token fields are hardcoded None: `usage` may be
+                        # UNBOUND here (read_usage itself is a candidate raiser),
+                        # so referencing it would raise NameError on a path that
+                        # is already unwinding an exception.
+                        self.journal.append(
+                            "session-end",
+                            task_id=task_id,
+                            status=result.status,
+                            tokens=None,
+                            tokens_weighted=None,
+                            **self._session_end_extras(result),
+                        )
+                    else:
+                        exc = sys.exc_info()[1]
+                        self.journal.append(
+                            "session-end",
+                            task_id=task_id,
+                            status="aborted",
+                            error=type(exc).__name__ if exc is not None else None,
+                        )
+                except Exception:  # nosec B110
+                    pass
         self._save()
+        self._note_story_token_budget(task)
         self._emit(
             "post_session",
             task,
             role=role,
-            session_status=result.status,
-            result_json=result.result_json,
+            # Reaching here means `adapter.run` returned (a non-None SessionResult)
+            # rather than raising past the finally, but pyright can't prove that
+            # through the try/finally, so it keeps `result` widened to | None.
+            session_status=result.status,  # pyright: ignore[reportOptionalMemberAccess]
+            result_json=result.result_json,  # pyright: ignore[reportOptionalMemberAccess]
         )
-        return result
+        # A post-session hook may be the session's last writer. The completed
+        # result was checkpointed before hooks so it is replayable, but a retained
+        # retry can already carry `harvest_wrote_ledger=True`; replay then
+        # deliberately preserves the saved attribution instead of comparing an
+        # engine-modified ledger again. Close that crash window immediately after
+        # hooks finish. Save only when the comparison changed, keeping the
+        # zero-plugin/no-ledger-change path free of a redundant state rewrite.
+        if (
+            resumable
+            and role == "dev"
+            and result.status == "completed"  # pyright: ignore[reportOptionalMemberAccess]
+            and result.result_json is not None  # pyright: ignore[reportOptionalMemberAccess]
+            and task.baseline_ledger_digest is not None
+        ):
+            ledger_changed = self._ledger_digest() != task.baseline_ledger_digest
+            if ledger_changed != task.ledger_changed_before_harvest:
+                task.ledger_changed_before_harvest = ledger_changed
+                self._save()
+        return result  # pyright: ignore[reportReturnType]
+
+    def _note_story_token_budget(self, task: StoryTask) -> None:
+        """Warn once when a story's cost-weighted spend crosses
+        ``limits.max_tokens_per_story``, at the session boundary that crossed it.
+
+        The cap is advisory by contract (docs/FEATURES.md) — this warns, it never
+        terminates. Enforcement is the separate mid-session guard (#158,
+        ``max_tokens_per_session``), a different cap with its own latch, untouched
+        here.
+
+        Placement is the whole point of #336. The predecessor check sat in
+        ``_finalize_commit_phase`` past ``advance(task, Phase.DONE)``, so it saw
+        only stories that committed and only after their last token was spent: the
+        reported 4x overrun happened on a story that DEFERRED, which produced no
+        record at all — total silence, not late silence. Every session of every run
+        type funnels through ``_run_session``, so judging here covers the deferring
+        and escalating stories too, and SweepEngine/StoriesEngine inherit it
+        unchanged.
+
+        Called after the tail ``_save()``, where ``task.tokens`` is both fresh
+        (``attach_session_usage`` folded this session in above) and
+        story-cumulative (it is the task's running total, not the session's). A
+        session that aborted never reaches here — the exception propagates past the
+        ``finally`` — so no story is judged on a usage read that did not happen.
+
+        Weight comes from live ``self.policy``, not ``state.cache_read_weight()``:
+        this is the enforcement side of the split documented at ``summary()`` —
+        displays must reproduce from state.json, budgets bind at the policy the
+        running process enforces.
+
+        Emit order is load-bearing at both ends — see the comments below. The
+        invariant: never latch a suppression bit before the record it suppresses
+        is durable."""
+        if task.token_budget_warned:
+            return
+        budget = self.policy.limits.max_tokens_per_story
+        weighted = task.tokens.weighted_total(self.policy.limits.cache_read_weight)
+        if weighted <= budget:
+            return
+        self.journal.append(
+            "token-budget-exceeded",
+            story_key=task.story_key,
+            weighted=weighted,
+            total=task.tokens.total,
+            budget=budget,
+        )
+        # Latch only once the record it suppresses is durable. Unlike the phase
+        # this method's siblings set before their own journal write
+        # (`_record_defer`, `_escalate`), `token_budget_warned` is rendered on no
+        # surface — it is a pure suppression bit, so "latch persisted, record
+        # lost" is a story that overran in total silence, i.e. #336 itself. The
+        # append above is unguarded IO (journal.py) and the run-level `finally`
+        # in `_run_inner` persists whatever the task carries on EVERY abort arm,
+        # so latching first would bury the overrun for good on an OSError there.
+        # Leaving it unlatched costs at most a duplicate notice next boundary.
+        task.token_budget_warned = True
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"story token budget exceeded: {task.story_key}",
+            f"{weighted} weighted tokens ({task.tokens.total} raw incl. cache reads) "
+            f"past the {budget} `limits.max_tokens_per_story` cap — advisory: the "
+            f"story continues. Stop the run with `bmad-loop stop` if the spend is "
+            f"no longer worth it.",
+        )
+        # ...and `_save()` stays AFTER the notice, the emit order every
+        # record-a-decision site shares. That same run-level `finally` already
+        # makes the latch durable on any in-process abort in this window, so only
+        # a SIGKILL can re-warn — and at-least-once is the right bias for a
+        # warning whose whole purpose is to not be silent: a duplicate ATTENTION
+        # line is cosmetic, a lost one is the bug. Do not hoist this above the
+        # emit pair; that trades the cosmetic failure for the silent one.
+        self._save()
 
     def _dev_prompt(self, task: StoryTask, feedback: Path | None) -> str:
         return self._generic_dev_prompt(task, feedback)
@@ -2018,17 +4126,201 @@ class Engine:
         `--feedback` flag: feedback is inlined as freeform intent pointing at the
         existing spec. On a repair re-invocation the spec is first re-opened
         (status → `in-progress`) so the skill's step-01 re-enters implement/review
-        on it rather than ingesting a finalized spec as mere context."""
+        on it rather than ingesting a finalized spec as mere context.
+
+        A patch-restore re-drive (#2564) must point at the spec explicitly: only
+        step-01's spec-pointer intent check EARLY EXITs on the `in-review` status
+        the re-arm set — and it exits before step-01's version-control sanity
+        check, which would otherwise HALT `blocked` on the very diff
+        `_restore_patch` just laid onto the tree. A bare story key takes the
+        freeform/epic path instead, where that dirty-tree check runs first."""
+        # Both injected clauses ride every leg, in this order — the park clause
+        # stays LAST because its docstring's backtick argument depends on nothing
+        # following it. Both are bare sentences, so this seam owns every separator:
+        # an em dash after the bare story key (the one leg whose text carries no
+        # terminal punctuation), a plain space after a sentence. A full stop
+        # followed by an em dash is punctuation noise and must never be assembled.
+        #
+        # `if tail else ""` is unreachable on the one class that reaches here
+        # (`Engine`, whose prohibition is unconditional; both subclasses override
+        # `_dev_prompt`), unlike the live guard on the review seam. Kept for
+        # symmetry and pinned with a monkeypatch.
+        clauses = [
+            c for c in (self._sprint_board_instruction(), self._operator_park_instruction()) if c
+        ]
+        tail = " ".join(clauses)
+        after_sentence = f" {tail}" if tail else ""
+        after_key = f" — {tail}" if tail else ""
         if feedback is None:
-            return f"/bmad-dev-auto {task.story_key}"
+            if task.restore_patch and task.spec_file:
+                return (
+                    f"/{self._dev_skill()} Resume review of the in-review spec at "
+                    f"`{task.spec_file}`. The attempted change was restored onto "
+                    f"the working tree after an intent-gap resolution; review it "
+                    f"against the amended spec."
+                ) + after_sentence
+            return f"/{self._dev_skill()} {task.story_key}" + after_key
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or task.story_key
         return (
-            f"/bmad-dev-auto Resume the autonomous dev session on the in-progress "
+            f"/{self._dev_skill()} Resume the autonomous dev session on the in-progress "
             f"spec at `{spec_ref}`. The previous session's work failed deterministic "
             f"verification; repair the working tree so verification passes without "
             f"changing the spec's frozen intent contract. Verification evidence is "
             f"in `{feedback}`."
+        ) + after_sentence
+
+    def _sprint_board_instruction(self) -> str:
+        """The board-ownership PROHIBITION — never write the board, never revert it
+        — injected into `_review_prompt` and `_generic_dev_prompt`, the two prompt
+        seams `Engine` itself builds, the way the deferred-work sentence beside it
+        is. It says nothing about what a session should do *instead*; that half is
+        `_board_handback_redirect`, and it rides the review prompt only.
+
+        Injection surface, exactly: story dev sessions (`_generic_dev_prompt`), the
+        review sessions of sprint and sweep runs (both inherit `_review_prompt`),
+        and every injected plugin-workflow session (`_run_session` wraps this in
+        `WORKFLOW_BOARD_CONTRACT` post-gate — those run in the same window, at
+        `post_dev_phase` / `post_review_result` / `pre_commit_gate`). `SweepEngine`
+        and `StoriesEngine` override `_dev_prompt`, so no bundle or stories dev
+        prompt reaches this; `StoriesEngine` overrides this method to "" as well,
+        which drops it — the redirect gated on it, and the workflow section — from
+        that mode's prompts too. Only the interactive resolve agent gets nothing
+        from this seam, which costs nothing: `bmad-loop-resolve`'s own skill already
+        forbids touching the board outright.
+
+        The three injection points deliberately share ONE wording, so a reviewer, a
+        dev session and a plugin workflow cannot be told three different things
+        about who owns the board.
+
+        They do NOT share unstrippability, and that asymmetry was weighed rather
+        than overlooked. The workflow section is post-gate because it has to be —
+        the prompt there is plugin text end to end, so there is no pre-gate string
+        to inject into. The dev/review injections stay pre-gate: moving only this
+        clause post-gate would assemble the review prompt in two files while the
+        deferred-work sentence it was written to sit beside stayed strippable, and
+        a plugin that rewrites `proposed_prompt` wholesale already discards the spec
+        path, the ledger sentence and the #261 `expected_spec` pin with it — the
+        codebase's existing reading is that such a rewrite means the plugin owns
+        that session. If unstrippability is ever wanted here, move the whole
+        orchestrator-authored appendix as one unit, not this sentence alone.
+
+        `_post_dev_state_sync` advances sprint-status.yaml right after the dev
+        session — to `done`, or to `awaiting-operator` on a park; those two values
+        are exhaustive there — but the story's single commit lands only after the
+        review loop, so every session dispatched in that window opens on an
+        uncommitted, unattributed board change with nothing in the repo naming its
+        author. A review session read the orchestrator's own write as a violation
+        of its spec's Boundaries section, reverted it, and the #334 contradiction
+        gate correctly escalated a story both sessions agreed was finished (#437).
+
+        The row is called BOOKKEEPING and explicitly NOT proof of verification,
+        because it is not: `_post_dev_state_sync` writes the board before
+        `_verify_dev_artifacts` runs, and a repair session is dispatched precisely
+        when that verification failed — it opens on a red tree under a `done` row.
+
+        This reverses the "#334: review prompts are unchanged by design" rationale,
+        which assumed forbidding the revert would let an unfinished story commit.
+        #334's own code refutes it: `verify.verify_review` gates the SPEC
+        frontmatter first and returns `retry` there, before it ever reads the
+        board. A reviewer withholding sign-off through the spec already blocks the
+        commit; the board revert was never the load-bearing channel.
+
+        Returned as a bare sentence with NO leading separator, because the call
+        sites need different ones. Deliberately backtick-free, for the reason
+        `_operator_park_instruction` documents, and injected BEFORE that clause so
+        the park contract stays the last thing a dev prompt says. Phrased as a
+        prohibition rather than a goal so the skill's intent-alignment auditor
+        cannot raise it as an `intent_gap`."""
+        return (
+            "sprint-status.yaml is owned by the orchestrator: never write it, and "
+            "never revert a change to it. A row at done or awaiting-operator is the "
+            "orchestrator's own bookkeeping — not a defect to fix, and not proof "
+            "that the work is verified."
+        )
+
+    def _board_handback_redirect(self) -> str:
+        """Where a review session that disagrees with the board should go instead.
+        Rides `_review_prompt` only, and only while the prohibition it follows is
+        non-empty — the gate lives HERE rather than in the caller so the invariant
+        is local and directly assertable (`StoriesEngine()._board_handback_redirect()
+        == ""`), and `_review_prompt` stays structurally identical to the dev seam.
+
+        `blocked` is named deliberately: it is the only spec status that both
+        withholds the commit and reaches a human (`devcontract` synthesizes a
+        CRITICAL from it and `decide_review_session` pauses). Any other non-terminal
+        status merely retries until the cycle budget exhausts and `_defer` rolls the
+        work back to baseline — honest dissent discarded in silence. "say why" is
+        load-bearing: the `## Auto Run Result` detail becomes the escalation text a
+        human reads.
+
+        The trigger is deliberately NARROW — "cannot be finished without a human
+        decision", not "looks unfinished". A review pass is itself a dev-primitive
+        run whose job is to fix what it finds or defer it; a broad trigger would
+        hand it a run-halting early exit on cycle 1 of 3.
+
+        Review-only for the same reason it exists: that CRITICAL halts the whole
+        run, which is the right trade for a review session and the wrong one for a
+        dev session, where it would flatly contradict `_operator_park_instruction`'s
+        "Never use the blocked status for this" a sentence later in the same prompt.
+
+        The vocabulary overlap with the park clause ("a human decision" vs "actions
+        only a HUMAN can perform outside the repo") was checked and is unreachable,
+        not merely unlikely: the two never co-occur because each rides a different
+        builder, and more strongly a parked story is never dispatched a review
+        session at all — `_review_and_commit` early-returns on `_park_awaiting_operator`.
+        The only residual is a story the dev pass should have parked and finalized
+        `done` instead, and there this opens no new path (`blocked` is the skill's
+        native escape) and displaces nothing better (park is dev-only, so a review
+        session cannot park either way). Pause-and-reach-a-human beats a false-green
+        `done`.
+
+        Bare sentence, no leading separator, backtick-free — same contract as the
+        clause it follows."""
+        if not self._sprint_board_instruction():
+            return ""
+        return (
+            "If the story cannot be finished without a human decision, finalize the "
+            "spec to status: blocked and say why. That is the hand-back channel; "
+            "the board is not."
+        )
+
+    def _operator_park_instruction(self) -> str:
+        """The park contract, injected into every dev prompt while
+        ``[operator] enabled``. "" when the feature is off.
+
+        Engine-injected rather than skill-owned because the durable home for it is
+        upstream — bmad-dev-auto's spec template and step-03/04 finalize rules —
+        and that PR is not landed. This is the shipped interim: the same words the
+        skill will eventually carry, said by the orchestrator so the state is
+        reachable now. When upstream lands, this method is what goes away.
+
+        The "never blocked" clause is the load-bearing half. `blocked` is the
+        skill's existing escape for "I cannot finish", and a human-only action is
+        exactly the shape that tempts it — but blocked HALTS the run, which is the
+        original defect: one story owing a DNS record stops every story behind
+        it.
+
+        Deliberately backtick-free. It is appended AFTER the repair prompt's
+        feedback-file pointer, and the last backtick-wrapped token in a dev prompt
+        is by convention that path — a backticked word here would quietly become
+        the "feedback file" to anything reading the prompt back.
+
+        Returned as a bare sentence with NO leading separator. The board clause now
+        always precedes it and ends in a full stop, where the em dash this used to
+        carry would render a `. — `; its sole caller owns every separator."""
+        if not self._operator_park_enabled():
+            return ""
+        return (
+            "If this story's acceptance criteria include actions only a HUMAN "
+            "can perform outside the repo (buy a domain, publish a DNS record, "
+            "grant an API key, click through a vendor console): complete every "
+            "part an agent CAN do, commit it, then finalize the spec frontmatter "
+            "to status: awaiting-operator and enumerate what is owed under an "
+            "operator_actions: key — a YAML list of strings, one imperative "
+            "instruction each, non-empty. Never use the blocked status for this: "
+            "blocked halts the whole run, and this story is finished as far as "
+            "you can take it."
         )
 
     def _reset_spec_for_repair(self, task: StoryTask) -> None:
@@ -2043,13 +4335,70 @@ class Engine:
         if not task.spec_file:
             return
         spec_path = Path(task.spec_file)
+        # Repair-write doctrine: raising beats dispatching a repair at a charged
+        # attempt against a spec still reading `done` — step-01 would ingest it as
+        # context and not resume, re-wedging silently (cf. runs.rearm_escalation).
         devcontract.reset_spec_status(spec_path, "in-progress")
         devcontract.strip_auto_run_result(spec_path)
+
+    def _reset_spec_for_review(self, task: StoryTask) -> SpecSnapshot | None:
+        """Strip the prior pass's stale `## Auto Run Result` before a review launch,
+        then capture a launch-state snapshot of the spec (#276 M1).
+
+        A follow-up review session re-invokes bmad-dev-auto on the FINALIZED spec,
+        which still carries the dev pass's terminal `## Auto Run Result` section.
+        The review's own step-04 entry write (it stamps the transient `in-review`
+        status) bumps the spec's mtime past `find_result_artifact`'s launch floor,
+        so the review's first result-less Stop reads that stale marker as this
+        session's terminal result and kills the session mid-flight — the #109 stall
+        grace can never arm on the review leg (issue #160). Cycle 2+ carries the
+        PREVIOUS review pass's own marker, so this runs before every review launch,
+        never on the crash-resume replay branch (no session launches there). Unlike
+        `_reset_spec_for_repair` the frontmatter is left untouched: `status: done` is
+        what routes the re-invocation's step-01 to a fresh step-04 review pass — the
+        HARD CONSTRAINT that the review-launch frontmatter status is NEVER mutated
+        (it is load-bearing skill routing), so every #276 mechanism observes only.
+
+        Returns a `SpecSnapshot` of the on-disk spec as it stood at launch — its
+        content hash, mtime, and normalized frontmatter status — so the generic
+        adapter's missing-marker fallback can refuse to synthesize from a candidate
+        whose bytes never changed this session (a `done` spec re-opened for review,
+        never re-written). "Normalized" means through `status_of`, the same reading
+        the adapter's `_observe_tick` compares against: a blank/YAML-null `status:`
+        must be `""` on BOTH sides or the tick fabricates a transition off it (see
+        that method's docstring — the two reads are one contract).
+
+        Snapshot capture is best-effort: a torn/unreadable read
+        degrades to `None` (journaled, `review-launch-snapshot`), and the fallback
+        then keeps its conservative 2-observation fingerprint path. Only the capture
+        is guarded — the strip keeps its raise-on-unreadable repair doctrine (see
+        `devcontract.strip_auto_run_result`): skipping the strip recreates the exact
+        #160 bug state, so it must surface.
+
+        No-op (returns `None`) when the dev skill is not the generic one or no spec
+        is recorded yet."""
+        if not self._generic_dev() or not task.spec_file:
+            return None
+        spec_path = Path(task.spec_file)
+        devcontract.strip_auto_run_result(spec_path)
+        try:
+            raw = spec_path.read_bytes()
+            mtime_ns = spec_path.stat().st_mtime_ns
+            fm_status = verify.status_of(verify.read_frontmatter(spec_path))
+        except OSError as e:
+            self._journal_spec_read_failed(spec_path, task.story_key, "review-launch-snapshot", e)
+            return None
+        return SpecSnapshot(
+            path=str(spec_path),
+            mtime_ns=mtime_ns,
+            sha256=hashlib.sha256(raw).hexdigest(),
+            fm_status=fm_status,
+        )
 
     def _write_feedback(self, task: StoryTask, reason: str) -> Path:
         """Persist a verification failure where the next session can read it —
         deterministic evidence must reach the LLM, not just the journal."""
-        path = self.run_dir / "feedback" / f"{task.story_key}-{len(task.sessions)}.md"
+        path = self.run_dir / "feedback" / f"{safe_segment(task.story_key)}-{len(task.sessions)}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             f"# Verification feedback: {task.story_key}\n\n"
@@ -2061,10 +4410,10 @@ class Engine:
         )
         return path
 
-    def _fix_phase(self, task: StoryTask, reason: str) -> bool:
+    def _fix_phase(self, task: StoryTask, reason: str) -> Decision:
         """Feedback-driven repair after a clean review whose verify commands
-        failed. Consumes the story's dev-attempt budget; returns True once the
-        commands pass so the review loop can re-review the repaired tree."""
+        failed. Consumes the story's dev-attempt budget; returns PROCEED once
+        commands pass, or terminal review routing when repair cannot continue."""
         while task.attempt < self.policy.limits.max_dev_attempts:
             task.attempt += 1
             feedback = self._write_feedback(task, reason)
@@ -2083,8 +4432,42 @@ class Engine:
                 details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
                 self._escalate(task, f"CRITICAL escalation from fix session: {details}")
             outcome = None
+            terminal = None
             if result.status == "completed":
-                outcome = verify.verify_commands_outcome(self.policy, self.workspace.root)
+                # A repair is another generic dev-primitive pass: it can leave
+                # terminal prose ahead of frontmatter and record fresh deferred
+                # findings just like the initial dev and review legs. Normalize
+                # and harvest before accepting its verify-green tree, because the
+                # next review pass may replace the frontmatter list.
+                self._reconcile_generic_terminal_status(task, result.result_json)
+                harvest_outcome = None
+                for harvest_attempt in range(1, HARVEST_REPAIR_READ_ATTEMPTS + 1):
+                    harvest_outcome = self._harvest_spec_deferrals(task, result.result_json)
+                    if harvest_outcome is None:
+                        break
+                    self.journal.append(
+                        "fix-harvest-failed",
+                        story_key=task.story_key,
+                        attempt=task.attempt,
+                        reason=harvest_outcome.reason,
+                        env_fault=harvest_outcome.env_fault,
+                        harvest_attempt=harvest_attempt,
+                    )
+                    if not harvest_outcome.retryable:
+                        break
+                if harvest_outcome is not None and harvest_outcome.retryable:
+                    outcome = harvest_outcome
+                    terminal = review_exhausted(
+                        task,
+                        "fix-session deferral harvest remained unreadable after "
+                        f"{HARVEST_REPAIR_READ_ATTEMPTS} attempts: "
+                        f"{harvest_outcome.reason}",
+                    )
+                else:
+                    terminal = None
+                outcome = harvest_outcome or verify.verify_commands_outcome(
+                    self.policy, self.workspace.root
+                )
                 if not outcome.ok:
                     reason = outcome.reason
             ok = outcome is not None and outcome.ok
@@ -2094,34 +4477,79 @@ class Engine:
                 attempt=task.attempt,
                 session_status=result.status,
                 ok=ok,
+                env_fault=bool((outcome is not None and outcome.env_fault) or result.env_fault),
             )
-            self._save()
+            if result.status != "completed" and result.env_fault:
+                # A fix session whose CLI lost its API connection (#194) did no
+                # repair work — another attempt cannot fix the run environment, so
+                # pause (re-arm restores the budget) instead of burning the dev
+                # budget. A completed-but-env-fault-grade verify failure is handled
+                # by the retryable check just below (its own escalate path).
+                self._escalate(
+                    task,
+                    env_fault_pause_reason("fix", result),
+                )
+            if outcome is not None and not outcome.ok and not outcome.retryable:
+                # escalate-grade failure (environment fault): another repair
+                # session cannot fix the run environment — stop spending the
+                # dev budget and pause for a human instead
+                self._escalate(task, outcome.reason)
             if ok:
-                return True
-        return False
+                # A verify-green repair supersedes the original accepted dev
+                # record as the owner of the tree now parked at DEV_VERIFY. Make
+                # that receipt durable in the same save as the fix decision so a
+                # sweep crash resumes the repaired tree instead of restarting it.
+                self._accept_current_dev_session(task)
+            self._save()
+            if terminal is not None:
+                return terminal
+            if ok:
+                return Decision(Action.PROCEED)
+        return Decision(Action.DEFER)
 
-    def _record_review_budget_followup(self, task: StoryTask) -> None:
-        """The review loop exhausted its budget on a *finalized, verify-green*
-        story that the pass kept recommending a follow-up for. The work is being
-        committed (not rolled back); preserve the lingering recommendation as a
-        new open deferred-work entry so a later, deliberate review can pick it up,
-        and notify the human. Called immediately before ``_commit`` so the ledger
+    def _record_review_budget_followup(self, task: StoryTask, damped: bool = False) -> None:
+        """A *finalized, verify-green* story that the review pass kept recommending
+        a follow-up for is being committed (not rolled back); preserve the lingering
+        recommendation as a new open deferred-work entry so a later, deliberate
+        review can pick it up. Called immediately before ``_commit`` so the ledger
         edit is squashed into the same commit.
+
+        Two callers, distinguished by ``damped``:
+          * ``damped=False`` — the review loop *exhausted* its ``max_review_cycles``
+            budget while still recommending a follow-up. A noteworthy event: always
+            notify the human.
+          * ``damped=True`` — the follow-up-review damping cap
+            (``limits.max_followup_reviews``) was spent, so the orchestrator
+            force-converged this finalized round instead of burning another cycle.
+            The expected steady state: stay quiet (no ATTENTION notice) unless the
+            re-review cap also fires.
 
         Re-review cap: if this story itself *originated* from such an entry (a
         sweep bundle closing a ``review-budget-followup`` id), don't re-file again
         — commit + notify only, so a second non-convergence reaches a human
-        instead of slowly looping across sweeps."""
+        instead of slowly looping across sweeps. The loud re-review notice fires on
+        both paths (a capped story that still won't converge must reach a human even
+        under damping)."""
         cycles = self.policy.limits.max_review_cycles
+        cap = self.policy.limits.max_followup_reviews
         spec = Path(task.spec_file).name if task.spec_file else task.story_key
         ledger = self.workspace.paths.deferred_work
-        reason = (
-            f"Review budget ({cycles} cycles) was exhausted with the story finalized "
-            f"(status: done, verify green) while the review pass kept recommending an "
-            f"independent follow-up. The work was committed by bmad-loop run "
-            f"{self.state.run_id}; this entry preserves the lingering follow-up "
-            f"recommendation for a deliberate later review."
-        )
+        if damped:
+            reason = (
+                f"The follow-up-review damping cap (limits.max_followup_reviews = {cap}) "
+                f"was spent with the story finalized (status: done, verify green) while "
+                f"the review pass still recommended an independent follow-up. The work "
+                f"was committed by bmad-loop run {self.state.run_id}; this entry "
+                f"preserves the lingering recommendation for a deliberate later review."
+            )
+        else:
+            reason = (
+                f"Review budget ({cycles} cycles) was exhausted with the story finalized "
+                f"(status: done, verify green) while the review pass kept recommending an "
+                f"independent follow-up. The work was committed by bmad-loop run "
+                f"{self.state.run_id}; this entry preserves the lingering follow-up "
+                f"recommendation for a deliberate later review."
+            )
         re_review = False
         if task.dw_ids and ledger.is_file():
             entries = {
@@ -2136,22 +4564,64 @@ class Engine:
             )
         refiled: str | None = None
         if not re_review:
-            refiled = deferredwork.append_entry(
-                ledger,
-                title=f"Follow-up review still recommended for {task.story_key} "
-                f"after the review budget was exhausted",
-                origin="review-budget-followup",
-                source_spec=spec,
-                reason=reason,
-                severity="low",
+            tail = "the damping cap was spent" if damped else "the review budget was exhausted"
+            title = f"Follow-up review still recommended for {task.story_key} after {tail}"
+            entry = {
+                "title": title,
+                "origin": "review-budget-followup",  # verbatim: re-review cap + replay dedupe key
+                "source_spec": spec,
+                "reason": reason,
+                "severity": "low",
+            }
+            # Persist the intent BEFORE the write, never after it succeeds. This
+            # writes the ACTIVE workspace's ledger, so under isolation the row is
+            # inside a unit worktree that `close_unit_workspace` deletes, and a
+            # gitignored one is skipped by `finalize_commit`'s `git add -A` in
+            # silence — the run journals `refiled: DW-n` having filed nothing a
+            # later sweep can reach (#425). The DONE-leg carry is the delivery
+            # path, and it reads only PERSISTED records.
+            #
+            # Recording after the append instead loses the row outright on a hard
+            # host loss: nothing saves between here and `_commit`'s COMMITTING
+            # save, and that window spans every blocking `pre_commit_gate`
+            # workflow (the shipped TEA plugin binds three, each a live session).
+            # The resumed run replays this same review result in the same
+            # worktree, `append_entry` dedupes the already-open row to None, the
+            # record is never made, and the carry finds an empty payload.
+            #
+            # Keyed dedupe, not an `if refiled:` gate, for the same reason
+            # `_harvest_spec_deferrals` keeps a stable union: a replay must not
+            # append a second copy, but it must not need a NEW id to record
+            # authorship either. Safe to pre-latch — `refiled_followups` is a
+            # record, not a suppression bit: both consumers (replay eligibility,
+            # the carry) only ever make the engine do more, and `append_entry`
+            # dedupes an already-open row, so recording an append that then fails
+            # costs at most a carry that files the row the operator was owed.
+            known = {
+                (str(item.get("origin", "")), str(item.get("source_spec", "")))
+                for item in task.refiled_followups
+            }
+            if (entry["origin"], entry["source_spec"]) not in known:
+                task.refiled_followups.append(entry)
+                self._save()
+            refiled = deferredwork.append_entry(ledger, **entry)
+        if damped:
+            self.journal.append(
+                "review-followup-damped",
+                story_key=task.story_key,
+                cycle=task.review_cycle,
+                cap=cap,
+                refiled=refiled,
+                re_review_capped=re_review,
             )
-        self.journal.append(
-            "review-budget-committed",
-            story_key=task.story_key,
-            cycles=cycles,
-            refiled=refiled,
-            re_review_capped=re_review,
-        )
+        else:
+            self.journal.append(
+                "review-budget-committed",
+                story_key=task.story_key,
+                cycles=cycles,
+                refiled=refiled,
+                re_review_capped=re_review,
+            )
         note = reason
         if re_review:
             note = (
@@ -2159,31 +4629,125 @@ class Engine:
                 f"still won't converge — a human should review whether the recommended "
                 f"follow-up is real before sweeping it again."
             )
+        # Exhaustion always notifies. Damped convergence is the expected steady
+        # state and stays quiet — EXCEPT when the re-review cap fires: a story that
+        # itself originated from a review-budget-followup entry still won't converge
+        # and must reach a human even under damping.
+        if not damped or re_review:
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"review budget reached, work committed: {task.story_key}",
+                note,
+            )
+
+    def _defer_recovery_note(self, task: StoryTask) -> str:
+        """Message tail naming where the deferred attempt's work survives (#333).
+
+        A bare reason leaves the operator to find the rolled-back work themselves
+        (the reporter used `git log --all`). In-place, the auto-rollback parked the
+        attempt on `task.preserve_ref`, which fast-forwards straight back. Isolated,
+        *this* defer rolls nothing back — a kept-failed unit's branch stays mounted —
+        but an EARLIER attempt's in-worktree dev-retry rollback parks on the same
+        shared refs, so `preserve_ref` can be set here too. Both are named; the
+        isolated arm deliberately prints no `merge --ff-only` line, because that ref
+        is not fast-forwardable from either tree (the unit branch has since moved on
+        with the deferred attempt's commits, and fast-forwarding it into the
+        operator's checkout would land a *discarded* attempt on their branch).
+
+        Empty when there is nothing to point at — a clean-tree defer that parked
+        nothing, a commits-preserve failure, rollback off, or `keep_failed` off with
+        no earlier ref — so the notice can never advertise a ref that was not
+        created. A *worktree*-snapshot failure is the one case that still points
+        somewhere: `preserve_partial` then downgrades the claim to the committed
+        half instead of hiding a ref that does exist. The pointer is a name, not a
+        promise: `scm.preserve_keep` prunes the oldest refs at a later run's start,
+        and nothing here re-validates it (this must stay git-free — `status` reads
+        `state.json` only)."""
+        if self._isolated:
+            note = ""
+            if self.policy.scm.keep_failed and task.branch:
+                note = f" — failed work kept on branch `{task.branch}`"
+            if task.preserve_ref:
+                half = " (commits only)" if task.preserve_partial else ""
+                note += (
+                    f" — an earlier rolled-back attempt is parked at `{task.preserve_ref}`{half}"
+                )
+            return note
+        if not task.preserve_ref:
+            return ""
+        recover = (
+            f'; recover with `git -C "{self.workspace.root}" '
+            f"merge --ff-only {task.preserve_ref}`"
+        )
+        if task.preserve_partial:
+            return (
+                f" — attempt COMMITS parked at `{task.preserve_ref}`{recover}; the "
+                f"uncommitted changes could not be captured (journal: "
+                f"attempt-worktree-preserve-failed) and did not survive the rollback"
+            )
+        return f" — attempt work parked at `{task.preserve_ref}`{recover}"
+
+    def _record_defer(self, task: StoryTask, reason: str, note: str | None = None) -> None:
+        """Journal + notify + persist the defer decision — the one record shape all
+        three emit sites share (#342). ``note`` overrides the recovery-note tail on
+        the rollback-pause path, where the reset never ran and the standard note's
+        parked/destroyed claims would be wrong."""
+        self.journal.append(
+            "story-deferred",
+            story_key=task.story_key,
+            reason=reason,
+            preserve_ref=task.preserve_ref or "",
+        )
         gates.notify(
             self.policy,
             self.run_dir,
-            f"review budget reached, work committed: {task.story_key}",
-            note,
+            f"story deferred: {task.story_key}",
+            reason + (self._defer_recovery_note(task) if note is None else note),
         )
+        self._save()
 
     def _defer(self, task: StoryTask, reason: str) -> None:
         task.defer_reason = reason
-        advance(task, Phase.DEFERRED)
         if self._isolated:
             # the failed work lives in the unit's worktree; the diff is captured
             # and the worktree kept/dropped by _integrate_unit. Don't touch the
             # tree here (no reset into the main repo — there's nothing to undo).
-            self.journal.append("story-deferred", story_key=task.story_key, reason=reason)
-            gates.notify(self.policy, self.run_dir, f"story deferred: {task.story_key}", reason)
-            self._save()
+            # Harvested findings are the exception: re-file them into the main
+            # checkout before the terminal save makes this defer durable. Keep
+            # the pre-terminal phase until that repair write succeeds: if its git
+            # commit fails, ordinary inflight recovery must re-enter this decision
+            # and then finish defer recording + unit teardown/integration.
+            self._carry_harvested_deferrals(task)
+            advance(task, Phase.DEFERRED)
+            self._record_defer(task, reason)
             return
+        advance(task, Phase.DEFERRED)
         if task.baseline_commit:
             self._stash_deferred_artifacts(task)
             deferred_work = self.workspace.paths.deferred_work
             snapshot = (
                 deferred_work.read_text(encoding="utf-8") if deferred_work.is_file() else None
             )
-            self._rollback_or_pause(task)
+            try:
+                self._rollback_or_pause(task)
+            except RunPaused:
+                # Narrow, deliberate catch of the unwind-to-the-top pause (#342):
+                # the pause already persisted Phase.DEFERRED (terminal), so resume
+                # will never re-enter this method — the defer record is emitted
+                # now or never. Every pause path fires BEFORE safe_reset, so the
+                # tree is untouched: the standard recovery note's parked/destroyed
+                # claims would be wrong here — the ACTION REQUIRED notice just
+                # above this one in ATTENTION is the authoritative pointer.
+                # Re-raised untouched: the run still pauses.
+                self._record_defer(
+                    task,
+                    reason,
+                    note=" — the tree was NOT rolled back: the run paused for manual "
+                    "recovery first (see the ACTION REQUIRED notice for where the "
+                    "attempt's work is)",
+                )
+                raise
             # reset reverts tracked deferred-work.md edits; restore review-found
             # defer entries — they are real knowledge worth keeping
             if snapshot is not None:
@@ -2193,31 +4757,312 @@ class Engine:
                 if current != snapshot:
                     deferred_work.parent.mkdir(parents=True, exist_ok=True)
                     deferred_work.write_text(snapshot, encoding="utf-8")
-        self.journal.append("story-deferred", story_key=task.story_key, reason=reason)
-        gates.notify(
-            self.policy,
-            self.run_dir,
-            f"story deferred: {task.story_key}",
-            reason,
+            # The restore deliberately keeps review-found ledger knowledge, but
+            # it also replays this bundle's accepted close after the code was
+            # discarded. Let the mode undo only the close it can identify as its
+            # own; the base path has no bundle close and is a no-op.
+            self._reopen_ledger_after_defer(task)
+        self._record_defer(task, reason)
+
+    def _reopen_ledger_after_defer(self, task: StoryTask) -> None:
+        """Undo mode-owned ledger closes after a defer discarded their code.
+
+        No-op on the base path; only ``SweepEngine`` writes reopenable bundle
+        closes. This is reached on the in-place branch after a reset was attempted
+        and the ledger was restored. An isolated defer returns earlier because the
+        unit worktree, including its close, is discarded without merging.
+        """
+        return
+
+    def _carry_isolated_ledger_writes(self, task: StoryTask) -> None:
+        """Apply Engine-owned ledger writes that an isolated merge may omit.
+
+        APPENDS FIRST, THEN CLOSES — the ordering is a correctness contract, not a
+        style. ``append_entry``'s idempotence scan is open-only, so a close that
+        ran first would hide an already-filed row from it and mint a duplicate
+        under a fresh id. That is why the two appends lead, why the story close
+        below trails them, and why ``SweepEngine``'s override runs its bundle
+        close strictly after ``super()``.
+
+        The collision is reachable, not theoretical: a story may declare
+        ``closes_deferred:`` on the very ``review-budget-followup`` row that
+        ``_carry_review_budget_followups`` is about to dedupe against. Close it
+        first and the follow-up is re-filed as a second entry.
+
+        The two closes never coexist on one task — ``SweepEngine`` overrides the
+        story producer to a no-op, and a story run has no bundle — so their
+        relative order is unobservable.
+        """
+        self._carry_harvested_deferrals(task)
+        self._carry_review_budget_followups(task)
+        self._carry_story_deferred_closes(task)
+
+    def _harvest_carry_commit_may_degrade(self, ledger: Path) -> bool:
+        """Whether a carry may remain uncommitted because git cannot own its path."""
+        repo = self.paths.repo_root
+        try:
+            rel = ledger.resolve().relative_to(repo.resolve()).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return True  # external or unresolvable ledgers are advisory artifacts
+        if verify.path_tracked(repo, rel):
+            return False
+        return rel not in verify.untracked_files(repo)
+
+    def _carry_harvested_deferrals(self, task: StoryTask) -> None:
+        """Re-file an isolated unit's harvested findings into the main ledger."""
+        if not task.harvested_deferrals:
+            return
+        ledger = self.paths.deferred_work
+        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        seen = deferredwork.parse_ledger(text)
+        carried: list[str] = []
+        for item in task.harvested_deferrals:
+            origin = str(item["origin"])
+            source_spec = str(item["source_spec"])
+            if any(
+                deferredwork.field_line_present(entry.body, "origin", origin)
+                and deferredwork.field_line_present(entry.body, "source_spec", source_spec)
+                for entry in seen
+            ):
+                continue
+            # Persist the commit obligation before the filesystem write. A host
+            # loss after append_entry writes the row but before it returns must
+            # still make replay commit the now-deduplicated tracked/untracked row.
+            # Latch only once a novel provenance is known: when every row already
+            # arrived through the merge, committing here could sweep unrelated
+            # operator edits to the same ledger into the carry commit.
+            if not task.harvest_carry_commit_pending:
+                task.harvest_carry_commit_pending = True
+                self._save()
+            location = item.get("location")
+            severity = item.get("severity")
+            dw_id = deferredwork.append_entry(
+                ledger,
+                title=str(item["title"]),
+                origin=origin,
+                location=str(location) if location else "n/a",
+                source_spec=source_spec,
+                reason=str(item["reason"]),
+                severity=str(severity) if severity else None,
+            )
+            if dw_id:
+                carried.append(dw_id)
+                # Keep the same-call dedupe status-agnostic too.
+                seen = deferredwork.parse_ledger(ledger.read_text(encoding="utf-8"))
+        commit_needed = bool(carried) or task.harvest_carry_commit_pending
+        if commit_needed:
+            # The pre-append latch also covers every git observation/write below.
+            # A failed add/status/commit can leave the row staged or dirty; replay
+            # must retry even when the provenance scan dedupes it to `carried == []`.
+            may_degrade = self._harvest_carry_commit_may_degrade(ledger)
+            try:
+                verify.commit_paths(
+                    self.paths.repo_root,
+                    f"chore(deferred-work): carry harvested findings from {task.story_key}",
+                    [ledger],
+                )
+            except verify.GitError as e:
+                if not may_degrade:
+                    raise
+                self.journal.append(
+                    "harvest-carry-uncommitted",
+                    story_key=task.story_key,
+                    dw_ids=carried,
+                    error=str(e),
+                )
+            task.harvest_carry_commit_pending = False
+            self._save()
+        self.journal.append("harvest-carried", story_key=task.story_key, dw_ids=carried)
+
+    def _carry_review_budget_followups(self, task: StoryTask) -> None:
+        """Re-file an isolated unit's review-budget follow-ups into the main ledger.
+
+        The third producer in the ``git add -A`` family (#425).
+        ``_record_review_budget_followup`` runs on a finalized, verify-green story
+        the review pass would not stop recommending a follow-up for; under
+        isolation that write is correct but is silently dropped when the main
+        ledger is gitignored. Hence a carry rather than a guard, which would
+        suppress a legitimate entry on every isolated run.
+
+        No ``_isolated`` predicate: ``refiled_followups`` is populated by that one
+        producer and this hook is reached only from the isolated DONE leg and its
+        replay, so the record IS the guard.
+
+        Unconditional and idempotent — ``append_entry`` dedupes an OPEN row with
+        the same ``origin:`` + ``source_spec:``, while an already-CLOSED row with
+        that provenance earns a fresh entry, exactly as a recurrence does in
+        place. That is what lets the producer record its intent BEFORE its own
+        append, which durability requires, so ``review-followup-carried`` with
+        ``dw_ids == []`` is an ordinary outcome and not a carry that ran on
+        nothing.
+
+        A TRACKED ledger is safe unconditionally: no exclude or ignore rule masks a
+        tracked file's MODIFICATION, so the unit's own write always rides the merge
+        and its row arrives already deduped — yielding an empty ``carried`` and no
+        commit.
+
+        The commit is best effort — unlike ``_carry_harvested_deferrals``, whose
+        re-raise is backed by ``harvest_carry_commit_pending`` — because it can
+        only ever FAIL: the sole ledger shape that reaches it is a gitignored one,
+        and ``git add`` refuses an ignored path with rc 1 every time, so a
+        commit-pending latch would just retry a refusal. Nor can it leave the tree
+        dirty, the shape it writes being the one git does not see. The row on disk
+        is the value; the commit is bookkeeping.
+
+        Every record must belong to the attempt now being committed — a premise
+        ``_dev_phase`` enforces, not this frame. A record left over from an
+        ABANDONED attempt died with its discarded worktree, so it has nothing
+        upstream to dedupe against and the carry would append AND commit a row
+        about work that never landed; the fresh-attempt clear beside
+        ``harvested_deferrals`` is what prevents that (#457).
+        """
+        if not task.refiled_followups:
+            return
+        ledger = self.paths.deferred_work
+        carried: list[str] = []
+        for item in task.refiled_followups:
+            severity = item.get("severity")
+            dw_id = deferredwork.append_entry(
+                ledger,
+                title=str(item["title"]),
+                origin=str(item["origin"]),
+                source_spec=str(item["source_spec"]),
+                reason=str(item["reason"]),
+                severity=str(severity) if severity else None,
+            )
+            if dw_id:
+                carried.append(dw_id)
+        if carried:
+            try:
+                verify.commit_paths(
+                    self.paths.repo_root,
+                    f"chore(deferred-work): carry {task.story_key}'s review follow-up",
+                    [ledger],
+                )
+            except verify.GitError as e:
+                self.journal.append(
+                    "review-followup-carry-uncommitted",
+                    story_key=task.story_key,
+                    dw_ids=carried,
+                    error=str(e),
+                )
+        self.journal.append("review-followup-carried", story_key=task.story_key, dw_ids=carried)
+
+    def _carry_story_deferred_closes(self, task: StoryTask) -> None:
+        """Re-apply a story's declared ledger CLOSES to the main checkout (#458).
+
+        The fourth and last producer in the ``git add -A`` family.
+        ``_close_declared_deferred`` writes the ACTIVE workspace's ledger, so under
+        isolation a gitignored one is flipped inside a unit worktree, skipped by
+        ``finalize_commit``'s ``git add -A`` in silence, and deleted with the
+        worktree — while the run has already journaled ``story-deferred-closed``.
+        Left uncarried the entry stays ``open``, so ``deferredwork.open_ids``
+        re-bundles resolved work on every later sweep: unbounded re-triage, not a
+        one-time drop.
+
+        ``mark_done_many``, NOT the reopenable variant ``SweepEngine`` uses: a story
+        close carries no operation id and no ``resolution-undo:`` line, so this is
+        what keeps a carried row byte-identical to one the merge delivered. The note
+        goes through ``_story_close_note`` for the same reason. Only the date can
+        differ, and only across a midnight boundary — the same accepted drift the
+        park record carries.
+
+        Unconditional and idempotent, with no tracked/ignored predicate. Idempotence
+        here is stronger than the appends': ``_apply_done`` returns None for a row
+        that is absent OR already ``done``, and ``_mark_done_many`` then writes
+        nothing at all — not even a byte-identical rewrite. So a tracked ledger,
+        whose close rode the merge, yields an empty ``carried`` and no commit, and a
+        replay re-applying a landed carry is a no-op. ``story-deferred-close-carried``
+        with ``dw_ids == []`` is an ordinary outcome.
+
+        Best effort, like ``SweepEngine``'s close and unlike
+        ``_carry_harvested_deferrals`` — and, as with
+        ``_carry_review_budget_followups``, because the commit can only ever FAIL
+        here rather than because failure is rare. Of the three shapes the main
+        ledger can take, only a gitignored one reaches ``commit_paths`` at all: a
+        tracked one is already closed by the merge, and an untracked-but-not-ignored
+        one never reaches this frame because ``clean_incoming_collisions`` refuses
+        the merge first. ``git add`` then refuses that ignored path with rc 1 every
+        time, so a commit-pending latch would only retry a refusal.
+
+        ``self.paths``, not ``self.workspace.paths``, states the intent — the MAIN
+        checkout's ledger. The two are the same path at every call site that
+        reaches here: the workspace is swapped back before
+        ``integrate_unit`` runs the hook, and before the resume replay does. So no
+        test can tell the two apart, and none pretends to; the explicit form is
+        kept because the intent stops being obvious the moment that stops holding.
+        """
+        if not task.story_closes_intended:
+            return
+        ledger = self.paths.deferred_work
+        carried = deferredwork.mark_done_many(
+            ledger,
+            task.story_closes_intended,
+            self._today(),
+            self._story_close_note(task),
         )
-        self._save()
+        if carried:
+            try:
+                verify.commit_paths(
+                    self.paths.repo_root,
+                    f"chore(deferred-work): close {task.story_key}'s declared ids",
+                    [ledger],
+                )
+            except verify.GitError as e:
+                self.journal.append(
+                    "story-deferred-close-carry-uncommitted",
+                    story_key=task.story_key,
+                    dw_ids=carried,
+                    error=str(e),
+                )
+        self.journal.append(
+            "story-deferred-close-carried", story_key=task.story_key, dw_ids=carried
+        )
 
     def _stash_deferred_artifacts(self, task: StoryTask) -> None:
         """Move the deferred story's spec out of the artifacts dir into the run
         dir: a leftover in-review spec would confuse the next attempt, but the
-        work in it is worth keeping for the human."""
+        work in it is worth keeping for the human.
+
+        A story that defers twice re-stashes the same filename, so the target may
+        exist. `shutil.move` survived that on Windows only by accident: `os.rename`
+        raises FileExistsError over an existing target, `move` catches *any* OSError
+        and falls back to `copy2` + `unlink`. Two real hazards ride on that fallback
+        (#101) — it re-fails outright when an AV/indexer handle turns the rename into
+        a sharing violation (WinError 5/32) and `copy2` then cannot open the same
+        locked target, and it is non-atomic, so a crash mid-copy leaves a truncated
+        stash. Staging a copy inside `dest` and `atomic_replace`-ing it onto the
+        target overwrites in one step, carries #98's win32 retry, and — because the
+        staging copy lives in `dest` — keeps the replace same-filesystem, preserving
+        `shutil.move`'s cross-device tolerance.
+
+        Both halves of the move are retried: Windows denies a delete against an open
+        handle just as it denies a rename-over, so an unretried `unlink` would fail
+        the run on the very hazard the replace now rides out. The order is
+        replace-then-unlink because `_defer` calls this before the rollback and the
+        `story-deferred` journal append — a failure here aborts the deferral, so it
+        must be able to leave a duplicate spec, never a hole where the work was."""
         if not task.spec_file:
             return
         spec_path = Path(task.spec_file)
         if not spec_path.is_file():
             return
-        dest = self.run_dir / "deferred" / task.story_key
+        dest = self.run_dir / "deferred" / safe_segment(task.story_key)
         dest.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(spec_path), str(dest / spec_path.name))
+        target = dest / spec_path.name
+        tmp = dest / (spec_path.name + ".tmp")
+        shutil.copy2(spec_path, tmp)
+        try:
+            atomic_replace(tmp, target)
+        except BaseException:
+            with contextlib.suppress(OSError):  # the copy is disposable; keep the real error
+                tmp.unlink(missing_ok=True)
+            raise
+        retrying_unlink(spec_path)
         self.journal.append(
             "deferred-artifacts-stashed",
             story_key=task.story_key,
-            stashed_to=str(dest / spec_path.name),
+            stashed_to=str(target),
         )
 
     def _escalate(self, task: StoryTask, reason: str) -> None:
@@ -2240,6 +5085,15 @@ class Engine:
             return
         if trigger in self.state.sweeps_triggered:
             return  # already fired before a pause/resume of this run
+        if graceful_stop_requested(self.run_dir):
+            # A pending graceful stop suppresses new child sweeps. Return (not
+            # raise): at the run-end call site the story queue is already empty,
+            # so finishing this run as `finished` is truthful — the finally clears
+            # the superseded control file. Crucially this precedes the append
+            # below, so the trigger stays UNrecorded and a later resume (after the
+            # request is cleared) can still fire the sweep it would have run.
+            self.journal.append("sweep-auto-suppressed", trigger=trigger)
+            return
         self.state.sweeps_triggered.append(trigger)
         self._save()
         try:
@@ -2255,7 +5109,7 @@ class Engine:
         try:
             self.sweep_factory(trigger)
             self.journal.append("sweep-auto-finished", trigger=trigger)
-        except Exception as e:  # noqa: BLE001 — child must never break the parent
+        except Exception as e:  # child must never break the parent
             self.journal.append("sweep-auto-failed", trigger=trigger, error=str(e))
             gates.notify(self.policy, self.run_dir, "auto sweep failed", f"{trigger}: {e}")
 

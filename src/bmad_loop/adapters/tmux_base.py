@@ -3,18 +3,19 @@
 This module is the **quarantine** for tmux/POSIX-shell knowledge: every tmux
 invocation and POSIX-shell trailer lives here (and in its POSIX leaf
 :mod:`.tmux_backend`). The point of the split is that a tmux-*family* backend —
-an eventual native-Windows "psmux" — can subclass :class:`BaseTmuxBackend` and
-override only the single spawn primitive :meth:`BaseTmuxBackend._run` (to tweak
-the binary or timeout — output decoding is the :attr:`BaseTmuxBackend._ENCODING`
-class attribute and a scrubbed per-call ``env`` is a ``_run`` parameter, neither
-an override) plus the shell-dialect hooks (``_shell_wrap``, ``_join_argv``,
+the native-Windows :mod:`.psmux_backend` leaf — can subclass :class:`BaseTmuxBackend` and
+swap only class attributes (:attr:`BaseTmuxBackend._BINARY` for the spawned
+binary, :attr:`BaseTmuxBackend._ENCODING` / :attr:`BaseTmuxBackend._ERRORS`
+for output decoding — a scrubbed
+per-call ``env`` is a ``_run`` parameter, and an :meth:`BaseTmuxBackend._run`
+override is left for timeout tweaks) plus the shell-dialect hooks (``_shell_wrap``, ``_join_argv``,
 ``_parked_trailer``, ``_source_prefix``, ``_window_launch`` and the
 ``_EXIT_CAPTURE``/``_ECHO``/``_PARK`` fragments), **without editing**
 :mod:`.tmux_backend`. For :meth:`~BaseTmuxBackend.new_window` /
 :meth:`~BaseTmuxBackend.new_parked_window` the hooks replace method-body
-overrides entirely; :meth:`~BaseTmuxBackend.pipe_pane` still hands tmux a POSIX
-``cat >>`` redirection, so it remains the one contract method a non-POSIX leaf
-overrides directly.
+overrides entirely; :meth:`~BaseTmuxBackend.pipe_pane` still hands the
+multiplexer a POSIX ``cat >>`` redirection, so a non-POSIX leaf overrides it
+directly, alongside whatever divergences its multiplexer forces on it.
 
 Every method that talks to tmux funnels through :meth:`BaseTmuxBackend._run`, the
 one place a subprocess is spawned. See :mod:`.multiplexer` for the contract.
@@ -26,14 +27,17 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
-from .multiplexer import MultiplexerError, TerminalMultiplexer
+from .multiplexer import MultiplexerError, TerminalMultiplexer, fold_version
 
 TMUX_TIMEOUT_S = 30
-# Per-window option value (vs a pane id) telling the parked trailer to detach the
-# client rather than switch it. Pane ids are %N, so this never collides with one.
+# Per-window option value (vs a pane target) telling the parked trailer to detach
+# the client rather than switch it. Recorded targets are backend-composed pane
+# targets (bare %N on tmux, =session:%N on psmux — see
+# TerminalMultiplexer.current_return_target), so this never collides with one.
 PARKED_RETURN_DETACH = "detach"
 
 
@@ -43,11 +47,22 @@ class TmuxError(MultiplexerError):
 
 class BaseTmuxBackend(TerminalMultiplexer):
     """tmux-family backend: all argv construction and every contract method, with
-    one overridable subprocess primitive (:meth:`_run`) every call funnels through."""
+    one overridable subprocess primitive (:meth:`_run`) every call funnels through.
+    The seam-canonical target grammar (``=session[:window]``, see
+    :meth:`TerminalMultiplexer.target`) coincides with tmux's exact-match target
+    syntax, so targets pass straight through to tmux — never parsed here."""
 
+    #: The binary every spawn, PATH probe, and in-source client verb targets.
+    #: A tmux-family leaf whose binary is not literally named ``tmux`` overrides
+    #: this one name instead of any method body.
+    _BINARY = "tmux"
     #: Output decoding for captured tmux text. ``None`` (POSIX) = locale default,
     #: byte-identical to a bare ``text=True``; a Windows leaf sets ``"utf-8"``.
     _ENCODING: str | None = None
+    #: Decode error handling to pair with :attr:`_ENCODING`. ``None`` (POSIX) =
+    #: the default strict handler; a Windows leaf sets ``"backslashreplace"`` so
+    #: a stray non-UTF-8 byte degrades visibly instead of raising mid-capture.
+    _ERRORS: str | None = None
 
     def _run(
         self,
@@ -56,7 +71,7 @@ class BaseTmuxBackend(TerminalMultiplexer):
         check: bool = True,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """The ONE place tmux is spawned. ``argv`` are the args after ``tmux``.
+        """The ONE place tmux is spawned. ``argv`` are the args after the binary.
 
         With ``check=True`` a non-zero exit raises :class:`TmuxError` (the strict
         form behind ``_tmux``); with ``check=False`` the completed process is
@@ -71,15 +86,16 @@ class BaseTmuxBackend(TerminalMultiplexer):
         vars — not from scratch (on Windows the child needs ``SystemRoot`` etc.).
         """
         proc = subprocess.run(
-            ["tmux", *argv],
+            [self._BINARY, *argv],
             capture_output=True,
             text=True,
             encoding=self._ENCODING,
+            errors=self._ERRORS,
             env=env,
             timeout=TMUX_TIMEOUT_S,
         )
         if check and proc.returncode != 0:
-            raise TmuxError(f"tmux {' '.join(argv[:2])} failed: {proc.stderr.strip()}")
+            raise TmuxError(f"{self._BINARY} {' '.join(argv[:2])} failed: {proc.stderr.strip()}")
         return proc
 
     def _tmux(self, *args: str) -> str:
@@ -91,7 +107,7 @@ class BaseTmuxBackend(TerminalMultiplexer):
         try:
             return self._run(list(args), check=True).stdout.strip()
         except (subprocess.TimeoutExpired, OSError) as exc:
-            raise TmuxError(f"tmux {args[0] if args else ''} failed: {exc}") from exc
+            raise TmuxError(f"{self._BINARY} {args[0] if args else ''} failed: {exc}") from exc
 
     # ----------------------------------------------------------- sessions
 
@@ -103,7 +119,7 @@ class BaseTmuxBackend(TerminalMultiplexer):
         try:
             probe = self._run(["has-session", "-t", f"={name}"], check=False)
         except (subprocess.TimeoutExpired, OSError) as exc:
-            raise TmuxError(f"tmux has-session failed: {exc}") from exc
+            raise TmuxError(f"{self._BINARY} has-session failed: {exc}") from exc
         return probe.returncode == 0
 
     def new_session(
@@ -121,9 +137,9 @@ class BaseTmuxBackend(TerminalMultiplexer):
         self._tmux("set-option", "-t", name, option, value)
 
     def kill_session(self, name: str) -> None:
-        # Tolerant of tmux being absent / the session already gone: a best-effort
-        # teardown backstop, never a hard failure.
-        if not shutil.which("tmux"):
+        # Tolerant of the binary being absent / the session already gone: a
+        # best-effort teardown backstop, never a hard failure.
+        if not shutil.which(self._BINARY):
             return
         try:
             self._run(["kill-session", "-t", f"={name}"], check=False)
@@ -131,10 +147,10 @@ class BaseTmuxBackend(TerminalMultiplexer):
             pass
 
     def list_sessions(self) -> list[str]:
-        # [] when tmux is missing, no server is running, or the query fails — the
-        # absence of sessions and the absence of tmux are indistinguishable here
-        # and callers treat both as "nothing live".
-        if not shutil.which("tmux"):
+        # [] when the binary is missing, no server is running, or the query fails
+        # — the absence of sessions and the absence of the multiplexer are
+        # indistinguishable here and callers treat both as "nothing live".
+        if not shutil.which(self._BINARY):
             return []
         try:
             proc = self._run(["list-sessions", "-F", "#{session_name}"], check=False)
@@ -146,8 +162,8 @@ class BaseTmuxBackend(TerminalMultiplexer):
 
     def session_options(self, option: str) -> dict[str, str]:
         # Map session name -> value of ``option`` ("" when unset). Same missing
-        # tmux / no-server tolerance as list_sessions().
-        if not shutil.which("tmux"):
+        # binary / no-server tolerance as list_sessions().
+        if not shutil.which(self._BINARY):
             return {}
         try:
             proc = self._run(
@@ -199,19 +215,23 @@ class BaseTmuxBackend(TerminalMultiplexer):
         return ["sh", "-c", source]
 
     def _parked_trailer(self, return_opt: str) -> str:
-        # After the park, switch an attached client back to its origin pane:
-        #   - return_opt == a pane id (%N): switch that client back there
-        #     (`switch-client -l` is a best-effort fallback when it is gone);
-        #   - return_opt == PARKED_RETURN_DETACH: detach the client so a blocking
+        # After the park, switch an attached client back to its origin pane.
+        # `return_opt` names the per-window option; on its recorded value:
+        #   - a pane target (backend-composed by current_return_target, replayed
+        #     opaquely here — bare %N on tmux, =session:%N on psmux): switch
+        #     that client back there (`switch-client -l` is a best-effort
+        #     fallback when it is gone);
+        #   - PARKED_RETURN_DETACH: detach the client so a blocking
         #     `tmux attach` returns and a suspended TUI resumes;
         #   - unset/empty: nobody attached interactively -> park as-is.
         # The tmux verbs are protocol-identical across the family; only the
         # surrounding control-flow syntax is dialect-specific.
+        mux = self._BINARY
         return (
-            f"ret=$(tmux show-options -wqv {shlex.quote(return_opt)} 2>/dev/null); "
-            f'if [ "$ret" = "{PARKED_RETURN_DETACH}" ]; then tmux detach-client 2>/dev/null; '
+            f"ret=$({mux} show-options -wqv {shlex.quote(return_opt)} 2>/dev/null); "
+            f'if [ "$ret" = "{PARKED_RETURN_DETACH}" ]; then {mux} detach-client 2>/dev/null; '
             'elif [ -n "$ret" ]; then '
-            'tmux switch-client -t "$ret" 2>/dev/null || tmux switch-client -l 2>/dev/null; '
+            f'{mux} switch-client -t "$ret" 2>/dev/null || {mux} switch-client -l 2>/dev/null; '
             "fi"
         )
 
@@ -287,7 +307,7 @@ class BaseTmuxBackend(TerminalMultiplexer):
                 ["list-windows", "-t", f"={session}", "-F", "#{window_id}"], check=False
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
-            raise TmuxError(f"tmux list-windows failed: {exc}") from exc
+            raise TmuxError(f"{self._BINARY} list-windows failed: {exc}") from exc
         if probe.returncode != 0:
             return []
         return probe.stdout.split()
@@ -295,11 +315,15 @@ class BaseTmuxBackend(TerminalMultiplexer):
     def pipe_pane(self, window_id: str, log_file: Path) -> None:
         # A CLI that crashes on launch (bad args, instant auth failure) can take
         # its window down before pipe-pane attaches, which races as "can't find
-        # window". That is not a setup failure, so tolerate it instead of raising.
+        # window". That is not a setup failure, so tolerate it instead of raising
+        # — but say so, or an empty run log is unexplainable.
         try:
             self._tmux("pipe-pane", "-t", window_id, "-o", f"cat >> {shlex.quote(str(log_file))}")
-        except TmuxError:
-            pass
+        except TmuxError as exc:
+            print(
+                f"warning: pipe-pane log capture failed for {window_id}: {exc}",
+                file=sys.stderr,
+            )
 
     def send_text(self, window_id: str, text: str) -> None:
         self._tmux("send-keys", "-t", window_id, "-l", text)
@@ -313,6 +337,19 @@ class BaseTmuxBackend(TerminalMultiplexer):
             self._run(["kill-window", "-t", target], check=False)
         except (subprocess.SubprocessError, OSError):
             pass
+
+    def window_pane_pids(self, target: str) -> list[int]:
+        # Capability method (see the seam default): a transport failure, a dead
+        # window, or unparsable output all degrade to the documented "unknown"
+        # sentinel [] — this feeds the kill escalation, which must never be the
+        # thing that raises.
+        try:
+            probe = self._run(["list-panes", "-t", target, "-F", "#{pane_pid}"], check=False)
+            if probe.returncode != 0:
+                return []
+            return [int(line) for line in probe.stdout.split()]
+        except (subprocess.SubprocessError, OSError, ValueError):
+            return []
 
     def list_windows(self, session: str, fields: list[str]) -> list[tuple[str, ...]]:
         fmt = "\t".join(f"#{{{field}}}" for field in fields)
@@ -365,8 +402,8 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # Inside tmux, nesting an attach is refused, so switch this client
         # instead (a `switch-client -l` brings it back).
         if os.environ.get("TMUX"):
-            return ["tmux", "switch-client", "-t", target]
-        return ["tmux", "attach", "-t", target]
+            return [self._BINARY, "switch-client", "-t", target]
+        return [self._BINARY, "attach", "-t", target]
 
     def current_pane_id(self) -> str | None:
         return self._display_message("#{pane_id}")
@@ -379,18 +416,27 @@ class BaseTmuxBackend(TerminalMultiplexer):
 
     def _display_message(self, fmt: str) -> str | None:
         """Resolve a tmux format string against this process's client, or None
-        when not inside tmux / tmux is unavailable."""
+        when not inside tmux / tmux is unavailable. The TMUX guard is what makes
+        "not inside" honest: against a live server, display-message would answer
+        for some OTHER client's session and misreport a plain shell as being
+        inside tmux — callers (in_ctl_session, the attach return-pane recording)
+        branch on exactly that distinction."""
+        if not os.environ.get("TMUX"):
+            return None
         try:
             proc = self._run(["display-message", "-p", fmt], check=False)
         except (subprocess.SubprocessError, OSError):
             return None
         return proc.stdout.strip() if proc.returncode == 0 else None
 
-    def detach_client(self) -> None:
+    def detach_client(self) -> bool:
+        # Returns True iff a client was detached; a transport failure didn't
+        # detach anything, so False is the honest answer.
         try:
-            self._run(["detach-client"], check=False)
+            proc = self._run(["detach-client"], check=False)
         except (subprocess.SubprocessError, OSError):
-            pass
+            return False
+        return proc.returncode == 0
 
     def switch_client(self, target: str, last_fallback: bool = False) -> bool:
         # Returns True iff a switch happened; a transport failure didn't switch, so
@@ -407,12 +453,19 @@ class BaseTmuxBackend(TerminalMultiplexer):
         return False
 
     def available(self) -> bool:
-        return shutil.which("tmux") is not None
+        return shutil.which(self._BINARY) is not None
 
     def version(self) -> str | None:
-        if not shutil.which("tmux"):
+        if not shutil.which(self._BINARY):
             return None
         try:
-            return self._tmux("-V")
+            raw = self._tmux("-V")
         except (MultiplexerError, subprocess.SubprocessError, OSError):
             return None
+        # The seam promises one line (TerminalMultiplexer.version). `-V` is one
+        # line on tmux, two on psmux (a `tmux X.Y.Z` compat line then its own),
+        # so fold rather than truncate — the tail is what names psmux as the
+        # answering binary. Order is load-bearing: PsmuxMultiplexer.available()
+        # parses the compat segment with an anchored match, so the first
+        # segment must stay first.
+        return fold_version(raw)

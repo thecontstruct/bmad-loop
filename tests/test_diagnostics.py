@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import re
 
+import pytest
+
 from bmad_loop import diagnostics, sanitize
 from bmad_loop.journal import Journal, save_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
@@ -25,6 +27,17 @@ SECRET_AWS = "AKIACANARY0123456789"
 HOME_PATH = "/home/canaryuser/secret/proj"
 CODE = "def steal_creds(token): return token"
 SHA = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+# Deliberately does NOT embed STORY_KEY: `checkpoint-pause` journals
+# `task.spec_file`, which `StoryTask._serialized_spec_file` persists
+# worktree-relative — a bare basename for a spec at the worktree root — and a
+# spec is free to be named after the feature rather than the story. Such a name
+# is identifier-shaped, so the scrub_json fallback emits it verbatim, and the
+# egress backstop cannot repair what was never aliased — only per-field routing
+# can. A name like `1.2-Acme….md` would be rescued by the story key inside it
+# and would prove nothing.
+SPEC_NAME = "AcmeVaultRotation.md"
+# The same spec as the reconcile kinds journal it: absolute, under the home path.
+SPEC_ABS = f"{HOME_PATH}/docs/stories/{SPEC_NAME}"
 
 CANARIES = [
     EMAIL,
@@ -46,11 +59,18 @@ CANARIES = [
     "CANARY_FEEDBACK",
     "CANARY_PATCH",
     SHA,
+    "AcmeVaultRotation",
 ]
 
 
-def _seed_run(root, run_id="20260627-120000-aaaa", *, extra_journal=None):
-    """Build a run dir loaded with canaries in every readable sink."""
+def _seed_run(root, run_id="20260627-120000-aaaa", *, extra_journal=None, sweeps_triggered=()):
+    """Build a run dir loaded with canaries in every readable sink.
+
+    ``sweeps_triggered`` seeds a routing gap the MARKDOWN report can reach: the
+    collector passes identifier-shaped entries through verbatim, and the report
+    renders them inline. (``extra_journal`` seeds a gap only the JSON document
+    reaches — markdown renders journal aggregates, never per-entry fields.)
+    """
     run_dir = root / ".bmad-loop" / "runs" / run_id
 
     task = StoryTask(
@@ -105,6 +125,7 @@ def _seed_run(root, run_id="20260627-120000-aaaa", *, extra_journal=None):
         },
         plugin_shared={"unity": {"creds": SECRET_AWS}},
         tasks={STORY_KEY: task},
+        sweeps_triggered=list(sweeps_triggered),
     )
     save_state(run_dir, state)
 
@@ -119,6 +140,14 @@ def _seed_run(root, run_id="20260627-120000-aaaa", *, extra_journal=None):
     )
     j.append("story-done", story_key=STORY_KEY, commit=SHA)
     j.append("sprint-status-unknown-keys", keys=[STORY_KEY, "9.9-OtherSecret"])
+    j.append("checkpoint-pause", story_key=STORY_KEY, checkpoint="plan", spec=SPEC_NAME)
+    # The SAME spec, in the other shape a producer emits: engine.py's reconcile
+    # and marker-repair kinds journal `str(spec_path)`, which
+    # `verify.resolve_spec_path` returns absolute, while `checkpoint-pause` above
+    # journals `task.spec_file` — persisted worktree-relative, so a bare basename
+    # for a root-level spec. Seeded here rather than in one test so the canary
+    # sweep covers the path shape too.
+    j.append("spec-status-reconciled", story_key=STORY_KEY, spec=SPEC_ABS)
     for kind, fields in extra_journal or []:
         j.append(kind, **fields)
 
@@ -178,6 +207,88 @@ def test_pseudonymization_is_stable_and_correlates(project):
     assert alias in combined
 
 
+def test_spec_name_is_aliased_in_its_own_namespace(project):
+    """The spec-carrying journal kinds carry the spec's name, which is the
+    customer's feature name. `test_no_canary_leaks_anywhere` already proves it does
+    not ship; this pins HOW — a per-field alias in a `spec` namespace of its own,
+    so it never renders in the epic-less `story-<hex>` shape a reused "story"
+    namespace would give a filename. Nothing else can cover it: the value is not
+    in the legend until it is routed, so the egress backstop has no alias to
+    substitute.
+
+    The namespace, not just the routing, is what this pins: `fullmatch` on the
+    `spec-` prefix is what fails if the field is moved to "story". (Correlation
+    across the two shapes a producer emits is a separate contract with its own
+    witness below — this test's run seeds both, but neither of its assertions can
+    see the difference.)"""
+    run_dir = _seed_run(project.project)
+    diag, pseudo, combined = _render_all([run_dir])
+    alias = next(a for _ns, orig, a in pseudo.entries() if orig == SPEC_NAME)
+    assert re.fullmatch(r"spec-[0-9a-f]{12}", alias), alias
+    assert alias in combined
+    # distinct from the story alias, and not wearing its shape
+    assert alias != diag.runs[0].tasks[0].alias
+
+
+def test_one_spec_gets_one_alias_whichever_shape_it_was_journalled_in(project):
+    """A spec journalled as a bare basename by `checkpoint-pause` and as an
+    absolute path by the reconcile kinds is ONE spec, and must read as one.
+
+    Aliasing is chosen over dropping precisely so a maintainer can follow one
+    identifier across events (`_JOURNAL_ALIAS_FIELDS`' own docstring says so), so
+    two aliases for one spec is not cosmetic — it is the feature failing silently
+    in a dump that looks correct. The seeded run carries both shapes; the fixture
+    can express the failure because `SPEC_ABS` and `SPEC_NAME` are different
+    strings that must nonetheless collapse to a single alias.
+
+    The legend assertion is the second half of the same fix and needs its own
+    line: normalizing to the basename is also what keeps the user's absolute home
+    path out of the `--legend` file. Before `spec` was routed at all, a path-shaped
+    value was rejected by `scrub_json` and never entered the map; routing it
+    without normalizing would have put it there."""
+    run_dir = _seed_run(project.project)
+    _diag, pseudo, _combined = _render_all([run_dir])
+    aliases = {a for _ns, orig, a in pseudo.entries() if SPEC_NAME in orig}
+    assert len(aliases) == 1, pseudo.entries()
+    originals = [orig for _ns, orig, _a in pseudo.entries() if SPEC_NAME in orig]
+    assert originals == [SPEC_NAME], originals
+    assert HOME_PATH not in str(pseudo.legend())
+
+
+def test_a_windows_spec_path_normalizes_to_the_same_alias():
+    """The basename split handles backslashes, on every platform.
+
+    A journal written on Windows is routinely read by `diagnose` on POSIX, where
+    `PurePath(r"C:\\Users\\a\\x.md").name` is the WHOLE string — so the split is
+    separator-agnostic by hand rather than delegated to pathlib. This test is the
+    Windows witness that runs on the POSIX lanes too: it asserts on strings, never
+    on the filesystem, so it must NOT be skipped off Windows — which is the only
+    reason the divergence is covered at all."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    posix = diagnostics._scrub_entry(
+        {"kind": "spec-status-reconciled", "spec": f"/home/u/docs/{SPEC_NAME}"}, pseudo, {}, None
+    )
+    windows = diagnostics._scrub_entry(
+        {"kind": "spec-status-reconciled", "spec": f"C:\\Users\\u\\docs\\{SPEC_NAME}"},
+        pseudo,
+        {},
+        None,
+    )
+    bare = diagnostics._scrub_entry(
+        {"kind": "checkpoint-pause", "spec": SPEC_NAME}, pseudo, {}, None
+    )
+    assert posix["spec"] == windows["spec"] == bare["spec"]
+    assert list(pseudo.legend().values()) == [SPEC_NAME]
+    # Totality: a value ending in a separator has an empty tail, and `alias()`
+    # passes "" through unaliased — the event would lose its only reference to
+    # the spec rather than gain one. The `or value` fallback owns this line.
+    trailing = diagnostics._scrub_entry(
+        {"kind": "spec-status-reconciled", "spec": "docs/"}, pseudo, {}, None
+    )
+    assert trailing["spec"] != ""
+    assert re.fullmatch(r"spec-[0-9a-f]{12}", trailing["spec"])
+
+
 def test_structure_is_preserved(project):
     run_dir = _seed_run(project.project)
     diag, _pseudo, _combined = _render_all([run_dir])
@@ -190,6 +301,10 @@ def test_structure_is_preserved(project):
     # token totals equal the one session's usage (the other session has none)
     assert run.token_totals["input_tokens"] == 100
     assert run.token_totals["total"] == 160
+    # both units, so a bundle reader isn't left recomputing the weighted figure
+    # the budgets actually judged (#129): 100 + 50 + round(10 * 0.1)
+    assert run.token_totals["weighted"] == 151
+    assert run.tasks[0].tokens["weighted"] == 151
     # logs file group reports a nonzero size but no path/content (covered above)
     logs = next(g for g in run.files if g.category == "logs")
     assert logs.count == 1 and logs.total_bytes > 0 and logs.total_lines == 2
@@ -242,3 +357,210 @@ def test_unreadable_run_does_not_crash(project):
     assert diag.runs[0].warnings  # flagged as unreadable
     # still renders without raising
     diagnostics.render_markdown(diag, pseudo=pseudo)
+
+
+# ------------------------------------------------------ backstop repair (#186)
+
+
+def _seed_routing_gap(project):
+    """A run whose journal carries a real story key in an UNLISTED field — the
+    _scrub_entry else-branch gap: identifier-shaped, so scrub_json passes it
+    verbatim while its aliased twin put the original into the legend."""
+    return _seed_run(
+        project.project,
+        extra_journal=[("custom-event", {"mystery_ref": STORY_KEY})],
+    )
+
+
+def test_routing_gap_is_repaired_end_to_end(project):
+    run_dir = _seed_routing_gap(project)
+    pseudo = sanitize.Pseudonymizer()
+    diag = diagnostics.collect([run_dir], pseudo=pseudo)
+    reps: list[tuple[str, int]] = []
+    js = diagnostics.render_json(diag, pseudo=pseudo, repairs=reps)  # must not raise
+    alias = next(a for ns, orig, a in pseudo.entries() if orig == STORY_KEY)
+    assert STORY_KEY not in js
+    assert alias in js
+    # the repair is disclosed in the dump itself and reported to the caller
+    assert json.loads(js)["backstop_repairs"] == {f"story:{alias}": 1}
+    assert reps == [(f"story:{alias}", 1)]
+    for canary in CANARIES:
+        assert canary not in js, f"LEAK after repair: {canary!r}"
+
+
+def test_render_json_keys_are_sorted(project):
+    """`sort_keys=True` keeps two dumps diffable. Only object_pairs_hook can see
+    key ORDER — json.loads into a dict preserves insertion order, so a plain
+    round-trip cannot detect the flag being dropped."""
+    run_dir = _seed_run(project.project)
+    pseudo = sanitize.Pseudonymizer()
+    js = diagnostics.render_json(diagnostics.collect([run_dir], pseudo=pseudo), pseudo=pseudo)
+
+    def hook(pairs):
+        keys = [k for k, _ in pairs]
+        assert keys == sorted(keys), f"object keys not sorted: {keys}"
+        return dict(pairs)
+
+    json.loads(js, object_pairs_hook=hook)
+
+
+def test_no_repairs_on_fully_routed_run(project):
+    """The canonical seeded run needs ZERO repairs — the repair path must never
+    silently normalize a new per-field routing gap (CI keeps catching them)."""
+    run_dir = _seed_run(project.project)
+    pseudo = sanitize.Pseudonymizer()
+    diag = diagnostics.collect([run_dir], pseudo=pseudo)
+    reps: list[tuple[str, int]] = []
+    md = diagnostics.render_markdown(diag, pseudo=pseudo, repairs=reps)
+    js = diagnostics.render_json(diag, pseudo=pseudo, repairs=reps)
+    assert reps == []
+    assert "Backstop repairs" not in md
+    assert "backstop_repairs" not in js
+
+
+def test_leakdetected_is_the_shared_sanitize_exception():
+    """The re-export must stay importable as diagnostics.LeakDetected — cli.py's
+    except clause resolves it here, and ruff's F401 autofix deletes a bare
+    re-export (the noqa carries it; this pin catches the regression)."""
+    assert diagnostics.LeakDetected is sanitize.LeakDetected
+
+
+def test_repair_note_is_inside_verified_bytes(project):
+    """The disclosure appended after repair is itself covered by the self-check."""
+    run_dir = _seed_routing_gap(project)
+    pseudo = sanitize.Pseudonymizer()
+    diag = diagnostics.collect([run_dir], pseudo=pseudo)
+    js = diagnostics.render_json(diag, pseudo=pseudo)
+    extras = [(orig, f"{ns}:{alias}") for ns, orig, alias in pseudo.entries()]
+    assert sanitize.assert_no_leak(js, extra=extras) == []
+
+
+# ---- JSON-encoding fidelity of the guard (regression: #195 dropped the second render) ----
+#
+# Until `--json` became a pure document, EVERY dump was rendered to markdown too,
+# and that raw-text pass is what actually caught these two. Once JSON mode stopped
+# calling render_markdown, the JSON render became the only guard — and json.dumps
+# is not a faithful carrier of the bytes assert_no_leak matches on: it doubles
+# backslashes, and by default escapes non-ASCII to \uXXXX. Both evasions were live.
+#
+# These inject at the render boundary (the collector would scrub such a value long
+# before it got here, which is exactly why the escape only ever bites on a routing
+# gap — the case the backstop exists for). Everything downstream of _to_jsonable is
+# the real path: real json.dumps options, real _guard, real fail-closed behavior.
+
+
+def _render_json_over(monkeypatch, payload, *, pseudo=None):
+    monkeypatch.setattr(diagnostics, "_to_jsonable", lambda _d: payload)
+    return diagnostics.render_json(object(), pseudo=pseudo)
+
+
+def test_json_escaped_windows_home_path_still_fails_closed(monkeypatch):
+    """json.dumps doubles the separator: `C:\\Users\\x` serializes as `C:\\\\Users\\\\x`.
+    A guard anchored on the raw form alone matched nothing and emitted the path."""
+    with pytest.raises(diagnostics.LeakDetected) as exc:
+        _render_json_over(monkeypatch, {"spec_file": r"C:\Users\alice\proj\story.md"})
+    assert "absolute-home-path" in exc.value.rules
+    # the POSIX form must keep firing too — the fix widened the rule, not moved it
+    with pytest.raises(diagnostics.LeakDetected) as exc:
+        _render_json_over(monkeypatch, {"spec_file": "/home/alice/proj/story.md"})
+    assert "absolute-home-path" in exc.value.rules
+
+
+def test_non_ascii_sensitive_value_reaches_the_guard(monkeypatch):
+    """With the default ensure_ascii=True the value is escaped to `caf\\u00e9-user`,
+    which matches no rule — yet json.loads hands the consumer back the original.
+    The document a consumer parses is therefore what must be asserted on."""
+    pseudo = sanitize.Pseudonymizer()
+    original = "café-user"
+    alias = pseudo.alias(original, ns="story", epic=1)
+
+    rendered = _render_json_over(monkeypatch, {"mystery_ref": original}, pseudo=pseudo)
+
+    # what a consumer actually receives — the escape hid the leak from `in rendered`
+    assert json.loads(rendered)["mystery_ref"] == alias
+    assert original not in rendered
+    assert json.loads(rendered)["backstop_repairs"] == {f"story:{alias}": 1}
+
+
+def test_env_tmux_version_folds_a_multi_line_probe(monkeypatch):
+    """tmux_version is a scalar JSON field. Pre-fold (#321), a two-line probe
+    hit scrub_text's line cap, whose "(N more lines redacted)" marker line
+    re-introduced the very newline the cap was meant to remove."""
+    from bmad_loop.adapters import multiplexer as mux_mod
+
+    class _TwoLineMux:
+        def version(self):
+            return "tmux 3.3.7\npsmux 3.3.7"
+
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _TwoLineMux())
+
+    env = diagnostics.collect_env()
+    assert env.tmux_version == "tmux 3.3.7; psmux 3.3.7"
+    assert env.multiplexer == "_TwoLineMux"
+
+
+def test_env_tmux_version_stays_bounded(monkeypatch):
+    """Nothing between here and the rendered dump bounds this field — asdict,
+    json.dumps and sanitize.guard all pass it through — and scrub_text's cap
+    only ever counted lines, so the fold owns the bound (#321)."""
+    from bmad_loop.adapters import multiplexer as mux_mod
+
+    class _ChattyMux:
+        def version(self):
+            return "tmux 3.3.7\n" + "\n".join("build detail " + "y" * 40 for _ in range(20))
+
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _ChattyMux())
+
+    env = diagnostics.collect_env()
+    assert env.tmux_version is not None
+    assert len(env.tmux_version) == mux_mod.VERSION_MAX_CHARS
+    assert "\n" not in env.tmux_version
+    assert env.tmux_version.startswith("tmux 3.3.7")
+
+
+def test_env_tmux_version_is_redacted_before_it_is_cut(monkeypatch):
+    """The scrub runs on the whole probe, not on what survives the fold.
+
+    The home path has to *straddle* the cut for this to mean anything: a probe
+    that fits under the bound passes whichever way round the two run. Padded so
+    the cut lands inside the path, folding first leaves a fragment `redact_home`
+    can no longer match — and its `~` never appears, which is what discriminates
+    the orders. `home not in ...` alone does not: the fragment isn't the whole
+    path either.
+    """
+    from bmad_loop.adapters import multiplexer as mux_mod
+
+    # A fixed home, not the host's: the padding below is arithmetic against its
+    # length, and CI's home differs per runner. expanduser reads HOME on POSIX
+    # and USERPROFILE on Windows, so set both (tests/test_sanitize.py does too).
+    home = "/private/bmad-loop-home"
+    monkeypatch.setenv("HOME", home)
+    monkeypatch.setenv("USERPROFILE", home)
+    lead = "tmux 3.3.7 "
+    pad = lead + "x" * (mux_mod.VERSION_MAX_CHARS - len(lead) - 3)
+
+    class _HomeyMux:
+        def version(self):
+            return f"{pad}{home}/src/tmux"
+
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _HomeyMux())
+
+    env = diagnostics.collect_env()
+    assert env.tmux_version is not None
+    assert env.tmux_version.endswith("…")  # the cut really fired
+    assert home not in env.tmux_version
+    assert "~" in env.tmux_version  # redaction saw the whole path, then the cut
+
+
+def test_non_ascii_survives_the_utf8_round_trip(tmp_path, monkeypatch):
+    """ensure_ascii=False emits real non-ASCII, so confirm the document still
+    round-trips through the encoding the CLI writes it with."""
+    rendered = _render_json_over(monkeypatch, {"note": "café — naïve ✓"})
+    path = tmp_path / "diag.json"
+    path.write_text(rendered, encoding="utf-8")  # exactly what cmd_diagnose --out does
+    assert json.loads(path.read_text(encoding="utf-8"))["note"] == "café — naïve ✓"
+
+
+# The pure guard-mechanics tests (hard-rule refusal, repair tally, cyclic
+# termination) live in tests/test_sanitize.py since #199 made guard shared API;
+# this file keeps the integration surface: real collectors, real renders.

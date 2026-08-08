@@ -8,14 +8,24 @@ that diagnostic shape from a run dir and routes every content-bearing value
 through the audited :mod:`bmad_loop.sanitize` chokepoint before rendering.
 
 It mirrors :mod:`bmad_loop.probe`: typed findings → collectors → ``render_markdown``
-/ ``render_json``, with ``--out``/``--json`` on the CLI. The safety model is
-fail-closed by construction: structure (counts, enums, ints, durations) is derived
+/ ``render_json``. On the CLI the default is the markdown report and ``--json``
+selects the pure JSON document instead (the :mod:`bmad_loop.machine` contract —
+one object on stdout, nothing else); ``--out FILE`` redirects whichever of the
+two was selected to a file. The safety model is fail-closed by construction:
+structure (counts, enums, ints, durations) is derived
 directly; every value that could carry content is dropped, reduced to a boolean,
 **pseudonymized** (story keys/branches/SHAs are identifier-shaped and would
 otherwise survive verbatim), or scrubbed. Unknown/future fields default to a
 ``scrub_json`` pass, never raw. As a final backstop the rendered bytes are run
-through :func:`sanitize.assert_no_leak`; on any hit the render raises so the
-command refuses to write.
+through :func:`sanitize.guard` — the fail-closed egress self-check shared with
+``probe-adapter`` since #199. A stray pseudonymized original (a
+per-field routing gap — the value is in the legend, so its safe alias is known)
+is **repaired** by substituting the alias, re-verified, and disclosed in the
+dump itself — a "Backstop repairs" section in the markdown report, an optional
+top-level ``backstop_repairs`` label→count key in the JSON document — so the gap
+still surfaces as a reportable bug even when only one of the two was rendered.
+A genuine PII/secret/path/username hit, or a repair that does not converge,
+raises so the command refuses to write.
 
 The guiding assumption: the dump will be posted publicly.
 """
@@ -24,6 +34,7 @@ from __future__ import annotations
 
 import json
 import platform
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -34,6 +45,20 @@ from . import __version__, sanitize
 from .journal import Journal, load_state
 from .model import RunState, StoryTask
 
+# The guard machinery (fail-closed egress self-check + alias-substitution
+# repair) moved to sanitize.py so probe-adapter shares the single audited
+# implementation (#199). LeakDetected stays importable from here — cli.py and
+# external callers resolve `diagnostics.LeakDetected` — so it carries a noqa:
+# without it ruff F401 autofixes the re-export away and the except clause in
+# cmd_diagnose breaks.
+from .sanitize import LeakDetected  # noqa: F401 — re-export
+
+# Deliberately NOT bumped when `--json` stopped being a fenced ```json block
+# inside the markdown report and became a pure document (machine.py contract):
+# this number versions the *document*, and the payload did not change. Bumping it
+# would falsely tell a consumer pinned to v1 that the fields it reads are gone,
+# while a consumer actually broken by the repackaging finds out immediately —
+# the fence is gone and json.loads fails. Bump only on a payload break.
 SCHEMA_VERSION = 1
 DEFAULT_JOURNAL_CAP = 200
 
@@ -54,7 +79,39 @@ _JOURNAL_ALIAS_FIELDS = {
     "target_branch": "branch",
     "commit": "commit",
     "baseline": "commit",
+    # A spec name IS the customer's feature name — `Pseudonymizer`'s own docstring
+    # has always listed "spec filenames" among what it exists to alias, so the
+    # omission here was a routing gap, not a policy. A producer that journals a
+    # bare basename passes a value `looks_like_identifier` waves through verbatim
+    # on the scrub_json fallback — and the egress backstop cannot rescue it,
+    # because it only repairs values already in the legend, so it happens to
+    # catch `1.2-Acme….md` (the story key is in there) and misses
+    # `AcmeVaultRotation.md` entirely. Its OWN namespace, not "story": the epic
+    # lookup below is keyed on ns == "story", so a filename aliased there would
+    # render as an epic-less `story-<hex>` — indistinguishable from a story key
+    # whose epic could not be resolved. See `_JOURNAL_BASENAME_NAMESPACES` for why
+    # the value is normalized first: the producers do NOT agree on a bare basename.
+    "spec": "spec",
 }
+# Namespaces whose journalled value arrives in more than one shape and must be
+# reduced to its basename before it is aliased. `spec` is one: engine.py's
+# reconcile and marker-repair kinds journal `str(spec_path)` (absolute —
+# `verify.resolve_spec_path` returns an absolute path), while stories_engine's
+# `checkpoint-pause` journals `task.spec_file`, which `StoryTask` persists
+# worktree-relative (a bare basename for a spec at the worktree root). Aliasing
+# the raw string would give ONE spec TWO aliases in a single dump, defeating the
+# correlation these fields are aliased rather than dropped to preserve, and would
+# park an absolute home path in the local `--legend` file (before `spec` was
+# routed such a value died at `scrub_json` and never entered the map at all).
+#
+# Split on BOTH separators rather than using `PurePath(...).name`: a journal
+# written on Windows is routinely diagnosed on POSIX, where `PurePath` treats a
+# backslash as an ordinary character and would keep the whole path. The cost is
+# that a POSIX filename containing a literal backslash aliases on its tail —
+# a pathological name, and the consequence is a shorter legend entry, never a
+# leak, since the alias is still stable and the raw value still never ships.
+_JOURNAL_BASENAME_NAMESPACES = frozenset({"spec"})
+_PATH_SEP_RE = re.compile(r"[\\/]")
 # Journal fields that carry free text (LLM/merge prose, prompts, errors). Never
 # emitted — replaced with a boolean presence marker so a maintainer still learns
 # the field was set without seeing it.
@@ -184,16 +241,22 @@ class Diagnostics:
 
 
 def collect_env() -> EnvInfo:
-    from .adapters.multiplexer import get_multiplexer
+    from .adapters.multiplexer import fold_version, get_multiplexer
 
     mux = "none"
     tmux_v = None
     try:
         backend = get_multiplexer()
         mux = type(backend).__name__
+        # fold_version both flattens and bounds (the seam's inline-render
+        # contract), so the max_lines=1 this used to carry is redundant — and it
+        # never held anyway: scrub_text's "(N more lines redacted)" marker is
+        # itself a new line, re-introducing exactly what the cap removed.
+        # Scrub first so the home/email redaction reads the whole probe rather
+        # than a tail the fold already cut.
         raw = backend.version()
-        tmux_v = sanitize.scrub_text(raw, max_lines=1) if raw else None
-    except Exception:  # noqa: BLE001  # nosec B110 - env probe is best-effort; absent mux is fine
+        tmux_v = fold_version(sanitize.scrub_text(raw)) if raw else None
+    except Exception:  # nosec B110 - env probe is best-effort; absent mux is fine
         pass
     return EnvInfo(
         os=platform.system(),
@@ -251,9 +314,12 @@ def _session_tally(tasks: list[StoryTask]) -> SessionTally:
     return SessionTally(by_status=dict(by_status), by_role=dict(by_role))
 
 
-def _task_diag(task: StoryTask, pseudo: sanitize.Pseudonymizer) -> TaskDiag:
+def _task_diag(task: StoryTask, pseudo: sanitize.Pseudonymizer, weight: float) -> TaskDiag:
     tokens = task.tokens.to_dict()
     tokens["total"] = task.tokens.total
+    # Derived from the run's snapshot weight, which this bundle also carries
+    # under policy.limits — so the figure stays checkable against its inputs.
+    tokens["weighted"] = task.tokens.weighted_total(weight)
     return TaskDiag(
         alias=pseudo.alias(task.story_key, ns="story", epic=task.epic),
         epic=task.epic,
@@ -309,6 +375,18 @@ def _alias_in_entry(entry: dict, pseudo: sanitize.Pseudonymizer, epic_by_key: di
     return None
 
 
+def _alias_input(value: Any, ns: str) -> Any:
+    """The string an alias is computed over: the basename for the path-shaped
+    namespaces, the value unchanged for every other one (and for any non-string,
+    which :meth:`Pseudonymizer.alias` handles itself)."""
+    if ns not in _JOURNAL_BASENAME_NAMESPACES or not isinstance(value, str):
+        return value
+    # `or value`: a value ending in a separator splits to an empty tail, and an
+    # empty string is the one input `alias()` passes through unaliased — so it
+    # would render as `""` and lose the event's only reference to the spec.
+    return _PATH_SEP_RE.split(value)[-1] or value
+
+
 def _scrub_entry(
     entry: dict,
     pseudo: sanitize.Pseudonymizer,
@@ -334,6 +412,7 @@ def _scrub_entry(
             out[k] = [pseudo.alias(x, ns=ns, epic=epic_by_key.get(str(x))) for x in v]
         elif k in _JOURNAL_ALIAS_FIELDS:
             ns = _JOURNAL_ALIAS_FIELDS[k]
+            v = _alias_input(v, ns)
             epic = epic_by_key.get(str(v)) if ns == "story" else None
             out[k] = pseudo.alias(v, ns=ns, epic=epic)
         else:
@@ -370,7 +449,13 @@ def summarize_journal(
         kind_histogram=dict(kinds),
         first_ts=first_ts,
         last_ts=last_ts,
-        duration_s=(round(last_ts - first_ts, 3) if first_ts is not None else None),
+        # first_ts/last_ts are set together (both None iff no timestamps), so the
+        # first_ts guard also proves last_ts is not None here.
+        duration_s=(
+            round(last_ts - first_ts, 3)  # pyright: ignore[reportOptionalOperand]
+            if first_ts is not None
+            else None
+        ),
         escalation_count=kinds.get("story-escalated", 0) + kinds.get("preference-escalation", 0),
         defer_count=kinds.get("story-deferred", 0),
         plugin_error_count=kinds.get("plugin-error", 0),
@@ -391,11 +476,15 @@ def collect_run(run_dir: Path, *, pseudo: sanitize.Pseudonymizer, cap: int) -> R
     tasks = list(state.tasks.values())
     epic_by_key = {t.story_key: t.epic for t in tasks}
 
+    weight = state.cache_read_weight()
     token_totals: Counter[str] = Counter()
     for t in tasks:
         for k, v in t.tokens.to_dict().items():
             token_totals[k] += v
         token_totals["total"] += t.tokens.total
+        # Per-task, matching Engine.summary and the TUI (weighted_total rounds
+        # internally, so summing per task is what keeps the numbers identical).
+        token_totals["weighted"] += t.tokens.weighted_total(weight)
 
     phase_hist: Counter[str] = Counter(str(t.phase) for t in tasks)
 
@@ -421,7 +510,7 @@ def collect_run(run_dir: Path, *, pseudo: sanitize.Pseudonymizer, cap: int) -> R
         phase_histogram=dict(phase_hist),
         token_totals=dict(token_totals),
         session_tally=_session_tally(tasks),
-        tasks=[_task_diag(t, pseudo) for t in tasks],
+        tasks=[_task_diag(t, pseudo, weight) for t in tasks],
         journal=summarize_journal(Journal(run_dir).entries(), pseudo, epic_by_key, cap=cap),
         files=summarize_files(run_dir),
     )
@@ -438,7 +527,7 @@ def collect(
     for run_dir in run_dirs:
         try:
             runs.append(collect_run(run_dir, pseudo=pseudo, cap=cap))
-        except Exception as e:  # noqa: BLE001 — one bad run never sinks the dump
+        except Exception as e:  # one bad run never sinks the dump
             runs.append(_unreadable_run(run_dir, e))
     return Diagnostics(
         schema_version=SCHEMA_VERSION,
@@ -489,13 +578,42 @@ def _to_jsonable(d: Diagnostics) -> dict:
     return asdict(d)
 
 
-def render_json(d: Diagnostics, *, pseudo: sanitize.Pseudonymizer | None = None) -> str:
-    rendered = json.dumps(_to_jsonable(d), indent=2, sort_keys=True)
-    _guard(rendered, pseudo)
+def render_json(
+    d: Diagnostics,
+    *,
+    pseudo: sanitize.Pseudonymizer | None = None,
+    repairs: list[tuple[str, int]] | None = None,
+) -> str:
+    # ensure_ascii=False is a SAFETY requirement, not cosmetics: the default
+    # escapes every non-ASCII char to \uXXXX, so a sensitive value like a
+    # non-ASCII username reaches _guard as "café-user" and matches nothing.
+    # The guard must see the string as itself. The document is only ever written
+    # with encoding="utf-8" (CLI --out) or printed to a UTF-8 stream, so emitting
+    # real non-ASCII is safe — and it must be identical in both dumps below, or
+    # the bytes we verified would not be the bytes we emit.
+    rendered = json.dumps(_to_jsonable(d), indent=2, sort_keys=True, ensure_ascii=False)
+    rendered, reps = sanitize.guard(rendered, pseudo)
+    if reps:
+        # Disclose the repair in the dump itself so the routing gap surfaces as
+        # a reportable bug. Substitution preserved JSON validity — a leaked
+        # original is identifier-shaped and its alias is [A-Za-z0-9-], neither
+        # side carries quotes or backslashes — so reload-and-extend is safe.
+        # backstop_repairs is an optional additive key: absent on a clean dump.
+        data = json.loads(rendered)
+        data["backstop_repairs"] = dict(reps)
+        rendered = json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False)
+        sanitize.assert_clean(rendered, pseudo)
+    if repairs is not None:
+        repairs.extend(reps)
     return rendered
 
 
-def render_markdown(d: Diagnostics, *, pseudo: sanitize.Pseudonymizer | None = None) -> str:
+def render_markdown(
+    d: Diagnostics,
+    *,
+    pseudo: sanitize.Pseudonymizer | None = None,
+    repairs: list[tuple[str, int]] | None = None,
+) -> str:
     out: list[str] = []
     out.append("# bmad-loop diagnostic dump (sanitized)")
     out.append("")
@@ -545,14 +663,15 @@ def render_markdown(d: Diagnostics, *, pseudo: sanitize.Pseudonymizer | None = N
         out.append("### Tasks")
         if r.tasks:
             out.append(
-                "| alias | epic | phase | att | rev | committed | spec | dw | sessions | tokens |"
+                "| alias | epic | phase | att | rev | committed | spec | dw | sessions "
+                "| weighted | raw |"
             )
-            out.append("|---|---|---|---|---|---|---|---|---|---|")
+            out.append("|---|---|---|---|---|---|---|---|---|---|---|")
             for t in r.tasks:
                 out.append(
                     f"| `{t.alias}` | {t.epic} | {t.phase} | {t.attempt} | {t.review_cycle} "
                     f"| {t.committed} | {t.spec_present} | {t.dw_count} | {t.n_sessions} "
-                    f"| {t.tokens.get('total', 0)} |"
+                    f"| {t.tokens.get('weighted', 0)} | {t.tokens.get('total', 0)} |"
                 )
         else:
             out.append("_no tasks._")
@@ -585,7 +704,26 @@ def render_markdown(d: Diagnostics, *, pseudo: sanitize.Pseudonymizer | None = N
         out.append("")
 
     rendered = "\n".join(out)
-    _guard(rendered, pseudo)
+    rendered, reps = sanitize.guard(rendered, pseudo)
+    if reps:
+        note = [
+            "",
+            "### Backstop repairs",
+            "",
+            "_The leak self-check caught stray occurrences of pseudonymized "
+            "identifiers that the per-field routing missed, and substituted "
+            "their aliases — a bmad-loop routing gap; please report it._",
+            "",
+        ]
+        for label, count in reps:
+            note.append(f"- `{label}`: {count} stray occurrence(s) pseudonymized")
+        note.append("")
+        rendered += "\n".join(note)
+        # The note is appended after the repair loop verified the body, so
+        # re-check the whole thing: the note must sit inside the verified bytes.
+        sanitize.assert_clean(rendered, pseudo)
+    if repairs is not None:
+        repairs.extend(reps)
     return rendered
 
 
@@ -593,23 +731,3 @@ def _dict_inline(d: dict) -> str:
     if not d:
         return "—"
     return ", ".join(f"{k}={v}" for k, v in sorted(d.items()))
-
-
-def _guard(rendered: str, pseudo: sanitize.Pseudonymizer | None) -> None:
-    """Fail closed: refuse to emit output that trips the leak self-check.
-
-    When the pseudonymizer is supplied, its legend's original values (the real
-    story keys/branches/SHAs) are fed in too, so any that slipped through the
-    per-field routing are caught here in the final bytes."""
-    extra = list(pseudo.legend().values()) if pseudo is not None else []
-    fired = sanitize.assert_no_leak(rendered, extra=extra)
-    if fired:
-        raise LeakDetected(fired)
-
-
-class LeakDetected(Exception):
-    """The rendered dump tripped sanitize.assert_no_leak — emission is refused."""
-
-    def __init__(self, rules: list[str]):
-        self.rules = rules
-        super().__init__("diagnostic dump tripped leak self-check: " + ", ".join(rules))

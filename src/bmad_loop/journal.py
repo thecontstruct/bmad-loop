@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any
 
 from .model import RunState
+from .platform_util import atomic_replace
 
 STATE_FILE = "state.json"
 JOURNAL_FILE = "journal.jsonl"
@@ -63,7 +63,7 @@ def save_state(run_dir: Path, state: RunState) -> None:
     target = run_dir / STATE_FILE
     tmp = target.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
-    os.replace(tmp, target)
+    atomic_replace(tmp, target)
 
 
 def load_state(run_dir: Path) -> RunState:

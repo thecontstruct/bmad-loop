@@ -20,6 +20,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -50,8 +51,35 @@ def test_builtin_unity_plugin_loads():
 
 def test_builtin_unity_plugin_ships_its_scripts():
     scripts = os.listdir(get_plugin("unity").scripts_dir)
-    for name in ("unity_plugin.py", "unity_ready.py", "unity_setup.py", "unity_teardown.py"):
+    for name in (
+        "unity_plugin.py",
+        "unity_ready.py",
+        "unity_setup.py",
+        "unity_teardown.py",
+        "unity_seed_assets.py",
+        "unity_quiesce.py",
+        "unity_dialog_probe.py",
+        "unity_facts.md",
+    ):
         assert name in scripts, name
+
+
+def test_builtin_unity_plugin_ships_scene_guard_payload():
+    """The scene auto-save guard payload (source + asmdef + fixed-GUID metas) ships
+    with the plugin so the seeder can copy it into consumer projects."""
+    payload = os.path.join(get_plugin("unity").scripts_dir, "unity_assets")
+    for name in (
+        "SceneAutoSaveGuard.cs",
+        "SceneAutoSaveGuard.cs.meta",
+        "BmadLoop.Unity.Editor.asmdef",
+        "BmadLoop.Unity.Editor.asmdef.meta",
+    ):
+        assert os.path.isfile(os.path.join(payload, name)), name
+    for name in ("BmadLoop.meta", "Editor.meta"):
+        assert os.path.isfile(os.path.join(payload, "_folders", name)), name
+    # the guard carries a machine-parseable version header (the seeder's contract)
+    with open(os.path.join(payload, "SceneAutoSaveGuard.cs"), encoding="utf-8") as fh:
+        assert "bmad-loop-scene-guard-version:" in fh.read()
 
 
 def test_builtin_unity_plugin_settings_schema():
@@ -63,11 +91,34 @@ def test_builtin_unity_plugin_settings_schema():
         "unity_path",
         "ready_timeout_sec",
         "ready_grace_sec",
+        "install_scene_guard",
+        "scene_guard_dir",
+        "quiesce_on_rollback",
+        "quiesce_timeout_sec",
+        "dialog_probe",
+        "dialog_probe_interval_sec",
+        "dialog_probe_notify",
     }
     assert by_key["editor_mode"].type == "select"
     assert by_key["editor_mode"].options == ("shared", "per_worktree")
     assert by_key["editor_mode"].default == "shared"
     assert by_key["ready_timeout_sec"].default == 600
+    assert by_key["install_scene_guard"].type == "bool"
+    assert by_key["install_scene_guard"].default is True
+    assert by_key["scene_guard_dir"].default == "Assets/BmadLoop/Editor"
+    assert by_key["quiesce_on_rollback"].type == "bool"
+    assert by_key["quiesce_on_rollback"].default is True
+    assert by_key["quiesce_timeout_sec"].type == "int"
+    assert by_key["quiesce_timeout_sec"].default == 60
+    assert by_key["quiesce_timeout_sec"].min == 1
+    # detect-only dialog probe: off by default, tunable interval + notify
+    assert by_key["dialog_probe"].type == "bool"
+    assert by_key["dialog_probe"].default is False
+    assert by_key["dialog_probe_interval_sec"].type == "int"
+    assert by_key["dialog_probe_interval_sec"].default == 5
+    assert by_key["dialog_probe_interval_sec"].min == 1
+    assert by_key["dialog_probe_notify"].type == "bool"
+    assert by_key["dialog_probe_notify"].default is True
 
 
 def test_unity_is_trust_gated():
@@ -103,6 +154,13 @@ def _make_unity(settings, scripts_dir):
         "unity_path": "",
         "ready_timeout_sec": 600,
         "ready_grace_sec": -1,
+        "install_scene_guard": True,
+        "scene_guard_dir": "Assets/BmadLoop/Editor",
+        "quiesce_on_rollback": True,
+        "quiesce_timeout_sec": 60,
+        "dialog_probe": False,
+        "dialog_probe_interval_sec": 5,
+        "dialog_probe_notify": True,
     }
     full.update(settings)
     return cls(manifest, full)
@@ -172,6 +230,79 @@ def test_worktree_teardown_is_best_effort(tmp_path):
     assert not ctx.vetoed
 
 
+# --------------------------------------------------- rollback quiesce hooks
+
+
+def test_rollback_hooks_run_quiesce_with_phase_and_timeout(tmp_path, monkeypatch):
+    """pre/post_rollback shell the quiesce helper with the phase in the env and the
+    quiesce_timeout_sec as the overall kill budget."""
+    inst = _make_unity({"quiesce_timeout_sec": 42}, tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        inst,
+        "_run_script",
+        lambda name, ctx, *, timeout, extra_env=None: (
+            calls.append((name, timeout, extra_env)) or (0, "")
+        ),
+    )
+    inst.on_pre_rollback(_ctx("pre_rollback", tmp_path))
+    inst.on_post_rollback(_ctx("post_rollback", tmp_path))
+    assert calls == [
+        ("unity_quiesce.py", 42, {"BMAD_LOOP_QUIESCE_PHASE": "pre"}),
+        ("unity_quiesce.py", 42, {"BMAD_LOOP_QUIESCE_PHASE": "post"}),
+    ]
+
+
+def test_rollback_hooks_skipped_when_disabled(tmp_path, monkeypatch):
+    inst = _make_unity({"quiesce_on_rollback": False}, tmp_path)
+    calls = []
+    monkeypatch.setattr(inst, "_run_script", lambda *a, **k: calls.append(a) or (0, ""))
+    inst.on_pre_rollback(_ctx("pre_rollback", tmp_path))
+    inst.on_post_rollback(_ctx("post_rollback", tmp_path))
+    assert calls == []  # quiesce did not run
+
+
+def test_rollback_hooks_skipped_for_non_ivanmurzak_mcp(tmp_path, monkeypatch):
+    """Only the IvanMurzak CLI is driven; CoplayDev has no quiesce helper here."""
+    inst = _make_unity({"mcp": "coplaydev"}, tmp_path)
+    calls = []
+    monkeypatch.setattr(inst, "_run_script", lambda *a, **k: calls.append(a) or (0, ""))
+    inst.on_pre_rollback(_ctx("pre_rollback", tmp_path))
+    inst.on_post_rollback(_ctx("post_rollback", tmp_path))
+    assert calls == []
+
+
+def test_rollback_hooks_never_veto_on_failure(tmp_path):
+    """The quiesce is best-effort — a failing (or missing) helper never vetoes; the
+    rollback stages forbid a veto anyway."""
+    # no unity_quiesce.py on disk -> _run_script returns rc!=0, must be swallowed
+    inst = _make_unity({}, tmp_path)
+    ctx = _ctx("pre_rollback", tmp_path)
+    inst.on_pre_rollback(ctx)
+    inst.on_post_rollback(_ctx("post_rollback", tmp_path))
+    assert not ctx.vetoed
+
+
+def test_run_script_merges_extra_env(tmp_path):
+    """_run_script layers extra_env over engine_env so per-call knobs (the quiesce
+    phase) reach the helper without polluting the base contract."""
+    # a tiny helper that dumps the phase env var it received, so we can read it back
+    (tmp_path / "echo_phase.py").write_text(
+        "import os, sys\nsys.stdout.write(os.environ.get('BMAD_LOOP_QUIESCE_PHASE', 'UNSET'))\n",
+        encoding="utf-8",
+    )
+    inst = _make_unity({}, tmp_path)
+    rc, out = inst._run_script(
+        "echo_phase.py",
+        _ctx("pre_rollback", tmp_path),
+        timeout=30,
+        extra_env={"BMAD_LOOP_QUIESCE_PHASE": "pre"},
+    )
+    assert rc == 0 and out == "pre"
+    # base engine_env is unchanged: without extra_env the var is absent
+    assert "BMAD_LOOP_QUIESCE_PHASE" not in inst.engine_env(_ctx("pre_rollback", tmp_path))
+
+
 # ------------------------------------------------------ UnityPlugin env contract
 
 
@@ -203,6 +334,308 @@ def test_engine_env_omits_agents_when_none(tmp_path):
     inst = _make_unity({}, tmp_path)
     env = inst.engine_env(_ctx("pre_ready_gate", tmp_path, agents=()))
     assert "BMAD_LOOP_ENGINE_AGENTS" not in env
+
+
+def test_engine_env_carries_scene_guard_settings(tmp_path):
+    on = _make_unity(
+        {"install_scene_guard": True, "scene_guard_dir": "Assets/Vendor/Editor"}, tmp_path
+    )
+    env = on.engine_env(_ctx("pre_ready_gate", tmp_path))
+    assert env["BMAD_LOOP_UNITY_INSTALL_SCENE_GUARD"] == "1"
+    assert env["BMAD_LOOP_UNITY_SCENE_GUARD_DIR"] == "Assets/Vendor/Editor"
+    off_env = _make_unity({"install_scene_guard": False}, tmp_path).engine_env(
+        _ctx("pre_ready_gate", tmp_path)
+    )
+    assert off_env["BMAD_LOOP_UNITY_INSTALL_SCENE_GUARD"] == "0"
+
+
+# ----------------------------------------- scene-guard seeding wired into the hooks
+
+
+def _real_unity(settings):
+    """A UnityPlugin whose {scripts} dir is the REAL bundled plugin dir, so its
+    hooks run the real unity_seed_assets.py against the ctx worktree."""
+    cls = _unity_plugin_module().UnityPlugin
+    manifest = PluginManifest(
+        name="unity", api_version=1, scripts_dir=get_plugin("unity").scripts_dir
+    )
+    full = {
+        "editor_mode": "shared",
+        "mcp": "ivanmurzak",
+        "unity_path": "",
+        "ready_timeout_sec": 600,
+        "ready_grace_sec": -1,
+        "install_scene_guard": True,
+        "scene_guard_dir": "Assets/BmadLoop/Editor",
+        "quiesce_on_rollback": True,
+        "quiesce_timeout_sec": 60,
+        "dialog_probe": False,
+        "dialog_probe_interval_sec": 5,
+        "dialog_probe_notify": True,
+    }
+    full.update(settings)
+    return cls(manifest, full)
+
+
+def _worktree_ctx(stage, worktree):
+    return HookContext(
+        stage,
+        run_id="r",
+        story_key="1-1-a",
+        repo_root=str(worktree),
+        run_dir=str(worktree),
+        worktree=str(worktree),
+    )
+
+
+def test_seed_scene_guard_installs_via_plugin(tmp_path):
+    (tmp_path / "Assets").mkdir()
+    inst = _real_unity({"editor_mode": "per_worktree"})
+    inst._seed_scene_guard(_worktree_ctx("pre_worktree_setup", tmp_path))
+    guard = tmp_path / "Assets" / "BmadLoop" / "Editor" / "SceneAutoSaveGuard.cs"
+    assert guard.is_file()
+    assert "bmad-loop-scene-guard-version:" in guard.read_text()
+
+
+def test_seed_scene_guard_honours_custom_dir_setting(tmp_path):
+    (tmp_path / "Assets").mkdir()
+    inst = _real_unity({"scene_guard_dir": "Assets/Third/Editor"})
+    inst._seed_scene_guard(_worktree_ctx("pre_ready_gate", tmp_path))
+    assert (tmp_path / "Assets" / "Third" / "Editor" / "SceneAutoSaveGuard.cs").is_file()
+
+
+def test_seed_scene_guard_skipped_when_disabled(tmp_path):
+    (tmp_path / "Assets").mkdir()
+    inst = _real_unity({"install_scene_guard": False})
+    inst._seed_scene_guard(_worktree_ctx("pre_ready_gate", tmp_path))
+    assert not (tmp_path / "Assets" / "BmadLoop").exists()
+
+
+def test_seed_scene_guard_never_vetoes_on_failure(tmp_path, monkeypatch):
+    """A seeding failure is logged, never vetoes — the guard is a convenience, not a
+    gate. Point the seeder at a bogus interpreter path so _run_script returns rc!=0."""
+    inst = _real_unity({"editor_mode": "per_worktree"})
+    monkeypatch.setattr(inst, "_run_script", lambda *a, **k: (1, "boom"))
+    ctx = _worktree_ctx("pre_worktree_setup", tmp_path)
+    inst._seed_scene_guard(ctx)  # must not raise, must not veto
+    assert not ctx.vetoed
+
+
+def test_pre_worktree_setup_seeds_before_editor_launch(tmp_path, monkeypatch):
+    """In per_worktree mode the guard is seeded strictly BEFORE unity_setup.py
+    launches the Editor, so the Editor's first import already sees it. A setup
+    failure still vetoes (defers) — the seed does not swallow it."""
+    inst = _real_unity({"editor_mode": "per_worktree"})
+    order = []
+    monkeypatch.setattr(inst, "_seed_scene_guard", lambda ctx: order.append("seed"))
+
+    def fake_run(name, ctx, *, timeout):
+        order.append(name)
+        return (2, "no editor")
+
+    monkeypatch.setattr(inst, "_run_script", fake_run)
+    ctx = _worktree_ctx("pre_worktree_setup", tmp_path)
+    inst.on_pre_worktree_setup(ctx)
+    assert order == ["seed", "unity_setup.py"]  # seed runs first
+    assert ctx.resolved_veto().action == "defer"
+
+
+def test_pre_ready_gate_seeds_only_in_shared_mode(tmp_path, monkeypatch):
+    """The ready gate fires in both modes, but seeding here is a shared-mode-only
+    job (per_worktree already seeded at pre_worktree_setup)."""
+    for mode, expect_seed in (("shared", True), ("per_worktree", False)):
+        inst = _real_unity({"editor_mode": mode})
+        seeded = []
+        monkeypatch.setattr(inst, "_seed_scene_guard", lambda ctx: seeded.append(True))
+        monkeypatch.setattr(inst, "_run_script", lambda *a, **k: (0, ""))
+        inst.on_pre_ready_gate(_worktree_ctx("pre_ready_gate", tmp_path))
+        assert bool(seeded) is expect_seed, mode
+
+
+# ------------------------------------------ prompt-fact injection (on_pre_session)
+
+
+def test_pre_session_appends_facts_to_nonempty_prompt():
+    """on_pre_session appends the shipped Unity scene-save facts to the whitelisted
+    proposed_prompt, preserving the original prompt as the prefix."""
+    inst = _real_unity({})  # real scripts_dir → real unity_facts.md
+    ctx = HookContext("pre_session", run_id="r", proposed_prompt="BASE PROMPT")
+    inst.on_pre_session(ctx)
+    assert ctx.proposed_prompt.startswith("BASE PROMPT\n\n")
+    assert "scene-save" in ctx.proposed_prompt  # a fact from unity_facts.md landed
+
+
+def test_pre_session_noop_when_prompt_empty():
+    """A fast-path emit with no prompt (None or "") is left untouched — nothing to
+    append onto, and we must never fabricate a prompt."""
+    inst = _real_unity({})
+    for empty in (None, ""):
+        ctx = HookContext("pre_session", run_id="r", proposed_prompt=empty)
+        inst.on_pre_session(ctx)
+        assert ctx.proposed_prompt == empty
+
+
+def test_pre_session_noop_when_facts_file_missing(tmp_path):
+    """A plugin dir with no unity_facts.md degrades to no injection (never crashes)."""
+    inst = _make_unity({}, tmp_path)  # tmp scripts dir ships no facts file
+    ctx = HookContext("pre_session", run_id="r", proposed_prompt="BASE")
+    inst.on_pre_session(ctx)
+    assert ctx.proposed_prompt == "BASE"
+
+
+# --------------------------------------------- detect-only dialog probe lifecycle
+
+
+class _ReapHost:
+    """Fake ProcessHost for the plugin-side probe reap: reports whether the recorded
+    pid is still ours and records any terminate."""
+
+    def __init__(self, ours=True):
+        self._ours = ours
+        self.terminated: list[int] = []
+
+    def alive_and_ours(self, pid, identity):
+        return self._ours
+
+    def terminate(self, pid):
+        self.terminated.append(pid)
+
+
+def test_engine_env_carries_dialog_probe_settings(tmp_path):
+    on = _make_unity(
+        {"dialog_probe": True, "dialog_probe_interval_sec": 9, "dialog_probe_notify": False},
+        tmp_path,
+    )
+    env = on.engine_env(_ctx("pre_run", tmp_path))
+    assert env["BMAD_LOOP_UNITY_DIALOG_PROBE"] == "1"
+    assert env["BMAD_LOOP_UNITY_DIALOG_PROBE_INTERVAL_SEC"] == "9"
+    assert env["BMAD_LOOP_UNITY_DIALOG_PROBE_NOTIFY"] == "0"
+    off = _make_unity({}, tmp_path).engine_env(_ctx("pre_run", tmp_path))
+    assert off["BMAD_LOOP_UNITY_DIALOG_PROBE"] == "0"  # off by default
+    assert off["BMAD_LOOP_UNITY_DIALOG_PROBE_NOTIFY"] == "1"  # notify defaults on
+
+
+def test_start_dialog_probe_launches_detached_with_scan_path(tmp_path, monkeypatch):
+    inst = _make_unity({"dialog_probe": True}, tmp_path)
+    calls = {}
+
+    class _FakePopen:
+        def __init__(self, argv, **kw):
+            calls["argv"] = argv
+            calls["kw"] = kw
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    inst._start_dialog_probe(_ctx("pre_run", tmp_path), "/scan/here")
+    argv = calls["argv"]
+    assert argv[0] == sys.executable
+    assert argv[1].replace("\\", "/").endswith("unity_dialog_probe.py")
+    assert argv[2] == "/scan/here"  # the path teardown's argv scan keys on
+    assert calls["kw"]["env"]["BMAD_LOOP_UNITY_DIALOG_PROBE"] == "1"
+    if sys.platform == "win32":
+        assert "creationflags" in calls["kw"]
+    else:
+        assert calls["kw"].get("start_new_session") is True  # POSIX detach
+
+
+def test_start_dialog_probe_noop_when_disabled(tmp_path, monkeypatch):
+    inst = _make_unity({"dialog_probe": False}, tmp_path)  # off (the default)
+    launched = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: launched.append(a))
+    inst._start_dialog_probe(_ctx("pre_run", tmp_path), "/x")
+    assert launched == []
+
+
+def test_start_dialog_probe_reaps_prior_before_launch(tmp_path, monkeypatch):
+    """Starting a probe first reaps any recorded one so a re-entry never runs two."""
+    inst = _make_unity({"dialog_probe": True}, tmp_path)
+    order = []
+    monkeypatch.setattr(inst, "_reap_dialog_probe", lambda ctx: order.append("reap"))
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: order.append("launch") or object())
+    inst._start_dialog_probe(_ctx("pre_run", tmp_path), "/x")
+    assert order == ["reap", "launch"]
+
+
+def test_on_pre_run_starts_probe_only_in_shared_mode(tmp_path, monkeypatch):
+    for mode, expect in (("shared", True), ("per_worktree", False)):
+        inst = _make_unity({"dialog_probe": True, "editor_mode": mode}, tmp_path)
+        started, reaped = [], []
+        monkeypatch.setattr(inst, "_start_dialog_probe", lambda ctx, path: started.append(path))
+        monkeypatch.setattr(inst, "_reap_dialog_probe", lambda ctx: reaped.append(True))
+        inst.on_pre_run(_ctx("pre_run", tmp_path))
+        assert reaped == [True]  # stale-sweep runs in both modes
+        assert bool(started) is expect, mode
+        if expect:
+            assert started == [str(tmp_path)]  # shared probe scans the repo root
+
+
+def test_on_pre_worktree_setup_starts_probe_with_worktree_path(tmp_path, monkeypatch):
+    inst = _make_unity({"dialog_probe": True, "editor_mode": "per_worktree"}, tmp_path)
+    started = []
+    monkeypatch.setattr(inst, "_seed_scene_guard", lambda ctx: None)
+    monkeypatch.setattr(inst, "_start_dialog_probe", lambda ctx, path: started.append(path))
+    monkeypatch.setattr(inst, "_run_script", lambda *a, **k: (0, ""))
+    inst.on_pre_worktree_setup(_ctx("pre_worktree_setup", tmp_path))
+    assert started == [str(tmp_path)]  # per_worktree probe scans the worktree
+
+
+def test_on_post_run_reaps_probe(tmp_path, monkeypatch):
+    inst = _make_unity({}, tmp_path)
+    reaped = []
+    monkeypatch.setattr(inst, "_reap_dialog_probe", lambda ctx: reaped.append(True))
+    monkeypatch.setattr(inst, "_run_script", lambda *a, **k: (0, ""))
+    inst.on_post_run(_ctx("post_run", tmp_path))
+    assert reaped == [True]
+
+
+def test_reap_dialog_probe_terminates_recorded_pid(tmp_path, monkeypatch):
+    inst = _make_unity({}, tmp_path)
+    (tmp_path / "unity-dialog-probe.pid").write_text("424242 100.0", encoding="utf-8")
+    host = _ReapHost(ours=True)
+    monkeypatch.setitem(type(inst)._reap_dialog_probe.__globals__, "get_process_host", lambda: host)
+    inst._reap_dialog_probe(_ctx("post_run", tmp_path))
+    assert host.terminated == [424242]
+    assert not (tmp_path / "unity-dialog-probe.pid").exists()  # handle cleared
+
+
+def test_reap_dialog_probe_skips_signal_for_stale_handle(tmp_path, monkeypatch):
+    """A recorded pid that is no longer ours (dead / reused) is never signalled, but
+    its stale handle is still cleared."""
+    inst = _make_unity({}, tmp_path)
+    (tmp_path / "unity-dialog-probe.pid").write_text("424242 100.0", encoding="utf-8")
+    host = _ReapHost(ours=False)
+    monkeypatch.setitem(type(inst)._reap_dialog_probe.__globals__, "get_process_host", lambda: host)
+    inst._reap_dialog_probe(_ctx("post_run", tmp_path))
+    assert host.terminated == []
+    assert not (tmp_path / "unity-dialog-probe.pid").exists()
+
+
+def test_reap_dialog_probe_noop_without_pidfile(tmp_path):
+    """No recorded probe → a clean no-op (no crash, no signal)."""
+    inst = _make_unity({}, tmp_path)
+    inst._reap_dialog_probe(_ctx("post_run", tmp_path))  # must not raise
+
+
+# ------------------------------ dialog-probe reap matcher (unity_teardown scan)
+
+
+def test_probe_argv_matcher_needs_both_worktree_and_script():
+    mod = _load_unity_teardown()
+    from pathlib import Path as _P
+
+    wt = _P("/tmp/wt-abc")
+    script = mod._DIALOG_PROBE_SCRIPT_BASENAME
+    assert mod._probe_argv_matches(f"/usr/bin/python {script} {wt}", wt) is True
+    # an Editor referencing the worktree but NOT the probe script → never matched
+    assert mod._probe_argv_matches(f"/opt/Unity -projectPath {wt}", wt) is False
+    # another unit's probe (script present, different worktree) → not ours to reap
+    assert mod._probe_argv_matches(f"python {script} /tmp/other-wt", wt) is False
+
+
+def test_lingering_probe_pids_no_false_match(tmp_path):
+    """The runner is python but its argv is pytest, not the probe script → nothing
+    matches (and the scan never crashes on a path no process references)."""
+    mod = _load_unity_teardown()
+    assert mod._lingering_probe_pids(tmp_path) == []
 
 
 # --------------------------------------------------- editor_mode↔isolation coupling
@@ -421,7 +854,7 @@ def test_unity_teardown_sweep_skips_force_kill_when_terminate_suffices(tmp_path,
     assert host.force_killed == []
 
 
-def test_unity_teardown_sweep_skips_force_kill_on_identity_mismatch(tmp_path, monkeypatch):
+def test_unity_teardown_sweep_skips_force_kill_on_identity_mismatch(tmp_path, monkeypatch, capsys):
     """A survivor whose identity changed between snapshot and escalation (pid reused)
     is never force-killed — guarding against SIGKILL landing on an unrelated process."""
     mod = _load_unity_teardown()
@@ -433,6 +866,7 @@ def test_unity_teardown_sweep_skips_force_kill_on_identity_mismatch(tmp_path, mo
     assert mod._force_kill_lingering(tmp_path) == 1
     assert host.terminated == [_FAKE_PID]
     assert host.force_killed == []  # identity no longer matches → refused
+    assert "skipping force-kill" in capsys.readouterr().err
 
 
 def test_unity_ready_grace_explicit_override(monkeypatch):

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
+import re
 import secrets
 import shutil
 import tarfile
@@ -13,12 +15,26 @@ from pathlib import Path
 from . import devcontract, verify
 from .adapters.multiplexer import get_multiplexer
 from .journal import STATE_FILE, Journal, load_state, save_state
-from .model import PAUSE_ESCALATION, Phase
+from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
+from .platform_util import (
+    MAX_SEGMENT,
+    atomic_replace,
+    has_parent_ref,
+    is_absolute_path,
+    retrying_unlink,
+    safe_segment,
+)
 from .process_host import get_process_host
 
 RUNS_DIR = Path(".bmad-loop") / "runs"
 ARCHIVE_DIR = Path(".bmad-loop") / "archive"
 PID_FILE = "engine.pid"
+# Cross-process channel for a graceful-stop request: a control file the requester
+# (CLI/TUI) writes and the engine polls at item boundaries. Distinct from the hard
+# SIGTERM stop_run delivers — there is no SIGUSR1 on Windows/psmux and SIGTERM
+# already means "hard stop". The engine stays the single writer of journal.jsonl;
+# requesters only ever touch this file.
+STOP_REQUEST_FILE = "stop-request.json"
 _INVALID_PID_IDENTITY = -1.0  # impossible process start/create time; forces "not ours"
 
 
@@ -26,6 +42,12 @@ class StopRunError(Exception):
     """A live run could not be stopped — the engine ignored SIGTERM and its pid's
     identity can no longer be verified, so force-killing would risk an unrelated
     (reused) pid. The caller surfaces this rather than silently marking stopped."""
+
+
+class GracefulStopError(Exception):
+    """A graceful-stop request could not be lodged (run already finished, or its
+    engine is provably dead so the request would never be consumed). ``str()`` is
+    the operator-facing message the CLI/TUI surface verbatim."""
 
 
 # How long stop_run waits for a signalled engine to exit before falling back to
@@ -36,6 +58,36 @@ _STOP_POLL_S = 0.1
 
 def new_run_id() -> str:
     return time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
+
+
+# A run id is a lookup key with exactly one legitimate producer (new_run_id), and it
+# lands in three positions at once: a directory name under RUNS_DIR, a multiplexer
+# session name (bmad-loop-<id>), and a git ref component (bmad-loop/<id>/<unit>).
+# So an id supplied from outside is *rejected*, never sanitized — coercing it would
+# break the id<->path<->session bijection the CLI relies on to find a run again.
+#
+# The charset is a superset of every new_run_id() output and excludes, by
+# construction: path separators and `..` (traversal), `<>:"|?*` plus trailing dots
+# and spaces (Windows), `.` and `:` (multiplexer session-name mangling), and all
+# whitespace/control characters. It is also identity under safe_ref_segment, so the
+# unit branch a run produces reads back verbatim — hence no ref check below.
+RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+
+
+def is_valid_run_id(value: str) -> bool:
+    """True when ``value`` is a run id we would have produced ourselves — the guard
+    every externally-supplied ``--run-id`` and every id recomposed from the outside
+    world (a foreign multiplexer session name) must pass before it touches a path.
+
+    The length cap is ``platform_util.MAX_SEGMENT``: a run id is a directory name.
+    The ``safe_segment`` identity check adds the one rule ``RUN_ID_RE`` cannot
+    express — the reserved Windows device basenames (``CON``, ``NUL``, ``COM1``…),
+    which are legal-looking ids that no filesystem will accept as a directory."""
+    return (
+        bool(RUN_ID_RE.fullmatch(value))
+        and len(value) <= MAX_SEGMENT
+        and safe_segment(value) == value
+    )
 
 
 def list_run_dirs(project: Path) -> list[Path]:
@@ -52,16 +104,24 @@ def latest_run_dir(project: Path) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def write_named_pid(pidfile: Path, pid: int) -> None:
+    """Record ``pid`` plus its identity to ``pidfile``, so a later liveness read can
+    tell our process from a stranger that inherited a reused pid (immediate on
+    Windows). One whitespace-delimited line: ``"<pid>"`` (legacy) or
+    ``"<pid> <identity>"``; the identity token is omitted when the platform can't
+    provide one. The parameterized form :func:`write_pid` builds on — reused for the
+    Unity dialog probe's own ``unity-dialog-probe.pid`` handle."""
+    identity = get_process_host().identity(pid)
+    line = f"{pid} {identity}" if identity is not None else str(pid)
+    pidfile.write_text(line, encoding="utf-8")
+
+
 def write_pid(run_dir: Path) -> None:
     """Record the engine pid plus its identity, so a later liveness read can tell
     our engine from a stranger that inherited a reused pid (immediate on Windows).
-    One whitespace-delimited line: ``"<pid>"`` (legacy) or ``"<pid> <identity>"``;
-    the identity token is omitted when the platform can't provide one. Never
-    deleted: a stale pid that reads as gone is the signal a run was interrupted."""
-    pid = os.getpid()
-    identity = get_process_host().identity(pid)
-    line = f"{pid} {identity}" if identity is not None else str(pid)
-    (run_dir / PID_FILE).write_text(line, encoding="utf-8")
+    Never deleted: a stale pid that reads as gone is the signal a run was
+    interrupted."""
+    write_named_pid(run_dir / PID_FILE, os.getpid())
 
 
 def session_name(run_id: str) -> str:
@@ -74,8 +134,14 @@ def attach_target_argv(target: str) -> list[str]:
     return get_multiplexer().attach_target_argv(target)
 
 
+def session_target(run_id: str) -> str:
+    """Seam-canonical target token for the run's agent session (see
+    :meth:`TerminalMultiplexer.target`)."""
+    return get_multiplexer().target(session_name(run_id))
+
+
 def attach_argv(run_id: str) -> list[str]:
-    return attach_target_argv(f"={session_name(run_id)}")
+    return attach_target_argv(session_target(run_id))
 
 
 # ---------------------------------------------------- run resolution / liveness
@@ -99,14 +165,30 @@ def short_ref(run_id: str) -> str:
     return run_id.rsplit("-", 1)[-1]
 
 
+def _is_path_escape(ref: str) -> bool:
+    """True when ``ref`` would steer ``run_dir_for``'s recomposition outside the
+    runs dir — it is absolute/drive-qualified, climbs with ``..``, or carries a
+    path separator of either flavour. Sub-check of the run-id charset rather than
+    `is_valid_run_id` itself: a run dir created by an older version (or by hand)
+    may bear a name we would no longer mint, and must stay addressable."""
+    return is_absolute_path(ref) or has_parent_ref(ref) or "/" in ref or "\\" in ref
+
+
 def resolve_run_dir(project: Path, ref: str) -> Path:
     """Full or partial run id -> its run dir. An exact id wins outright;
     otherwise a partial matches when the trailing segment starts with `ref` or
     the full id ends with `ref` (run ids are date-prefixed, so the tail is what
-    distinguishes them). Raises RunRefError on no match / ambiguity."""
-    exact = run_dir_for(project, ref)
-    if is_run(exact):
-        return exact
+    distinguishes them). Raises RunRefError on no match / ambiguity.
+
+    The exact branch recomposes a path from the raw ref, so it is skipped for any
+    ref that could escape the runs dir (`bmad-loop delete ../../x` would otherwise
+    rmtree an outside directory that happens to hold a state.json). Such a ref
+    falls through to partial matching, which can only ever yield a name
+    `list_run_dirs` enumerated — and so cannot escape."""
+    if not _is_path_escape(ref):
+        exact = run_dir_for(project, ref)
+        if is_run(exact):
+            return exact
     matches = [
         d
         for d in list_run_dirs(project)
@@ -128,13 +210,20 @@ def read_pid(run_dir: Path) -> int | None:
 
 
 def read_pid_identity(run_dir: Path) -> tuple[int | None, float | None]:
-    """The recorded engine pid and its persisted identity. ``(None, None)`` when the
-    file is missing or the pid is unparseable; identity ``None`` for a legacy
+    """The recorded engine pid and its persisted identity, from ``<run_dir>/engine.pid``.
+    Thin wrapper over :func:`read_named_pid_identity` (which other pid files — the
+    Unity dialog probe's — reuse)."""
+    return read_named_pid_identity(run_dir / PID_FILE)
+
+
+def read_named_pid_identity(pidfile: Path) -> tuple[int | None, float | None]:
+    """The pid and its persisted identity recorded in ``pidfile``. ``(None, None)``
+    when the file is missing or the pid is unparseable; identity ``None`` for a legacy
     pid-only file (callers then degrade to a bare existence check). A malformed
     second token is not legacy: it returns an impossible identity so reuse guards
     fail closed. First token is the pid, an optional second token the identity float."""
     try:
-        tokens = (run_dir / PID_FILE).read_text(encoding="utf-8").split()
+        tokens = pidfile.read_text(encoding="utf-8").split()
     except OSError:
         return None, None
     if not tokens:
@@ -214,7 +303,7 @@ def project_tag(project: Path) -> str:
     return str(project.resolve())
 
 
-def tmux_sessions() -> list[str]:
+def mux_sessions() -> list[str]:
     """All live session names, or [] when the multiplexer is missing, no server
     is running, or the query fails."""
     return get_multiplexer().list_sessions()
@@ -222,7 +311,7 @@ def tmux_sessions() -> list[str]:
 
 def session_project_tags() -> dict[str, str]:
     """Map each live session name to its PROJECT_OPTION value ("" when unset).
-    Same missing-multiplexer/no-server guards as tmux_sessions()."""
+    Same missing-multiplexer/no-server guards as mux_sessions()."""
     return get_multiplexer().session_options(PROJECT_OPTION)
 
 
@@ -248,10 +337,12 @@ def prunable_sessions(project: Path) -> tuple[list[str], list[str], set[str]]:
     prunable: list[str] = []
     live: list[str] = []
     unknown: set[str] = set()
-    for name in tmux_sessions():
+    for name in mux_sessions():
         if name == CTL_SESSION or not name.startswith(_SESSION_PREFIX):
             continue
         run_id = name[len(_SESSION_PREFIX) :]
+        if not is_valid_run_id(run_id):
+            continue  # a foreign/mangled session name must not steer a run-dir path
         run_dir = run_dir_for(project, run_id)
         tag = tags.get(name, "")
         if tag:
@@ -284,6 +375,67 @@ def prune_sessions(
     return prunable, live, unknown
 
 
+def graceful_stop_requested(run_dir: Path) -> bool:
+    """True when a graceful-stop request is pending for this run (its control file
+    is present). The single definition of "requested" the engine checks at item
+    boundaries and the CLI/TUI surface — a bare existence read, never raising."""
+    return (run_dir / STOP_REQUEST_FILE).is_file()
+
+
+def clear_graceful_stop(run_dir: Path) -> bool:
+    """Consume a pending graceful-stop request, returning True iff one was present
+    and removed. Never raises: a hard stop and a resume both call this to cancel a
+    superseded request, and a missing file (already consumed by the engine, or
+    never written) or an unremovable one must not wedge those paths. Uses the same
+    win32 sharing-violation retry the atomic write pairs with."""
+    try:
+        retrying_unlink(run_dir / STOP_REQUEST_FILE)
+    except OSError:
+        # FileNotFoundError (nothing pending) or a genuine removal failure — either
+        # way nothing was discarded, and the caller must not see an exception.
+        return False
+    return True
+
+
+def request_graceful_stop(run_dir: Path) -> str:
+    """Ask a live run to stop gracefully: finish the in-flight item (story ->
+    dev/review/commit, or a sweep bundle through commit) cleanly, then finalize and
+    stop — resumable, unlike the hard SIGTERM :func:`stop_run` delivers.
+
+    Delivery is the :data:`STOP_REQUEST_FILE` control file, written atomically (tmp
+    + ``atomic_replace``) so a concurrent engine read never sees a partial file.
+    Never signals the process and never writes ``journal.jsonl`` (engine-owned
+    single-writer). Returns a status token for the caller to message on:
+
+    - ``"requested"`` — file written; a provably-live engine will honor it.
+    - ``"already-pending"`` — a request was already on disk; left untouched so its
+      original ``requested_at`` stands (idempotent — a second ask is a no-op).
+    - ``"requested-unverifiable"`` — file written, but engine liveness read
+      ``'unknown'`` (e.g. a win32 access-denied pid): the request stands and fires
+      if an engine is in fact running; the caller warns that it can't confirm.
+
+    Raises :class:`GracefulStopError` when the run has already finished (nothing to
+    stop) or its engine is provably dead (no consumer — ``resume`` is the tool).
+    """
+    state = load_state(run_dir)
+    if state.finished:
+        raise GracefulStopError(f"run {run_dir.name} has already finished — nothing to stop")
+    if graceful_stop_requested(run_dir):
+        return "already-pending"  # keep the original request's timestamp
+    liveness = engine_liveness(run_dir)
+    if liveness == "dead":
+        raise GracefulStopError(
+            f"run {run_dir.name} has no live engine — a graceful stop request would "
+            f"never be consumed; use `bmad-loop resume {run_dir.name}` to continue it"
+        )
+    path = run_dir / STOP_REQUEST_FILE
+    tmp = path.with_name(path.name + ".tmp")
+    body = json.dumps({"requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": "graceful"})
+    tmp.write_text(body, encoding="utf-8")
+    atomic_replace(tmp, path)
+    return "requested" if liveness == "alive" else "requested-unverifiable"
+
+
 def stop_run(run_dir: Path) -> bool:
     """Stop a live run. Returns False if it was already finished.
 
@@ -298,6 +450,11 @@ def stop_run(run_dir: Path) -> bool:
     state = load_state(run_dir)
     if state.finished:
         return False
+
+    # A hard stop always supersedes a pending graceful request — cancel it so a
+    # later resume doesn't re-honor a stop the operator escalated past (covers the
+    # signalled, force-kill, and mark-stopped fallback paths below alike).
+    clear_graceful_stop(run_dir)
 
     host = get_process_host()
     pid, identity = read_pid_identity(run_dir)  # identity recorded at run start, not sampled now
@@ -357,15 +514,15 @@ def delete_run(run_dir: Path) -> None:
 
 def archive_run(project: Path, run_dir: Path) -> Path:
     """Compress a run dir into .bmad-loop/archive/<id>.tar.gz and remove the
-    original. The tarball is written to a temp path then os.replace'd into place
-    so a partial archive never appears. Callers enforce the live guard."""
+    original. The tarball is written to a temp path then atomically replaced into
+    place so a partial archive never appears. Callers enforce the live guard."""
     archive_dir = project / ARCHIVE_DIR
     archive_dir.mkdir(parents=True, exist_ok=True)
     dest = archive_dir / f"{run_dir.name}.tar.gz"
     tmp = dest.with_suffix(".tar.gz.tmp")
     with tarfile.open(tmp, "w:gz") as tar:
         tar.add(run_dir, arcname=run_dir.name)
-    os.replace(tmp, dest)
+    atomic_replace(tmp, dest)
     shutil.rmtree(run_dir)
     return dest
 
@@ -385,7 +542,7 @@ def _state_or_none(run_dir: Path):
     never reclaim) what you cannot positively read."""
     try:
         return load_state(run_dir)
-    except Exception:  # noqa: BLE001 - unreadable/corrupt state ⇒ leave it alone
+    except Exception:  # unreadable/corrupt state ⇒ leave it alone
         return None
 
 
@@ -505,7 +662,69 @@ class RearmError(Exception):
     """The run/story is not in a re-armable escalation state."""
 
 
-def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
+def validate_restore_latch(
+    state: RunState, task: StoryTask, story_key: str, *, worktree_isolation: bool = False
+) -> str | None:
+    """Every precondition an intent-gap patch-restore latch (BMAD-METHOD #2564) must
+    satisfy, in one place. Returns an operator-facing error string, or None to latch.
+
+    The single seam for both entry points: `rearm_escalation` (which performs the
+    latch, and is also reachable programmatically — a TUI restore, a future caller)
+    and `cli._resolve_restore_patch` (which fails fast *before* the interactive
+    resolve session, so an unhonorable restore doesn't cost an agent conversation).
+    Splitting these let a non-CLI caller bypass the worktree half; keeping them here
+    means a caller cannot latch a patch the engine could never honor.
+
+    The CLI knows one thing this cannot: the *live* policy's isolation mode, which
+    may have been edited between escalation and resolve. It passes that as
+    `worktree_isolation`; the recorded `task.worktree_path` (how the unit actually
+    executed) is checked here either way, so both entry points reject a
+    worktree-isolation restore and the CLI additionally catches a policy flip.
+
+    Path resolution and trusted-roots containment stay CLI-side: they need
+    `--project` and the loaded bmad config, neither of which run state carries.
+    """
+    # A sentinel-wedged story escalated BEFORE planning — there is no attempted
+    # implementation to restore, and its re-arm re-dispatches a planning leg.
+    # Keyed on the recorded detection verdict (task.sentinel_kind), not the on-disk
+    # basename, mirroring rearm_escalation's sentinel-clear branch.
+    if state.source == "stories" and task.sentinel_kind:
+        return (
+            f"story {story_key} is wedged on a pre-planning {task.sentinel_kind} sentinel — "
+            "there is no attempted implementation to restore, and the re-drive starts "
+            "at planning. Re-run resolve without a restore patch for a clean re-plan."
+        )
+    # Same seam, broader shape: a restore only works through the spec's in-review
+    # flip, so an escalation with NO recorded spec (an ambiguous two-file wedge, an
+    # unknown --story selector, a session that died before naming one) has no
+    # routing target — the latch would stick, the flip would be skipped, and the
+    # engine would lay the patch onto the tree before a planning leg.
+    if not task.spec_file:
+        return (
+            f"story {story_key} has no recorded spec file, so a restored patch has no "
+            "review to resume (the re-drive starts at planning). Re-run resolve "
+            "without a restore patch for a from-scratch re-drive."
+        )
+    # Restore is an in-place-only recovery: a worktree-isolation re-drive discards
+    # the unit's worktree (engine._finish_inflight — taking a patch saved inside it
+    # along) and re-mounts a fresh one, so the re-apply could only fail on a
+    # destroyed patch file. Reject up front instead of latching a patch that can
+    # never restore.
+    if worktree_isolation or task.worktree_path:
+        return (
+            "restore patch is unsupported for worktree-isolation runs (the re-drive "
+            "discards and re-mounts the unit's worktree, so an in-place restore has "
+            "nothing durable to land on) — re-arm from scratch instead: drop "
+            "--restore-patch, or if the resolve agent recorded the restore in "
+            "resolution.json, re-run with --no-interactive (which ignores that "
+            "marker) instead of repeating the agent session"
+        )
+    return None
+
+
+def rearm_escalation(
+    run_dir: Path, story_key: str | None = None, *, restore_patch: str | None = None
+) -> str:
     """Re-arm an escalation-paused story so the next resume re-drives it.
 
     Flips the escalated task out of its terminal ESCALATED phase back to
@@ -514,14 +733,39 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
     spec. The baseline itself is advanced to the project's current HEAD (and
     the untracked snapshot refreshed) so commits and files the resolve session
     produced count as the rebuild's starting point, not as attempt debris to
-    roll back. Deterministically sets that spec's status to `ready-for-dev` so
-    the dev session routes straight to implement, and strips the escalated
-    attempt's stale `## Auto Run Result` section so the re-drive cannot read
-    as terminal from its first save. Does NOT clear the pause; the caller
-    resumes the run separately.
+    roll back. Strips the escalated attempt's stale `## Auto Run Result`
+    section so the re-drive cannot read as terminal from its first save, and
+    sets the spec's frontmatter status so step-01 routes to the right stage.
+    Does NOT clear the pause; the caller resumes the run separately.
 
-    Returns the re-armed story key. Raises RearmError when the run is not
-    paused at the escalation stage or the target story is not escalated.
+    Two re-drive modes, selected by `restore_patch`:
+
+    - **from-scratch** (default, ``restore_patch=None``): status → ``ready-for-dev``
+      so the dev session re-implements from a clean baseline. Assigning None also
+      clears any stale latch from a prior restore attempt the human abandoned.
+    - **patch-restore** (BMAD-METHOD #2564, ``restore_patch`` set): the human
+      confirmed the escalated attempt's reading was correct. Status → ``in-review``
+      so step-01 routes straight to step-04, and the path is latched onto the task
+      (`task.restore_patch`) so the engine re-applies the saved patch onto the
+      baseline before dispatching — the re-driven session resumes review on the
+      restored diff instead of re-implementing. The status is set here
+      deterministically; the resolve agent must NOT set it. Because the baseline
+      advances (above) while the patch was diffed from the OLD baseline, a resolve
+      session that committed changes to the patched files makes the re-drive's
+      apply fail — the engine then escalates loudly instead of dispatching on a
+      half-restored tree (see verify.apply_patch).
+
+    Stories mode: when the escalated spec is a fixed-slug sentinel
+    (`<id>-unresolved.md` / `<id>-ambiguous.md`, written by a pre-planning HALT),
+    it cannot be re-opened by a status flip — its very presence wedges the id.
+    Instead preserve a copy under `{run_dir}/sentinels/`, journal `sentinel-cleared`
+    with the blocking condition, and delete it, so the re-dispatch resolves to a
+    clean PENDING and re-plans from scratch (leg 1 again for a spec_checkpoint id).
+
+    Returns the re-armed story key. Raises RearmError when the run is not paused at
+    the escalation stage, the target story is not escalated, or a supplied
+    `restore_patch` fails `validate_restore_latch` (the shared precondition set —
+    sentinel wedge, spec-less escalation, worktree isolation).
     """
     state = load_state(run_dir)
     if state.paused_stage != PAUSE_ESCALATION:
@@ -537,15 +781,106 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
         raise RearmError(f"run {run_dir.name} has no task for story {key}")
     if task.phase != Phase.ESCALATED:
         raise RearmError(f"story {key} is not escalated (phase: {task.phase})")
+    # Patch-restore preconditions (T1 guard + spec-less wedge + worktree isolation),
+    # rejected here before any task mutation so the escalation stays armed for a
+    # corrected resolve. `cli._resolve_restore_patch` runs the same validator ahead
+    # of the interactive session; this call is what makes a programmatic caller
+    # (TUI restore parity, scripts) unable to bypass it.
+    if restore_patch:
+        err = validate_restore_latch(state, task, key)
+        if err is not None:
+            raise RearmError(err)
 
+    journal = Journal(run_dir)
+    # Read before the unconditional overwrite below: they describe the restore
+    # attempt this re-arm is abandoning, and the residue block needs both.
+    old_latch = task.restore_patch
+    old_baseline = task.baseline_commit
     # deliberate reset, not a normal state-machine transition (mirrors
     # engine._finish_inflight): a clean re-attempt against the corrected spec.
     task.phase = Phase.PENDING
     task.attempt = 0
     task.review_cycle = 0
+    task.followup_reviews_spent = 0  # human-resolved re-drive gets a fresh damping budget
     task.defer_reason = None
     task.rearmed = True  # resume-time recovery notice describes a clean rebuild,
     # not a failed attempt (engine._finish_inflight clears it once the rebuild runs)
+    # Always (re)assign the latch: a None restore_patch clears a stale one left by
+    # a prior restore attempt the human then chose to redo from scratch.
+    task.restore_patch = restore_patch
+
+    if task.spec_file:
+        spec_path = Path(task.spec_file)
+        # Stories mode only: a fixed-slug pre-planning-halt sentinel
+        # (`<id>-unresolved.md` / `<id>-ambiguous.md`) is cleared by deletion, not a
+        # status flip. Clear it ONLY when the run recorded this task AS a sentinel at
+        # detection time (`task.sentinel_kind`, stamped by StoriesEngine's pick-time
+        # wedge / post-dev read-back) — never by re-deriving from the basename. That
+        # keeps a real story spec that merely happens to be named `<key>-unresolved.md`,
+        # or a *non-sentinel* escalation whose spec matches the convention, on the
+        # status-flip path so it is kept, not deleted. Gate on the run source too (the
+        # convention exists only in stories mode) and defensively re-confirm the
+        # on-disk name still matches the recorded slug before deleting.
+        sentinel_kind = task.sentinel_kind if state.source == "stories" else ""
+        if sentinel_kind and _sentinel_condition(spec_path, key) == sentinel_kind:
+            # a sentinel is cleared by deletion, not a status flip; drop the stale
+            # spec_file so the re-dispatch starts from PENDING (clean re-plan).
+            _clear_sentinel(run_dir, journal, spec_path, key, sentinel_kind)
+            task.spec_file = None
+            task.sentinel_kind = ""  # verdict discharged; the re-dispatch is clean
+        else:
+            try:
+                # Route /bmad-dev-auto via the spec's frontmatter status (decision
+                # table): patch-restore -> in-review -> step-04 (resume review on
+                # the restored diff); from-scratch -> ready-for-dev -> step-03
+                # (re-implement). Independent of the resolve agent having set it.
+                target_status = "in-review" if restore_patch else "ready-for-dev"
+                verify.set_frontmatter_status(spec_path, target_status)
+                # drop the stale `## Auto Run Result` section along with the status flip
+                # (mirrors engine._reset_spec_for_repair): find_result_artifact keys on
+                # that heading, so leaving it would let the re-driven session's first
+                # save of the spec parse as the prior attempt's terminal outcome.
+                devcontract.strip_auto_run_result(spec_path)
+            except verify.FrontmatterWriteError as e:
+                # The spec reads fine but carries `status:` in a shape no line
+                # edit can move (a block scalar, a flow mapping, a value continued
+                # on the next line). This used to be a silent no-op on a bool
+                # nobody read: the re-drive was dispatched anyway, step-01 saw the
+                # unchanged terminal status and routed the session to "ingest as
+                # context, do not resume", and the story re-wedged with nothing on
+                # the record explaining why. Abort here for the same reason as
+                # below, with the remedy this cause actually has.
+                raise RearmError(
+                    f"cannot re-open story spec {spec_path} for the re-drive: {e} "
+                    f"— the re-drive would repeat the wedge it is meant to clear"
+                ) from e
+            except (OSError, UnicodeDecodeError) as e:
+                # Both helpers re-read the spec as UTF-8; an undecodable PRESENT
+                # spec is a first-class escalation state (resolve_story_spec
+                # degrades it to a wedge), so it can reach this flip. Without the
+                # flip the re-drive would just re-wedge — abort BEFORE any state
+                # is persisted (save_state runs below) with an actionable error
+                # instead of a traceback; the escalation stays armed for a retry.
+                raise RearmError(
+                    f"cannot re-open story spec {spec_path} for the re-drive "
+                    f"({e.__class__.__name__}: {e}) — fix or replace the file "
+                    f"(it must be readable UTF-8), then re-run resolve"
+                ) from e
+
+    # A previous restore latch is being replaced (or re-latched onto the same
+    # patch): the abandoned attempt applied that patch, so its NEW files sit
+    # untracked in the tree right now. The refresh below would capture them as
+    # "pre-existing" — after which every rollback preserves them and
+    # finalize_commit's `add -A` sweeps the abandoned attempt into the corrected
+    # story's commit. Subtract them instead (issue #90).
+    #
+    # Runs after the spec block for the same reason the refresh does (a cleared
+    # sentinel must not be snapshotted), and before it because it feeds it.
+    # Nothing is deleted here: the re-drive's reset (verify.safe_rollback) removes
+    # whatever the refreshed snapshot no longer blesses, at the right moment.
+    stale_residue = _stale_restore_residue(
+        Path(state.project), journal, key, old_latch, old_baseline
+    )
 
     # Advance the attempt baseline to the project's current HEAD and refresh the
     # untracked snapshot: whatever the human-driven resolve session left on the
@@ -557,30 +892,160 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
     # very gap the human just resolved. Best-effort: on a git failure the old
     # baseline stands (the redrive rollback path tolerates a stale baseline; it
     # just loses this protection).
-    # The two locals are computed before either task field is assigned, so a
-    # failure on either git call can't advance baseline_commit while
-    # baseline_untracked stays stale, or vice versa.
+    # Runs AFTER the spec block so a just-cleared stories sentinel (an untracked
+    # file removed above) is not captured into baseline_untracked as a phantom
+    # pre-existing untracked file. The two locals are computed before either task
+    # field is assigned, so a failure on either git call can't advance
+    # baseline_commit while baseline_untracked stays stale, or vice versa.
     try:
         repo = Path(state.project)
         head = verify.rev_parse_head(repo)
-        untracked = sorted(verify.untracked_files(repo))
+        untracked = sorted(verify.untracked_files(repo) - stale_residue)
         task.baseline_commit = head
         task.baseline_untracked = untracked
-    except Exception:  # noqa: BLE001  # nosec B110 - best-effort git read, must not fail re-arm
+    except Exception:  # nosec B110 - best-effort git read, must not fail re-arm
         pass
 
-    if task.spec_file:
-        # route /bmad-dev-auto to re-implement (decision table: ready-for-dev
-        # -> step-03); independent of the resolve agent having set it.
-        verify.set_frontmatter_status(Path(task.spec_file), "ready-for-dev")
-        # drop the stale `## Auto Run Result` section along with the status flip
-        # (mirrors engine._reset_spec_for_repair): find_result_artifact keys on
-        # that heading, so leaving it would let the re-driven session's first
-        # save of the spec parse as the prior attempt's terminal outcome.
-        devcontract.strip_auto_run_result(Path(task.spec_file))
+    # Patch-restore only: re-stamp the spec's own baseline to the advanced one.
+    # The in-review route skips step-03 — the only step that stamps
+    # `baseline_revision` — so without this the re-driven step-04 would build its
+    # review diff (and, on an intent-gap/bad-spec re-triage, revert) "since" the
+    # ORIGINAL pre-attempt sha, clawing back the very resolve-session commits the
+    # advance above just blessed as the re-drive's starting point. Loud on
+    # failure: a silently stale spec baseline is exactly the hazard being closed
+    # (the spec block above already proved the file readable, so this is remote).
+    if restore_patch and task.spec_file and task.baseline_commit:
+        try:
+            verify.set_frontmatter_field(
+                Path(task.spec_file), "baseline_revision", task.baseline_commit
+            )
+        except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
+            # FrontmatterWriteError joins the tuple rather than getting its own
+            # arm: the remedy is the same sentence ("fix the file"), and the
+            # exception already says which shape it could not move. What matters
+            # is that it aborts here — the stale-baseline hazard this block exists
+            # to close is exactly what a swallowed write would leave behind.
+            raise RearmError(
+                f"cannot re-stamp baseline_revision on {task.spec_file} "
+                f"({e.__class__.__name__}: {e}) — fix the file, then re-run resolve"
+            ) from e
 
     save_state(run_dir, state)
-    Journal(run_dir).append(
-        "story-escalation-resolved", story_key=key, baseline=task.baseline_commit or ""
+    journal.append(
+        "story-escalation-resolved",
+        story_key=key,
+        baseline=task.baseline_commit or "",
+        restore=bool(restore_patch),
     )
     return key
+
+
+def _stale_restore_residue(
+    repo: Path,
+    journal: Journal,
+    story_key: str,
+    old_latch: str | None,
+    old_baseline: str | None,
+) -> set[str]:
+    """The untracked files an abandoned patch-restore attempt left in the tree —
+    to be subtracted from the re-arm's refreshed `baseline_untracked` (issue #90).
+
+    Empty when no restore was latched. Deliberately *not* a `git apply -R`: the
+    re-drive's own reset already reverts the patch's tracked hunks, an `apply -R`
+    fails outright on any drift the resolve session introduced, and it misbehaves
+    on the committed variant below. Only the patch's new files are durable
+    contamination, and naming them is enough — `verify.safe_rollback` deletes
+    whatever the refreshed snapshot stops blessing.
+
+    Also journals (warn-only) the commits sitting between the OLD baseline and the
+    new one: a commit the escalated re-drive session made now becomes the next
+    re-drive's permanent starting point, and no reset revisits it. It is not
+    mechanically reversible — the resolve session's own blessed commits live in the
+    same range and reverting those would claw back the human's resolution — so the
+    human is the classifier. `bmad-loop resolve` echoes these to stderr.
+
+    Best-effort throughout: a deleted or unreadable patch, a non-repo project, a
+    bad old baseline — none may wedge a resolve. Every failure degrades to the
+    pre-#90 behavior and says so in the journal.
+    """
+    if not old_latch:
+        return set()
+    patch_path = verify.resolve_restore_path(old_latch, repo)
+
+    residue: set[str] = set()
+    try:
+        residue = verify.patch_new_files(patch_path)
+    except (OSError, UnicodeDecodeError) as e:
+        # degrade to the pre-#90 snapshot rather than wedge the resolve
+        journal.append(
+            "stale-restore-unparseable",
+            story_key=story_key,
+            patch=str(patch_path),
+            error=f"{e.__class__.__name__}: {e}",
+        )
+    else:
+        if residue:
+            journal.append(
+                "stale-restore-excluded",
+                story_key=story_key,
+                patch=str(patch_path),
+                files=sorted(residue),
+            )
+
+    # Independent of the parse above — an unreadable patch must not also cost the
+    # human the only notice they get about the committed variant.
+    if old_baseline:
+        try:
+            shas = verify.commits_above(repo, old_baseline)
+        except Exception:  # nosec B110 - warn-only, must not fail re-arm
+            shas = []
+        if shas:
+            journal.append(
+                "stale-restore-commits",
+                story_key=story_key,
+                old_baseline=old_baseline,
+                commits=shas,
+            )
+    return residue
+
+
+def _sentinel_condition(spec_path: Path, story_key: str) -> str | None:
+    """The blocking condition (``unresolved`` / ``ambiguous``) iff ``spec_path`` is
+    a fixed-slug pre-planning-halt sentinel for ``story_key``, else None."""
+    from .stories import SENTINEL_SLUGS
+
+    for slug in SENTINEL_SLUGS:
+        if spec_path.name == f"{story_key}-{slug}.md":
+            return slug
+    return None
+
+
+def _clear_sentinel(
+    run_dir: Path, journal: Journal, spec_path: Path, story_key: str, sentinel_kind: str
+) -> None:
+    """Preserve a copy of the sentinel under ``{run_dir}/sentinels/`` (a write-only
+    breadcrumb of what blocked planning), journal ``sentinel-cleared`` — carrying
+    both the fixed slug (``sentinel_kind``) and the *recorded blocking condition*
+    parsed from the sentinel's ``## Auto Run Result`` (the reason planning halted) —
+    then delete the sentinel so the next dispatch is clean."""
+    from .stories import recorded_blocking_condition
+
+    dest_dir = run_dir / "sentinels"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    condition = ""
+    if spec_path.is_file():
+        try:
+            condition = recorded_blocking_condition(spec_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            # An unreadable/binary sentinel still gets preserved+deleted so re-arm
+            # completes; we just journal an empty blocking condition.
+            condition = ""
+        shutil.copy2(spec_path, dest_dir / spec_path.name)
+        spec_path.unlink()
+    journal.append(
+        "sentinel-cleared",
+        story_key=story_key,
+        sentinel_kind=sentinel_kind,
+        condition=condition,
+        sentinel=spec_path.name,
+    )

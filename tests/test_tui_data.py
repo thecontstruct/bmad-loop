@@ -9,9 +9,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from conftest import install_bmad_config, write_sprint
 
-from bmad_loop import deferredwork
+from bmad_loop import deferredwork, policy
 from bmad_loop.adapters import tmux_base
 from bmad_loop.journal import Journal, save_state
 from bmad_loop.model import RunState
@@ -177,6 +178,67 @@ def test_finished_beats_stopped(tmp_path):
     assert data.discover_runs(tmp_path)[0].status == data.FINISHED
 
 
+def test_discover_runs_marks_graceful_stop_pending_while_running(tmp_path):
+    from bmad_loop.runs import STOP_REQUEST_FILE
+
+    run_dir = make_run(tmp_path, "20260611-120000-cccc")
+    write_pid(run_dir)  # test process pid: alive -> RUNNING
+    assert data.discover_runs(tmp_path)[0].stopping is False  # no request yet
+    (run_dir / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
+    info = data.discover_runs(tmp_path)[0]
+    assert info.status == data.RUNNING
+    assert info.stopping is True
+
+
+def test_discover_runs_marks_graceful_stop_pending_while_unknown(tmp_path, monkeypatch):
+    # An unverifiable ('unknown') pid still has an engine that can consume the control
+    # file, so the "stopping" badge shows for an UNKNOWN-status run too — matching the
+    # CLI's graceful_stop_pending, which projects the request on liveness != "dead".
+    from bmad_loop import runs
+    from bmad_loop.runs import STOP_REQUEST_FILE
+
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
+    (run_dir / "engine.pid").write_text("4242 123.0")
+
+    class Host:
+        def liveness_of(self, pid, identity):
+            return "unknown"
+
+    monkeypatch.setattr(runs, "get_process_host", lambda: Host())
+    assert data.discover_runs(tmp_path)[0].stopping is False  # no request yet
+    (run_dir / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
+    info = data.discover_runs(tmp_path)[0]
+    assert info.status == data.UNKNOWN
+    assert info.stopping is True
+
+
+def test_stopping_ignored_on_a_non_running_run(tmp_path):
+    # The engine consumes the control file at the stop boundary; a file lingering
+    # on an already-stopped or finished run must not read as still-stopping.
+    from bmad_loop.runs import STOP_REQUEST_FILE
+
+    stopped = make_run(tmp_path, "20260611-100000-aaaa", stopped=True)
+    (stopped / "engine.pid").write_text(str(dead_pid()))
+    (stopped / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
+    finished = make_run(tmp_path, "20260611-110000-bbbb", finished=True)
+    (finished / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
+    infos = {i.run_id: i for i in data.discover_runs(tmp_path)}
+    assert infos["20260611-100000-aaaa"].status == data.STOPPED
+    assert infos["20260611-100000-aaaa"].stopping is False
+    assert infos["20260611-110000-bbbb"].status == data.FINISHED
+    assert infos["20260611-110000-bbbb"].stopping is False
+
+
+def test_watcher_stopping_reads_the_control_file(tmp_path):
+    from bmad_loop.runs import STOP_REQUEST_FILE
+
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.stopping() is False
+    (run_dir / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
+    assert watcher.stopping() is True
+
+
 def test_discover_runs_legacy_no_pid_is_unknown(tmp_path, monkeypatch):
     make_run(tmp_path, "20260611-100000-aaaa")
     # legacy liveness now flows through the multiplexer backend; patch its seam.
@@ -184,6 +246,7 @@ def test_discover_runs_legacy_no_pid_is_unknown(tmp_path, monkeypatch):
     assert data.discover_runs(tmp_path)[0].status == data.UNKNOWN
 
 
+@pytest.mark.usefixtures("force_tmux_backend")  # asserts tmux liveness through the seam
 def test_legacy_run_with_live_tmux_session_is_running(tmp_path, monkeypatch):
     run_dir = make_run(tmp_path, "20260611-100000-aaaa")
     monkeypatch.setattr(tmux_base.shutil, "which", lambda _: "/usr/bin/tmux")
@@ -542,6 +605,81 @@ def test_log_view_strips_private_marker_sgr_split_across_reads(tmp_path):
     assert not any(style.underline for _, _, style in line.spans)
 
 
+def test_log_view_strips_private_marker_mid_params(tmp_path):
+    # gemini's XTMODKEYS reply `CSI > 4 ; ? m` carries the `?` marker *inside* the
+    # params. Unstripped, pyte 0.8.2 dispatches it with private=True and
+    # select_graphic_rendition rejects the kwarg — the TypeError that killed the
+    # whole TUI in #111.
+    path = tmp_path / "task.log"
+    path.write_bytes(b"\x1b[>4;?mhello world\r\n")
+    view = data.LogView(path)
+    assert view.read_new() is True
+    line = view.render()
+    assert "hello world" in line.plain
+    assert not any(style.underline for _, _, style in line.spans)
+
+
+def test_log_view_survives_gemini_startup_preamble(tmp_path):
+    # The exact byte prefix from the #111 traceback: the gemini CLI's terminal
+    # capability negotiation burst, including the crashing `CSI > 4 ; ? m`.
+    path = tmp_path / "task.log"
+    path.write_bytes(
+        b"\x1b[8m\x1b[?u\x1b]11;?\x1b\\\x1b[>q\x1b[>4;?m\x1b[c\x1b[2K\r\x1b[0m" b"ready to work\r\n"
+    )
+    view = data.LogView(path)
+    assert view.read_new() is True
+    assert "ready to work" in view.render().plain
+
+
+def test_log_view_strips_vim9_private_sgr(tmp_path):
+    # `CSI ? 4 m` (vim 9+, upstream selectel/pyte#202): marker in first position
+    # but final `m` — must be stripped, not read as underline or crash pyte.
+    path = tmp_path / "task.log"
+    path.write_bytes(b"\x1b[?4mhello\r\n")
+    view = data.LogView(path)
+    assert view.read_new() is True
+    line = view.render()
+    assert "hello" in line.plain
+    assert not any(style.underline for _, _, style in line.spans)
+
+
+def test_log_view_strips_private_marker_mid_params_split_across_reads(tmp_path):
+    # The #111 sequence straddles two reads; the held-back trailing CSI (whose
+    # char class already admits marker bytes anywhere) lets the filter see it
+    # whole on the next read.
+    path = tmp_path / "task.log"
+    path.write_bytes(b"\x1b[>4;?")
+    view = data.LogView(path)
+    view.read_new()
+    with path.open("ab") as f:
+        f.write(b"mhello\r\n")
+    assert view.read_new() is True
+    line = view.render()
+    assert "hello" in line.plain
+    assert not any(style.underline for _, _, style in line.spans)
+
+
+def test_log_view_survives_unfilterable_private_csi(tmp_path):
+    # Belt-and-braces: a private-marked CSI with a non-`m` final passes the strip
+    # filter deliberately (only marker-SGR is stripped) and crashes raw pyte 0.8.2
+    # (`cursor_position() got an unexpected keyword argument 'private'`). The
+    # tolerant stream drops the sequence instead of killing the poll worker, and
+    # the emulator keeps rendering everything after it.
+    path = tmp_path / "task.log"
+    path.write_bytes(b"\x1b[?1;1Hhello\r\n")
+    view = data.LogView(path)
+    assert view.read_new() is True
+    assert "hello" in view.render().plain
+
+    with path.open("ab") as f:
+        f.write(b"\x1b[31mstill alive\x1b[0m\r\n")
+    assert view.read_new() is True
+    line = view.render()
+    assert "still alive" in line.plain
+    styled = {line.plain[s:e] for s, e, st in line.spans if st.color is not None}
+    assert "still alive" in styled
+
+
 def test_log_view_history_beyond_screen(tmp_path):
     path = tmp_path / "task.log"
     path.write_bytes(b"".join(f"row {i:03d}\r\n".encode() for i in range(1, 81)))
@@ -675,6 +813,18 @@ def test_active_task_id_from_journal(tmp_path):
     assert data.active_task_id(tmp_path, entries) is None  # no logs fallback either
 
 
+def test_active_task_id_clears_on_aborted_session_end(tmp_path):
+    # No logs/ here on purpose: this pins the journal-scan contract (an explicit
+    # aborted end clears the active id). With logs present the newest-log
+    # fallback would still tail the ended session — deliberate, so the operator
+    # keeps the aborted log on screen; covered by the fallback test below.
+    entries = [
+        {"kind": "session-start", "task_id": "t1"},
+        {"kind": "session-end", "task_id": "t1", "status": "aborted", "error": "RuntimeError"},
+    ]
+    assert data.active_task_id(tmp_path, entries) is None
+
+
 def test_active_task_id_falls_back_to_newest_log(tmp_path):
     logs = tmp_path / "logs"
     logs.mkdir()
@@ -682,6 +832,103 @@ def test_active_task_id_falls_back_to_newest_log(tmp_path):
     (logs / "t-new.log").write_text("new")
     os.utime(logs / "t-old.log", ns=(1, 1))
     assert data.active_task_id(tmp_path, []) == "t-new"
+
+
+def test_active_task_id_matches_open_session_start(tmp_path):
+    # Regression: extracting _open_session_start must leave active_task_id
+    # byte-identical, including the logs/ fallback tail.
+    entries = [
+        {"kind": "session-start", "task_id": "t1"},
+        {"kind": "session-end", "task_id": "t1"},
+        {"kind": "session-start", "task_id": "t2"},
+    ]
+    assert data.active_task_id(tmp_path, entries) == "t2"
+    assert data._open_session_start(entries) is entries[-1]  # the open entry itself
+
+    closed = entries + [{"kind": "session-end", "task_id": "t2"}]
+    assert data.active_task_id(tmp_path, closed) is None
+    assert data._open_session_start(closed) is None
+
+    # nothing open in the journal -> newest-log fallback still fires
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "t-old.log").write_text("old")
+    (logs / "t-new.log").write_text("new")
+    os.utime(logs / "t-old.log", ns=(1, 1))
+    assert data.active_task_id(tmp_path, closed) == "t-new"
+
+
+# ------------------------------------------------------------- active agent
+
+
+def test_active_agent_from_stamped_session_start():
+    entries = [
+        {
+            "kind": "session-start",
+            "task_id": "1-1-alpha-dev-3",
+            "role": "dev",
+            "adapter": "claude",
+            "model": "opus",
+            "story_key": "1-1-alpha",
+        },
+    ]
+    assert data.active_agent(entries, None) == data.ActiveAgent(
+        task_id="1-1-alpha-dev-3",
+        story_key="1-1-alpha",
+        role="dev",
+        name="claude",
+        model="opus",
+    )
+
+
+def test_active_agent_none_after_matching_session_end():
+    entries = [
+        {
+            "kind": "session-start",
+            "task_id": "1-1-alpha-dev-3",
+            "role": "dev",
+            "adapter": "claude",
+            "model": "opus",
+            "story_key": "1-1-alpha",
+        },
+        {"kind": "session-end", "task_id": "1-1-alpha-dev-3"},
+    ]
+    assert data.active_agent(entries, None) is None
+
+
+def test_active_agent_falls_back_to_policy_snapshot():
+    # An entry recorded before adapter stamping (#153 phase 1) has no "adapter"
+    # and no "story_key": identity is rebuilt from the run's policy snapshot,
+    # resolved for the entry's role, and the story key is peeled off the
+    # task_id. A review-stage model override must win over the base model.
+    snapshot = {"adapter": {"name": "claude", "model": "opus", "review": {"model": "haiku"}}}
+    entries = [{"kind": "session-start", "task_id": "2-3-beta-review-1", "role": "review"}]
+    agent = data.active_agent(entries, snapshot)
+    resolved = policy.adapter_policy_from_snapshot(snapshot).resolved("review")
+    assert agent is not None
+    assert (agent.name, agent.model) == (resolved.name, resolved.model) == ("claude", "haiku")
+    assert agent.story_key == "2-3-beta"  # peeled from "-review-1"
+    assert agent.role == "review"
+
+
+def test_active_agent_labeled_session_peels_story_key():
+    # A labeled plugin session's task_id carries the label, not the role; the
+    # recorded role won't match, so the story key peels via best-effort rsplit.
+    entries = [{"kind": "session-start", "task_id": "4-2-gamma-tea-7", "role": "dev"}]
+    agent = data.active_agent(entries, {"adapter": {"name": "codex", "model": "gpt-5"}})
+    assert agent is not None
+    assert agent.story_key == "4-2-gamma"  # "-tea-7" stripped despite role != "tea"
+    assert (agent.name, agent.model) == ("codex", "gpt-5")
+
+
+def test_active_agent_none_without_resolvable_snapshot():
+    # Unstamped entry + no trustworthy snapshot: an all-"claude" reconstruction
+    # would mislabel a run that predates stamping, so the agent is unknown.
+    unstamped = [{"kind": "session-start", "task_id": "2-3-beta-review-1", "role": "review"}]
+    assert data.active_agent(unstamped, None) is None
+    assert data.active_agent(unstamped, {}) is None
+    assert data.active_agent(unstamped, {"adapter": {}}) is None  # table without a name
+    assert data.active_agent([], None) is None  # no open session at all
 
 
 # ---------------------------------------------------------- pending decision
@@ -744,6 +991,63 @@ def test_sprint_overview_unavailable(tmp_path, project):
     assert data.sprint_overview(project.project) is None
     project.sprint_status.write_text("- just\n- a\n- list\n")
     assert data.sprint_overview(project.project) is None
+
+
+# ------------------------------------------------- stories mode: pause + board
+
+
+def test_discover_runs_reports_pause_stage(tmp_path):
+    from bmad_loop.model import PAUSE_PLAN_CHECKPOINT
+
+    make_run(
+        tmp_path,
+        "20260101-000000-aaaa",
+        paused_reason="plan checkpoint for 1",
+        paused_stage=PAUSE_PLAN_CHECKPOINT,
+    )
+    info = data.discover_runs(tmp_path)[0]
+    assert info.status == data.PAUSED
+    assert info.paused_stage == PAUSE_PLAN_CHECKPOINT
+
+
+def test_discover_runs_pause_stage_blank_when_not_paused(tmp_path):
+    # a finished run keeps its last paused_stage in state; it must not badge.
+    make_run(tmp_path, "20260101-000000-aaaa", finished=True, paused_stage="plan-checkpoint")
+    info = data.discover_runs(tmp_path)[0]
+    assert info.status == data.FINISHED
+    assert info.paused_stage == ""
+
+
+def _write_stories(folder: Path, entries: list[dict]) -> None:
+    import yaml
+
+    (folder / "stories").mkdir(parents=True, exist_ok=True)
+    (folder / "stories.yaml").write_text(yaml.safe_dump(entries, sort_keys=False))
+
+
+def test_stories_overview_reads_board(tmp_path):
+    folder = tmp_path / "epic-1"
+    _write_stories(
+        folder,
+        [
+            {"id": "1", "title": "First", "description": "d", "spec_checkpoint": True},
+            {"id": "2", "title": "Second", "description": "d", "done_checkpoint": True},
+        ],
+    )
+    (folder / "stories" / "1-slug.md").write_text("---\nstatus: done\n---\n", encoding="utf-8")
+    rows = data.stories_overview(tmp_path, "epic-1")
+    assert rows is not None
+    assert [(r.id, r.label) for r in rows] == [("1", "done"), ("2", "pending")]
+    assert rows[0].spec_checkpoint and rows[1].done_checkpoint
+
+
+def test_stories_overview_none_when_unavailable(tmp_path):
+    assert data.stories_overview(tmp_path, "") is None  # no folder pinned
+    assert data.stories_overview(tmp_path, "missing") is None  # no stories.yaml
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    (bad / "stories.yaml").write_text("not: a list\n", encoding="utf-8")
+    assert data.stories_overview(tmp_path, "bad") is None  # invalid manifest, no raise
 
 
 # ------------------------------------------------------------- deferred work
@@ -888,3 +1192,55 @@ def test_run_watcher_state_refreshes_on_same_size_rewrite(tmp_path):
     assert after.st_size == pinned.st_size and after.st_mtime_ns == pinned.st_mtime_ns
 
     assert watcher.state() is not first  # re-parsed because the inode changed
+
+
+def test_rich_color_maps_pyte_names_to_valid_rich_colors():
+    # pyte emits aixterm bright names without an underscore (e.g. "brightbrown"
+    # for SGR 93). _rich_color remaps pyte's "brown"/"brightbrown" and then
+    # applies the "bright" -> "bright_" transform; the remap target must stay in
+    # pyte's underscore-free namespace or the transform doubles the underscore
+    # into an invalid "bright__yellow" and every log render raises ColorParseError.
+    from rich.color import Color
+
+    cases = {
+        "default": None,
+        "brown": "yellow",
+        "brightbrown": "bright_yellow",  # regression: was "bright__yellow"
+        "bfightmagenta": "bright_magenta",  # pyte 0.8.2 BG_AIXTERM[105] typo
+        "red": "red",
+        "brightred": "bright_red",
+        "brightyellow": "bright_yellow",
+        "ff00aa": "#ff00aa",
+    }
+    for pyte_name, expected in cases.items():
+        got = data._rich_color(pyte_name)
+        assert got == expected, f"{pyte_name!r} -> {got!r}, expected {expected!r}"
+        if got is not None:
+            Color.parse(got)  # must be a color rich accepts, else the TUI crashes
+
+    # Exhaustive: every name the installed pyte can emit must map to something
+    # rich parses — a pyte bump that adds/renames table entries fails here, not
+    # in the dashboard's poll worker.
+    import pyte.graphics as graphics
+
+    every_pyte_name = (
+        set(graphics.FG.values())
+        | set(graphics.BG.values())
+        | set(graphics.FG_AIXTERM.values())
+        | set(graphics.BG_AIXTERM.values())
+    )
+    for pyte_name in sorted(every_pyte_name):
+        got = data._rich_color(pyte_name)
+        if got is not None:
+            Color.parse(got)
+
+
+def test_char_style_degrades_unparseable_color_instead_of_raising():
+    # Belt to the sweep test's suspenders: if a color name rich can't parse
+    # ever slips through _rich_color, the run renders uncolored instead of
+    # killing the poll worker (and, via exit_on_error, the whole app).
+    key = ("no_such_color", "default", True, False, True, False, False)
+    style = data._char_style(key)
+    assert style.color is None and style.bgcolor is None
+    assert style.bold and style.underline and not style.italic
+    assert data._char_style(key) is style  # fallback is cached like any other

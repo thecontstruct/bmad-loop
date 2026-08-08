@@ -119,7 +119,7 @@ body:
     attributes:
       label: Diagnostic dump (bmad-loop diagnose)
       description: |
-        Output of `bmad-loop diagnose --out diag.md` (add `--json` for a machine-readable block, or `--all` to cover every run). **Drag-and-drop the `diag.md` file here** (or paste its contents). It's sanitized — identifiers are pseudonymized and the output is re-scanned by a fail-closed leak check before it's written — but **no scrubber is perfect**: open the file and verify it contains no PII, secrets, or project-specific content before attaching.
+        Output of `bmad-loop diagnose --out diag.md` (add `--all` to cover every run; `--json --out diag.json` writes a machine-readable JSON document instead of the markdown report). **Drag-and-drop the written file here** (or paste its contents). It's sanitized — identifiers are pseudonymized and the output is re-scanned by a fail-closed leak check before it's written — but **no scrubber is perfect**: open the file and verify it contains no PII, secrets, or project-specific content before attaching.
 
   - type: checkboxes
     id: terms

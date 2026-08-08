@@ -8,6 +8,8 @@ the legacy ``platform_util`` entry points still delegate, plus the real
 from __future__ import annotations
 
 import os
+import stat
+import subprocess
 import sys
 
 import pytest
@@ -66,3 +68,784 @@ def test_has_parent_ref_detects_escapes(value):
 def test_has_parent_ref_ignores_non_segments(value):
     # `..hidden` / `a..b` contain the substring but not a `..` path segment.
     assert platform_util.has_parent_ref(value) is False
+
+
+@pytest.mark.parametrize("value", ["", ".", "./", ".//", "./.", ".\\"])
+def test_names_tree_root_catches_every_spelling_of_the_root(value):
+    # `""` is the spelling an emptiness check catches; the rest are why this exists.
+    # `.\` is the Windows-only one — POSIX parsing keeps it as a one-segment name,
+    # the same asymmetry `is_absolute_path` checks both flavors for.
+    assert platform_util.names_tree_root(value) is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ". ",  # Win32 trims the trailing space -> names the containing dir
+        ".  ",
+        ".. ",  # the space stops it matching `..`, so Win32 trims rather than climbs
+        "...",
+        "....",
+        "   ",  # no period at all, still trimmed to empty
+        ". .",
+        " . ",
+        "./ ",
+        ".\\ ",  # separator + a component that is nothing but a space
+    ],
+)
+def test_names_tree_root_catches_the_win32_trim_aliases(value):
+    # Win32 strips every trailing period and space from a path's final component,
+    # so each of these names the tree root there. Both pure pathlib flavours keep
+    # them as ordinary one-segment names, which is exactly why the lexical guard
+    # has to know the rule — `resolve()` would, but these are checked at load,
+    # long before any path is resolved. Parametrized apart from the `.`/`./` cases
+    # so restoring the pure-equality-only guard reddens these and only these.
+    assert platform_util.names_tree_root(value) is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ".claude/skills",
+        "a",
+        "a/.",
+        "./a",
+        ".hidden",
+        "..",
+        "a/b",
+        "foo. ",  # strips to `foo` — names a CHILD, not the root
+        "foo ",
+        "a/. ",  # the trailing component is trimmed away, leaving `a`
+        ".claude/skills ",
+        "..hidden",
+        "a..b",
+        "../..",  # every component is dots, but these climb — has_parent_ref's job
+        "a/..",
+    ],
+)
+def test_names_tree_root_accepts_anything_naming_a_child(value):
+    # `a/.` and `./a` normalize to a real child, so they name something inside the
+    # tree. `..` names the PARENT, which is `has_parent_ref`'s job, not this one —
+    # the guards are paired at every call site. The trailing-space entries are the
+    # boundary of the trim rule: a component only stops naming something once it is
+    # *nothing but* periods and spaces.
+    assert platform_util.names_tree_root(value) is False
+
+
+# ---------------------------------------------------------------- atomic_replace
+
+
+def _flaky_replace(fail_times: int, real=os.replace):
+    """os.replace that raises a sharing violation the first ``fail_times`` calls."""
+    calls = {"n": 0}
+
+    def replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= fail_times:
+            raise PermissionError(5, "Access is denied")
+        real(src, dst)
+
+    return replace, calls
+
+
+def test_atomic_replace_retries_then_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+
+    replace, calls = _flaky_replace(2)
+    monkeypatch.setattr(platform_util.os, "replace", replace)
+
+    src = tmp_path / "s.tmp"
+    src.write_text("x", encoding="utf-8")
+    dst = tmp_path / "d.json"
+    platform_util.atomic_replace(src, dst)
+
+    assert calls["n"] == 3
+    assert len(sleeps) == 2  # one backoff before each retry
+    assert dst.read_text(encoding="utf-8") == "x"
+
+
+def test_atomic_replace_permanent_failure_reraises(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    monkeypatch.setattr(platform_util.time, "sleep", lambda _s: None)
+
+    def always_denied(src, dst):
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(platform_util.os, "replace", always_denied)
+
+    with pytest.raises(PermissionError):
+        platform_util.atomic_replace(tmp_path / "s", tmp_path / "d")
+
+
+def test_atomic_replace_no_retry_on_posix(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "linux")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+
+    def denied(src, dst):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(platform_util.os, "replace", denied)
+
+    with pytest.raises(PermissionError):
+        platform_util.atomic_replace(tmp_path / "s", tmp_path / "d")
+    assert sleeps == []  # zero backoff — a real POSIX error surfaces at once
+
+
+# ------------------------------------------------------------- atomic_write_text
+
+
+def test_atomic_write_text_replaces_contents(tmp_path):
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+
+    platform_util.atomic_write_text(target, "after")
+
+    assert target.read_text(encoding="utf-8") == "after"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_atomic_write_text_preserves_the_target_mode(tmp_path):
+    """`os.replace` swaps in a NEW inode, so a naive tmp-write-and-replace resets
+    the file's permissions to the umask default — silently widening a 0600 ledger
+    to world-readable, or dropping group-write on a shared artifact dir.
+
+    0o640, NOT 0o600: `mkstemp` creates its temp at 0600 already, so asserting that
+    value passed with `copymode` deleted — the pin held for the wrong reason. Any
+    mode the staging temp does not arrive with makes the ablation bite."""
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+    target.chmod(0o640)
+
+    platform_util.atomic_write_text(target, "after")
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_atomic_write_text_writes_through_a_symlink(tmp_path):
+    """Replacing the LINK would turn it into a regular file and orphan the real
+    ledger, so the link is resolved first and the target is what gets rewritten."""
+    real = tmp_path / "real-ledger.md"
+    real.write_text("before", encoding="utf-8")
+    link = tmp_path / "ledger.md"
+    link.symlink_to(real)
+
+    platform_util.atomic_write_text(link, "after")
+
+    assert link.is_symlink()
+    assert real.read_text(encoding="utf-8") == "after"
+
+
+def test_atomic_write_text_preserves_extended_attributes(tmp_path):
+    """`os.replace` swaps a fresh inode into place, so anything carried by the old
+    inode rather than by its name is silently reset — xattrs included, which on a
+    ledger is where an SELinux label or a backup tool's marker lives. Deleting
+    `_copy_xattrs` left every other test green (#284 follow-up review, finding 8).
+
+    Skipped where the platform or filesystem has no user xattrs (Windows, macOS's
+    different API, tmpfs mounted `nouser_xattr`) — the helper is best-effort by
+    design and must stay silent there, which the write below also proves."""
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+    setxattr = getattr(os, "setxattr", None)
+    if setxattr is None:
+        pytest.skip("no os.setxattr on this platform")
+    try:
+        setxattr(target, "user.bmad-loop-test", b"kept")
+    except OSError as e:
+        pytest.skip(f"filesystem does not support user xattrs: {e}")
+
+    platform_util.atomic_write_text(target, "after")
+
+    assert target.read_text(encoding="utf-8") == "after"
+    assert os.getxattr(target, "user.bmad-loop-test") == b"kept"
+
+
+def test_atomic_write_text_fsyncs_before_it_publishes(tmp_path, monkeypatch):
+    """`os.replace` is atomic against concurrent readers, but that says nothing
+    about a machine losing power: closing the temp only hands its bytes to the
+    page cache, so the rename can be durable while the data is not, and the new
+    name comes back pointing at a zero-length file. An empty ledger *parses* — as
+    no entries — so the failure reads as every hand-written entry having vanished
+    rather than as corruption."""
+    order = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(
+        platform_util.os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1]
+    )
+    monkeypatch.setattr(
+        platform_util.os, "replace", lambda s, d: (order.append("replace"), real_replace(s, d))[1]
+    )
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+
+    platform_util.atomic_write_text(target, "after")
+
+    assert order == ["fsync", "replace"]  # the sync must precede the publish
+    assert target.read_text(encoding="utf-8") == "after"
+
+
+def test_atomic_write_text_leaves_no_temp_behind(tmp_path):
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+
+    platform_util.atomic_write_text(target, "after")
+
+    assert [p.name for p in tmp_path.iterdir()] == ["ledger.md"]
+
+
+def test_atomic_write_text_cleans_up_and_keeps_the_original_on_failure(tmp_path, monkeypatch):
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(platform_util.os, "replace", boom)
+
+    with pytest.raises(OSError):
+        platform_util.atomic_write_text(target, "after")
+
+    assert target.read_text(encoding="utf-8") == "before"
+    assert [p.name for p in tmp_path.iterdir()] == ["ledger.md"]  # no orphaned temp
+
+
+def test_atomic_write_text_temp_name_is_unique_per_call(tmp_path, monkeypatch):
+    """A fixed `<name>.tmp` sibling is a collision between two writers of the same
+    file — the second clobbers the first's staged content and one replace lands
+    a half-written mix."""
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+    seen: list[str] = []
+    real_replace = os.replace
+
+    def record(src, dst):
+        seen.append(os.path.basename(src))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(platform_util.os, "replace", record)
+
+    platform_util.atomic_write_text(target, "a")
+    platform_util.atomic_write_text(target, "b")
+
+    assert len(set(seen)) == 2
+
+
+# ------------------------------------------------------------ atomic_write_bytes
+#
+# Mirrored from the eight text cases above rather than parametrized over both, and
+# deliberately: each property is a separate PIN the git-add shield now depends on
+# (install.py's `_worktree_local_exclude` writes through this variant, not the text
+# one), and the two helpers share a private tail that a later edit could split
+# without either name changing. A parametrized suite would also lose the
+# per-property rationale the text docstrings carry, which is where the reasons live.
+# What is NOT mirrored is anything about encoding — the last case below is the whole
+# difference between the two.
+
+
+def test_atomic_write_bytes_replaces_contents(tmp_path):
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before")
+
+    platform_util.atomic_write_bytes(target, b"after")
+
+    assert target.read_bytes() == b"after"
+
+
+def test_atomic_write_bytes_writes_bytes_no_codec_can_decode(tmp_path):
+    """The reason this variant exists (#384): the payload is an operator's git
+    exclude file, whose patterns are POSIX paths and therefore arbitrary bytes.
+    `atomic_write_text` would have to encode, and a strict UTF-8 encode of a
+    legacy-encoded file's content raises."""
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before\n")
+
+    platform_util.atomic_write_bytes(target, b"secret-\xff\n/probe\n")
+
+    assert target.read_bytes() == b"secret-\xff\n/probe\n"
+
+
+def test_atomic_write_bytes_does_not_translate_newlines(tmp_path):
+    """The one behavioral difference from the text sibling, and it is load-bearing on
+    Windows. `atomic_write_text` opens in text mode with the translating `newline`
+    default, so an LF payload lands as CRLF there — correct for a ledger a human
+    edits, wrong for a file being copied byte-for-byte from somewhere else. Binary
+    mode does no translation on any platform, which is what makes a verbatim copy
+    verbatim."""
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before\n")
+
+    platform_util.atomic_write_bytes(target, b"a\nb\n")
+
+    assert target.read_bytes() == b"a\nb\n"  # never b"a\r\nb\r\n"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_atomic_write_bytes_preserves_the_target_mode(tmp_path):
+    """Same pin as the text sibling — and the one the shield leans on hardest: an
+    exclude file git cannot READ is one git silently IGNORES, so a mode reset here
+    stages the very files the exclude was written to hide.
+
+    0o640 rather than 0o600 for the reason the text sibling gives: `mkstemp`'s temp
+    is already 0600, so that value cannot tell a preserved mode from a fresh one."""
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before")
+    target.chmod(0o640)
+
+    platform_util.atomic_write_bytes(target, b"after")
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_atomic_write_bytes_writes_through_a_symlink(tmp_path):
+    real = tmp_path / "real-exclude"
+    real.write_bytes(b"before")
+    link = tmp_path / "exclude"
+    link.symlink_to(real)
+
+    platform_util.atomic_write_bytes(link, b"after")
+
+    assert link.is_symlink()
+    assert real.read_bytes() == b"after"
+
+
+def test_atomic_write_bytes_preserves_extended_attributes(tmp_path):
+    """Skipped where the platform or filesystem has no user xattrs, exactly as the
+    text sibling is — the helper is best-effort there by design."""
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before")
+    setxattr = getattr(os, "setxattr", None)
+    if setxattr is None:
+        pytest.skip("no os.setxattr on this platform")
+    try:
+        setxattr(target, "user.bmad-loop-test", b"kept")
+    except OSError as e:
+        pytest.skip(f"filesystem does not support user xattrs: {e}")
+
+    platform_util.atomic_write_bytes(target, b"after")
+
+    assert target.read_bytes() == b"after"
+    assert os.getxattr(target, "user.bmad-loop-test") == b"kept"
+
+
+def test_atomic_write_bytes_fsyncs_before_it_publishes(tmp_path, monkeypatch):
+    """Same ordering pin as the text sibling: a durable rename over data still in the
+    page cache comes back as a zero-length file, which for an exclude reads as "no
+    patterns" — a shield that silently excludes nothing."""
+    order = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(
+        platform_util.os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1]
+    )
+    monkeypatch.setattr(
+        platform_util.os, "replace", lambda s, d: (order.append("replace"), real_replace(s, d))[1]
+    )
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before")
+
+    platform_util.atomic_write_bytes(target, b"after")
+
+    assert order == ["fsync", "replace"]  # the sync must precede the publish
+    assert target.read_bytes() == b"after"
+
+
+def test_atomic_write_bytes_leaves_no_temp_behind(tmp_path):
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before")
+
+    platform_util.atomic_write_bytes(target, b"after")
+
+    assert [p.name for p in tmp_path.iterdir()] == ["exclude"]
+
+
+def test_atomic_write_bytes_cleans_up_and_keeps_the_original_on_failure(tmp_path, monkeypatch):
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before")
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(platform_util.os, "replace", boom)
+
+    with pytest.raises(OSError):
+        platform_util.atomic_write_bytes(target, b"after")
+
+    assert target.read_bytes() == b"before"
+    assert [p.name for p in tmp_path.iterdir()] == ["exclude"]  # no orphaned temp
+
+
+def test_atomic_write_bytes_temp_name_is_unique_per_call(tmp_path, monkeypatch):
+    target = tmp_path / "exclude"
+    target.write_bytes(b"before")
+    seen: list[str] = []
+    real_replace = os.replace
+
+    def record(src, dst):
+        seen.append(os.path.basename(src))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(platform_util.os, "replace", record)
+
+    platform_util.atomic_write_bytes(target, b"a")
+    platform_util.atomic_write_bytes(target, b"b")
+
+    assert len(set(seen)) == 2
+
+
+def test_atomic_write_bytes_stages_in_the_targets_own_directory(tmp_path, monkeypatch):
+    """The temp has to be a SIBLING of the target, and this pins the shared tail for
+    both variants. `os.replace` cannot cross a filesystem, and the default temp dir
+    is a different mount on plenty of boxes (always, on a runner with a tmpfs
+    `/tmp`) — so a temp staged there fails the publish with EXDEV *after* the
+    content is written, turning an atomic write into a guaranteed one.
+
+    Recorded from `os.replace`'s source argument, because the pre-existing
+    "leaves no temp behind" assertion cannot see this: it lists the TARGET's
+    directory, which a temp staged in `/tmp` is trivially absent from — with
+    `dir=` dropped, that assertion still passes."""
+    target = tmp_path / "sub" / "exclude"
+    target.parent.mkdir()
+    target.write_bytes(b"before")
+    staged: list[str] = []
+    real_replace = os.replace
+
+    def record(src, dst):
+        staged.append(os.path.dirname(str(src)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(platform_util.os, "replace", record)
+
+    platform_util.atomic_write_bytes(target, b"after")
+
+    assert staged == [str(target.parent)]
+    assert target.read_bytes() == b"after"
+
+
+def test_atomic_write_bytes_creates_a_missing_target_at_the_private_mode(tmp_path):
+    """A target that does not exist yet is created at `mkstemp`'s 0600, not the umask
+    default — the shared contract's deliberate choice, and the reason
+    `_worktree_local_exclude` `touch()`es the exclude before calling this: it needs
+    the file to already exist so a readable mode is what gets carried over."""
+    target = tmp_path / "exclude"
+
+    platform_util.atomic_write_bytes(target, b"fresh")
+
+    assert target.read_bytes() == b"fresh"
+    if sys.platform != "win32":
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+# --------------------------------------------------------------- retrying_unlink
+
+
+def test_retrying_unlink_retries_then_succeeds(tmp_path, monkeypatch):
+    # Windows denies a delete against an open handle exactly as it denies a
+    # rename-over, so the second half of a staged move needs the same backoff.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+
+    victim = tmp_path / "spec.md"
+    victim.write_text("x", encoding="utf-8")
+    calls = {"n": 0}
+    real_unlink = os.unlink
+
+    def flaky_unlink(path, **_kw):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError(32, "The process cannot access the file")
+        real_unlink(path)
+
+    monkeypatch.setattr(platform_util.os, "unlink", flaky_unlink)
+    platform_util.retrying_unlink(victim)
+
+    assert calls["n"] == 3
+    assert len(sleeps) == 2
+    assert not victim.exists()
+
+
+def test_retrying_unlink_no_retry_on_posix(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "linux")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+
+    def denied(_path, **_kw):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(platform_util.os, "unlink", denied)
+    victim = tmp_path / "spec.md"
+    victim.write_text("x", encoding="utf-8")
+
+    with pytest.raises(PermissionError):
+        platform_util.retrying_unlink(victim)
+    assert sleeps == []  # a real POSIX error surfaces at once
+
+
+def test_retrying_unlink_propagates_missing_file(tmp_path):
+    # not a sharing violation — no retry, no swallow
+    with pytest.raises(FileNotFoundError):
+        platform_util.retrying_unlink(tmp_path / "gone.md")
+
+
+# --------------------------------------------------------------------- file_lock
+
+
+def test_file_lock_excludes_second_acquirer(tmp_path):
+    """While held, a second (non-blocking) acquisition on the same path fails —
+    the deterministic exclusion probe, no sleep-based negative assertion. Runs
+    the fcntl branch on POSIX and the msvcrt branch on the Windows CI leg."""
+    lock = tmp_path / "state.json.lock"
+    with platform_util.file_lock(lock):
+        with pytest.raises(OSError):
+            with platform_util.file_lock(lock, blocking=False):
+                pass  # pragma: no cover — must not be reached
+    # Released on exit: the probe now succeeds.
+    with platform_util.file_lock(lock, blocking=False):
+        pass
+
+
+def test_file_lock_creates_parent_and_lock_file(tmp_path):
+    lock = tmp_path / "deep" / "nested" / "s.lock"
+    with platform_util.file_lock(lock):
+        assert lock.exists()
+
+
+def test_file_lock_reentry_after_exception(tmp_path):
+    """An exception inside the critical section still releases the lock."""
+    lock = tmp_path / "s.lock"
+    with pytest.raises(RuntimeError):
+        with platform_util.file_lock(lock):
+            raise RuntimeError("boom")
+    with platform_util.file_lock(lock, blocking=False):
+        pass
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes; Windows has no umask")
+def test_file_lock_is_created_owner_only(tmp_path):
+    """The lock's mode is stated by the code, not inherited from whoever ran first.
+
+    A repository shared between OS users is refused before the shield ever takes
+    this lock (`install._shield_shared_repository`, #384), so owner-only is the
+    whole policy — but leaving `os.open` mode-less would still make the mode a
+    property of the creator's umask rather than a decision: measured, 022 yields
+    0o755 and 077 yields 0o700.
+
+    `os.umask(0o022)` is the point of the fixture, not hygiene. At this box's own
+    0o077 the mode-less code produces 0o600 by accident and the ablation does not
+    bite — the same trap as
+    `test_install.py::test_worktree_local_exclude_created_exclude_stays_readable`.
+
+    Ablation (run): drop the `0o600` argument from `file_lock`'s `os.open` and this
+    fails reporting 0o755."""
+    lock = tmp_path / "s.lock"
+    previous = os.umask(0o022)
+    try:
+        with platform_util.file_lock(lock):
+            pass
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600, oct(stat.S_IMODE(lock.stat().st_mode))
+
+
+# ------------------------------------------------------------------ safe_segment
+
+
+def _is_legal_segment(seg: str) -> bool:
+    return (
+        bool(seg)
+        and len(seg) <= platform_util.MAX_SEGMENT
+        and not platform_util._ILLEGAL_SEGMENT_CHARS.search(seg)
+        and not seg.endswith((" ", "."))
+        and not platform_util._is_reserved_basename(seg)
+    )
+
+
+@pytest.mark.parametrize(
+    "value", ["3-2-digest-delivery", "epic1_story2", "a.b.c", "plain", "console"]
+)
+def test_safe_segment_identity_for_clean_input(value):
+    # a legal segment (incl. the non-reserved 'console') is returned byte-identical
+    assert platform_util.safe_segment(value) == value
+
+
+@pytest.mark.parametrize(
+    "value, base",
+    [
+        ('a<b>c:"d/e\\f|g?h*i', "a_b_c__d_e_f_g_h_i"),  # every illegal char -> _ (`:"` = two)
+        ("with\ttab", "with_tab"),  # control char
+        ("x.", "x"),  # trailing dot stripped
+        ("y ", "y"),  # trailing space stripped
+        ("CON", "_CON"),  # reserved basename
+        ("nul", "_nul"),  # case-insensitive
+        ("COM1.txt", "_COM1.txt"),  # reserved even with extension
+        ("LPT9", "_LPT9"),
+        ("COM0", "_COM0"),  # COM0/LPT0 are reserved too
+        ("CON .txt", "_CON .txt"),  # reserved stem with a trailing space before the extension
+        ("CONIN$", "_CONIN$"),  # console device names are reserved ($ is otherwise legal)
+        ("conout$.log", "_conout$.log"),  # case-insensitive, with extension
+    ],
+)
+def test_safe_segment_coerces_and_suffixes_changed_input(value, base):
+    out = platform_util.safe_segment(value)
+    assert out != value
+    assert out.startswith(base + "-")  # sanitized base + collision-suffix digest
+    assert _is_legal_segment(out)
+
+
+def test_safe_segment_distinct_dirty_keys_never_collide():
+    # same sanitized base but different raw input must not share a segment (would
+    # otherwise cross-wire two stories' task dirs / logs / feedback files)
+    a = platform_util.safe_segment("a:b")
+    b = platform_util.safe_segment("a?b")
+    assert a.startswith("a_b-") and b.startswith("a_b-")
+    assert a != b
+
+
+def test_safe_segment_caps_length():
+    out = platform_util.safe_segment("x" * 500)
+    assert len(out) <= platform_util.MAX_SEGMENT
+    assert _is_legal_segment(out)
+
+
+def test_dirty_story_key_segment_is_creatable(tmp_path):
+    # the sanitized segment a consumer builds a dir from must be creatable on this OS
+    from bmad_loop import resolve
+
+    d = resolve._story_dir(tmp_path, 'a<b>:c."')
+    d.mkdir(parents=True)
+    assert d.is_dir()
+
+
+# -------------------------------------------------------------- safe_ref_segment
+
+# Raw keys spanning every rule class, shared by the property tests and the git
+# oracle. Only the sanitizer's *output* is ever handed to git, so NUL/DEL/tab in
+# here never reach a subprocess argv.
+_REF_CORPUS = [
+    # clean — must survive the oracle byte-identical
+    "3-2-digest-delivery",
+    "epic1_story2",
+    "a.b.c",
+    "plain",
+    "CON",
+    "-leading-dash",
+    "a<b>c",
+    'a"b|c',
+    "a]b",
+    "@@",
+    "é-ünïcødé",
+    # one per coercion rule
+    "a:b",
+    "a b",
+    "a~b",
+    "a^b",
+    "a?b",
+    "a*b",
+    "a[b",
+    "a\\b",
+    "a/b",
+    "with\ttab",
+    "a\x7fb",
+    "a\x00b",
+    "a..b",
+    "a@{b",
+    ".hidden",
+    "x.",
+    "a.lock",
+    "@",
+    "",
+    "x" * 500,
+    # adversarial combinations
+    "...",
+    "....",
+    ".lock",
+    "..lock",
+    "a.lock.lock",
+    "@{u}",
+    "refs/heads/x",
+    "/lead",
+    "trail/",
+    "a//b",
+    "  ",
+    "story/1:2..3@{now}.lock",
+]
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["3-2-digest-delivery", "epic1_story2", "a.b.c", "plain", "CON", "-leading-dash", "a<b>c"],
+)
+def test_safe_ref_segment_identity_for_clean_input(value):
+    # git's alphabet is not Windows': `CON` and `a<b>c` are ref-legal (safe_segment
+    # rewrites both), and a leading `-` is legal inside the always-prefixed branch.
+    assert platform_util.safe_ref_segment(value) == value
+
+
+@pytest.mark.parametrize(
+    "value, base",
+    [
+        ("a:b", "a_b"),  # colon
+        ("a b", "a_b"),  # space
+        ("a~b", "a_b"),
+        ("a^b", "a_b"),
+        ("a?b", "a_b"),
+        ("a*b", "a_b"),
+        ("a[b", "a_b"),
+        ("a\\b", "a_b"),
+        ("a/b", "a_b"),  # would split one component into two
+        ("with\ttab", "with_tab"),  # control char
+        ("a\x7fb", "a_b"),  # DEL
+        ("a..b", "a__b"),  # ref-illegal, filename-legal
+        ("a@{b", "a_{b"),
+        (".hidden", "_hidden"),  # leading dot
+        ("x.", "x."),  # trailing dot: no rewrite, the digest suffix is the fix
+        ("a.lock", "a.lock"),  # trailing .lock: ditto
+        ("@", "_"),  # lone @
+        ("", "_"),
+    ],
+)
+def test_safe_ref_segment_coerces_and_suffixes_changed_input(value, base):
+    out = platform_util.safe_ref_segment(value)
+    assert out != value
+    assert out.startswith(base + "-")  # sanitized base + collision-suffix digest
+
+
+def test_safe_ref_segment_distinct_dirty_keys_never_collide():
+    # `a..b` and `a//b` sanitize to the same base — the digest keeps their unit
+    # branches (and so their merge targets) distinct
+    a = platform_util.safe_ref_segment("a..b")
+    b = platform_util.safe_ref_segment("a//b")
+    assert a.startswith("a__b-") and b.startswith("a__b-")
+    assert a != b
+
+
+def test_safe_ref_segment_caps_length():
+    assert len(platform_util.safe_ref_segment("x" * 500)) <= platform_util.MAX_SEGMENT
+
+
+@pytest.mark.parametrize("value", _REF_CORPUS)
+@pytest.mark.parametrize(
+    "template",
+    [
+        "bmad-loop/rid/{}",  # unit_key, branch_per=story
+        "bmad-loop/{}/1-1-a",  # run_id, branch_per=story
+        "bmad-loop/{}",  # run_id, branch_per=run
+    ],
+    ids=["unit_key", "run_id", "run_id_shared"],
+)
+def test_safe_ref_segment_output_passes_git_check_ref_format(value, template):
+    """Oracle: git itself validates every sanitized segment, in each position
+    `workspace.unit_branch_name` actually places it. Pure-Python sanitization is
+    only as good as its agreement with `git check-ref-format`."""
+    branch = template.format(platform_util.safe_ref_segment(value))
+    proc = subprocess.run(
+        ["git", "check-ref-format", "--branch", branch],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"{value!r} -> {branch!r}: {proc.stderr.strip()}"

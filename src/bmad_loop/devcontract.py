@@ -20,12 +20,17 @@ match) still runs in verify.py against actual on-disk state.
 
 from __future__ import annotations
 
+import hashlib
 import re
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .verify import DEV_WORKFLOW, read_frontmatter
+from . import deferredwork
+from .frontmatter import _edit_frontmatter_block, status_of
+from .platform_util import atomic_replace
+from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 
 # The section the skill appends on EVERY terminal path (success and blocked),
 # per its step-02/03/04 finalize instructions. Its presence is our completion
@@ -42,6 +47,14 @@ STATUS_LINE_RE = re.compile(
 # Terminal frontmatter statuses the skill can leave behind.
 DONE = "done"
 BLOCKED = "blocked"
+# The story's agent-doable work is finished, but its acceptance criteria include
+# external actions only a human can perform (#335). Terminal beside DONE and
+# BLOCKED, and deliberately NOT rendered as an escalation: BLOCKED means the
+# session could not proceed and the run must halt, while a park means it finished
+# everything an agent could and the run should move on. Synthesizing a CRITICAL
+# here would collapse that distinction into the pause channel — exactly the
+# failure the state exists to avoid.
+AWAITING_OPERATOR = "awaiting-operator"
 
 # The status a plan-halt dispatch leaves behind: under folder+id dispatch a
 # `Halt after planning.` directive makes the skill HALT right after the
@@ -56,12 +69,16 @@ PLAN_HALT_STATUS = "ready-for-dev"
 # its prose terminal `## Auto Run Result` Status is `done`. Deliberately an
 # allowlist: anything else (already-`done`, `blocked`, or an unknown custom token)
 # is left untouched, so reconciliation can never override a status the skill set on
-# purpose. `""` covers a blank or missing frontmatter `status:` — `reset_spec_status`
-# fills/inserts the line in that case. `in-review` is included because on the sole
-# (generic `bmad-dev-auto`) path it is only ever the transient marker step-04 sets at
-# its start; the skill self-finalizes to `done`. The legacy `bmad-loop-dev` fork that
-# used `in-review` as a deliberate review-handoff terminal is retired, so nothing
-# leaves `in-review` on purpose anymore.
+# purpose. `""` covers a blank or missing frontmatter `status:` — `status_of`
+# normalizes a YAML-null value to `""` alongside the missing key (#358), and
+# `reset_spec_status` fills/inserts the line in either case. `in-review` is included because step-04 sets
+# it transiently at the start of a review pass; the skill self-finalizes to `done`,
+# so a spec left AT `in-review` with a prose `done` result is a mid-review interrupt
+# safe to reconcile forward. The intent-gap patch-restore re-drive (BMAD-METHOD
+# #2564) deliberately re-arms the spec TO `in-review` before a session (so step-01
+# routes straight to step-04 on the restored diff) — but that is the pre-session
+# status the re-driven skill then advances past; it never LEAVES a spec at
+# `in-review` as a terminal, so the reconcile allowlist semantics are unchanged.
 RECONCILABLE_FROM = frozenset({"", "draft", "ready-for-dev", "in-progress", "in-review"})
 
 # The leading `---\n …frontmatter… \n---` block, captured in three parts so the
@@ -77,9 +94,13 @@ _FM_STATUS_RE = re.compile(
 )
 
 # The skill's no-spec fallback artifact (HALT when {spec_file} is unknown/missing):
-# `{implementation_artifacts}/bmad-dev-auto-result-<slug-or-timestamp>.md`. It
-# carries a terminal frontmatter `status:` but no `## Auto Run Result` heading.
-FALLBACK_RESULT_PREFIX = "bmad-dev-auto-result-"
+# `{implementation_artifacts}/<skill>-result-<slug-or-timestamp>.md`. It carries a
+# terminal frontmatter `status:` but no `## Auto Run Result` heading. BOTH eras are
+# listed and matched unconditionally: the artifact is named after whichever skill
+# wrote it, and a run can read an artifact left by the other era (a resume across an
+# upstream upgrade, or a project mid-migration), so this must never be keyed on the
+# skill name resolved on disk today.
+FALLBACK_RESULT_PREFIXES = ("bmad-build-auto-result-", "bmad-dev-auto-result-")
 
 
 @dataclass(frozen=True)
@@ -123,13 +144,20 @@ def _fenced(text: str, offset: int) -> bool:
     return open_marker is not None
 
 
-def _section_headings(text: str) -> list[re.Match[str]]:
-    """`AUTO_RUN_HEADING_RE` matches that are real section headings. A heading
-    quoted inside a fenced code block (a frozen intent showing an example of the
-    terminal section, a log excerpt) is documentation, not structure — treating
-    it as terminal would let such a spec read as a result artifact from the
-    agent's first save (#52)."""
-    return [m for m in AUTO_RUN_HEADING_RE.finditer(text) if not _fenced(text, m.start())]
+def _section_headings(
+    text: str, pattern: re.Pattern[str] = AUTO_RUN_HEADING_RE
+) -> list[re.Match[str]]:
+    """`pattern` matches that are real section headings. A heading quoted inside
+    a fenced code block (a frozen intent showing an example of the terminal
+    section, a log excerpt) is documentation, not structure — treating it as
+    terminal would let such a spec read as a result artifact from the agent's
+    first save (#52).
+
+    `pattern` is a parameter rather than a hard-coded `AUTO_RUN_HEADING_RE`
+    because the ``## Operator Confirmation`` section needs the identical fence
+    reading for the identical reason, and a second copy of `_fenced`'s
+    open-marker walk is exactly the kind of near-duplicate that drifts."""
+    return [m for m in pattern.finditer(text) if not _fenced(text, m.start())]
 
 
 def _next_heading_start(text: str, offset: int) -> int:
@@ -161,6 +189,138 @@ def parse_auto_run_result(text: str) -> AutoRunResult:
     return AutoRunResult(present=True, status=status, detail=body.strip())
 
 
+# ------------------------------------------------ deferred review findings
+#
+# Since BMAD-METHOD #2640 the dev primitive records findings triaged as `defer`
+# in its spec's frontmatter. The parser stays content-keyed so an older skill
+# (field absent) and a newer skill with no findings are indistinguishable.
+DEFERRED_FIELD = "deferred"
+_SUMMARY_LIMIT = 200
+_EVIDENCE_LIMIT = 1000
+_LOCATION_LIMIT = 200
+
+
+@dataclass(frozen=True)
+class DeferredFinding:
+    """One well-formed deferred finding, normalized for a ledger entry."""
+
+    summary: str
+    evidence: str
+    location: str
+    severity: str
+    fingerprint: str
+
+
+def harvest_fingerprint(*parts: str) -> str:
+    """Return a stable short identity over NUL-separated ledger values.
+
+    A NUL inside a value is indistinguishable from the separator, so refuse it
+    rather than assigning two distinct findings the same structural identity.
+    The frontmatter parser reports such values as malformed before calling this
+    helper; the guard also keeps direct callers from creating an ambiguous key.
+    """
+    if any("\0" in part for part in parts):
+        raise ValueError("fingerprint parts must not contain NUL characters")
+    return hashlib.sha1(
+        "\0".join(parts).encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()[:12]
+
+
+def _flatten(value: Any, limit: int) -> str:
+    """Collapse a YAML scalar to one clamped line.
+
+    Strip after clamping because the cut can land on a join space. Keeping that
+    cleanup here makes the value written to the ledger and the value used in its
+    fingerprint identical.
+    """
+    if value is None:
+        return ""
+    return " ".join(str(value).split())[:limit].strip()
+
+
+def _is_yaml_scalar(value: Any) -> bool:
+    """Whether PyYAML's loaded value came from a scalar-shaped node."""
+    # str/bytes are Sequences in Python but scalar values in YAML. SafeLoader's
+    # collection nodes otherwise become mappings, sequences, or sets.
+    return isinstance(value, (str, bytes)) or not isinstance(value, (Mapping, Sequence, Set))
+
+
+def _contains_nul(value: Any) -> bool:
+    """Whether a YAML text scalar contains a NUL before normalization/clamping."""
+    return (isinstance(value, str) and "\0" in value) or (
+        isinstance(value, bytes) and b"\0" in value
+    )
+
+
+def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], list[str]]:
+    """Parse a frontmatter ``deferred:`` list into findings and malformed notes.
+
+    Missing, null, and empty lists mean no findings. Malformed items cost only
+    themselves; well-formed siblings still parse. Text fields accept YAML
+    scalars (numeric and boolean scalars are string-normalized), never
+    collections or embedded NULs. This observation path never raises for the
+    YAML shapes it accepts.
+    """
+    raw = fm.get(DEFERRED_FIELD)
+    if raw is None:
+        return [], []
+    if not isinstance(raw, list):
+        return [], [f"`{DEFERRED_FIELD}:` is not a list (got {type(raw).__name__})"]
+
+    findings: list[DeferredFinding] = []
+    malformed: list[str] = []
+    for i, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            malformed.append(f"item {i}: not a mapping (got {type(item).__name__})")
+            continue
+        summary_raw = item.get("summary")
+        if not _is_yaml_scalar(summary_raw):
+            malformed.append(
+                f"item {i}: `summary` is not a scalar (got {type(summary_raw).__name__})"
+            )
+            continue
+        bad_optional = next(
+            (field for field in ("evidence", "location") if not _is_yaml_scalar(item.get(field))),
+            None,
+        )
+        if bad_optional is not None:
+            value = item[bad_optional]
+            malformed.append(
+                f"item {i}: `{bad_optional}` is not a scalar (got {type(value).__name__})"
+            )
+            continue
+        raw_text_values = {
+            "summary": summary_raw,
+            "evidence": item.get("evidence"),
+            "location": item.get("location"),
+        }
+        bad_nul = next(
+            (field for field, value in raw_text_values.items() if _contains_nul(value)), None
+        )
+        if bad_nul is not None:
+            malformed.append(f"item {i}: `{bad_nul}` contains a NUL character")
+            continue
+        summary = _flatten(summary_raw, _SUMMARY_LIMIT)
+        if not summary:
+            malformed.append(f"item {i}: no usable `summary`")
+            continue
+        evidence = _flatten(item.get("evidence"), _EVIDENCE_LIMIT)
+        location = _flatten(item.get("location"), _LOCATION_LIMIT)
+        findings.append(
+            DeferredFinding(
+                summary=summary,
+                evidence=evidence,
+                location=location,
+                severity=deferredwork.SEVERITY_ALIASES.get(
+                    str(item.get("severity", "")).strip().lower(), ""
+                ),
+                fingerprint=harvest_fingerprint(summary, location),
+            )
+        )
+    return findings, malformed
+
+
 @dataclass(frozen=True)
 class SynthResult:
     """A synthesized result.json plus the cross-check signal. `result_json` is
@@ -169,6 +329,25 @@ class SynthResult:
 
     result_json: dict[str, Any] | None
     status_consistent: bool
+
+
+def _read_text_or_empty(path: Path) -> str:
+    """Read a spec on the *read-back* path, degrading an unreadable file to "".
+
+    An absent, binary/truncated, or unreadable spec carries no parseable result
+    section, so it reads exactly like a spec that has not terminated yet — the
+    caller then waits, nudges, or keeps its verdict. Never a crash: this runs on
+    the observation path, where the orchestrator's job is to classify what it
+    finds, not to trust it. (UnicodeDecodeError is a ValueError, not an OSError.)
+
+    The *repair* path deliberately does the opposite — `reset_spec_status` and
+    `strip_auto_run_result` let an unreadable spec raise, because silently
+    skipping a rewrite leaves the spec in a state the caller believes it fixed.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
 
 
 def synthesize_result(
@@ -202,13 +381,32 @@ def synthesize_result(
     so a plan-halt ``ready-for-dev`` (no such prose) is never reconciled to
     ``done`` and this leg's success outcome is not clobbered.
     """
-    fm = read_frontmatter(spec_path)
-    fm_status = str(fm.get("status", "")).strip().lower()
-    arr = parse_auto_run_result(
-        spec_path.read_text(encoding="utf-8") if spec_path.is_file() else ""
-    )
+    try:
+        fm = read_frontmatter(spec_path)
+    except OSError:
+        # Same degrade as `_read_text_or_empty` below, for the same reason: this is
+        # the read-back path. An unreadable spec is not evidence a session
+        # finished, so treat it exactly like one that has not terminated yet — the
+        # caller keeps polling, and a fault that persists past the grace window
+        # lands as a stall/timeout verdict that `_post_kill_reconcile` can still
+        # rescue. Crashing here would take the whole run down for a spec the CLI
+        # merely had open for writing.
+        return SynthResult(result_json=None, status_consistent=True)
+    # Through `status_of`, never a local `str(...)`: it normalizes a YAML-null
+    # `status:` (the blank line a bmad-dev-auto template legitimately leaves — see
+    # `_FM_STATUS_RE`) to `""` alongside the missing key. A local stringification
+    # made that `"none"`, which is truthy, so the prose fallback below never fired
+    # and a blank-frontmatter/prose-`done` spec synthesized `status="none"` with
+    # `status_consistent=False` — the exact shape `_post_kill_reconcile` documents
+    # as rescuable (#369).
+    fm_status = status_of(fm)
+    arr = parse_auto_run_result(_read_text_or_empty(spec_path))
 
-    terminal = (DONE, BLOCKED, PLAN_HALT_STATUS) if plan_halt else (DONE, BLOCKED)
+    terminal = (
+        (DONE, BLOCKED, AWAITING_OPERATOR, PLAN_HALT_STATUS)
+        if plan_halt
+        else (DONE, BLOCKED, AWAITING_OPERATOR)
+    )
     # Not terminal yet: no result section AND frontmatter not at a terminal state.
     if not arr.present and fm_status not in terminal:
         return SynthResult(result_json=None, status_consistent=True)
@@ -242,6 +440,14 @@ def synthesize_result(
     # on a blocked exit, so only carry it through on `done`.
     if status == DONE:
         result["followup_review_recommended"] = bool(fm.get("followup_review_recommended", False))
+    # A park's obligations travel with its result so the engine never has to
+    # re-read the spec to learn them. Folded on the awaiting-operator status
+    # ONLY: an `operator_actions:` list left on a `done` or `blocked` spec is
+    # not a park, and carrying it would let a story register obligations the
+    # verify gates never held it to. Malformed shapes read as [] here and are
+    # refused by verify's non-empty gate, which owns the retry + feedback.
+    if status == AWAITING_OPERATOR:
+        result["operator_actions"] = list(operator_actions_of(fm))
     # Mark the clean plan-halt success so verify/engine expect a planned spec
     # (status ready-for-dev, no implementation work). Never marked when a block
     # escalation is present — that routes to PAUSE, not a plan-review pause.
@@ -273,21 +479,151 @@ def find_result_artifact(impl_artifacts: Path, *, since_ns: int) -> Path | None:
             mtime_ns = path.stat().st_mtime_ns
         except OSError:
             continue
-        if mtime_ns < since_ns:
+        if not is_result_artifact(path, since_ns=since_ns):
             continue
-        # The no-spec fallback is recognized by name (it has no Auto Run Result
-        # heading); every other artifact must carry a real (non-fenced) terminal
-        # section — a fence-quoted example must not qualify the spec (#52).
-        if not path.name.startswith(FALLBACK_RESULT_PREFIX):
-            try:
-                text = path.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            if not _section_headings(text):
-                continue
         if best is None or mtime_ns > best[0]:
             best = (mtime_ns, path)
     return best[1] if best else None
+
+
+def is_result_artifact(path: Path, *, since_ns: int) -> bool:
+    """Whether ONE file qualifies as a session's result artifact — the per-path
+    predicate `find_result_artifact` applies to each glob hit, factored out so a
+    caller that already KNOWS which spec the session owed (the orchestrator hands
+    the review session its path in the prompt) can test that one file instead of
+    scanning a directory shared with every concurrent run (#261).
+
+    Qualifies when the file was modified at/after ``since_ns`` (the session-launch
+    floor) AND either is the by-name no-spec fallback (`bmad-build-auto-result-*`,
+    or `bmad-dev-auto-result-*` pre-rename — it carries no heading by design, and
+    both spellings match unconditionally) or carries a real, non-fenced
+    ``## Auto Run Result`` heading — a fence-quoted example must not qualify the
+    spec (#52). An unreadable/undecodable candidate cannot be SHOWN to carry a
+    terminal section, so it does not qualify (UnicodeDecodeError is a ValueError,
+    so a bare ``except OSError`` let a torn mid-write spec crash the scan)."""
+    try:
+        if path.stat().st_mtime_ns < since_ns:
+            return False
+    except OSError:
+        return False
+    if path.name.startswith(FALLBACK_RESULT_PREFIXES):
+        return True
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return bool(_section_headings(text))
+
+
+def find_frontmatter_candidates(impl_artifacts: Path, *, since_ns: int) -> list[Path]:
+    """Missing-marker fallback scan (#224): specs this session finalized to a
+    terminal frontmatter ``status:`` WITHOUT appending the ``## Auto Run Result``
+    marker `find_result_artifact` keys on. The skill's HALT instructions make the
+    append unconditional, but compliance is intermittent — without this scan such
+    a spec is invisible to the harvest and a finished story rides stall-nudges to
+    timeout, then loses its work to a retry/DEFER cycle.
+
+    A candidate must be modified at/after `since_ns` (same session-launch floor
+    as the marker scan), carry ZERO real (non-fenced) marker headings, not be the
+    no-spec fallback file (that one is already matched by name on the normal
+    path), and have a terminal frontmatter ``status:`` (``done``, ``blocked``, or
+    ``awaiting-operator``). Returns ALL matches, most-recent first — the caller refuses to guess between several
+    and must apply its own stability fingerprint before synthesizing, because a
+    terminal frontmatter under a live window is weaker evidence than the marker.
+    """
+    if not impl_artifacts.is_dir():
+        return []
+    found: list[tuple[int, Path]] = []
+    for path in impl_artifacts.glob("*.md"):
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            continue
+        if not is_frontmatter_candidate(path, since_ns=since_ns):
+            continue
+        found.append((mtime_ns, path))
+    found.sort(key=lambda t: t[0], reverse=True)
+    return [p for _, p in found]
+
+
+def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
+    """Whether ONE file qualifies for the missing-marker fallback — the per-path
+    predicate `find_frontmatter_candidates` applies to each glob hit, factored out
+    for the same reason as `is_result_artifact`: a caller holding the spec path the
+    session actually owed can test that file alone instead of a shared directory
+    (#261).
+
+    Qualifies when the file is modified at/after ``since_ns``, is NOT the no-spec
+    fallback (already matched by name on the marker path), carries ZERO real
+    (non-fenced) marker headings — one would put it in `find_result_artifact`'s
+    territory — and has a terminal frontmatter ``status:`` (``done``,
+    ``blocked``, or ``awaiting-operator``). Any
+    unreadable/undecodable read degrades to False, never an exception."""
+    if path.name.startswith(FALLBACK_RESULT_PREFIXES):
+        return False
+    try:
+        if path.stat().st_mtime_ns < since_ns:
+            return False
+    except OSError:
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    if _section_headings(text):
+        return False  # carries a real marker — the normal scan's territory
+    try:
+        fm = read_frontmatter(path)
+    except OSError:
+        return False
+    return status_of(fm) in (DONE, BLOCKED, AWAITING_OPERATOR)
+
+
+def _atomic_write_spec(spec_path: Path, text: str) -> None:
+    """Rewrite ``spec_path`` with ``text`` via a same-directory temp file + atomic
+    rename, so an interrupted / short / disk-full write can never truncate the
+    canonical spec — a failed repair must lose no work (fault injection on the old
+    truncating ``write_text`` reduced a 46-byte spec to 12). Bytes are written
+    verbatim (``write_bytes``, not ``write_text``): every caller here has already
+    captured and preserved the file's own line endings, and ``write_text``'s
+    ``newline=None`` default would re-translate ``\\n``→``\\r\\n`` on Windows. The
+    ``.tmp`` sibling ends in ``.tmp`` (not ``.md``), so the ``*.md`` artifact scans
+    never see it. On any failure the temp file is removed and the error re-raised —
+    the callers impose best-effort, the writer never swallows."""
+    tmp = spec_path.with_suffix(spec_path.suffix + ".tmp")
+    try:
+        tmp.write_bytes(text.encode("utf-8"))
+        atomic_replace(tmp, spec_path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _render_status_line(line: str, m: re.Match[str], value: str) -> str:
+    """`reset_spec_status`'s replacement for a matched ``status:`` line: the
+    value moves, its quote style and any trailing inline comment stay.
+
+    Deliberately different from `frontmatter._replace_value`, which carries the
+    comment through but drops the quotes — that writer's callers read the result
+    back as a bare ``status: done``, this one's tests pin the quote style.
+    Sharing the VERIFICATION is the point; the formatting each already had
+    right."""
+    # Guarantee `key: value` spacing: a bare `status:` (no trailing space) would
+    # otherwise fill to `status:done` — invalid YAML, the key is lost.
+    pre = m.group("pre")
+    if not pre.endswith((" ", "\t")):
+        pre += " "
+    # When the value was blank with a trailing inline comment, `rest` begins at
+    # the `#`; abutting the value (`status: done# c`) makes the `#` part of the
+    # scalar instead of a comment. Re-insert a separating space.
+    rest = m.group("rest")
+    if rest.startswith("#"):
+        rest = " " + rest
+    q = m.group("q")
+    return f"{pre}{q}{value}{q}{rest}" + ("\n" if line.endswith("\n") else "")
 
 
 def reset_spec_status(spec_path: Path, new_status: str) -> bool:
@@ -302,47 +638,51 @@ def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     prose body (e.g. the ``## Auto Run Result`` section). A present-but-empty status
     is filled, and a frontmatter block with NO ``status:`` line at all gets one
     inserted before the closing fence (the skill's template can leave it blank or
-    absent). Returns True on a real change, False when the spec is absent, has no
-    frontmatter block, or is already at ``new_status``."""
+    absent).
+
+    Returns True on a real change, False when the spec is absent, has no
+    frontmatter block, or is already at ``new_status``. Raises
+    `FrontmatterWriteError` when the reader can see a status the line edit cannot
+    safely move: `_FM_STATUS_RE` reads only a ``[A-Za-z-]*`` value, so it used to
+    fill ``status: |`` to ``status: done|`` and ``status: 123`` to
+    ``status: done123`` — silently, with a True return — and it rewrote a nested
+    ``meta.status:`` in preference to the real key. The shared
+    `frontmatter._edit_frontmatter_block` re-parses each trial edit before keeping
+    it, so those become a loud refusal instead of a corrupted spec. Only
+    `engine._reconcile_generic_terminal_status` reads the return; the raise is what
+    reaches the other three call sites, which treat it as a repair write."""
     if not spec_path.is_file():
         return False
-    text = spec_path.read_text(encoding="utf-8")
+    # Raw read (not read_text), like the append/strip siblings: universal-newline
+    # translation would hand this writer an all-LF copy of a CRLF spec and
+    # `_atomic_write_spec` would then persist it, relaying every line ending in
+    # the file from a repair contracted to move one value.
+    #
+    # Reading the bytes as authored makes one asymmetry with
+    # `frontmatter.set_frontmatter_status` observable, and it is pinned rather
+    # than fixed: that writer splits with `splitlines`, which treats a bare `\r`
+    # as a line break, so a CR-only spec rewrites fine there. `_FRONTMATTER_RE`
+    # and `_FM_STATUS_RE` are line-oriented on `\r?\n`, so a CR-only spec finds
+    # no frontmatter block here and returns False. Widening them to `\r` would
+    # change what counts as a line for every reader keyed on these patterns
+    # (`^` in MULTILINE still would not follow), which is a larger contract than
+    # this fix owns — no BMAD tool authors CR-only files.
+    text = spec_path.read_bytes().decode("utf-8")
     fm = _FRONTMATTER_RE.match(text)
     if not fm:
         return False
     head, body, tail = fm.group(1), fm.group(2), fm.group(3)
-    changed = False
-
-    def _repl(m: re.Match[str]) -> str:
-        nonlocal changed
-        if m.group("val") == new_status:
-            return m.group(0)
-        changed = True
-        # Guarantee `key: value` spacing: a bare `status:` (no trailing space)
-        # would otherwise fill to `status:done` — invalid YAML, the key is lost.
-        pre = m.group("pre")
-        if not pre.endswith((" ", "\t")):
-            pre += " "
-        # When the value was blank with a trailing inline comment, `rest` begins at
-        # the `#`; abutting the value (`status: done# c`) makes the `#` part of the
-        # scalar instead of a comment. Re-insert a separating space.
-        rest = m.group("rest")
-        if rest.startswith("#"):
-            rest = " " + rest
-        return f"{pre}{m.group('q')}{new_status}{m.group('q')}{rest}"
-
-    if _FM_STATUS_RE.search(body):
-        new_body = _FM_STATUS_RE.sub(_repl, body, count=1)
-    else:
-        # No status: line at all — insert one before the closing fence, matching
-        # the block's line ending. `body` always ends with a newline (captured by
-        # _FRONTMATTER_RE), so this lands on its own line.
-        nl = "\r\n" if body.endswith("\r\n") else "\n"
-        new_body = f"{body}status: {new_status}{nl}"
-        changed = True
-    if not changed:
+    new_body = _edit_frontmatter_block(
+        body,
+        "status",
+        new_status,
+        pattern=_FM_STATUS_RE,
+        render=_render_status_line,
+        insert=True,
+    )
+    if new_body is None:
         return False
-    spec_path.write_text(head + new_body + tail + text[fm.end() :], encoding="utf-8")
+    _atomic_write_spec(spec_path, head + new_body + tail + text[fm.end() :])
     return True
 
 
@@ -366,7 +706,14 @@ def strip_auto_run_result(spec_path: Path) -> bool:
     first save read as a result — so that failure must surface, not be swallowed."""
     if not spec_path.is_file():
         return False
-    text = spec_path.read_text(encoding="utf-8")
+    # Raw read (not read_text) for the append's reason, in reverse: the append
+    # preserves the spec's endings, so a strip that read through universal
+    # newlines would not round-trip its own sibling's output — it would return a
+    # CRLF spec relaid to LF. An undecodable spec still raises UnicodeDecodeError
+    # (repair-write doctrine). A CR-only spec is invisible to
+    # `AUTO_RUN_HEADING_RE`'s MULTILINE `^` and no-ops — the same pinned
+    # asymmetry `reset_spec_status` documents above.
+    text = spec_path.read_bytes().decode("utf-8")
     matches = _section_headings(text)
     if not matches:
         return False
@@ -378,5 +725,168 @@ def strip_auto_run_result(spec_path: Path) -> bool:
         kept.append(text[pos : m.start()])
         pos = _next_heading_start(text, m.end())
     kept.append(text[pos:])
-    spec_path.write_text("".join(kept), encoding="utf-8")
+    _atomic_write_spec(spec_path, "".join(kept))
     return True
+
+
+# Provenance stamped into a synthesized `## Auto Run Result` section so a human
+# (or a later re-derivation) can tell an orchestrator-repaired marker from one
+# the skill wrote itself. Single line (no internal newlines) so the writer's
+# line-ending detection governs every break in the appended block.
+ORCHESTRATOR_SYNTH_NOTE = (
+    "_Appended by the bmad-loop orchestrator (missing-marker repair, #224): the "
+    "session finalized this spec's frontmatter without its `## Auto Run Result` "
+    "marker, so the orchestrator synthesized the result from the frontmatter and "
+    "appended this section._"
+)
+
+
+# The heading `bmad-loop confirm` writes to record a human's out-of-band sign-off,
+# and the pattern that reads it back. Both spellings live here because the section
+# is now STRUCTURE, not just prose: `confirm` resumes an interrupted confirmation
+# by detecting this heading, so the writer's literal and the reader's pattern must
+# agree or a resumed story is confirmed twice — or never. The writer interpolates
+# the constant; a round-trip test pins the two against each other.
+OPERATOR_CONFIRM_HEADING = "## Operator Confirmation"
+OPERATOR_CONFIRM_HEADING_RE = re.compile(r"^##\s+Operator Confirmation\s*$", re.MULTILINE)
+
+# Provenance for the operator-confirmation section, mirroring
+# ORCHESTRATOR_SYNTH_NOTE: says who wrote the section and on whose word, so a
+# reader never mistakes an out-of-band human sign-off for something a dev
+# session concluded on its own. Single line, for the same reason as its sibling.
+OPERATOR_CONFIRM_NOTE = (
+    "_Appended by the bmad-loop orchestrator (`bmad-loop confirm`, #335): a human "
+    "confirmed these external actions out of band, and the story was advanced from "
+    "`awaiting-operator` to `done`._"
+)
+
+
+def append_auto_run_result(spec_path: Path, status: str, *, detail: str = "") -> bool:
+    """Append a synthesized ``## Auto Run Result`` marker section — the inverse of
+    `strip_auto_run_result`.
+
+    The missing-marker fallback (#224) synthesizes a session's result from a spec
+    that carries a terminal frontmatter ``status:`` but never got the marker the
+    skill owed; this writer brings that spec back into contract. Before the append
+    a marker-less terminal spec sits in `find_frontmatter_candidates`' territory
+    (it requires ZERO real headings); after it the spec carries exactly one real
+    ``## Auto Run Result`` heading and moves into `find_result_artifact`'s
+    (requires >= 1), so a later re-read is harvested on the normal marker path
+    instead of the fallback scan, and the next review launch strips it exactly
+    like a skill-written marker (#160).
+
+    Returns False when the spec is absent, or when a REAL (non-fenced)
+    ``## Auto Run Result`` heading is already present — idempotence, and the same
+    #52 symmetry the strip honors: a fence-quoted heading (a frozen intent's
+    example) is documentation, not a marker, so it does NOT block the append. A
+    present-but-unreadable spec RAISES rather than no-ops (the repair-write
+    doctrine `strip_auto_run_result` and `reset_spec_status` share — the CALLER
+    imposes best-effort); silently skipping would leave the spec in a state the
+    caller believes it repaired.
+
+    Newline handling follows `reset_spec_status`'s intent: the file's line ending
+    is detected (CRLF vs LF) and reused for the appended block, and a missing
+    trailing newline is added so the heading can never glue onto the last body line
+    (``...body## Auto Run Result``). The spec is read as raw bytes rather than via
+    `read_text`, whose universal-newline translation would both hide a CRLF file's
+    ending and silently rewrite its whole body to LF — an in-place repair must not
+    mutate line endings it did not author. The section is ``## Auto Run Result`` /
+    blank / ``Status: <status>`` / blank / the provenance note (plus an optional
+    detail paragraph). ``status`` is normalized lowercase and MUST be the spec's
+    own frontmatter ``status`` — the caller passes exactly that — so
+    `synthesize_result`'s ``consistent`` cross-check holds on every later re-read."""
+    if not spec_path.is_file():
+        return False
+    # Raw read (not read_text): preserve the file's exact line endings, and let an
+    # undecodable spec raise UnicodeDecodeError like the strip's read (repair-write
+    # doctrine — the caller imposes best-effort, never the writer).
+    text = spec_path.read_bytes().decode("utf-8")
+    if _section_headings(text):
+        return False  # a real marker is already present — idempotent
+    status = status.strip().lower()
+    nl = "\r\n" if "\r\n" in text else "\n"
+    # Ensure the heading lands after a newline the scan can recognize. A file
+    # already ending in "\n" (LF, or the "\n" of a CRLF) is left byte-for-byte
+    # intact, so a strip of this exact append round-trips. A file ending in a BARE
+    # "\r" is the trap: it reads as "already terminated", but AUTO_RUN_HEADING_RE's
+    # "^" (MULTILINE) only matches after "\n" — a heading glued directly after "\r"
+    # is invisible to the scan. Complete such a bare CR to CRLF (preserving the
+    # authored CR) so the heading begins on a recognized line boundary.
+    if text.endswith("\r"):
+        text += "\n"
+    elif text and not text.endswith("\n"):
+        text += nl
+    section = f"## Auto Run Result{nl}{nl}Status: {status}{nl}{nl}{ORCHESTRATOR_SYNTH_NOTE}{nl}"
+    if detail:
+        section += f"{nl}{detail.strip()}{nl}"
+    _atomic_write_spec(spec_path, text + section)
+    return True
+
+
+def append_operator_confirmation(spec_path: Path, actions: Sequence[str], *, date: str) -> bool:
+    """Append the ``## Operator Confirmation`` audit section `bmad-loop confirm`
+    writes when a human signs off a parked story (#335).
+
+    This section is the whole audit trail for the part of a story that happened
+    OUTSIDE the repository. The commit shows what the agent did; nothing in git
+    can show that someone bought the domain or published the DNS record, so the
+    spec has to say it, next to the ``operator_actions:`` it is answering. The
+    actions are restated rather than referenced because the frontmatter list is
+    the *claim* and this is the *acknowledgment* — a later reader comparing them
+    can see whether the spec was edited between the park and the confirmation.
+
+    Unlike `append_auto_run_result` this does NOT no-op on a heading that is
+    already there. A repeated confirmation is a real event (a spec reverted to
+    the park status and confirmed again), and dropping the second record would
+    make the audit trail claim there was only ever one. Sections accumulate,
+    newest last.
+
+    Repair-write doctrine, as the neighbouring writers: an absent spec returns
+    False (the caller decides whether that is fatal); a present-but-unreadable
+    spec, or a failing write, RAISES — `confirm` is about to move the board to
+    `done`, and it must not do that believing it recorded something it did not.
+
+    Line endings are handled exactly as in `append_auto_run_result`: raw byte
+    read, detected CRLF/LF reused for every break, bare-CR completed so the
+    heading starts on a recognized line boundary."""
+    if not spec_path.is_file():
+        return False
+    text = spec_path.read_bytes().decode("utf-8")
+    nl = "\r\n" if "\r\n" in text else "\n"
+    if text.endswith("\r"):
+        text += "\n"
+    elif text and not text.endswith("\n"):
+        text += nl
+    # A blank line before the heading, not merely a terminated last line: this
+    # section is written to be READ, and every markdown renderer (and linter)
+    # wants a heading separated from the paragraph above it.
+    if text and not text.endswith(nl * 2):
+        text += nl
+    # One line per action, in the order they were declared and acknowledged.
+    items = "".join(f"- {a}{nl}" for a in actions)
+    section = (
+        f"{OPERATOR_CONFIRM_HEADING}{nl}{nl}"
+        f"Confirmed {date}: the external actions this story owed were carried out.{nl}{nl}"
+        f"{items}{nl}{OPERATOR_CONFIRM_NOTE}{nl}"
+    )
+    _atomic_write_spec(spec_path, text + section)
+    return True
+
+
+def has_operator_confirmation(spec_path: Path) -> bool:
+    """Whether a spec already carries a REAL ``## Operator Confirmation`` section
+    — the on-disk acknowledgment `bmad-loop confirm` reads to tell an interrupted
+    confirmation from a fresh one (#335).
+
+    Fence-aware for the same reason `_section_headings` is (#52), and the stakes
+    here are higher than on the auto-run path: a frozen intent that shows an
+    example ``## Operator Confirmation`` block inside a code fence must not let
+    `confirm` conclude a human already signed off and skip straight to advancing
+    the board. The section on disk IS the acknowledgment, so a quoted one would
+    finish a story nobody confirmed.
+
+    Reads on the *observation* path and degrades accordingly (`_read_text_or_empty`):
+    an absent or unreadable spec cannot be SHOWN to carry an acknowledgment, so it
+    reads as False and the caller takes the ordinary path, which does its own
+    reading and reports the real fault."""
+    return bool(_section_headings(_read_text_or_empty(spec_path), OPERATOR_CONFIRM_HEADING_RE))

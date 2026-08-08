@@ -14,10 +14,10 @@ import subprocess
 
 import pytest
 
-from bmad_loop.adapters import tmux_base
+from bmad_loop.adapters import multiplexer, tmux_base
 from bmad_loop.adapters.base import SessionSpec
 from bmad_loop.adapters.generic import GenericAdapter
-from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
+from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer, parse_target
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.adapters.tmux_backend import TmuxMultiplexer
 from bmad_loop.policy import LimitsPolicy, Policy
@@ -239,12 +239,13 @@ def test_seam_methods_never_leak_raw_subprocess_error(boom_run, tmp_path):
     assert mux.show_window_option("@1", "opt") == ""
     assert mux.switch_client("s") is False
     assert mux.switch_client("s", last_fallback=True) is False
+    assert mux.detach_client() is False
     assert mux.kill_window("@1") is None
     assert mux.select_window("@1") is None
     assert mux.set_window_option("@1", "opt", "val") is None
     assert mux.unset_window_option("@1", "opt") is None
-    assert mux.detach_client() is None
     assert mux.pipe_pane("@1", tmp_path / "log") is None
+    assert mux.window_pane_pids("@1") == []
 
     # Already-correct swallowers stay swallowing (lock-in).
     assert mux.kill_session("s") is None
@@ -271,6 +272,126 @@ def test_seam_honesty_holds_for_psmux_style_run_override(monkeypatch):
         mux.window_alive("s", "@1")
     # sentinel methods still degrade rather than leak the raw timeout
     assert mux.list_windows("s", ["window_id"]) == []
+
+
+# ------------------------------------- window_pane_pids capability (#157)
+#
+# Like version(), window_pane_pids is a NON-abstract capability method: an
+# out-of-tree backend implementing only the abstract set (herdr) keeps working
+# with zero edits and inherits the "capability not offered" sentinel [].
+
+
+def test_window_pane_pids_default_is_capability_not_offered():
+    # StubMux implements only the abstract contract — it instantiates without
+    # window_pane_pids and inherits the degrade sentinel from the seam base.
+    assert StubMux().window_pane_pids("@1") == []
+
+
+def test_tmux_window_pane_pids_parses_pane_pid_lines(monkeypatch):
+    mux = TmuxMultiplexer()
+    seen: dict = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = list(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="1234\n5678\n", stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
+    assert mux.window_pane_pids("@7") == [1234, 5678]
+    assert seen["argv"] == ["tmux", "list-panes", "-t", "@7", "-F", "#{pane_pid}"]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        lambda argv: (_ for _ in ()).throw(subprocess.TimeoutExpired(argv, 30)),
+        lambda argv: subprocess.CompletedProcess(argv, 1, stdout="", stderr="no window"),
+        lambda argv: subprocess.CompletedProcess(argv, 0, stdout="not-a-pid\n", stderr=""),
+    ],
+    ids=["timeout", "dead-window", "garbage-output"],
+)
+def test_tmux_window_pane_pids_degrades_to_empty(monkeypatch, outcome):
+    mux = TmuxMultiplexer()
+    monkeypatch.setattr(tmux_base.subprocess, "run", lambda argv, **k: outcome(argv))
+    assert mux.window_pane_pids("@7") == []
+
+
+# -------------------------------- version() is one bounded line, always (#321)
+#
+# Consumers render version() inline (the `mux` table, validate's preflight
+# finding, the diagnostic dump), so the seam owes them a single line — and a
+# bounded one, since the table sizes its columns off the widest cell. psmux's
+# `-V` prints two lines — a `tmux X.Y.Z` compat line plus its own — and the base
+# folds them here so no consumer has to.
+
+
+def _version_stdout(monkeypatch, stdout: str):
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=""),
+    )
+
+
+def test_version_folds_a_multi_line_probe_onto_one_line(monkeypatch):
+    _version_stdout(monkeypatch, "tmux 3.3.7\npsmux 3.3.7 (05cc5d4 2026-07-20)\n")
+
+    got = TmuxMultiplexer().version()
+
+    assert got is not None and "\n" not in got
+    # Folded, not truncated: dropping the tail would hide which binary runs.
+    assert got == "tmux 3.3.7; psmux 3.3.7 (05cc5d4 2026-07-20)"
+    # Order is load-bearing — PsmuxMultiplexer.available() anchors its version
+    # match at position 0, so the compat line must stay first.
+    assert got.startswith("tmux 3.3.7")
+
+
+def test_version_of_a_single_line_probe_is_unchanged(monkeypatch):
+    # The POSIX path must stay byte-identical: no separator, no reformatting.
+    _version_stdout(monkeypatch, "tmux 3.4\n")
+
+    assert TmuxMultiplexer().version() == "tmux 3.4"
+
+
+def test_version_drops_blank_segments_and_strips_the_rest(monkeypatch):
+    # A blank line would otherwise fold into a bare "; ; " run, and an indented
+    # continuation line into "tmux 3.3.7;   psmux ...".
+    _version_stdout(monkeypatch, "tmux 3.3.7\n\n   \n  psmux 3.3.7\n")
+
+    assert TmuxMultiplexer().version() == "tmux 3.3.7; psmux 3.3.7"
+
+
+def test_version_of_an_all_blank_probe_is_the_none_sentinel(monkeypatch):
+    # A probe that exits 0 printing nothing reports "no version" — the sentinel
+    # this method documents — not a version that happens to be empty.
+    _version_stdout(monkeypatch, "\n  \n")
+
+    assert TmuxMultiplexer().version() is None
+
+
+def test_version_is_bounded_not_just_flattened(monkeypatch):
+    # `mux` sizes every column off the widest cell, so an unbounded single line
+    # breaks the table exactly as the embedded newline did — length is half the
+    # seam's promise. The cut is at the tail, which the psmux gate's anchored
+    # parse never reads.
+    _version_stdout(monkeypatch, "tmux 3.4 " + "x" * 300)
+
+    got = TmuxMultiplexer().version()
+
+    assert got is not None
+    assert len(got) == multiplexer.VERSION_MAX_CHARS
+    assert got.startswith("tmux 3.4 ") and got.endswith("…")
+
+
+def test_version_of_a_real_probe_is_never_truncated(monkeypatch):
+    # The bound must clear the probes that actually exist by a wide margin —
+    # otherwise it trades one unreadable cell for a useless one.
+    _version_stdout(monkeypatch, "tmux 3.3.7\npsmux 3.3.7 (05cc5d4 2026-07-20)\n")
+
+    got = TmuxMultiplexer().version()
+
+    assert got == "tmux 3.3.7; psmux 3.3.7 (05cc5d4 2026-07-20)"
+    assert len(got) < multiplexer.VERSION_MAX_CHARS
 
 
 # ---------------------------------------------- _run seam: encoding + env (#40)
@@ -303,6 +424,7 @@ def test_run_posix_default_passes_no_encoding_and_no_env(monkeypatch):
     # inherit the parent env (env=None).
     assert rec.kwargs["text"] is True
     assert rec.kwargs["encoding"] is None
+    assert rec.kwargs["errors"] is None
     assert rec.kwargs["env"] is None
 
 
@@ -506,3 +628,46 @@ def test_dialect_leaf_new_window_routes_launch_through_hook(monkeypatch, tmp_pat
         "wrapped:cmd",
     ]
     assert "-e" not in rec.argv  # env strategy fully delegated to the hook
+
+
+# ------------------------------------------------------------ target contract
+#
+# target() is the seam-canonical encoder core uses instead of hand-assembling
+# "=session[:window]" strings; parse_target is the matching decoder a native-id
+# backend reuses instead of re-deriving the grammar. Pure string work: no
+# subprocess, no env sensitivity, safe on every CI leg. Both backends are
+# constructed directly (their constructors are documented side-effect-free).
+
+
+def test_target_default_grammar():
+    mux = TmuxMultiplexer()
+    assert mux.target("s") == "=s"
+    assert mux.target("s", "w") == "=s:w"
+    # falsy window collapses to the session-only form, mirroring parse_target's
+    # "=s:" -> ("s", None) decode
+    assert mux.target("s", None) == "=s"
+    assert mux.target("s", "") == "=s"
+
+
+@pytest.mark.parametrize(
+    ("session", "window"),
+    [("s", None), ("s", "w"), ("bmad-loop-ctl", "run-20260714-abc")],
+)
+def test_parse_target_round_trips_the_encoder(session, window):
+    mux = TmuxMultiplexer()
+    assert parse_target(mux.target(session, window)) == (session, window)
+
+
+def test_parse_target_edges():
+    # empty window part decodes like the session-only form
+    assert parse_target("=s:") == ("s", None)
+    # window is everything after the FIRST colon (minted names carry no colon,
+    # but the split rule is pinned regardless)
+    assert parse_target("=s:a:b") == ("s", "a:b")
+
+
+@pytest.mark.parametrize("native", ["@1", "%3", "w1:p1"])
+def test_parse_target_passes_native_ids_through(native):
+    # non-"=" targets are backend-native ids: the decoder answers None and the
+    # backend resolves them itself
+    assert parse_target(native) is None

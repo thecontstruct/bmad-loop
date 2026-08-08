@@ -1,8 +1,10 @@
 """RunState serialization + lifecycle-flag tests."""
 
+import json
+
 import pytest
 
-from bmad_loop.model import RunState, SessionRecord, StoryTask, TokenUsage
+from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
 
 
 def _state(**kw) -> RunState:
@@ -15,6 +17,25 @@ def _task_with_session(usage: TokenUsage | None = None) -> StoryTask:
         SessionRecord(task_id="1-1-a-dev-1", role="dev", status="completed", usage=usage)
     )
     return task
+
+
+def test_run_state_stories_fields_default_and_round_trip():
+    default = _state()
+    assert default.source == "sprint-status"
+    assert default.spec_folder == ""
+    stories = _state(source="stories", spec_folder="_bmad-output/epic-1")
+    back = RunState.from_dict(stories.to_dict())
+    assert back.source == "stories"
+    assert back.spec_folder == "_bmad-output/epic-1"
+
+
+def test_run_state_stories_fields_default_when_absent_from_dict():
+    # a pre-stories state.json (no source/spec_folder keys) reads as sprint mode
+    d = _state().to_dict()
+    del d["source"]
+    del d["spec_folder"]
+    back = RunState.from_dict(d)
+    assert back.source == "sprint-status" and back.spec_folder == ""
 
 
 def test_attach_session_usage_folds_usage_into_record_and_totals():
@@ -62,6 +83,30 @@ def test_session_record_result_json_defaults_none_for_legacy_state():
     assert SessionRecord.from_dict(doc).result_json is None
 
 
+def test_session_record_adapter_identity_round_trips():
+    record = SessionRecord(
+        task_id="1-1-a-dev-1",
+        role="dev",
+        status="completed",
+        adapter="claude",
+        model="opus",
+    )
+    back = SessionRecord.from_dict(record.to_dict())
+    assert back.adapter == "claude"
+    assert back.model == "opus"
+
+
+def test_session_record_adapter_identity_defaults_for_legacy_state():
+    # a state.json from before #153 has no adapter/model keys — it must load with
+    # "" defaults (adapter "" flags a record that predates identity stamping)
+    doc = SessionRecord(task_id="1-1-a-dev-1", role="dev", status="completed").to_dict()
+    del doc["adapter"]
+    del doc["model"]
+    back = SessionRecord.from_dict(doc)
+    assert back.adapter == ""
+    assert back.model == ""
+
+
 def test_followup_review_recommended_round_trips():
     task = StoryTask(story_key="1-1-a", epic=1, followup_review_recommended=True)
     assert StoryTask.from_dict(task.to_dict()).followup_review_recommended is True
@@ -73,6 +118,17 @@ def test_followup_review_recommended_defaults_false_for_legacy_state():
     assert StoryTask.from_dict(doc).followup_review_recommended is False
 
 
+def test_followup_reviews_spent_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, followup_reviews_spent=2)
+    assert StoryTask.from_dict(task.to_dict()).followup_reviews_spent == 2
+
+
+def test_followup_reviews_spent_defaults_zero_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["followup_reviews_spent"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).followup_reviews_spent == 0
+
+
 def test_resolved_redrive_round_trips():
     task = StoryTask(story_key="1-1-a", epic=1, resolved_redrive=True)
     assert StoryTask.from_dict(task.to_dict()).resolved_redrive is True
@@ -82,6 +138,227 @@ def test_resolved_redrive_defaults_false_for_legacy_state():
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
     del doc["resolved_redrive"]  # state.json from before the field existed
     assert StoryTask.from_dict(doc).resolved_redrive is False
+
+
+def test_plan_checkpoint_pending_round_trips():
+    task = StoryTask(story_key="1", epic=0, plan_checkpoint_pending=True)
+    assert StoryTask.from_dict(task.to_dict()).plan_checkpoint_pending is True
+
+
+def test_plan_checkpoint_pending_defaults_false_for_legacy_state():
+    doc = StoryTask(story_key="1", epic=0).to_dict()
+    del doc["plan_checkpoint_pending"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).plan_checkpoint_pending is False
+
+
+def test_sentinel_kind_round_trips():
+    task = StoryTask(story_key="1", epic=0, sentinel_kind="unresolved")
+    assert StoryTask.from_dict(task.to_dict()).sentinel_kind == "unresolved"
+
+
+def test_sentinel_kind_defaults_empty_for_legacy_state():
+    doc = StoryTask(story_key="1", epic=0).to_dict()
+    del doc["sentinel_kind"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).sentinel_kind == ""
+
+
+_DEFERRED_STATE_KEYS = (
+    "baseline_ledger_digest",
+    "pre_harvest_ledger",
+    "pre_harvest_ledger_captured",
+    "harvest_wrote_ledger",
+    "ledger_changed_before_harvest",
+    "harvested_deferrals",
+    "bundle_closes_intended",
+    "refiled_followups",
+    "story_closes_intended",
+    "accepted_dev_session_index",
+    "harvest_carry_commit_pending",
+    "isolated_ledger_carried",
+)
+
+
+def test_deferred_work_state_fields_round_trip_through_json():
+    """All twelve fields are hand-enumerated in both serializers. Non-default
+    values make a missing line on either side observable, while the JSON leg pins
+    the on-disk container shape rather than only an in-memory dataclass copy."""
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        baseline_ledger_digest="a" * 64,
+        pre_harvest_ledger="",
+        pre_harvest_ledger_captured=True,
+        harvest_wrote_ledger=True,
+        ledger_changed_before_harvest=True,
+        harvested_deferrals=[{"origin": "spec-deferred abc", "title": "finding"}],
+        bundle_closes_intended=["DW-3", "DW-7"],
+        refiled_followups=[{"origin": "review-budget-followup", "title": "follow-up"}],
+        story_closes_intended=["DW-4"],
+        accepted_dev_session_index=3,
+        harvest_carry_commit_pending=True,
+        isolated_ledger_carried=True,
+    )
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+
+    assert restored.baseline_ledger_digest == "a" * 64
+    assert restored.pre_harvest_ledger == ""
+    assert restored.pre_harvest_ledger is not None
+    assert restored.pre_harvest_ledger_captured is True
+    assert restored.harvest_wrote_ledger is True
+    assert restored.ledger_changed_before_harvest is True
+    assert restored.harvested_deferrals == [{"origin": "spec-deferred abc", "title": "finding"}]
+    assert restored.bundle_closes_intended == ["DW-3", "DW-7"]
+    assert restored.refiled_followups == [
+        {"origin": "review-budget-followup", "title": "follow-up"}
+    ]
+    assert restored.story_closes_intended == ["DW-4"]
+    assert restored.accepted_dev_session_index == 3
+    assert restored.harvest_carry_commit_pending is True
+    assert restored.isolated_ledger_carried is True
+
+
+def test_deferred_work_state_fields_default_for_one_old_state_dict():
+    """A state.json written before this package has none of the twelve keys.
+    Every load must use ``d.get`` so resume reaches the old behavior instead of
+    raising KeyError; one shared old document prevents testing only a subset."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    for key in _DEFERRED_STATE_KEYS:
+        del doc[key]
+
+    restored = StoryTask.from_dict(doc)
+    assert restored.baseline_ledger_digest is None
+    assert restored.pre_harvest_ledger is None
+    assert restored.pre_harvest_ledger_captured is False
+    assert restored.harvest_wrote_ledger is False
+    assert restored.ledger_changed_before_harvest is False
+    assert restored.harvested_deferrals == []
+    assert restored.bundle_closes_intended == []
+    assert restored.refiled_followups == []
+    assert restored.story_closes_intended == []
+    assert restored.accepted_dev_session_index is None
+    assert restored.harvest_carry_commit_pending is False
+    assert restored.isolated_ledger_carried is False
+
+
+def test_pre_harvest_ledger_preserves_absent_empty_and_text_states():
+    """Empty text means an existing empty ledger; None means no file. Collapsing
+    them would turn the common empty-ledger restore into an unlink."""
+    for value in (None, "", "# Deferred Work\n"):
+        restored = StoryTask.from_dict(
+            StoryTask(story_key="1-1-a", epic=1, pre_harvest_ledger=value).to_dict()
+        ).pre_harvest_ledger
+        assert restored == value
+        assert (restored is None) is (value is None)
+
+
+def test_deferred_work_state_containers_do_not_alias_the_persisted_doc():
+    doc = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        harvested_deferrals=[
+            {"title": "original", "metadata": {"labels": ["review"]}},
+        ],
+        bundle_closes_intended=["DW-1"],
+        refiled_followups=[{"title": "followup", "metadata": {"labels": ["review"]}}],
+    ).to_dict()
+    restored = StoryTask.from_dict(doc)
+    restored.harvested_deferrals[0]["title"] = "mutated"
+    restored.harvested_deferrals[0]["metadata"]["labels"].append("follow-up")
+    restored.bundle_closes_intended.append("DW-2")
+    restored.refiled_followups[0]["title"] = "mutated"
+    restored.refiled_followups[0]["metadata"]["labels"].append("follow-up")
+    assert doc["harvested_deferrals"] == [
+        {"title": "original", "metadata": {"labels": ["review"]}},
+    ]
+    assert doc["bundle_closes_intended"] == ["DW-1"]
+    assert doc["refiled_followups"] == [
+        {"title": "followup", "metadata": {"labels": ["review"]}},
+    ]
+
+
+def test_deferred_work_state_container_defaults_are_not_shared():
+    one = StoryTask(story_key="1-1-a", epic=1)
+    other = StoryTask(story_key="1-2-b", epic=1)
+    one.harvested_deferrals.append({"title": "one"})
+    one.bundle_closes_intended.append("DW-1")
+    one.refiled_followups.append({"title": "one"})
+    assert other.harvested_deferrals == []
+    assert other.bundle_closes_intended == []
+    assert other.refiled_followups == []
+
+
+def test_restore_patch_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, restore_patch="artifacts/attempt.patch")
+    assert StoryTask.from_dict(task.to_dict()).restore_patch == "artifacts/attempt.patch"
+
+
+def test_restore_patch_defaults_none_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["restore_patch"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).restore_patch is None
+
+
+def test_preserve_ref_round_trips():
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        preserve_ref="attempt-preserve/run-1-abcd1234",
+        preserve_partial=True,
+    )
+    restored = StoryTask.from_dict(task.to_dict())
+    assert restored.preserve_ref == "attempt-preserve/run-1-abcd1234"
+    # the partial marker must survive resume too, or a resumed run's defer notice
+    # silently re-acquires the whole-attempt promise for a commits-only ref
+    assert restored.preserve_partial is True
+
+
+def test_preserve_ref_defaults_none_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["preserve_ref"]  # state.json from before the field existed
+    del doc["preserve_partial"]
+    restored = StoryTask.from_dict(doc)
+    assert restored.preserve_ref is None and restored.preserve_partial is False
+
+
+def test_operator_actions_round_trip():
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.AWAITING_OPERATOR,
+        operator_actions=["buy the domain", "publish the DKIM TXT record"],
+    )
+    restored = StoryTask.from_dict(task.to_dict())
+    # the phase travels as its plain token, so a parked run resumes parked
+    assert restored.phase is Phase.AWAITING_OPERATOR
+    assert task.to_dict()["phase"] == "awaiting-operator"
+    # order is meaningful — the human works the list top-down
+    assert restored.operator_actions == ["buy the domain", "publish the DKIM TXT record"]
+
+
+def test_operator_actions_defaults_empty_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["operator_actions"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).operator_actions == []
+
+
+def test_operator_actions_are_not_shared_between_tasks():
+    """`field(default_factory=list)` rather than a shared `[]` default: two parked
+    stories in one run must not accumulate each other's actions."""
+    one = StoryTask(story_key="1-1-a", epic=1)
+    other = StoryTask(story_key="1-2-b", epic=1)
+    one.operator_actions.append("buy the domain")
+    assert other.operator_actions == []
+
+
+def test_token_budget_warned_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, token_budget_warned=True)
+    assert StoryTask.from_dict(task.to_dict()).token_budget_warned is True
+
+
+def test_token_budget_warned_defaults_false_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["token_budget_warned"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).token_budget_warned is False
 
 
 def test_stopped_round_trips():

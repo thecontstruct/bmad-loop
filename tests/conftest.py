@@ -3,17 +3,23 @@ that simulate the side effects skill sessions would have on disk."""
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 import yaml
 
+from bmad_loop import cli, documents
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.bmadconfig import ProjectPaths
-from bmad_loop.verify import rev_parse_head
+from bmad_loop.checks import ValidationReport
+from bmad_loop.journal import save_state
+from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, SessionRecord, StoryTask
+from bmad_loop.verify import finalize_commit, rev_parse_head
 
 # The suite reads/writes UTF-8 files (specs, journals, JSON, reports). Windows'
 # default text encoding is cp1252, so a plain read_text()/open() throws
@@ -29,6 +35,28 @@ if sys.platform == "win32" and not sys.flags.utf8_mode:
     )
 
 
+@pytest.fixture
+def force_tmux_backend(monkeypatch):
+    """Pin the tmux transport backend by name, regardless of host platform.
+
+    External backends discovered via the ``bmad_loop.mux_backends`` entry-point
+    scan may match any platform — the herdr adapter matches win32, where tmux
+    does not — so on a host with such a package installed ``get_multiplexer()``
+    would select it and tests that assert tmux-specific argv/behaviour *through
+    the seam* would drive the wrong backend. Forcing
+    ``BMAD_LOOP_MUX_BACKEND=tmux`` selects tmux by name (the env override
+    bypasses the platform predicate and ``available()``), so these tests stay
+    environment-independent. On a stock POSIX box this is a no-op — tmux is
+    already the default. The cache is cleared on both ends so the forced choice
+    takes effect and does not leak to later tests."""
+    from bmad_loop.adapters import multiplexer
+
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "tmux")
+    multiplexer.get_multiplexer.cache_clear()
+    yield
+    multiplexer.get_multiplexer.cache_clear()
+
+
 def write_script_launcher(directory: Path, name: str, body: str) -> Path:
     """Write a fake CLI launcher for the host OS."""
     directory = Path(directory)
@@ -36,7 +64,9 @@ def write_script_launcher(directory: Path, name: str, body: str) -> Path:
     sidecar.write_text(body, encoding="utf-8")
     if sys.platform == "win32":
         launcher = directory / f"{name}.cmd"
-        launcher.write_text(f'@"{sys.executable}" "{sidecar}" %*\r\n', encoding="utf-8")
+        # `\n`, not `\r\n`: write_text translates it to the CRLF cmd wants, so an
+        # explicit `\r` would land on disk doubled (`\r\r\n`).
+        launcher.write_text(f'@"{sys.executable}" "{sidecar}" %*\n', encoding="utf-8")
     else:
         launcher = directory / name
         launcher.write_text(
@@ -53,6 +83,10 @@ def write_script_launcher(directory: Path, name: str, body: str) -> Path:
 # re-deriving the win32 branch.
 
 _OK = "exit 0"  # cross-platform always-success verb (both `cmd /c` and `sh -c` honor it)
+# Its counterpart. `false`, the POSIX reflex, is *not* the same thing on Windows:
+# cmd has no such verb, so it reads as a broken environment rather than a failing
+# check (issue #302) — an ordinary-failure test written with it asserts nothing.
+_FAIL = "exit 1"
 _RUN = "%BMAD_LOOP_RUN_DIR%" if sys.platform == "win32" else "$BMAD_LOOP_RUN_DIR"
 
 
@@ -64,6 +98,67 @@ def _file_exists_cmd(path) -> str:
     if sys.platform == "win32":
         return f'if exist "{path}\\NUL" (exit 1) else if exist "{path}" (exit 0) else (exit 1)'
     return f'test -f "{path}"'
+
+
+def passes_once(marker) -> str:
+    """Return a host-shell command that succeeds once, then fails.
+
+    ``marker`` must be an explicit absolute path outside the worktree. Verify
+    commands receive no ``BMAD_LOOP_RUN_DIR`` environment variable, and a marker
+    inside the worktree can be removed by rollback between the two executions.
+    """
+    if sys.platform == "win32":
+        win = str(marker).replace("/", "\\")
+        return f'if exist "{win}" (exit 1) else (type nul > "{win}")'
+    return f'test ! -f "{marker}" && touch "{marker}"'
+
+
+# A tool no host has: sh exits 127, cmd exits 1 with "is not recognized" (#302).
+# Both classify as verify environment faults — the point of the tests using it.
+MISSING_TOOL_CMD = "definitely-not-a-real-cmd-302"
+
+
+def _self_disarming_cmd(project_dir: Path, stem: str = "check") -> str:
+    """A verify command that passes once, then breaks its own environment — the
+    seeded-worktree fault of issue #126.
+
+    POSIX: a script that drops its own exec bit, so the next run dies rc=126.
+    win32: cmd has no exec bit, and a batch file cannot disarm itself at all
+    (cmd re-reads it per line, so deleting or renaming it kills the *current*
+    run with "The batch file cannot be found."). The win32 twin therefore burns
+    a flag file and reaches for a tool that is not there on the second run —
+    cmd's own "is not recognized", the env fault of #302. A `.sh` command would
+    be worse than useless here: cmd hands it to the file association, which pops
+    an interactive picker mid-suite (#292)."""
+    if sys.platform == "win32":
+        armed = project_dir / f"{stem}.armed"
+        armed.write_text("", encoding="utf-8")
+        return f'if exist "{armed}" (del "{armed}") else ({MISSING_TOOL_CMD})'
+    script = project_dir / f"{stem}.sh"
+    script.write_text(f'#!/bin/sh\nchmod 644 "{script}"\nexit 0\n', encoding="utf-8")
+    script.chmod(0o755)
+    return f'"{script}"'
+
+
+def _write_check_script(project_dir: Path, stem: str = "check") -> tuple[Path, str]:
+    """An always-passing verify script for the host shell. Returns (script, command)."""
+    if sys.platform == "win32":
+        script = project_dir / f"{stem}.cmd"
+        script.write_text("@exit /b 0\n", encoding="utf-8")
+    else:
+        script = project_dir / f"{stem}.sh"
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        script.chmod(0o755)
+    return script, f'"{script}"'
+
+
+def _disarm_check_script(script: Path) -> None:
+    """Break the script the way the host shell notices: POSIX drops the exec bit
+    (rc=126); cmd has no exec bit, so the file goes away (#302)."""
+    if sys.platform == "win32":
+        script.unlink()
+    else:
+        script.chmod(0o644)
 
 
 def _touch_run(marker: str) -> str:
@@ -108,8 +203,90 @@ def git(repo: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
+# ------------------------------------------------ machine-readable CLI output
+
+
+def machine_json(argv, capsys, *, rc: int = 0, err_contains: str | None = None):
+    """Run a `--json` CLI command and parse the WHOLE of stdout — parsing the
+    full stream (not a substring) is itself the assertion that nothing but the
+    document is printed (the machine.py purity contract).
+
+    `rc` is the expected exit code, and it is not always 0: a command may report
+    a negative verdict through its exit status while still owing the caller a
+    complete document. Only stdout purity is being asserted here, not success.
+
+    `err_contains` guards the other stream. The default — stderr is *empty* — is
+    the strict form and the one to reach for; pass a substring only for a command
+    that documents chatter there, as `probe-adapter --json` does by routing its
+    human `ok:` trailer to stderr so stdout stays the document alone. That is an
+    opt-in to a different assertion, never a waiver: the substring must be
+    present, so a trailer that silently moves back to stdout still fails.
+    """
+    assert cli.main(argv) == rc
+    out, err = capsys.readouterr()
+    if err_contains is None:
+        assert err == ""
+    else:
+        assert err_contains in err
+    return json.loads(out)
+
+
+def make_validate_document(findings, *, stories_on: bool = False, spec_folder: str = ""):
+    """Build a REAL `validate --json` document from (check, severity, message,
+    detail) tuples, for tests that need to *stub* one rather than run validate.
+
+    A sibling of machine_json, not an extension of it: that helper drives
+    cli.main + capsys to assert stdout purity, so it can only ever produce the
+    document a real run happens to emit on the host. Callers here need a chosen
+    document (a specific severity mix, a specific detail shape) and no
+    subprocess.
+
+    It is built by driving the same ValidationReport -> validate_document path
+    the CLI drives, so the shape cannot drift from the contract by being
+    hand-written. Going through ValidationReport.add also means its assert
+    (checks.py) rejects invented check ids: a test cannot quietly pin behaviour
+    to a check that does not exist.
+    """
+    report = ValidationReport()
+    for check, severity, message, detail in findings:
+        report.add(check, severity, message, detail)
+    return documents.validate_document(report, stories_on, spec_folder)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_ambient_git_ignores(tmp_path_factory: pytest.TempPathFactory):
+    """Shadow the two ignore sources git reads from OUTSIDE the repo, for every test.
+
+    Developer boxes routinely carry `.claude/` or `.codex/` in a global gitignore —
+    ignoring your AI tooling everywhere is the obvious thing to do — and without this
+    the shield tests silently measure that instead of the shield. The failure is not
+    only a red: a global `.codex/` makes `git add -A` skip the hook config, so the
+    file the test believes it TRACKED is untracked, the tracked-file filter is never
+    reached, and `ls-files -ci --exclude-standard` answers "" because an untracked
+    file is not tracked-and-ignored. The test passes having exercised nothing.
+
+    Two sources, and both are needed: `core.excludesFile` from `~/.gitconfig`
+    (suppressed by pointing GIT_CONFIG_GLOBAL at a file that does not exist), and its
+    documented fallback `$XDG_CONFIG_HOME/git/ignore`, which still applies once the
+    key is unset. Session-scoped so `_project_template`'s own `add -A` is covered too.
+
+    `GIT_CONFIG_NOSYSTEM` is deliberately NOT set, for the reason
+    `test_shield_falls_back_to_home_when_xdg_is_relative` records: it would suppress
+    Git-for-Windows' system `core.autocrlf` and make unrelated tracked files read as
+    modified. A system-level excludes file therefore stays reachable — tests that
+    depend on a path really being tracked assert that as a precondition."""
+    env = tmp_path_factory.mktemp("git-env")
+    mp = pytest.MonkeyPatch()
+    mp.setenv("GIT_CONFIG_GLOBAL", str(env / "no-such-gitconfig"))
+    mp.setenv("XDG_CONFIG_HOME", str(env / "xdg"))
+    yield
+    mp.undo()
+
+
 @pytest.fixture(scope="session")
-def _project_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+def _project_template(
+    tmp_path_factory: pytest.TempPathFactory, _isolate_ambient_git_ignores: None
+) -> Path:
     """Master sandbox repo, built once per xdist worker. NEVER hand this path to
     a test — a mutation would poison every later test in the worker; tests get
     disposable copies via `project`. (Do not chmod it read-only either: copytree
@@ -155,19 +332,164 @@ def install_bmad_config(paths: ProjectPaths) -> None:
     )
 
 
+def _write_skill_stubs(skills: Path, catalog: dict) -> None:
+    """Stub every skill in `catalog` (an install.py {skill: marker_files} map) under
+    `skills`. Reading the catalog instead of restating it means a newly required
+    skill or marker file fails the scaffolds loudly rather than drifting."""
+    for skill, markers in catalog.items():
+        d = skills / skill
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(f"# {skill}\n", encoding="utf-8")
+        for marker in markers:
+            (d / marker).write_text("x\n", encoding="utf-8")
+
+
+RENDERER_STUB_SKILL_MD = (
+    "Run `uv run {project-root}/_bmad/scripts/render_skill.py` and follow its output.\n"
+)
+RENDERER_WORKFLOW_MD = "Read [[bmad-snapshot:step-04-review.md]] fully.\n"
+RENDERER_SCRIPT_IMPORTING_SIBLING = "from config_utils import load_central_config\n"
+
+
+def install_dev_base_skills(root: Path, tree: str = ".claude/skills", *, folder_id: bool) -> Path:
+    """Lay down stubs of the upstream skills the orchestrator drives on every dev run
+    (`install.DEV_BASE_SKILLS`: bmad-dev-auto + the review hunters) under
+    ``root/tree``, so the run-start preflight (`install.missing_base_skills`) passes.
+
+    ``folder_id`` also writes bmad-dev-auto's step-01 carrying the dispatch marker
+    `install.missing_stories_support` content-probes for — stories mode needs a newer
+    bmad-dev-auto than file existence alone can prove. Returns the skills tree root."""
+    from bmad_loop.install import (
+        DEV_BASE_SKILLS,
+        STORIES_PROBE_FILE,
+        STORIES_PROBE_SKILL,
+        STORIES_PROBE_TEXT,
+    )
+
+    skills = Path(root) / tree
+    _write_skill_stubs(skills, DEV_BASE_SKILLS)
+    if folder_id:
+        (skills / STORIES_PROBE_SKILL / STORIES_PROBE_FILE).write_text(
+            f"This is a **{STORIES_PROBE_TEXT}** router.\n", encoding="utf-8"
+        )
+    return skills
+
+
+def install_build_auto_skill(
+    root: Path,
+    tree: str = ".claude/skills",
+    *,
+    folder_id: bool = True,
+    renderer_stub: bool = False,
+) -> Path:
+    """The post-rename twin of :func:`install_dev_base_skills`: lay down the NEW dev
+    primitive (`install.DEV_PRIMITIVE_NEW`) plus the review hunters under ``root/tree``.
+
+    Deliberately lays down ONE era. A test that wants both names on disk calls this
+    *and* :func:`install_dev_base_skills`; a test that wants only the legacy era calls
+    that one alone. (Note :func:`install_base_skills` lays down BOTH, because
+    `BASE_SKILLS` is the copy-if-present worktree catalog and names both eras — so a
+    scaffold built from it resolves to the new name.)
+
+    ``folder_id`` writes the resolved primitive's step-01 carrying the dispatch marker
+    `install.missing_stories_support` content-probes for, exactly as the legacy twin
+    does — under `bmad-build-auto`, since that is the name that resolves here.
+
+    ``renderer_stub`` changes only the installed primitive's content discriminator
+    and adds a complete source graph. Project-global renderer files stay explicit in
+    each test so every presence gate has an observable clearing leg."""
+    from bmad_loop.install import (
+        DEV_BASE_SKILLS,
+        DEV_PRIMITIVE_LEGACY,
+        DEV_PRIMITIVE_MARKERS,
+        DEV_PRIMITIVE_NEW,
+        STORIES_PROBE_FILE,
+        STORIES_PROBE_TEXT,
+    )
+
+    # The hunters, read off the catalog rather than restated — but with the primitive
+    # entry swapped for the new name, since DEV_BASE_SKILLS is keyed on the legacy one.
+    hunters = {k: v for k, v in DEV_BASE_SKILLS.items() if k != DEV_PRIMITIVE_LEGACY}
+    skills = Path(root) / tree
+    _write_skill_stubs(skills, {DEV_PRIMITIVE_NEW: DEV_PRIMITIVE_MARKERS, **hunters})
+    primitive = skills / DEV_PRIMITIVE_NEW
+    if renderer_stub:
+        (primitive / "SKILL.md").write_text(RENDERER_STUB_SKILL_MD, encoding="utf-8")
+        (primitive / "workflow.md").write_text(RENDERER_WORKFLOW_MD, encoding="utf-8")
+    if folder_id:
+        (primitive / STORIES_PROBE_FILE).write_text(
+            f"This is a **{STORIES_PROBE_TEXT}** router.\n", encoding="utf-8"
+        )
+    return skills
+
+
+def install_dev_shim(root: Path, tree: str = ".claude/skills", *, with_review: bool = True) -> Path:
+    """Lay down ONLY the post-rename forwarding shim: a lone `bmad-dev-auto/SKILL.md`
+    with no marker files and no new-name skill beside it.
+
+    This is the install `bmad-loop validate` must REFUSE (`skills.base-shim`) rather
+    than drive: the shim's customization-migration gate is interactive, so an
+    unattended session dispatched into it HALTs having written nothing to disk.
+
+    ``with_review`` also stubs the merged reviewer, which satisfies `_review_findings`'
+    static fallback — so a shim test's findings are exactly the shim finding, and an
+    assertion on their count is not silently counting absent review layers too."""
+    from bmad_loop.install import DEV_PRIMITIVE_LEGACY, MERGED_REVIEW_SKILL
+
+    skills = Path(root) / tree
+    shim = skills / DEV_PRIMITIVE_LEGACY
+    shim.mkdir(parents=True, exist_ok=True)
+    (shim / "SKILL.md").write_text(f"# {DEV_PRIMITIVE_LEGACY}\n", encoding="utf-8")
+    if with_review:
+        _write_skill_stubs(skills, {MERGED_REVIEW_SKILL: ()})
+    return skills
+
+
 def install_base_skills(paths: ProjectPaths, trees=(".claude/skills", ".agents/skills")) -> None:
-    """Lay down stubs of the non-bundled upstream skills the orchestrator drives
-    (bmad-dev-auto + the review hunters) so the run-start preflight
-    (`install.missing_base_skills`) passes."""
+    """Stub every non-bundled upstream skill (`install.BASE_SKILLS` — a superset of
+    DEV_BASE_SKILLS that also covers what a worktree mount must copy) in each of a
+    sandbox project's active CLI skill trees. Sprint mode drives any dev primitive,
+    so no folder+id probe is written.
+
+    BASE_SKILLS names BOTH primitive eras, so this lays down both and the tree
+    resolves to `bmad-build-auto`. For a single-era scaffold use
+    :func:`install_dev_base_skills` (legacy) or :func:`install_build_auto_skill`."""
     from bmad_loop.install import BASE_SKILLS
 
     for tree in trees:
-        for skill, markers in BASE_SKILLS.items():
-            d = paths.project / tree / skill
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "SKILL.md").write_text(f"# {skill}\n", encoding="utf-8")
-            for marker in markers:
-                (d / marker).write_text("x\n", encoding="utf-8")
+        _write_skill_stubs(paths.project / tree, BASE_SKILLS)
+
+
+def attach_profile(adapter, name: str = "claude", project: Path | None = None):
+    """Give a scripted adapter the ``profile`` a real CLI adapter carries, so the
+    seams that read ``adapter.profile.skill_tree`` — chiefly ``Engine._dev_skill``,
+    which resolves the invoked dev-primitive NAME off disk — see a real skill tree.
+
+    `MockAdapter` deliberately has no `profile` at all, and that is not an
+    oversight to paper over globally: the profile-less shape IS the None-tree
+    fallback path (legacy name), so it stays the default and gets pinned by its
+    own test. Attach only where the resolved name is what's under test. Returns
+    the adapter for chaining."""
+    from bmad_loop.adapters.profile import get_profile
+
+    adapter.profile = get_profile(name, project)
+    return adapter
+
+
+def fault_read_text(monkeypatch, target: Path) -> None:
+    """Make exactly ``target``'s ``read_text`` raise PermissionError; every other
+    path still reads normally. A selective monkeypatch rather than chmod: chmod is a
+    no-op for root and carries no read bit on Windows, so the fault would silently
+    not fire on half the CI matrix. ``read_bytes`` is untouched, so a test can still
+    assert the faulted file's contents are unchanged."""
+    real = Path.read_text
+
+    def fake(self, *a, **kw):
+        if self == target:
+            raise PermissionError(13, "Permission denied")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", fake)
 
 
 def write_sprint(paths: ProjectPaths, statuses: dict[str, str]) -> None:
@@ -182,10 +504,89 @@ def set_sprint(paths: ProjectPaths, key: str, status: str) -> None:
     paths.sprint_status.write_text(yaml.safe_dump(doc, sort_keys=False))
 
 
-def write_spec(path: Path, status: str, baseline: str, *, prose_status: str | None = None) -> None:
+def render_deferred(items) -> str:
+    """Render the post-#2640 ``deferred:`` frontmatter shape.
+
+    Free-form values use the real YAML block scalars: ``>-`` for folded
+    summary/location and ``|-`` for literal evidence. A non-dict list item and a
+    dict missing ``summary`` intentionally remain expressible for malformed-item
+    tests.
+    """
+    if not items:
+        return "deferred: []\n"
+    lines = ["deferred:"]
+    for item in items:
+        if not isinstance(item, dict):
+            lines.append(f"  - {item}")
+            continue
+        rendered = False
+        for key in ("summary", "evidence", "location", "severity"):
+            if key not in item:
+                continue
+            lead = "    " if rendered else "  - "
+            rendered = True
+            value = str(item[key])
+            if not value:
+                lines.append(f"{lead}{key}: ''")
+            elif key == "severity":
+                lines.append(f"{lead}{key}: {value}")
+            else:
+                style = "|-" if key == "evidence" else ">-"
+                lines.append(f"{lead}{key}: {style}")
+                lines.extend(f"      {line}" for line in value.splitlines())
+        if not rendered:
+            lines.append("  - {}")
+    return "\n".join(lines) + "\n"
+
+
+def write_spec(
+    path: Path,
+    status: str,
+    baseline: str,
+    *,
+    prose_status: str | None = None,
+    closes_deferred: object = None,
+    operator_actions: object = None,
+    deferred=None,
+) -> None:
+    """Write a spec the way the real bmad-dev-auto skill does. The skill's step-03
+    stamps `baseline_revision` and NEVER `baseline_commit` (that name exists only
+    in the orchestrator's synthesized result.json), so this fixture stamps the
+    same key — a reader that only knows `baseline_commit` must fail a test here,
+    not sail through production (issue #89).
+
+    ``closes_deferred`` writes the story-declared ledger-closure field (#234): a
+    list renders as a YAML flow sequence, and a bare string renders as a scalar —
+    the wrong-container mistake whose handling must not depend on which file it
+    was made in.
+
+    ``operator_actions`` writes the park declaration (#335) as a real YAML BLOCK
+    sequence — the shape the dev prompt asks a session for, and the shape a human
+    reads back — so the reading under test is the one production sees. A non-list
+    renders as a scalar, which is the wrong-container mistake for this field
+    too (a bare string is iterable, so a lenient reader would turn one
+    instruction into a list of characters).
+
+    ``deferred`` adds the post-#2640 frontmatter list using
+    :func:`render_deferred`. ``None`` omits the field entirely (the pre-#2640
+    shape); ``[]`` emits an explicit empty list. It is rendered last so adding
+    this fixture capability does not reorder either pre-existing declaration.
+    """
+    declare = ""
+    if isinstance(closes_deferred, list):
+        declare = f"closes_deferred: [{', '.join(closes_deferred)}]\n"
+    elif closes_deferred is not None:
+        declare = f"closes_deferred: {closes_deferred}\n"
+    if isinstance(operator_actions, list):
+        rendered = "".join(f"  - {a}\n" for a in operator_actions)
+        declare += f"operator_actions:\n{rendered}" if rendered else "operator_actions: []\n"
+    elif operator_actions is not None:
+        declare += f"operator_actions: {operator_actions}\n"
+    if deferred is not None:
+        declare += render_deferred(deferred)
     body = (
         f"---\ntitle: 'test'\ntype: 'feature'\nstatus: '{status}'\n"
-        f"baseline_commit: '{baseline}'\n---\n\n## Intent\n\ntest spec\n"
+        f"baseline_revision: '{baseline}'\n{declare}---\n\n## Intent\n\ntest spec\n"
     )
     if prose_status is not None:
         # mirror bmad-dev-auto's terminal finalize: it appends a `## Auto Run
@@ -200,6 +601,63 @@ def spec_path(paths: ProjectPaths, story_key: str) -> Path:
     return paths.implementation_artifacts / f"spec-{story_key}.md"
 
 
+def committing_crash_state(
+    paths: ProjectPaths, engine, *, post_squash: bool = False, operator_actions: list | None = None
+) -> str:
+    """Persist the exact state.json shape from issue #115: a task at COMMITTING
+    (the save right after advance(COMMITTING), before finalize_commit / the DONE
+    save that stamps commit_sha). Fully verified on disk: attempt work committed
+    above baseline (only the work file — sweeping the still-untracked sprint
+    board into the commit would make a later baseline reset delete it), spec at
+    done, sprint synced at DEV time. review_cycle stays 0 — the
+    _skip_review_and_commit path reaches COMMITTING with zero review sessions.
+    With post_squash, finalize_commit already ran before the death (squashed
+    commit at HEAD, clean tree) but commit_sha was never persisted.
+
+    With ``operator_actions``, the crashed story is a PARK (#335): spec + board at
+    `awaiting-operator` and the actions already latched on the task, exactly as
+    `_park_awaiting_operator` leaves it before `advance(COMMITTING)`. That latch
+    is the whole point — it is what the resume arm re-derives the final phase
+    from, with no code of its own. Returns the baseline sha."""
+    parked = bool(operator_actions)
+    status = "awaiting-operator" if parked else "done"
+    baseline = rev_parse_head(paths.project)
+    src = paths.project / "src.txt"
+    src.write_text(src.read_text() + "change for 1-1-a\n")
+    git(paths.project, "add", "src.txt")
+    git(paths.project, "commit", "-q", "-m", "attempt work for 1-1-a")
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, status, baseline, operator_actions=operator_actions)
+    write_sprint(paths, {"1-1-a": status})
+    if post_squash:
+        finalize_commit(paths.project, baseline, "pre-crash squash")
+
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.COMMITTING, attempt=1)
+    task.review_cycle = 0
+    task.baseline_commit = baseline
+    task.baseline_untracked = []
+    task.spec_file = str(sp)
+    task.operator_actions = list(operator_actions or [])
+    task.record_session(
+        SessionRecord(
+            task_id="1-1-a-dev-1",
+            role="dev",
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": "1-1-a",
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "escalations": [],
+                "followup_review_recommended": False,
+            },
+        )
+    )
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+    return baseline
+
+
 def dev_effect(
     paths: ProjectPaths,
     story_key: str,
@@ -207,6 +665,11 @@ def dev_effect(
     final_status: str = "done",
     followup_review: bool = True,
     prose_status: str | None = None,
+    seen: list[str] | None = None,
+    write_src: bool = True,
+    closes_deferred: object = None,
+    operator_actions: object = None,
+    deferred=None,
 ):
     """Simulate a successful bmad-dev-auto session: it self-finalizes the spec
     (no in-review handoff — always straight to ``done``) but never touches the
@@ -218,14 +681,39 @@ def dev_effect(
     ``review.trigger = "recommended"``; set False to exercise the skip path.
     ``prose_status`` appends a terminal ``## Auto Run Result`` block with that
     Status line — pair it with a non-terminal ``final_status`` to reproduce the
-    skill leaving frontmatter behind its prose (the reconcile path)."""
+    skill leaving frontmatter behind its prose (the reconcile path).
+
+    ``operator_actions`` pairs with ``final_status="awaiting-operator"`` to
+    simulate a session that finished its agent-doable work and parked the rest on
+    a human (#335); it is written to the spec frontmatter only, never to
+    result.json, because the engine re-reads the spec for it.
+
+    ``seen``, when given, collects `src.txt` as the session found it on entry — the
+    patch-restore tests assert the re-driven session ran against the RESTORED diff.
+    ``write_src=False`` then keeps the session from appending its own line, so what
+    lands in the tree is exactly what the restore laid down (the applied patch is
+    the session's proof of work; a second edit would muddy the assertion).
+
+    ``deferred`` records post-#2640 review findings in the spec frontmatter; the
+    simulated session still never writes the deferred-work ledger itself."""
 
     def effect(spec: SessionSpec) -> SessionResult:
         baseline = rev_parse_head(paths.project)
         source = paths.project / "src.txt"
-        source.write_text(source.read_text() + f"change for {story_key}\n")
+        if seen is not None:
+            seen.append(source.read_text())
+        if write_src:
+            source.write_text(source.read_text() + f"change for {story_key}\n")
         sp = spec_path(paths, story_key)
-        write_spec(sp, final_status, baseline, prose_status=prose_status)
+        write_spec(
+            sp,
+            final_status,
+            baseline,
+            prose_status=prose_status,
+            closes_deferred=closes_deferred,
+            operator_actions=operator_actions,
+            deferred=deferred,
+        )
         # deliberately NO set_sprint: the dev skill does not write sprint-status
         return SessionResult(
             status="completed",
@@ -271,7 +759,9 @@ def review_effect(
         sp = spec_path(paths, story_key)
         baseline = _spec_baseline(sp)
         status = "done" if finalized else "in-progress"
-        write_spec(sp, status, baseline)
+        # A review pass rewrites the status, not the whole frontmatter — carry any
+        # `closes_deferred:` declaration through verbatim, as the real skill does.
+        write_spec(sp, status, baseline, closes_deferred=_spec_closes_deferred(sp))
         if finalized:
             set_sprint(paths, story_key, "done")
         return SessionResult(
@@ -290,11 +780,82 @@ def review_effect(
     return effect
 
 
-def _spec_baseline(path: Path) -> str:
+def _spec_closes_deferred(path: Path) -> object:
+    """The spec's `closes_deferred:` declaration as `write_spec` would re-render
+    it — a list for a flow sequence, the raw text otherwise. None when absent."""
     for line in path.read_text().splitlines():
-        if line.startswith("baseline_commit:"):
+        if line.startswith("closes_deferred:"):
+            value = line.split(":", 1)[1].strip()
+            if value.startswith("[") and value.endswith("]"):
+                return [p.strip() for p in value[1:-1].split(",") if p.strip()]
+            return value
+    return None
+
+
+def _spec_baseline(path: Path) -> str:
+    """Read back whichever baseline key a spec carries: `write_spec` stamps
+    `baseline_revision` like the real skill, but hand-rolled fixture specs (and
+    re-arm's re-stamp) may carry either."""
+    for line in path.read_text().splitlines():
+        if line.startswith(("baseline_commit:", "baseline_revision:")):
             return line.split(":", 1)[1].strip().strip("'\"")
     return ""
+
+
+def ignore_before_commit(project: ProjectPaths, *patterns: str) -> None:
+    """Append gitignore patterns, leaving the file staged for a later commit.
+
+    Appends rather than rewrites: the sandbox template ships `.bmad-loop/runs/`,
+    and clobbering it leaves the run dir tracked, so `worktree_clean()` then fails
+    for a reason that has nothing to do with the test. Leaving the change
+    UNCOMMITTED is what lets a following `write_ledger(..., commit=True)` succeed —
+    once the rule is committed, `git add -A` stages nothing for the now-ignored
+    ledger and the commit fails on an empty index.
+    """
+    gitignore = project.project / ".gitignore"
+    existing = gitignore.read_text(encoding="utf-8")
+    prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
+    gitignore.write_text(prefix + "".join(f"{pattern}\n" for pattern in patterns), encoding="utf-8")
+
+
+def crash_at_merge_back(engine, *, after: str = "merge") -> None:
+    """Kill the host inside the isolated DONE arm, in one of its two windows.
+
+    `WorktreeFlow.integrate_unit`'s DONE arm runs merge -> carry -> latch, and each
+    gap has its own recovery contract:
+
+    - ``"merge"``: after `merge_local`, before `_carry_isolated_ledger_writes`. The
+      branch landed and the worktree is gone; no ledger write happened.
+    - ``"carry"``: after the whole carry, before `isolated_ledger_carried` is set
+      and saved. This is the window that pins call-site latching — a latch moved
+      inside the base hook is already durable here, so the resume finds the task
+      latched and never replays.
+
+    `_emit("post_merge")` cannot stand in for either: it fires above the teardown,
+    so the crash would land outside the window under test.
+
+    Replaces a method on the engine INSTANCE rather than monkeypatching the class.
+    `WorktreeFlow` is handed `carry_isolated_ledger_writes=lambda task:
+    self._carry_isolated_ledger_writes(task)`, a late-binding lambda, so instance
+    assignment is what the callback sees.
+    """
+    if after not in ("merge", "carry"):
+        raise ValueError(f"unknown crash window: {after!r}")
+    if after == "merge":
+
+        def crash_before_carry(_task) -> None:
+            raise RuntimeError("host died after merge, before the ledger carry")
+
+        engine._carry_isolated_ledger_writes = crash_before_carry
+        return
+
+    original = engine._carry_isolated_ledger_writes
+
+    def crash_after_carry(task) -> None:
+        original(task)
+        raise RuntimeError("host died after the ledger carry, before its latch")
+
+    engine._carry_isolated_ledger_writes = crash_after_carry
 
 
 # ----------------------------------------------------------- sweep helpers
@@ -369,6 +930,8 @@ def bundle_dev_effect(
     followup_review: bool = True,
     final_status: str = "done",
     prose_status: str | None = None,
+    deferred=None,
+    write_src: bool = True,
 ):
     """Simulate a bmad-dev-auto bundle dev session: edits code and self-finalizes
     the bundle spec to ``done`` (no in-review handoff). On the decoupled path the
@@ -376,16 +939,19 @@ def bundle_dev_effect(
     ``mark_ledger=True`` is kept only for the legacy-marking path in older tests.
     ``followup_review`` mirrors `followup_review_recommended` — defaults True so
     the bundle review runs under the default trigger = "recommended". ``final_status``
-    / ``prose_status`` mirror ``dev_effect``: pair a non-terminal ``final_status``
-    with ``prose_status="done"`` to reproduce the skill finalizing in prose only."""
+    / ``prose_status`` / ``deferred`` / ``write_src`` mirror ``dev_effect``: pair
+    a non-terminal ``final_status`` with ``prose_status="done"`` to reproduce the
+    skill finalizing in prose only; ``write_src=False`` expresses a session whose
+    only post-baseline diff comes from orchestrator ledger bookkeeping."""
 
     def effect(spec: SessionSpec) -> SessionResult:
         baseline = rev_parse_head(paths.project)
         source = paths.project / "src.txt"
-        source.write_text(source.read_text() + f"change for dw-{name}\n")
+        if write_src:
+            source.write_text(source.read_text() + f"change for dw-{name}\n")
         sp = bundle_spec_path(paths, name)
         # mirror the skill: always self-finalize the bundle spec straight to done
-        write_spec(sp, final_status, baseline, prose_status=prose_status)
+        write_spec(sp, final_status, baseline, prose_status=prose_status, deferred=deferred)
         if mark_ledger:
             mark_ledger_done(paths, dw_ids)
         return SessionResult(
@@ -430,3 +996,118 @@ def bundle_review_effect(paths: ProjectPaths, name: str, clean: bool = True):
         )
 
     return effect
+
+
+def bundle_dev_escalates(paths: ProjectPaths, name: str, dw_ids, detail: str = "intent gap"):
+    """Simulate a bmad-dev-auto bundle session that hits an intent gap during its
+    inline review: it reverts its attempt, saves a patch, writes the bundle spec
+    ``blocked``, and surfaces a CRITICAL escalation naming the spec — so the run
+    pauses for `bmad-loop resolve --restore-patch`. ``spec_file`` in the result lets
+    ``_record_dev_spec`` latch ``task.spec_file`` (the restore re-arm's in-review
+    target), and the ``blocked`` status keeps the dw ids open (not synced done)."""
+
+    def effect(spec: SessionSpec) -> SessionResult:
+        sp = bundle_spec_path(paths, name)
+        baseline = rev_parse_head(paths.project)
+        write_spec(sp, "blocked", baseline)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": f"dw-{name}",
+                "spec_file": str(sp),
+                "dw_ids": list(dw_ids),
+                "escalations": [
+                    {"type": "bundle-item-blocked", "severity": "CRITICAL", "detail": detail}
+                ],
+            },
+        )
+
+    return effect
+
+
+# --------------------------------------------------------- escalated-run scaffolds
+
+
+@dataclass
+class EscalatedRun:
+    """What `escalated_run` built, so each caller can unpack only what it asserts on."""
+
+    run_dir: Path
+    state: RunState
+    task: StoryTask
+
+
+def escalated_run(
+    project: Path,
+    run_id: str = "r1",
+    *,
+    story_key: str = "s1",
+    epic: int = 1,
+    attempt: int = 1,
+    review_cycle: int = 0,
+    baseline_commit: str | None = None,
+    started_at: str = "now",
+    paused_reason: str = "CRITICAL escalation",
+    source: str = "sprint-status",
+    spec_file: str | None = None,
+    restore_patch: str | None = None,
+    sentinel_kind: str = "",
+    worktree_path: str = "",
+    with_session: bool = False,
+    git_project: bool = False,
+) -> EscalatedRun:
+    """A saved RunState paused at a CRITICAL escalation, with one ESCALATED task —
+    the shared shape behind test_runs / test_resolve / test_cli, whose three local
+    copies had drifted into different defaults, different return tuples, and one
+    unique kwarg each. Parameterized as a superset rather than lowest-common-
+    denominator: every field a caller relied on is still reachable, so no test's
+    fixture-specific assertion is weakened by the dedup.
+
+    ``with_session`` appends the completed review SessionRecord the resolve-context
+    builder reads. ``git_project`` makes ``state.project`` a REAL repo (spec files
+    already written are committed, run state is gitignored) so `rearm_escalation`'s
+    baseline snapshot refresh actually runs and `baseline_commit` defaults to HEAD —
+    in a bare tmp_path its best-effort `except` swallows every git call and the
+    refresh silently no-ops.
+    """
+    project = Path(project)
+    if git_project:
+        (project / ".gitignore").write_text(".bmad-loop/\n")  # keep run state out of the snapshot
+        git(project, "init", "-q", "-b", "main")
+        git(project, "config", "user.email", "test@test")
+        git(project, "config", "user.name", "test")
+        git(project, "add", "-A")
+        git(project, "commit", "-q", "-m", "initial")
+        if baseline_commit is None:
+            baseline_commit = git(project, "rev-parse", "HEAD")
+
+    task = StoryTask(
+        story_key=story_key,
+        epic=epic,
+        phase=Phase.ESCALATED,
+        attempt=attempt,
+        review_cycle=review_cycle,
+        baseline_commit=baseline_commit,
+        spec_file=spec_file,
+        restore_patch=restore_patch,
+        sentinel_kind=sentinel_kind,
+        worktree_path=worktree_path,
+    )
+    if with_session:
+        task.sessions.append(
+            SessionRecord(task_id=f"{story_key}-review-1", role="review", status="completed")
+        )
+    state = RunState(
+        run_id=run_id,
+        project=str(project),
+        started_at=started_at,
+        paused_reason=paused_reason,
+        paused_stage=PAUSE_ESCALATION,
+        paused_story_key=story_key,
+        tasks={story_key: task},
+        source=source,
+    )
+    run_dir = project / ".bmad-loop" / "runs" / run_id
+    save_state(run_dir, state)
+    return EscalatedRun(run_dir=run_dir, state=state, task=task)

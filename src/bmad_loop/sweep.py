@@ -13,15 +13,15 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from . import deferredwork, gates, verify
 from .engine import Engine
-from .escalation import critical_escalations
+from .escalation import critical_escalations, env_fault_pause_reason
 from .model import Phase, StoryTask
+from .platform_util import atomic_replace
 from .statemachine import advance
 from .workspace import discard_worktree
 
@@ -35,6 +35,10 @@ TRIAGE_WORKFLOW = "deferred-sweep-triage"
 MIGRATE_KEY = "sweep-migrate"
 MIGRATE_WORKFLOW = "deferred-sweep-migrate"
 BUNDLE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,39}$")
+# the inverse of SweepEngine._bundle_key: "dw-<name>" (cycle 1) / "dw<N>-<name>".
+# A cycle-1 key always has "-" straight after "dw", so the cycle group matches
+# empty and the split stays unambiguous even for a bundle named "2fix".
+BUNDLE_KEY_RE = re.compile(r"^dw(\d*)-(.+)$")
 DECISION_EFFECTS = ("build", "close", "keep-open")
 
 
@@ -398,16 +402,35 @@ class SweepEngine(Engine):
         self._skipped_decisions: set[str] = set()
         self.state.run_type = "sweep"
 
-    # the date stamped into ledger edits; isolated for tests
-    def _today(self) -> str:
-        return time.strftime("%Y-%m-%d")
+    def _remaining_estimate(self) -> int | None:
+        """Sweep override of the graceful-stop hint: how many deferred-work
+        entries are still open in the ledger — the work a resume would pick up.
+        Like the base, a hint only: the whole body is guarded so an
+        unreadable/invalid ledger returns None rather than derailing the stop."""
+        try:
+            ledger = self.workspace.paths.deferred_work
+            text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+            return len(deferredwork.open_ids(text))
+        except Exception:  # a hint must never break the stop
+            return None
 
     # ------------------------------------------------------------ main loop
 
     def _loop(self) -> None:
         ledger = self.workspace.paths.deferred_work
         cycle = max(1, self.state.sweep_cycle)
+        if self._finish_inflight_bundles():
+            # a recovered bundle's ledger restore can leave the tree dirty, and
+            # triage plus the first bundle baseline need a clean one. Guarded on
+            # a non-empty pass so a fresh sweep never commits the user's dirt.
+            self._commit_ledger("chore(sweep): commit ledger after recovering in-flight bundles")
         while True:
+            # First statement of the loop body: covers the boundary right after
+            # _finish_inflight_bundles on resume and between repeat cycles. A
+            # request during a cycle is caught before the next _run_bundle (see
+            # _cycle); one landing between cycles stops here before cycle N+1
+            # re-triages.
+            self._check_graceful_stop()
             self.state.sweep_cycle = cycle
             self._save()
             text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
@@ -450,6 +473,64 @@ class SweepEngine(Engine):
             self._commit_ledger("chore(sweep): commit ledger before next sweep cycle")
             cycle += 1
 
+    def _finish_inflight_bundles(self) -> int:
+        """Re-drive every bundle this run left in flight, keyed on the task's own
+        persisted story_key. Returns how many were recovered.
+
+        The base Engine._loop opens with _finish_inflight for exactly this reason;
+        the sweep loop used to recover a bundle only from inside _run_bundle, which
+        a cycle reaches only after re-deriving the bundle's key from the *current*
+        triage plan. A re-armed bundle therefore survived a resume solely because
+        the cached triage.json reloaded and re-emitted the same bundle name — lose
+        that cache and a fresh triage partitions the ids under new names, silently
+        orphaning the human's resolution (#94).
+
+        Runs before the ledger is read, so a bundle it closes leaves the open set
+        and no fresh triage can re-bundle those ids (validate_triage rejects a plan
+        whose open_ids disagree with the ledger). A recovered bundle that defers or
+        escalates keeps its ids open. A dev-leg discard never closes them; an
+        in-place post-acceptance defer reopens this run's close, while an isolated
+        unit's close dies with its unmerged worktree. The existing failed_ids filter
+        then drops the fresh plan's overlapping bundle."""
+        recovered = 0
+        for task in list(self.state.tasks.values()):
+            if task.terminal or not BUNDLE_KEY_RE.match(task.story_key):
+                continue
+            recovered += 1
+            self.journal.append(
+                "sweep-inflight-redrive",
+                story_key=task.story_key,
+                phase=str(task.phase),
+                rearmed=task.rearmed,  # read before the recovery clears the latch
+            )
+            if self._recover_inflight_bundle(task):
+                continue
+            self._ensure_bundle_intent(task)
+            self._save()
+            self._emit("pre_bundle", task)
+            self._run_story(task)
+            self._emit("post_bundle", task)
+        return recovered
+
+    def _warn_stranded_bundles(self) -> None:
+        """Invariant: _finish_inflight_bundles has driven every persisted bundle to
+        a terminal phase before a cycle picks new work. A survivor means a bundle
+        would be silently dropped — say so loudly rather than sweep past it."""
+        stranded = [
+            t.story_key
+            for t in self.state.tasks.values()
+            if BUNDLE_KEY_RE.match(t.story_key) and not t.terminal
+        ]
+        if not stranded:
+            return
+        self.journal.append("sweep-inflight-stranded", story_keys=stranded)
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"{len(stranded)} sweep bundle(s) left in flight",
+            "not re-driven by this cycle: " + ", ".join(stranded),
+        )
+
     def _cycle(self, cycle: int, open_now: set[str]) -> bool:
         """One triage -> close -> decide -> bundle pass. Returns whether the
         cycle completed any addressable work — the repeat loop's progress
@@ -457,6 +538,7 @@ class SweepEngine(Engine):
         already-resolved closes, the replayed (idempotent) closes report 0 and
         the run stops with no-progress; errs toward stopping, never loops."""
         self._emit("pre_sweep_cycle", phase=str(cycle))
+        self._warn_stranded_bundles()
         plan = self._ensure_triage(open_now, cycle)
         closed = self._close_resolved(plan)
         answers, decisions_closed = self._decisions_phase(plan)
@@ -467,6 +549,13 @@ class SweepEngine(Engine):
             self._emit("post_sweep_cycle", phase=str(cycle))
             return False
         for bundle in bundles:
+            # Item boundary: a request during bundle N lets N finish through
+            # commit; bundle N+1 never starts. A request landing during triage
+            # reaches the first iteration here, so triage completes but zero
+            # bundles run. Mid-cycle stop is resume-safe: sweep_cycle is
+            # persisted, triage.json is cached, closes are idempotent, and
+            # terminal tasks are skipped on re-drive.
+            self._check_graceful_stop()
             self._run_bundle(bundle, cycle)
         bundles_done = sum(
             1
@@ -514,38 +603,88 @@ class SweepEngine(Engine):
             task = StoryTask(story_key=key, epic=0, dw_ids=list(bundle.dw_ids))
             self.state.tasks[key] = task
             self.journal.append("bundle-start", story_key=key, dw_ids=list(bundle.dw_ids))
-        else:
-            # interrupted mid-bundle: same recovery as Engine._finish_inflight
-            self.journal.append("resume-restart", story_key=key, phase=str(task.phase))
-            isolated = self._isolated and task.worktree_path
-            if task.phase == Phase.DEV_VERIFY and task.spec_file:
-                self._save()
-                if isolated:
-                    unit = self._reopen_unit(task)
-                    prev = self.workspace
-                    self.workspace = unit.workspace
-                    try:
-                        self._review_and_commit(task)
-                    finally:
-                        self.workspace = prev
-                    self._integrate_unit(task, unit)
-                else:
-                    self._review_and_commit(task)
-                return
-            if isolated:
-                # drop the half-built worktree; _run_story mounts a fresh one
-                discard_worktree(self.paths.repo_root, task.worktree_path, task.branch)
-                task.worktree_path = ""
-                task.branch = ""
-            elif task.baseline_commit:
-                self._rollback_or_pause(task)
-            task.phase = Phase.PENDING  # deliberate reset, not a normal transition
+        elif self._recover_inflight_bundle(task):
+            return
         dirname = bundle.name if cycle == 1 else f"c{cycle}-{bundle.name}"
         task.bundle_file = str(self._write_intent(bundle, dirname))
         self._save()
         self._emit("pre_bundle", task)
         self._run_story(task)
         self._emit("post_bundle", task)
+
+    def _recover_inflight_bundle(self, task: StoryTask) -> bool:
+        """Recover a bundle task interrupted mid-flight (or re-armed after a
+        human resolved its escalation via `bmad-loop resolve`): the same recovery
+        as Engine._finish_inflight, including the re-drive latch so a
+        human-resolved escalation is protected through every reset (mirrors
+        engine.py:1163-1169).
+
+        Returns True when the persisted PROCEED receipt carried the bundle all
+        the way through accepted sync, review, and commit — the caller is done.
+        Returns False once the task has been reset to PENDING, leaving the caller
+        to dispatch it. A bare DEV_VERIFY + spec_file shape is insufficient: the
+        pre-action decision save has the same shape for rejected decisions.
+
+        Deliberately narrower than the base _finish_inflight: no
+        `_resumable_session` arm, so a bundle whose host died in the
+        post-session window still restarts rather than replaying its recorded
+        result. Lifting that is a resume-fidelity change of its own. The
+        COMMITTING window IS recovered, though — same as the base engine's
+        resume-commit arm (#115)."""
+        isolated = self._isolated and task.worktree_path
+        if task.phase == Phase.COMMITTING:
+            # the gate+advance save landed pre-death; finish the commit
+            # instead of rolling verified bundle work back (see
+            # Engine._finalize_commit_phase for the re-drive contract).
+            self.journal.append("resume-commit", story_key=task.story_key)
+            if isolated:
+                unit = self._reopen_unit(task)
+                prev = self.workspace
+                self.workspace = unit.workspace
+                try:
+                    self._finalize_commit_phase(task)
+                finally:
+                    self.workspace = prev
+                self._integrate_unit(task, unit)
+            else:
+                self._finalize_commit_phase(task)
+            return True
+        self.journal.append("resume-restart", story_key=task.story_key, phase=str(task.phase))
+        if (
+            task.phase == Phase.DEV_VERIFY
+            and task.spec_file
+            and self._accepted_dev_session_matches(task)
+        ):
+            self._save()
+            if isolated:
+                unit = self._reopen_unit(task)
+                prev = self.workspace
+                self.workspace = unit.workspace
+                try:
+                    self._resume_after_dev_verify(task)
+                finally:
+                    self.workspace = prev
+                self._integrate_unit(task, unit)
+            else:
+                self._resume_after_dev_verify(task)
+            return True
+        if isolated:
+            # drop the half-built worktree; _run_story mounts a fresh one
+            discard_worktree(
+                self.paths.repo_root, task.worktree_path, task.branch, run_dir=self.run_dir
+            )
+            task.worktree_path = ""
+            task.branch = ""
+        elif task.baseline_commit:
+            # latch resolved_redrive so the corrected spec + restored diff stay
+            # protected through every reset of this re-drive, not just this
+            # first one; cause="resolved" keeps a human-initiated re-arm
+            # pause-free regardless of scm.rollback_on_failure
+            task.resolved_redrive = task.resolved_redrive or task.rearmed
+            self._rollback_or_pause(task, cause="resolved" if task.rearmed else "stopped")
+        task.rearmed = False  # past rollback (only reached when not paused)
+        task.phase = Phase.PENDING  # deliberate reset, not a normal transition
+        return False
 
     # ------------------------------------------------------------ migration
 
@@ -619,7 +758,18 @@ class SweepEngine(Engine):
                 session_status=result.status,
                 ok=not errors,
                 errors=errors,
+                env_fault=result.env_fault,
             )
+            if result.status != "completed" and result.env_fault:
+                # The migration session's CLI lost its API connection (#194): it did
+                # no rewrite work, so pause (the ESCALATED-resume above resets
+                # task.attempt to 0 — fresh budget) instead of charging a migration
+                # attempt. Escalate BEFORE the _safe_reset/attempt-cap path; that
+                # resume also restores the ledger if the worktree is dirty.
+                self._escalate(
+                    task,
+                    env_fault_pause_reason("migration", result),
+                )
             if not errors:
                 advance(task, Phase.DONE)
                 self._save()
@@ -668,11 +818,21 @@ class SweepEngine(Engine):
         triage_key = TRIAGE_KEY + suffix
         if triage_path.is_file():
             # already validated this run; the ledger has moved since (closes,
-            # decisions), so skip the open-set equality re-check
-            plan, errors = validate_triage(_read_json(triage_path), None)
-            if plan is not None:
-                return plan
-            self.journal.append("sweep-triage-reload-failed", errors=errors)
+            # decisions), so skip the open-set equality re-check. A cache we
+            # cannot read or that is not a JSON object degrades to a fresh
+            # triage — a truncated file must not crash the whole run.
+            try:
+                cached = _read_json(triage_path)
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+                self.journal.append("sweep-triage-reload-failed", errors=[f"unreadable: {exc}"])
+            else:
+                if isinstance(cached, dict):
+                    plan, errors = validate_triage(cached, None)
+                else:
+                    plan, errors = None, [f"not a JSON object: {type(cached).__name__}"]
+                if plan is not None:
+                    return plan
+                self.journal.append("sweep-triage-reload-failed", errors=errors)
 
         task = self.state.tasks.get(triage_key)
         if task is None:
@@ -712,7 +872,16 @@ class SweepEngine(Engine):
                 session_status=result.status,
                 ok=plan is not None,
                 errors=errors,
+                env_fault=result.env_fault,
             )
+            if result.status != "completed" and result.env_fault:
+                # transport/API failure (#194): pause rather than charge a triage
+                # attempt for a session that never reached the API. The
+                # ESCALATED-resume above resets task.attempt to 0 (fresh budget).
+                self._escalate(
+                    task,
+                    env_fault_pause_reason("triage", result),
+                )
             if plan is not None:
                 advance(task, Phase.DONE)
                 self._save()
@@ -784,7 +953,7 @@ class SweepEngine(Engine):
         if seeded:
             tmp = decisions_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(answers, indent=2), encoding="utf-8")
-            tmp.replace(decisions_path)
+            atomic_replace(tmp, decisions_path)
         pending = [d for d in plan.decisions if d.id not in answers]
         answered_interactively = False
         if not self.prompting:
@@ -822,7 +991,7 @@ class SweepEngine(Engine):
                 }
                 tmp = decisions_path.with_suffix(".tmp")
                 tmp.write_text(json.dumps(answers, indent=2), encoding="utf-8")
-                tmp.replace(decisions_path)
+                atomic_replace(tmp, decisions_path)
                 self.journal.append(
                     "decision-answered",
                     dw_id=decision.id,
@@ -845,16 +1014,33 @@ class SweepEngine(Engine):
         detach a plain-shell client, switch a tmux client back to its origin. A
         plain foreground sweep (nobody attached, no return target) is untouched.
 
-        After a successful return we go unattended for the rest of the run: a
-        later --repeat cycle's input() would otherwise block forever in a window
-        no one is viewing. New decisions then defer via the unattended path,
-        recorded for `bmad-loop decisions` or the next attended sweep."""
+        We then go unattended for the rest of the run: a later --repeat cycle's
+        input() would otherwise block forever in a window no one is viewing. New
+        decisions defer via the unattended path instead, recorded for
+        `bmad-loop decisions` or the next attended sweep.
+
+        The trigger for that is "nobody can be relied on to answer here any
+        more", NOT "the hand-back succeeded" — the two come apart on a failed
+        return, in opposite directions. A failed switch is evidence the client
+        is still in this window with a human in front of it (ATTENDED: keep
+        prompting, which is the whole point of #227). A failed detach reports
+        only that no hand-back was verified — nothing attached, an effect the
+        backend cannot observe, or no detach verb at all — and under that
+        uncertainty going unattended is the outcome that does not strand a
+        --repeat cycle on input(); the decisions it defers stay reachable via
+        `bmad-loop decisions`. Only a real return is announced: UNREACHABLE
+        prints nothing, since there may be no one to read it."""
         from .tui import launch  # import-light: launch.py has no textual imports
 
-        if launch.return_attached_client():
+        outcome = launch.return_attached_client()
+        if outcome is launch.ReturnOutcome.ATTENDED:
+            return
+        self.prompting = False
+        if outcome is launch.ReturnOutcome.RETURNED:
             self.journal.append("sweep-returned-after-decisions")
             self.prompter.print_fn("✓ decisions recorded — sweep continues in the background")
-            self.prompting = False
+        else:
+            self.journal.append("sweep-return-no-client")
 
     def _apply_decision_effect(self, decision: Decision, option: DecisionOption) -> None:
         ledger = self.workspace.paths.deferred_work
@@ -969,21 +1155,73 @@ class SweepEngine(Engine):
         path.write_text("\n".join(lines), encoding="utf-8")
         return path
 
+    def _ensure_bundle_intent(self, task: StoryTask) -> None:
+        """Guarantee a recovered bundle has the intent file its dev prompt points
+        at. The rendered intent.md persists in the run dir and the prompt consumes
+        nothing else from the plan, so the normal case is to reuse it untouched.
+
+        Only when it is gone do we rebuild a degraded one from the task itself.
+        The triage session's authored intent prose is the single unrecoverable
+        piece; the verbatim ledger entries _write_intent re-attaches carry the
+        actual work, so say plainly that they are now the contract."""
+        if task.bundle_file and Path(task.bundle_file).is_file():
+            return
+        match = BUNDLE_KEY_RE.match(task.story_key)
+        if match is None:  # pragma: no cover - callers filter on BUNDLE_KEY_RE
+            return
+        cycle = int(match.group(1)) if match.group(1) else 1
+        name = match.group(2)
+        bundle = Bundle(
+            name=name,
+            dw_ids=tuple(task.dw_ids),
+            intent=(
+                "Resolve the deferred-work entries reproduced below. This bundle's "
+                "original triage intent did not survive the run it was written in, "
+                "so the verbatim ledger entries are the authoritative statement of "
+                "the work."
+            ),
+        )
+        dirname = name if cycle == 1 else f"c{cycle}-{name}"
+        task.bundle_file = str(self._write_intent(bundle, dirname))
+        self.journal.append(
+            "sweep-intent-regenerated",
+            story_key=task.story_key,
+            dw_ids=list(task.dw_ids),
+            path=task.bundle_file,
+        )
+
     # ------------------------------------------------------ override seams
 
     def _dev_prompt(self, task: StoryTask, feedback: Path | None) -> str:
         return self._generic_bundle_prompt(task, feedback)
 
     def _generic_bundle_prompt(self, task: StoryTask, feedback: Path | None) -> str:
-        """Bundle invocation for the generic bmad-dev-auto dev skill: the self-contained
+        """Bundle invocation for the generic dev primitive (disk-resolved, see
+        ``Engine._dev_skill``): the self-contained
         intent.md (intent + verbatim ledger entries) is handed over as freeform
         intent. The orchestrator owns the deferred-work ledger — the skill is told
-        not to edit it — and records resolution itself in `_post_dev_state_sync`.
-        On a repair the bundle spec is re-opened first (B6) so step-01 resumes."""
+        not to edit it — and records resolution itself in `_post_dev_accepted_sync`.
+        On a repair the bundle spec is re-opened first (B6) so step-01 resumes.
+
+        A patch-restore re-drive (#2564, #75) must point at the bundle spec
+        explicitly: only step-01's spec-pointer intent check EARLY EXITs on the
+        `in-review` status the re-arm set — before step-01's version-control
+        sanity check, which would otherwise HALT `blocked` on the diff
+        `_restore_patch` just laid onto the tree. The freeform intent.md pointer
+        takes the path where that dirty-tree check runs first."""
         bundle_ref = task.bundle_file or task.story_key
         if feedback is None:
+            if task.restore_patch and task.spec_file:
+                return (
+                    f"/{self._dev_skill()} Resume review of the in-review spec at "
+                    f"`{task.spec_file}` for the deferred-work bundle `{bundle_ref}`. "
+                    f"The attempted change was restored onto the working tree after "
+                    f"an intent-gap resolution; review it against the amended spec. "
+                    f"Do NOT edit the deferred-work ledger; the orchestrator records "
+                    f"resolution."
+                )
             return (
-                f"/bmad-dev-auto Implement the deferred-work bundle described in "
+                f"/{self._dev_skill()} Implement the deferred-work bundle described in "
                 f"`{bundle_ref}` — it carries the intent and the verbatim ledger "
                 f"entries to resolve. Do NOT edit the deferred-work ledger; the "
                 f"orchestrator records resolution."
@@ -991,7 +1229,7 @@ class SweepEngine(Engine):
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or bundle_ref
         return (
-            f"/bmad-dev-auto Resume the autonomous dev session on the in-progress "
+            f"/{self._dev_skill()} Resume the autonomous dev session on the in-progress "
             f"spec at `{spec_ref}` for the deferred-work bundle `{bundle_ref}`. The "
             f"previous session's work failed deterministic verification; repair the "
             f"working tree so verification passes without changing the frozen intent "
@@ -1000,11 +1238,26 @@ class SweepEngine(Engine):
         )
 
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
+        """No-op: bundles have no sprint-status row for the pre-gate sync.
+
+        This override and the accepted-only override below are one behavior
+        change. Leaving the former close here as well would run bundle closure
+        twice at two different gate positions.
+        """
+        return
+
+    def _post_dev_accepted_sync(self, task: StoryTask, result_json: dict | None) -> None:
         """Generic-path ledger single-writer for bundles. The decoupled
         bmad-dev-auto skill does not touch the ledger, so the orchestrator marks
         each dw id the bundle owns ``done`` once the bundle's spec reaches the
-        terminal status for the current stage. Mirrors the story sprint sync;
-        no-op on the legacy path."""
+        terminal status for the current stage. No-op on the legacy path.
+
+        This runs only after the artifact gate, verify commands, and ``decide_dev``
+        have accepted the attempt. In particular, ``outcome.ok`` is insufficient:
+        a CRITICAL escalation in the session result preempts that outcome. The
+        review gate later requires these entries closed; ``_verify_review`` retains
+        its separate reclose because a review session can rewrite the ledger.
+        """
         if not self._generic_dev():
             return
         spec_file = (result_json or {}).get("spec_file")
@@ -1012,6 +1265,24 @@ class SweepEngine(Engine):
             return
         success_status = "in-review" if self._dev_review_enabled() else "done"
         self._close_bundle_ledger_when_spec_status(task, str(spec_file), success_status)
+
+    def _bundle_close_operation_id(self, task: StoryTask) -> str:
+        """Stable identity for a close and its possible defer-time undo."""
+        return f"{self.state.run_id}/{task.story_key}"
+
+    def _bundle_close_note(self, task: StoryTask) -> str:
+        """Resolution note shared by a bundle close and its possible undo."""
+        return f"resolved by sweep bundle {task.story_key}"
+
+    def _close_declared_deferred(
+        self, task: StoryTask, snapshot: list[tuple[Path, str]] | None = None
+    ) -> None:
+        """No-op: a bundle's ledger closure is owned by
+        ``_close_bundle_ledger_when_spec_status``, which runs after accepted dev
+        because ``verify_review_bundle`` *requires* those entries closed before the
+        later commit boundary. Letting the base class's commit-boundary hook (#234)
+        also fire here would re-derive closure for a task whose ids come from
+        ``task.dw_ids``, not from a ``closes_deferred:`` declaration."""
 
     def _close_bundle_ledger_when_spec_status(
         self,
@@ -1023,17 +1294,143 @@ class SweepEngine(Engine):
         spec_path = verify.resolve_spec_path(spec_file, self.workspace.paths)
         if not spec_path.is_file():
             return
-        if verify.status_of(verify.read_frontmatter(spec_path)) != success_status:
+        fm = self._observed_frontmatter(spec_path, task.story_key, "bundle-ledger-close")
+        if fm is None:
+            return
+        if verify.status_of(fm) != success_status:
             return
         ledger = self.workspace.paths.deferred_work
-        note = f"resolved by sweep bundle {task.story_key}"
-        marked = [i for i in task.dw_ids if deferredwork.mark_done(ledger, i, self._today(), note)]
+        note = self._bundle_close_note(task)
+        # Record the intended ids, never only `marked`. This method is called once
+        # after accepted dev and again by the review-leg reclose. The second call
+        # normally finds every entry already done, so `marked` is empty; deriving
+        # the record from it would erase exactly the state a landing bundle needs.
+        task.bundle_closes_intended = list(task.dw_ids)
+        marked = deferredwork.mark_done_many_reopenable(
+            ledger,
+            task.dw_ids,
+            self._today(),
+            note,
+            self._bundle_close_operation_id(task),
+        )
         if marked:
             self.journal.append(kind, story_key=task.story_key, dw_ids=marked)
 
+    def _reopen_ledger_after_defer(self, task: StoryTask) -> None:
+        """Reopen only this run's bundle closes after its code was discarded.
+
+        ``Engine._defer`` deliberately restores the whole post-review ledger after
+        rollback so harvested findings survive. That restore can also replay a
+        bundle close whose code no longer exists. The operation-specific undo marker
+        makes this "undo my close", not "open these ids": human, legacy, and earlier
+        run closures remain untouched. Replaying this method is idempotent.
+        """
+        ledger = self.workspace.paths.deferred_work
+        note = self._bundle_close_note(task)
+        operation_id = self._bundle_close_operation_id(task)
+        reopened = [i for i in task.dw_ids if deferredwork.mark_open(ledger, i, note, operation_id)]
+        if reopened:
+            self.journal.append("sweep-bundle-reopened", story_key=task.story_key, dw_ids=reopened)
+
+    def _carry_isolated_ledger_writes(self, task: StoryTask) -> None:
+        """The base hook's sweep half: re-apply this bundle's ledger CLOSES to the
+        MAIN checkout after an isolated unit lands, the base having first carried
+        the harvest.
+
+        ``super()`` runs FIRST, and that is a contract rather than a style choice.
+        ``deferredwork.append_entry``'s idempotence scan is OPEN-ONLY, so a close
+        applied ahead of the harvest hides an already-filed row from it and mints a
+        duplicate under a fresh id. The base hook now ends with a CLOSE of its own
+        (``_carry_story_deferred_closes``, #458) and still satisfies the rule, since
+        both of its appends precede it; the two closes never coexist on one task,
+        because ``_close_declared_deferred`` is a no-op here and a story run has no
+        bundle. ``_carry_harvested_deferrals`` defends the same
+        hazard a second time with its own status-agnostic pre-scan, which is exactly
+        why the order is pinned by a test: with that second line of defence in place
+        a reversal is silent today and would only surface if the pre-scan were ever
+        narrowed back to the writer's semantics.
+
+        ``_close_bundle_ledger_when_spec_status`` writes
+        ``self.workspace.paths.deferred_work`` — under ``scm.isolation = "worktree"``
+        that is the unit worktree's copy. The shape this rescues is a GITIGNORED
+        ledger named in ``scm.worktree_seed``: the flip lands in the worktree, then
+        ``finalize_commit``'s ``git add -A`` skips the ignored path in silence, so it
+        never rides the unit branch and the merge brings nothing over. The bundle's
+        entries stay ``open``, ``deferredwork.open_ids`` re-bundles them, and every
+        later sweep re-triages work that is already done — an unbounded loop rather
+        than a one-time drop, which is what makes this worth a carry.
+
+        An UNSEEDED gitignored ledger is a different, still-open hole this cannot
+        reach: a worktree checks out tracked files only, so the ledger is absent
+        there entirely, ``verify_review_bundle`` (which reads the WORKTREE's copy)
+        never sees the ids ``done``, and the unit DEFERS on a fixable retry instead
+        of landing. That shape is loud where this one is silent, and no DONE-leg
+        carry helps a unit that never reaches DONE (#426).
+
+        DONE leg only, deliberately: ``Engine._defer``'s isolated arm calls
+        ``_carry_harvested_deferrals`` directly and never this hook, and
+        ``_replay_unlatched_ledger_carries``'s DEFERRED leg matches it for the same
+        reason. A defer discarded the code the close claims to have RESOLVED, and a
+        close is the most expensive engine-side write to leave behind — ``open_ids``
+        re-bundles only ``open`` entries, so a wrong ``done`` is invisible to every
+        future sweep.
+
+        Keyed on ``task.bundle_closes_intended``, never on the ids the in-worktree
+        close managed to flip: those are exactly empty in the broken case above.
+        The close is written reopenable, with the same note and operation id as the
+        in-worktree close, so a carried row is indistinguishable from one that
+        arrived through the merge instead of a second row shape for one event.
+
+        No ``_generic_dev()`` guard, unlike the two ledger WRITERS: the record is
+        the guard. ``bundle_closes_intended`` is assigned only by
+        ``_close_bundle_ledger_when_spec_status``, which ``_post_dev_accepted_sync``
+        reaches on the generic path alone, so on the legacy path — where the session
+        owns the ledger — it is empty and this returns before touching anything. A
+        second predicate saying the same thing would be a branch no test can redden.
+
+        The commit is best effort, where ``_carry_harvested_deferrals`` re-raises on
+        a ledger git can own. The asymmetry is deliberate: that method's raise is
+        backed by ``harvest_carry_commit_pending``, so a replay still owes the commit
+        after dedup empties its carried list. This carry has no such latch and its
+        flips are idempotent, so a replay finds nothing left to commit — raising here
+        would cost the run its ``integrate_unit`` over bookkeeping whose real work is
+        already done. The flips themselves are unguarded: losing them is the hazard
+        this exists to prevent.
+        """
+        super()._carry_isolated_ledger_writes(task)
+        if not task.bundle_closes_intended:
+            return
+        ledger = self.paths.deferred_work
+        carried = deferredwork.mark_done_many_reopenable(
+            ledger,
+            task.bundle_closes_intended,
+            self._today(),
+            self._bundle_close_note(task),
+            self._bundle_close_operation_id(task),
+        )
+        if carried:
+            try:
+                verify.commit_paths(
+                    self.paths.repo_root,
+                    f"chore(deferred-work): close {task.story_key}'s bundle ids",
+                    [ledger],
+                )
+            except verify.GitError as e:
+                self.journal.append(
+                    "sweep-bundle-close-carry-uncommitted",
+                    story_key=task.story_key,
+                    dw_ids=carried,
+                    error=str(e),
+                )
+        self.journal.append("sweep-bundle-close-carried", story_key=task.story_key, dw_ids=carried)
+
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         return verify.verify_dev_bundle(
-            task, self.workspace.paths, result_json, review_enabled=self._dev_review_enabled()
+            task,
+            self.workspace.paths,
+            result_json,
+            review_enabled=self._dev_review_enabled(),
+            engine_written=self._harvest_gate_exclude(task),
         )
 
     def _verify_review(self, task: StoryTask):
@@ -1048,6 +1445,13 @@ class SweepEngine(Engine):
                 task, task.spec_file, "done", kind="sweep-bundle-reclosed"
             )
         return verify.verify_review_bundle(task, self.workspace.paths, self.policy)
+
+    def _operator_park_enabled(self) -> bool:
+        # A bundle carries no sprint-status entry, so the pair a park is verified
+        # against does not exist, and `verify_review_bundle` gates on closed dw
+        # ids instead. Whether a deferred-work bundle can owe a human action is a
+        # separate question from whether a story can; not answered here.
+        return False
 
     def _commit_message(self, task: StoryTask) -> str:
         rendered = self._render_commit_template(task)

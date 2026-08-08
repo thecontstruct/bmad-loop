@@ -18,7 +18,9 @@ from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 
-from ..platform_util import has_parent_ref, is_absolute_path
+import regex
+
+from ..platform_util import has_parent_ref, is_absolute_path, names_tree_root
 
 USAGE_PARSERS = {"claude-jsonl", "codex-rollout", "gemini-chat", "copilot-events", "none"}
 HOOK_DIALECTS = {
@@ -27,16 +29,32 @@ HOOK_DIALECTS = {
     "gemini-settings-json",
     "copilot-settings-json",
     "antigravity-hooks-json",
+    # hookless: the adapter observes completion itself (HTTP/SSE transport) —
+    # no hook config is ever written, so config_path/events must stay empty.
+    "none",
 }
 CANONICAL_EVENTS = {"SessionStart", "Stop", "SessionEnd", "PreCompact"}
 USER_PROFILES_REL = Path(".bmad-loop") / "profiles"
 
-# legacy adapter names from older policy.toml files
-ALIASES = {"claude-code-tmux": "claude"}
+# legacy adapter names from older policy.toml files, plus friendly short names
+ALIASES = {"claude-code-tmux": "claude", "opencode": "opencode-http"}
 
 
 class ProfileError(Exception):
     pass
+
+
+# Every fault a raw coercion over a `tomllib` value can raise — the set is CLOSED,
+# not a list of the ones seen so far, which is what makes funnelling on it a funnel
+# rather than another round of enumeration. `tomllib` yields exactly nine types
+# (str, int, float, bool, datetime, date, time, list, dict) and all nine were run
+# through this module's coercions: `int()`/`float()` answer TypeError for the five
+# non-numerics, ValueError for a non-numeric str and for `nan`, and **OverflowError**
+# for `inf`/`-inf` (int) and for an int too large to be a float — `tomllib` accepts
+# arbitrary-precision integers, so that second one is reachable from a config file.
+# Iteration and `.items()` add TypeError and AttributeError and nothing new.
+# `plugins/manifest.py` funnels on the same set for the same reason.
+CONVERSION_FAULTS = (AttributeError, OverflowError, TypeError, ValueError)
 
 
 @dataclass(frozen=True)
@@ -84,6 +102,20 @@ class CLIProfile:
     # that a `git worktree add` checkout omits; provision_worktree copies them in
     # from the main repo so isolated dev/review sessions can reach the MCP server.
     seed_files: tuple[str, ...] = ()
+    # Python `re` patterns matched line-by-line against the ANSI-stripped tail of
+    # a non-completed session's pane log to classify a transport/API *environment
+    # fault* (#194) — e.g. an "API Error … Connection refused" the CLI printed
+    # while idling out the session clock. Compiled and validated at parse time
+    # (an invalid regex is a profile error). Seeded only for `claude`; empty =
+    # inert. Override/extend via a project profile in .bmad-loop/profiles/.
+    env_fault_patterns: tuple[str, ...] = ()
+
+    @property
+    def hookless(self) -> bool:
+        """True for profiles whose adapter observes completion itself (HTTP/SSE)
+        instead of via hook scripts — no hook config exists to register, merge,
+        validate, or git-exclude."""
+        return self.hooks.dialect == "none"
 
     def render_prompt(self, prompt: str) -> str:
         """Render the engine's canonical "/skill args" prompt for this CLI.
@@ -102,6 +134,14 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     def fail(msg: str) -> ProfileError:
         return ProfileError(f"profile {source}: {msg}")
 
+    def str_list(key: str) -> tuple[str, ...]:
+        # TOML arrays parse as list; reject a bare string (which would iterate to
+        # per-character entries) or a scalar (a raw TypeError) with a friendly error.
+        raw = doc.get(key, [])
+        if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+            raise fail(f"{key} must be a list of strings")
+        return tuple(raw)
+
     name = str(doc.get("name", "")).strip()
     binary = str(doc.get("binary", "")).strip()
     if not name or not binary:
@@ -113,16 +153,30 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     dialect = str(hooks_d.get("dialect", ""))
     if dialect not in HOOK_DIALECTS:
         raise fail(f"hooks.dialect must be one of {sorted(HOOK_DIALECTS)}: got {dialect!r}")
-    config_path = str(hooks_d.get("config_path", ""))
-    if not config_path or is_absolute_path(config_path) or has_parent_ref(config_path):
-        raise fail("hooks.config_path must be a project-relative path")
-    events_d = hooks_d.get("events")
-    if not isinstance(events_d, dict) or not events_d:
-        raise fail("hooks.events must map native event names to canonical ones")
-    events = {str(k): str(v) for k, v in events_d.items()}
-    bad = sorted(set(events.values()) - CANONICAL_EVENTS)
-    if bad:
-        raise fail(f"hooks.events values must be canonical {sorted(CANONICAL_EVENTS)}: got {bad}")
+    if dialect == "none":
+        # hookless: nothing is ever registered, so a config_path or events map
+        # is a contradiction — reject rather than silently ignore.
+        if hooks_d.get("config_path") or hooks_d.get("events"):
+            raise fail('hookless profiles (dialect = "none") must not set hooks.config_path/events')
+        config_path = ""
+        events: dict[str, str] = {}
+    else:
+        config_path = str(hooks_d.get("config_path", ""))
+        if (
+            names_tree_root(config_path)
+            or is_absolute_path(config_path)
+            or has_parent_ref(config_path)
+        ):
+            raise fail("hooks.config_path must be a project-relative path")
+        events_d = hooks_d.get("events")
+        if not isinstance(events_d, dict) or not events_d:
+            raise fail("hooks.events must map native event names to canonical ones")
+        events = {str(k): str(v) for k, v in events_d.items()}
+        bad = sorted(set(events.values()) - CANONICAL_EVENTS)
+        if bad:
+            raise fail(
+                f"hooks.events values must be canonical {sorted(CANONICAL_EVENTS)}: got {bad}"
+            )
 
     usage_parser = str(doc.get("usage_parser", "none"))
     if usage_parser not in USAGE_PARSERS:
@@ -138,13 +192,24 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         raise fail(f"stop_without_result_nudges must be >= 0: got {stop_nudges}")
 
     skill_tree = str(doc.get("skill_tree", ".claude/skills"))
-    if not skill_tree or is_absolute_path(skill_tree) or has_parent_ref(skill_tree):
+    if names_tree_root(skill_tree) or is_absolute_path(skill_tree) or has_parent_ref(skill_tree):
         raise fail("skill_tree must be a project-relative path")
 
-    seed_files = tuple(str(s) for s in doc.get("seed_files", ()))
+    seed_files = str_list("seed_files")
+    # `names_tree_root` subsumes the emptiness check it replaced. These entries feed
+    # provision_worktree's seed loop, where any spelling of the root ("", ".", "./",
+    # ".\") resolves src to the repo root and dst to the worktree — both pass the
+    # loop's containment checks, so the whole repo is copied in.
     for seed in seed_files:
-        if not seed or is_absolute_path(seed) or has_parent_ref(seed):
+        if names_tree_root(seed) or is_absolute_path(seed) or has_parent_ref(seed):
             raise fail(f"seed_files entries must be project-relative paths: got {seed!r}")
+
+    env_fault_patterns = str_list("env_fault_patterns")
+    for pattern in env_fault_patterns:
+        try:
+            regex.compile(pattern)  # same engine the adapter matches with (timeout-guarded)
+        except regex.error as e:
+            raise fail(f"env_fault_patterns entry is not a valid regex: {pattern!r} ({e})") from e
 
     return CLIProfile(
         name=name,
@@ -152,8 +217,8 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         hooks=HookSpec(dialect=dialect, config_path=config_path, events=events),
         skill_tree=skill_tree,
         prompt_template=str(doc.get("prompt_template", "{prompt}")),
-        launch_args=tuple(str(a) for a in doc.get("launch_args", ())),
-        bypass_args=tuple(str(a) for a in doc.get("bypass_args", ())),
+        launch_args=str_list("launch_args"),
+        bypass_args=str_list("bypass_args"),
         model_flag=str(doc.get("model_flag", "--model")),
         env={str(k): str(v) for k, v in doc.get("env", {}).items()},
         usage_parser=usage_parser,
@@ -162,6 +227,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         subagent_stop_without_transcript=bool(doc.get("subagent_stop_without_transcript", False)),
         first_run_note=str(doc.get("first_run_note", "")),
         seed_files=seed_files,
+        env_fault_patterns=env_fault_patterns,
     )
 
 
@@ -170,7 +236,19 @@ def _load_toml(text: str, source: str) -> CLIProfile:
         doc = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise ProfileError(f"profile {source}: invalid TOML: {e}") from e
-    return _parse_profile(doc, source)
+    try:
+        return _parse_profile(doc, source)
+    except ProfileError:
+        raise  # intent: a domain error is never re-wrapped (it is not a CONVERSION_FAULT)
+    except CONVERSION_FAULTS as e:
+        # A funnel, not per-field guards: `_parse_profile`'s raw conversions
+        # (`float()`, `int()`, `.items()`) raise bare conversion errors on
+        # TOML-legal values of the wrong type, and every consumer keys its
+        # fault handling on ProfileError — `validate`'s role loop reports an
+        # `adapter.profile` failure, `_require_base_skills` skips the one
+        # profile, `install` prints FAIL. A bare escape crashed `validate`
+        # before any document was printed.
+        raise ProfileError(f"profile {source}: malformed field value: {e}") from e
 
 
 def load_profiles(project: Path | None = None) -> dict[str, CLIProfile]:

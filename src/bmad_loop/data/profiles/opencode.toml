@@ -1,0 +1,13 @@
+# OpenCode (opencode.ai) driven over its local HTTP server (`opencode serve`) —
+# hookless: the adapter owns the server process and observes turn completion via
+# SSE + polling, so no hook scripts or config merges are ever written.
+# API facts pinned against opencode 1.18.2 (2026-07-16): see the adapters/opencode_http.py docstring.
+name = "opencode-http"
+binary = "opencode"
+prompt_template = "Use the {skill} skill now: {args}"
+usage_parser = "none"
+skill_tree = ".claude/skills"
+first_run_note = "run `opencode auth login` once on this machine; headless servers reuse the stored credentials"
+
+[hooks]
+dialect = "none"

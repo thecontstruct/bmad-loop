@@ -18,9 +18,18 @@ events = { SessionStart = "SessionStart", Stop = "Stop" }
 """
 
 
+HOOKLESS_PROFILE = """
+name = "mycli-http"
+binary = "mycli"
+
+[hooks]
+dialect = "none"
+"""
+
+
 def test_builtin_profiles_load():
     profiles = load_profiles()
-    assert {"claude", "codex", "gemini"} <= set(profiles)
+    assert {"claude", "codex", "gemini", "opencode-http"} <= set(profiles)
     assert profiles["claude"].usage_parser == "claude-jsonl"
     assert profiles["codex"].hooks.dialect == "codex-hooks-json"
     assert "SessionEnd" not in profiles["codex"].hooks.events  # codex has no such hook
@@ -57,11 +66,34 @@ def test_builtin_profiles_load():
         assert profiles[name].stop_without_result_nudges is None
         assert profiles[name].subagent_stop_without_transcript is False
     # claude forces its classic (inline/scrollback) renderer so a pane capture is
-    # not collapsed to the final frame by the fullscreen alt-screen TUI; other
-    # profiles add no such env override
+    # not collapsed to the final frame by the fullscreen alt-screen TUI, and
+    # disables background tasks so a dev session cannot background its
+    # implementation sub-agent and strand it at turn end (#109); other profiles
+    # add no such env overrides
     assert profiles["claude"].env.get("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN") == "1"
-    for name in ("codex", "gemini", "copilot"):
+    assert profiles["claude"].env.get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS") == "1"
+    for name in sorted(set(profiles) - {"claude"}):
         assert "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN" not in profiles[name].env
+        assert "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" not in profiles[name].env
+    # transport-failure classification (#194): only claude seeds env_fault_patterns
+    # (the "API Error … connection cause" signature); every other built-in ships
+    # none, so classification stays inert until a project overlay adds patterns
+    assert profiles["claude"].env_fault_patterns  # non-empty
+    for name in ("codex", "gemini", "copilot", "antigravity", "opencode-http"):
+        assert profiles[name].env_fault_patterns == ()
+    # opencode-http is hookless (HTTP/SSE transport): no hook dialect surfaces,
+    # skills read from the claude tree, usage comes over HTTP (no transcript parser)
+    opencode = profiles["opencode-http"]
+    assert opencode.hookless is True
+    assert opencode.hooks.dialect == "none"
+    assert opencode.hooks.config_path == ""
+    assert opencode.hooks.events == {}
+    assert opencode.skill_tree == ".claude/skills"
+    assert opencode.usage_parser == "none"
+    assert opencode.binary == "opencode"
+    # every hook-driven built-in stays non-hookless
+    for name in sorted(set(profiles) - {"opencode-http"}):
+        assert profiles[name].hookless is False
 
 
 def test_usage_grace_and_nudges_default_when_unset(tmp_path):
@@ -83,6 +115,29 @@ def test_seed_files_default_empty_when_unset(tmp_path):
     assert load_profiles(tmp_path)["mycli"].seed_files == ()
 
 
+def test_env_fault_patterns_default_empty_when_unset(tmp_path):
+    # MINIMAL_PROFILE omits env_fault_patterns -> defaults to () (classification inert)
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
+    assert load_profiles(tmp_path)["mycli"].env_fault_patterns == ()
+
+
+def test_env_fault_patterns_parse_from_overlay(tmp_path):
+    # a project overlay may add/extend the transport-failure patterns; they parse
+    # into a tuple verbatim (compilation validated, see the invalid-regex case)
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace(
+            "[hooks]",
+            'env_fault_patterns = ["API Error.*refused", "socket hang up"]\n[hooks]',
+        )
+    )
+    prof = load_profiles(tmp_path)["mycli"]
+    assert prof.env_fault_patterns == ("API Error.*refused", "socket hang up")
+
+
 def test_skill_tree_defaults_when_unset():
     # MINIMAL_PROFILE omits skill_tree -> defaults to .claude/skills
     assert get_profile("claude").skill_tree == ".claude/skills"
@@ -90,6 +145,21 @@ def test_skill_tree_defaults_when_unset():
 
 def test_legacy_alias_resolves():
     assert get_profile("claude-code-tmux").name == "claude"
+
+
+def test_opencode_alias_resolves():
+    assert get_profile("opencode").name == "opencode-http"
+
+
+def test_hookless_user_profile_parses(tmp_path):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli-http.toml").write_text(HOOKLESS_PROFILE)
+    prof = load_profiles(tmp_path)["mycli-http"]
+    assert prof.hookless is True
+    assert prof.hooks.dialect == "none"
+    assert prof.hooks.config_path == ""
+    assert prof.hooks.events == {}
 
 
 def test_unknown_profile_raises():
@@ -103,6 +173,10 @@ def test_render_prompt_passthrough_and_template():
     codex = get_profile("codex")
     assert codex.render_prompt("/bmad-dev-auto 1-1-a") == (
         "Use the $bmad-dev-auto skill now, and use subagents as needed: 1-1-a"
+    )
+    opencode = get_profile("opencode-http")
+    assert opencode.render_prompt("/bmad-dev-auto 1-1-a") == (
+        "Use the bmad-dev-auto skill now: 1-1-a"
     )
     # non-slash prompts pass through {prompt}; {skill}/{args} degrade gracefully
     assert claude.render_prompt("just do it") == "just do it"
@@ -157,6 +231,64 @@ def test_user_profile_overlay(tmp_path):
             ),
             "seed_files",
         ),
+        # A root-naming entry is the harmful one, and `""` is only one spelling of
+        # it: these feed provision_worktree's seed loop, where any of them resolves
+        # src to the repo root and dst to the worktree — both pass its containment
+        # checks, so the whole repo is copied in and the copy recurses into itself.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'seed_files = ["."]\n[hooks]'),
+            "seed_files",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'seed_files = ["./"]\n[hooks]'),
+            "seed_files",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'skill_tree = "."\n[hooks]'),
+            "skill_tree",
+        ),
+        (
+            MINIMAL_PROFILE.replace(
+                'config_path = ".mycli/settings.json"',
+                'config_path = "."',
+            ),
+            "relative",
+        ),
+        # an env_fault_patterns entry that is not a valid regex fails fast at parse
+        (
+            MINIMAL_PROFILE.replace(
+                "[hooks]",
+                'env_fault_patterns = ["API Error(unbalanced"]\n[hooks]',
+            ),
+            "env_fault_patterns",
+        ),
+        # list fields must be a TOML array of strings: a bare string would iterate to
+        # per-character entries (regexes, in env_fault_patterns' case) and a scalar
+        # would leak a raw TypeError — both are rejected with a friendly ProfileError.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'env_fault_patterns = "API"\n[hooks]'),
+            "env_fault_patterns must be a list of strings",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "env_fault_patterns = 5\n[hooks]"),
+            "env_fault_patterns must be a list of strings",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "env_fault_patterns = [1]\n[hooks]"),
+            "env_fault_patterns must be a list of strings",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "launch_args = [1]\n[hooks]"),
+            "launch_args must be a list of strings",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "seed_files = 3\n[hooks]"),
+            "seed_files must be a list of strings",
+        ),
+        (
+            MINIMAL_PROFILE.replace('bypass_args = ["--yes"]', 'bypass_args = "x"'),
+            "bypass_args must be a list of strings",
+        ),
         (
             MINIMAL_PROFILE.replace("[hooks]", "usage_grace_s = -1\n[hooks]"),
             "usage_grace_s",
@@ -164,6 +296,56 @@ def test_user_profile_overlay(tmp_path):
         (
             MINIMAL_PROFILE.replace("[hooks]", "stop_without_result_nudges = -2\n[hooks]"),
             "stop_without_result_nudges",
+        ),
+        # TOML-legal values of the wrong TYPE hit raw conversions (`float()`,
+        # `int()`, `.items()`) — the `_load_toml` funnel turns those bare
+        # ValueError/TypeError/AttributeError escapes into ProfileError, which
+        # is what every consumer's fault handling keys on. Ablation: drop the
+        # funnel arm and these four raise the bare exception instead.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'usage_grace_s = "invalid"\n[hooks]'),
+            "malformed field value",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "usage_grace_s = [1]\n[hooks]"),
+            "malformed field value",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'stop_without_result_nudges = "x"\n[hooks]'),
+            "malformed field value",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'env = "invalid"\n[hooks]'),
+            "malformed field value",
+        ),
+        # `inf` and an oversized int are legal TOML and raise OverflowError, a
+        # sibling of neither ValueError nor TypeError — the rows that show why
+        # the funnel has to be the CLOSED set for the tomllib domain rather than
+        # the types seen so far. Ablation: drop OverflowError from
+        # CONVERSION_FAULTS and exactly these two raise the bare exception.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "stop_without_result_nudges = inf\n[hooks]"),
+            "malformed field value",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", f"usage_grace_s = {'9' * 400}\n[hooks]"),
+            "malformed field value",
+        ),
+        # real dialects still hard-require config_path and events
+        (
+            MINIMAL_PROFILE.replace('config_path = ".mycli/settings.json"', ""),
+            "config_path",
+        ),
+        (
+            MINIMAL_PROFILE.replace(
+                'events = { SessionStart = "SessionStart", Stop = "Stop" }', ""
+            ),
+            "events",
+        ),
+        # hookless must not carry hook plumbing (config_path/events)
+        (
+            MINIMAL_PROFILE.replace('dialect = "claude-settings-json"', 'dialect = "none"'),
+            "hookless",
         ),
     ],
 )
@@ -173,3 +355,46 @@ def test_invalid_profiles_rejected(tmp_path, mutation, match):
     (profiles_dir / "bad.toml").write_text(mutation)
     with pytest.raises(ProfileError, match=match):
         load_profiles(tmp_path)
+
+
+# every type `tomllib` can yield, plus the numeric spellings that are legal TOML
+# and hostile to a raw coercion
+TOML_VALUE_DOMAIN = [
+    '"x"',
+    "1",
+    "1.5",
+    "true",
+    "1979-05-27T07:32:00Z",
+    "1979-05-27",
+    "07:32:00",
+    "[1]",
+    "{ k = 1 }",
+    "inf",
+    "-inf",
+    "nan",
+    "9" * 400,  # tomllib keeps arbitrary precision; float() of this overflows
+]
+
+
+@pytest.mark.parametrize("value", TOML_VALUE_DOMAIN)
+@pytest.mark.parametrize("key", ["usage_grace_s", "stop_without_result_nudges"])
+def test_every_toml_value_type_parses_or_raises_profile_error(tmp_path, key, value):
+    """The closure pin behind `CONVERSION_FAULTS`: a profile field can hold any of
+    the nine types `tomllib` yields, and the contract is that each either parses or
+    raises the DOMAIN error — never a bare conversion fault out of a `float()`,
+    `int()` or `.items()`.
+
+    Both a float knob and an int knob, because they fault differently: `inf` is a
+    fine float and an OverflowError for `int()`, while a 400-digit integer is a
+    fine int and an OverflowError for `float()`. A per-type exception list cannot
+    promise this; two review rounds each added one type after a bot found a
+    spelling nobody had tried."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "probe.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f"{key} = {value}\n[hooks]")
+    )
+    try:
+        load_profiles(tmp_path)
+    except ProfileError:
+        pass

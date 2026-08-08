@@ -37,6 +37,24 @@ def test_advance_to_in_progress_lifts_backlog_epic(tmp_path):
     assert sprintstatus.load(p).epics[3] == "in-progress"  # epic lifted
 
 
+def test_advance_split_story_lifts_backlog_epic(tmp_path):
+    # a split-story key (issue #144) must advance and lift its epic like any other
+    text = (
+        "last_updated: 01-06-2026 10:00\n"
+        "development_status:\n"
+        "  epic-2: backlog\n"
+        "  2-6a-build-structure: backlog\n"
+        "  2-6b-extend-structure: backlog\n"
+    )
+    p = tmp_path / "sprint-status.yaml"
+    p.write_text(text, encoding="utf-8")
+    out = sprintstatus.advance(p, "2-6a-build-structure", "in-progress")
+    assert out == "in-progress"
+    assert sprintstatus.story_status(p, "2-6a-build-structure") == "in-progress"
+    assert sprintstatus.load(p).epics[2] == "in-progress"  # epic lifted
+    assert sprintstatus.story_status(p, "2-6b-extend-structure") == "backlog"  # sibling untouched
+
+
 def test_advance_preserves_comments_and_structure(tmp_path):
     p = _write(tmp_path)
     sprintstatus.advance(p, "3-2-digest-delivery", "in-progress")
@@ -52,6 +70,36 @@ def test_advance_never_regresses(tmp_path):
     out = sprintstatus.advance(p, "4-1-thing", "in-progress")  # currently review
     assert out == "review"
     assert sprintstatus.story_status(p, "4-1-thing") == "review"
+
+
+def test_advance_confirms_a_parked_story_forward_to_done(tmp_path):
+    """The exit move `bmad-loop confirm` will need: because `awaiting-operator`
+    sits below `done` in STATUS_ORDER, completing a parked story is an ordinary
+    forward advance through the sole writer — no invariant exception required."""
+    p = _write(tmp_path)
+    sprintstatus.advance(p, "3-2-digest-delivery", "awaiting-operator")
+    assert sprintstatus.story_status(p, "3-2-digest-delivery") == "awaiting-operator"
+
+    out = sprintstatus.advance(p, "3-2-digest-delivery", "done")
+
+    assert out == "done"
+    assert sprintstatus.story_status(p, "3-2-digest-delivery") == "done"
+
+
+def test_advance_never_regresses_done_into_awaiting_operator(tmp_path):
+    """The other half of the ordering: once a story is `done`, nothing walks the
+    board back to `awaiting-operator`. This is a real hardening, not a restatement
+    — before the token joined STATUS_ORDER it was unordered, so the never-regress
+    guard's `target in STATUS_ORDER` arm short-circuited and this write went
+    through. (Demoting a done story is Phase 4's `operator.on_review_demotion`
+    question, and it will need its own deliberate, allowlisted writer.)"""
+    p = _write(tmp_path)
+    before = p.read_text()
+
+    out = sprintstatus.advance(p, "3-1-login", "awaiting-operator")  # already done
+
+    assert out == "done"
+    assert p.read_text() == before
 
 
 def test_advance_returns_current_when_line_not_rewritable(tmp_path):

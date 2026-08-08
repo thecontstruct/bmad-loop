@@ -8,6 +8,7 @@ guides below go deeper, roughly in the order you'll need them.
 - **[Setup guide](setup-guide.md)** — install the tools, pick a CLI, initialize a project, pass preflight, and uninstall.
 - **[TUI guide](tui-guide.md)** — the dashboard: layout, key bindings, the settings editor, and troubleshooting.
 - **[Features & functionality](FEATURES.md)** — the full capability matrix and policy reference.
+- **[Terminal multiplexer backends](multiplexer-backends.md)** — which backend drives your agent sessions (tmux bundled; externals like the [herdr adapter](https://github.com/pbean/bmad-loop-adapter-herdr) install as packages), how selection works, and how external backends arrive.
 
 ## Extending bmad-loop
 

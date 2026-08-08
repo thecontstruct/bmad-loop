@@ -231,6 +231,22 @@ async def test_settings_screen_blocks_invalid_value(project):
         assert (project.project / POLICY_FILE).read_text(encoding="utf-8") == POLICY_TEMPLATE
 
 
+async def test_settings_screen_mux_backend_select_roundtrip(project):
+    """The mux backend dropdown persists a chosen backend through the same save
+    path as every other field — a regression guard for the str->select change and
+    the runtime-injected options (assigning a value that isn't an offered option
+    raises, so this also asserts tmux is on the menu)."""
+    write_policy(project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = await open_settings(app, pilot)
+        screen.query_one("#mux-backend", Select).value = "tmux"
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        saved = policy_mod.loads((project.project / POLICY_FILE).read_text(encoding="utf-8"))
+        assert saved.mux.backend == "tmux"
+
+
 async def test_settings_screen_review_toggle_roundtrip(project):
     write_policy(project)
     app = BmadLoopApp(project.project)

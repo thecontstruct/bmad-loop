@@ -8,23 +8,51 @@ policy's test/lint gates with the orchestrator's own subprocess calls.
 from __future__ import annotations
 
 import os
+import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-
-import yaml
+from typing import Any, Literal, overload
 
 from . import deferredwork
 from .bmadconfig import ProjectPaths
-from .model import StoryTask
+from .frontmatter import FrontmatterWriteError  # noqa: F401 — re-export
+from .frontmatter import set_frontmatter_status  # noqa: F401 — re-export
+from .frontmatter import (
+    _edit_frontmatter_block,
+    _split_frontmatter,
+    operator_actions_of,
+    read_frontmatter,
+    status_of,
+)
+from .model import StoryTask, VerifyOutcome
 from .policy import POLICY_FILE, Policy
-from .sprintstatus import story_status
+from .sprintstatus import STATUS_ORDER, story_status
 
 GIT_TIMEOUT_S = 120
 COMMAND_TIMEOUT_S = 30 * 60
+
+# Current bound on a single git subprocess. Module state rather than a per-call
+# parameter so the ~40 git helpers need no threading; the engine overrides it
+# from `limits.git_timeout_s` at startup, everything else keeps the default.
+_git_timeout_s = GIT_TIMEOUT_S
+
+
+def configure_git_timeout(seconds: int) -> None:
+    """Set the per-git-call timeout (`limits.git_timeout_s`). Called once by the
+    engine when it binds its policy; standalone verify users keep GIT_TIMEOUT_S."""
+    global _git_timeout_s
+    _git_timeout_s = seconds
+
+
+# How git's own diff format names the absent side of a creation/deletion. A
+# protocol token git emits verbatim on every platform, Windows included — never
+# opened, never joined onto. Only `patch_new_files` reads it.
+_DIFF_ABSENT = "/dev/null"  # portability: git diff-format token, not a real path
 
 # result.json `workflow` value for the dev pass. A machine contract: the
 # orchestrator forges this value in `devcontract` when synthesizing the dev
@@ -48,39 +76,74 @@ class GitError(Exception):
     pass
 
 
-@dataclass(frozen=True)
-class VerifyOutcome:
-    ok: bool
-    reason: str = ""
-    severity: str = ""  # "" | "CRITICAL" | "PREFERENCE" — set when not retryable
-    # fixable failures carry concrete evidence (failing command output) that a
-    # feedback-driven repair session can act on; non-fixable retries start over
-    fixable: bool = False
+class GitSpawnError(GitError):
+    """The git child could not be spawned at all (an OSError out of
+    `subprocess.run` — EMFILE, ENOMEM, ENOENT on the git binary). A GitError so
+    every existing guard treats it like any other git failure; a distinct type
+    so the rare caller can tell "git said no" from "the machine is broken"
+    (#343). The underlying errno stays reachable via ``exc.__cause__.errno``."""
 
-    @classmethod
-    def passed(cls) -> "VerifyOutcome":
-        return cls(ok=True)
 
-    @classmethod
-    def retry(cls, reason: str, fixable: bool = False) -> "VerifyOutcome":
-        return cls(ok=False, reason=reason, fixable=fixable)
+@overload
+def _run_git(
+    cmd: list[str], repo: Path, *, env: dict[str, str] | None = ..., binary: Literal[False] = ...
+) -> subprocess.CompletedProcess[str]: ...
 
-    @classmethod
-    def escalate(cls, reason: str, severity: str = "CRITICAL") -> "VerifyOutcome":
-        return cls(ok=False, reason=reason, severity=severity)
 
-    @property
-    def retryable(self) -> bool:
-        return not self.ok and not self.severity
+@overload
+def _run_git(
+    cmd: list[str], repo: Path, *, env: dict[str, str] | None = ..., binary: Literal[True]
+) -> subprocess.CompletedProcess[bytes]: ...
+
+
+def _run_git(
+    cmd: list[str], repo: Path, *, env: dict[str, str] | None = None, binary: bool = False
+) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+    """Sole spawn point for git subprocesses. Three failures are raised by
+    `subprocess.run` *before* any return code exists — a timeout (#156), a
+    spawn-level OSError (#343), and a strict-decode fault on the child's output
+    (#377) — so left uncaught any of them would bypass every `except GitError`
+    guard and crash the run. All are translated here into the GitError taxonomy
+    — observation guards degrade, unguarded paths fail typed — with the spawn
+    class marked as `GitSpawnError` for the callers that must distinguish an
+    environment fault from git refusing.
+
+    The decode fault is real, not theoretical: POSIX filenames are arbitrary
+    bytes, and while `core.quotePath` C-quotes them to ASCII for ordinary
+    porcelain, `-z` disables that quoting (`dirty_paths`, `branch_incoming_paths`,
+    `commit_paths`), `worktree list --porcelain` never applied it, and `git diff`
+    emits file *content* verbatim (`capture_diff`) — so one latin-1 file is
+    enough. Translating is deliberately all this does; making such paths usable
+    (`errors="surrogateescape"`) is a separate call, since surrogates would then
+    flow into the UTF-8 journal and JSON writes downstream.
+
+    `binary=True` skips the decode entirely and hands back the raw
+    `CompletedProcess[bytes]` — see `git_bytes`, the public accessor for it.
+
+    Every git child runs with `LC_ALL=C` so messages stay stable English: the one
+    place that inspects git *text* rather than a return code — `safe_rollback`'s
+    benign "pathspec did not match" tolerance — must not misread a translated
+    message under a localized git (#236). Merged last so it wins over both the
+    inherited environment and any explicit `env` (the `_git_env` callers' throwaway
+    `GIT_INDEX_FILE` / synthetic identity vars are preserved by the spread)."""
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=not binary,
+            timeout=_git_timeout_s,
+            env={**(env if env is not None else os.environ), "LC_ALL": "C"},
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(f"git {cmd[3]} timed out after {_git_timeout_s}s in {repo}") from exc
+    except UnicodeDecodeError as exc:
+        raise GitError(f"git {cmd[3]} returned undecodable output in {repo}: {exc}") from exc
+    except OSError as exc:
+        raise GitSpawnError(f"git {cmd[3]} failed to spawn in {repo}: {exc}") from exc
 
 
 def _git(repo: Path, *args: str) -> tuple[int, str]:
-    proc = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        capture_output=True,
-        text=True,
-        timeout=GIT_TIMEOUT_S,
-    )
+    proc = _run_git(["git", "-C", str(repo), *args], repo)
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
 
@@ -88,12 +151,7 @@ def _git_raw(repo: Path, *args: str) -> tuple[int, str]:
     """Like `_git` but returns stdout verbatim (no strip, no stderr merge) — for
     NUL-delimited (`-z`) output whose records can begin with a space (porcelain
     status codes like ' M'), which `_git`'s strip() would corrupt."""
-    proc = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        capture_output=True,
-        text=True,
-        timeout=GIT_TIMEOUT_S,
-    )
+    proc = _run_git(["git", "-C", str(repo), *args], repo)
     return proc.returncode, proc.stdout
 
 
@@ -101,14 +159,31 @@ def _git_env(repo: Path, *args: str, env: dict[str, str]) -> tuple[int, str]:
     """Like `_git` but runs with an explicit environment — used to point git at a
     throwaway `GIT_INDEX_FILE` so a snapshot can stage the tree without touching
     the real index."""
-    proc = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        capture_output=True,
-        text=True,
-        timeout=GIT_TIMEOUT_S,
-        env=env,
-    )
+    proc = _run_git(["git", "-C", str(repo), *args], repo, env=env)
     return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def git_bytes(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    """Run one `git -C <repo> …` through the chokepoint, capturing raw BYTES.
+
+    For the callers the `(rc, str)` wrappers above cannot serve, on two counts:
+
+    * **bytes, not a strict decode.** POSIX filenames are arbitrary bytes, so a
+      repo path invalid in the locale codec reaches a `text=True` call on an
+      ordinary box. `_run_git` now translates that into `GitError` (#377) rather
+      than letting it escape untyped — but a caller whose contract is "answer the
+      question or skip silently" wants the bytes themselves, not a raised
+      taxonomy member. Decode at the point of use with `os.fsdecode`.
+    * **the returncode is an answer, not a fault.** The `CompletedProcess` is
+      returned whatever the rc, never `check=True`: `git config --get` of an unset
+      key exits 1, and that *is* the reply. Callers branch on `returncode`.
+
+    Standing inside the chokepoint is what buys the rest: the `LC_ALL=C` pin so
+    git's message text stays stable English (#236), and the `_git_timeout_s` bound
+    the engine sets from `limits.git_timeout_s` (#156). The two faults with no rc
+    to return still raise — a timeout as `GitError`, a spawn failure as
+    `GitSpawnError` — since neither can be expressed as a `CompletedProcess`."""
+    return _run_git(["git", "-C", str(repo), *args], repo, binary=True)
 
 
 def rev_parse_head(repo: Path) -> str:
@@ -118,16 +193,58 @@ def rev_parse_head(repo: Path) -> str:
     return out
 
 
-def worktree_clean(repo: Path) -> bool:
-    # The orchestrator's own config file (.bmad-loop/policy.toml) is excluded:
-    # the TUI settings editor rewrites it, and a tracked config edit must not
-    # count as a "dirty tree" that blocks run/sweep/validate or forces a commit.
-    # Scope is policy.toml only — the deferred-work ledger also lives under
-    # .bmad-loop/ and is meant to be committed (see sweep._commit_ledger).
-    rc, out = _git(repo, "status", "--porcelain", "--", ".", f":(exclude){POLICY_FILE_REL}")
+def last_commit_for(repo: Path, path: Path) -> str:
+    """Sha of the most recent commit touching ``path``, or ``""`` when no commit
+    does (an untracked or deleted-without-history file) or the path lies outside
+    the repo. Backs the derived provenance of an operator park record, which is
+    written into the very commit it rides and so cannot store its own sha. Git
+    failures raise :class:`GitError` like every sibling; only the path relation
+    degrades silently, mirroring `commit_paths`' outside-the-repo contract."""
+    try:
+        rel = Path(path).resolve().relative_to(repo.resolve()).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    rc, out = _git(repo, "log", "-n", "1", "--format=%H", "--", rel)
     if rc != 0:
-        raise GitError(f"git status failed in {repo}: {out}")
-    return out == ""
+        raise GitError(f"git log failed in {repo}: {out}")
+    return out
+
+
+def worktree_clean(repo: Path) -> bool:
+    """True when the tree holds no change git would report.
+
+    The orchestrator's own config file (.bmad-loop/policy.toml) is excluded: the TUI
+    settings editor rewrites it, and a tracked config edit must not count as a "dirty
+    tree" that blocks run/sweep/validate or forces a commit. Scope is policy.toml only
+    — the deferred-work ledger also lives under .bmad-loop/ and is meant to be
+    committed (see sweep._commit_ledger).
+
+    Reads `stdout` ALONE rather than `_git`'s stdout+stderr merge, for the reason
+    :func:`path_tracked` spells out: `status` exits 0 while still writing to stderr (a
+    `core.fsmonitor` hook that cannot exec, an unknown `core.fsyncMethod`, a stale
+    index advisory), and against the merged stream that chatter is indistinguishable
+    from a porcelain record — a pristine tree answers DIRTY. That direction is not
+    benign here: seven callers gate on it, and `cli.py`'s three refuse the command
+    outright, so a host with a noisy git config could never start a run and the
+    message would name no file. The error path keeps the merge, where stderr is the
+    only informative half."""
+    proc = _run_git(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "status",
+            "--porcelain",
+            "--",
+            ".",
+            f":(exclude){POLICY_FILE_REL}",
+        ],
+        repo,
+    )
+    if proc.returncode != 0:
+        merged = (proc.stdout + proc.stderr).strip()
+        raise GitError(f"git status failed in {repo}: {merged}")
+    return proc.stdout.strip() == ""
 
 
 def same_commit(a: str, b: str) -> bool:
@@ -138,7 +255,27 @@ def same_commit(a: str, b: str) -> bool:
     return a.startswith(b) or b.startswith(a)
 
 
-def has_changes_since(repo: Path, baseline: str, exclude: tuple[str, ...] = ()) -> bool:
+def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    """True when `ancestor` is an ancestor of (or equal to) `descendant`.
+
+    Any git failure — unknown ref, shallow history, not a repo, a timeout
+    (surfacing as GitError since `_run_git` translates it, #156) — reads as
+    False: callers use this to *relax* a gate, so uncertainty must keep the
+    gate strict."""
+    try:
+        code, _ = _git(repo, "merge-base", "--is-ancestor", ancestor, descendant)
+    except (OSError, GitError):
+        return False
+    return code == 0
+
+
+def has_changes_since(
+    repo: Path,
+    baseline: str,
+    exclude: tuple[str, ...] = (),
+    *,
+    baseline_untracked: list[str] | None = None,
+) -> bool:
     """True if tracked changes since baseline OR untracked files exist.
 
     `exclude` is repo-relative posix dir prefixes whose changes don't count —
@@ -146,13 +283,59 @@ def has_changes_since(repo: Path, baseline: str, exclude: tuple[str, ...] = ()) 
     BMAD artifact folders (see `artifact_relpaths`), so a session that only
     rewrites its own spec (e.g. the frontmatter-status reconcile) under those
     folders doesn't register as real implementation work. Mirrors
-    `attempt_dirty`'s exclusion. Default `()` keeps the unscoped behavior."""
+    `attempt_dirty`'s exclusion. Default `()` keeps the unscoped behavior.
+
+    `baseline_untracked` is the untracked-file snapshot taken when the baseline
+    was recorded; when given, those files already existed before the session ran
+    and are subtracted, so pre-session residue (e.g. an earlier halt's saved
+    intent-gap patch, which `_protected_relpaths` shields from every reset) can
+    never masquerade as this session's work.
+
+    `None` means count EVERY untracked file — deliberately the *opposite* of
+    `attempt_dirty`'s `None` = ignore-all, and not an oversight. The two gates
+    fail open in opposite directions: a proof-of-work gate must fail open toward
+    "work happened" (a pre-snapshot run must not have its gate silently
+    weakened into never seeing new files), while a rollback gate must fail open
+    toward "nothing to remove" (never delete a file it cannot prove this attempt
+    created). Keep it that way."""
     rc, _ = _git(repo, "diff", "--quiet", baseline, "--", ".", *_exclude_specs(exclude))
     if rc != 0:
         return True
     created = untracked_files(repo)
+    if baseline_untracked is not None:
+        created -= set(baseline_untracked)
     created = {p for p in created if not _path_under_any(p, exclude)}
     return bool(created)
+
+
+def path_changed_since(
+    repo: Path,
+    baseline: str,
+    rel: str,
+    *,
+    baseline_untracked: list[str] | None = None,
+) -> bool:
+    """Whether one literal repo-relative path changed since ``baseline``.
+
+    This is the single-path form of :func:`has_changes_since`: tracked content
+    is compared to the recorded commit, while an ordinary untracked path counts
+    only when the attempt's baseline snapshot did not already contain it.
+    ``baseline_untracked=None`` keeps the proof gate's legacy behavior of
+    counting every ordinary untracked path. Ignored paths are absent from
+    :func:`untracked_files` and therefore cannot become proof of work here.
+
+    Any non-zero diff result fails open toward "changed", matching the
+    authoritative :func:`has_changes_since` gate. The literal pathspec is
+    required for operator-configured ledger paths containing Git wildmatch
+    characters.
+    """
+    rc, _ = _git(repo, "diff", "--quiet", baseline, "--", f":(literal){rel}")
+    if rc != 0:
+        return True
+    untracked = untracked_files(repo)
+    if rel not in untracked:
+        return False
+    return baseline_untracked is None or rel not in set(baseline_untracked)
 
 
 def attempt_dirty(
@@ -189,12 +372,47 @@ def attempt_dirty(
 
 
 def _exclude_specs(dirs: tuple[str, ...]) -> list[str]:
-    """git pathspec `:(exclude)<dir>` args for each repo-relative dir prefix."""
-    return [f":(exclude){d}" for d in dirs]
+    """git pathspec `:(exclude,literal)<dir>` args for each repo-relative dir prefix.
+
+    `literal` for the same reason as :func:`_literal_specs` — git reads a positional
+    operand as a PATHSPEC, so `[`, `]`, `*` and `?` in an operator-configured dir are
+    wildmatch metacharacters — but the harm here runs the other way: an over-matching
+    exclusion HIDES a diff instead of exposing a file. `has_changes_since` and
+    `attempt_dirty` both spend these on `diff --quiet . :(exclude)<dir>`, so a dir
+    whose name carries a `*` excludes a sibling tree as well and the attempt reads
+    CLEAN when it changed — the same false "no changes" that a dev attempt's dirtiness
+    check exists to prevent (#423 item 3).
+
+    It also realigns this half with :func:`_path_under_any`, the Python `startswith`
+    that filters the untracked half of the very same `has_changes_since` call. The two
+    disagreed on exactly the shapes that glob (#423 item 4): the tracked half excluded
+    a path the untracked half still counted, so one function's two branches answered
+    differently about what "under the artifact dir" means. Literal is the reading
+    `_path_under_any` already implements, which is why fixing the git half is the right
+    direction and not a coin flip.
+
+    `*` and `?` both cross `/` here — `FNM_PATHNAME` is opt-in via `:(glob)`, which this
+    never sets — but only a `*` reaches a sibling DIRECTORY's contents; a same-length
+    `[…]`/`?` collision reaches a sibling FILE only, because the pathspec has to match
+    the whole path. Both magic words go in ONE comma-separated `:(...)` prefix — the
+    global `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` form would disarm the
+    `:(exclude)` magic too and silently stop excluding anything at all. Stable from the
+    git 2.20 floor `install._WORKTREE_CONFIG_GIT` declares to current."""
+    return [f":(exclude,literal){d}" for d in dirs]
+
+
+def _literal_specs(rels: list[str]) -> list[str]:
+    """git pathspec `:(literal)<rel>` for each repo-relative posix path — the operand
+    form that means "this path", not "this glob". See `path_tracked` for why."""
+    return [f":(literal){r}" for r in rels]
 
 
 def _path_under_any(path: str, prefixes: tuple[str, ...]) -> bool:
-    """True if repo-relative posix `path` equals or sits under any `prefixes` dir."""
+    """True if repo-relative posix `path` equals or sits under any `prefixes` dir.
+
+    The literal reading of "under", and since #423 item 4 the one `_exclude_specs`
+    agrees with — the two filter the tracked and untracked halves of a single
+    `has_changes_since` answer and must not disagree."""
     return any(path == p or path.startswith(p.rstrip("/") + "/") for p in prefixes)
 
 
@@ -206,6 +424,106 @@ def untracked_files(repo: Path) -> set[str]:
     if rc != 0:
         raise GitError(f"git ls-files --others failed in {repo}: {out}")
     return {line.strip() for line in out.splitlines() if line.strip()}
+
+
+def path_tracked(repo: Path, rel: str) -> bool:
+    """True when repo-relative posix ``rel`` has an index entry — i.e. git OWNS the
+    path, so a `reset --hard` restores it and no caller should delete it by hand.
+
+    The single-path complement of :func:`untracked_files`, and the pair is what makes
+    the third state legible: neither tracked nor in that set means IGNORED, which no
+    rollback step touches at all (`reset --hard` skips it, and this module never runs
+    `git clean`). A caller that reasons only over "tracked vs untracked" silently
+    files every ignored path under whichever branch it wrote last.
+
+    Only the output's EMPTINESS is read, never its text: `core.quotePath` mangles
+    non-ASCII names, and a tracked-but-deleted-from-the-worktree path still lists (the
+    index entry outlives the file), which is exactly the state a caller must not
+    mistake for "not git's". Not `--error-unmatch`, which reports "not tracked" and
+    "git blew up" with the same non-zero rc; not `check-ignore`, which answers whether
+    a RULE matches rather than whether git owns the path — a `git add -f`'d file under
+    an ignore rule has to read tracked here.
+
+    Reads `stdout` ALONE, not `_git`'s stdout+stderr merge: `ls-files` exits 0 while
+    still writing to stderr — a `core.fsmonitor` hook that cannot exec, an unknown
+    `core.fsyncMethod` — and against the merged stream that chatter reads as an index
+    entry for a path git does not track at all. The failure is silent and inverted
+    (untracked answers "tracked"), so callers act on the opposite of the truth. The
+    error path keeps the merge, where stderr is the only informative half.
+
+    The pathspec is forced LITERAL, because git reads a positional operand as a
+    PATHSPEC and not as a path: `[`, `]`, `*` and `?` in ``rel`` are wildmatch
+    metacharacters, so a probe for an ABSENT path answers True the moment some OTHER
+    tracked path happens to match the glob. The error is one-directional —
+    `match_pathspec_item` compares literally before it falls through to fnmatch, so a
+    genuinely tracked path never reads untracked — and it runs toward the answer that
+    authorizes leaving a file alone, which is how a harvested ledger under an
+    operator-named `implementation_artifacts` (`bmadconfig._resolve` takes that key
+    verbatim, metacharacters and all) outlived the rollback that discarded the code it
+    described. Not the global `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` form,
+    which would also disarm the `:(exclude)` magic `worktree_clean`, `has_changes_since`
+    and `attempt_dirty` are built on; the per-operand prefix is scoped to this call. It
+    costs the callers nothing: that same literal comparison is what matches a DIRECTORY
+    prefix, so `_bmad/render` still lists everything beneath it (`cmd_validate`'s
+    render-tracked warning), and it additionally disarms a ``rel`` that itself begins
+    with `:`, which git would otherwise parse as magic and answer the empty set for.
+    Stable from the git 2.20 floor `install._WORKTREE_CONFIG_GIT` declares to current;
+    below a version that understands the prefix it would read as a literal FILENAME,
+    match nothing and answer False, which is the one direction that authorizes a
+    delete.
+
+    Raises GitError like every other probe in this module. Callers inside a rollback
+    `finally` catch it and degrade toward leaving the file alone: uncertainty must
+    never authorize a delete. The message keeps the BARE ``rel``: the operator's path is
+    its informative half and the magic prefix is our own plumbing.
+
+    Three live callers, all reached through this one chokepoint: `git.render-tracked`
+    (`cmd_validate`), `_ledger_is_gits_to_restore` (the harvest revert) and
+    `_harvest_carry_commit_may_degrade` (the isolation carry)."""
+    proc = _run_git(["git", "-C", str(repo), "ls-files", "--", *_literal_specs([rel])], repo)
+    if proc.returncode != 0:
+        merged = (proc.stdout + proc.stderr).strip()
+        raise GitError(f"git ls-files -- {rel} failed in {repo}: {merged}")
+    return bool(proc.stdout.strip())
+
+
+def path_tracked_file(repo: Path, rel: str) -> bool:
+    """True when repo-relative posix ``rel`` is tracked AND names a regular FILE rather
+    than a directory prefix.
+
+    The distinction :func:`path_tracked` deliberately does not draw. Its literal
+    pathspec matches a directory prefix too — that is load-bearing there, which is why
+    `_bmad/render` answers True for the whole tree beneath it — so a caller that must
+    know *which* of the two it holds cannot get it from that boolean.
+
+    The one caller is the worktree git-add shield, where the two cases want OPPOSITE
+    treatment (#392). Measured, git 2.55.0:
+
+    * An exclude pattern naming a tracked regular file suppresses NOTHING. git consults
+      ignore rules only for untracked paths, so `git add -A` stages a modification to it
+      regardless. The pattern's only effect is to make the file answer
+      `ls-files -ci --exclude-standard`, i.e. read as tracked-and-ignored — which is a
+      state repo-hygiene gates reject, and how a shield meant to keep the orchestrator's
+      files OUT of a story commit came to block one instead.
+    * The same pattern over a tracked DIRECTORY really does hide new children, so it
+      stays. There is no pattern shape that keeps that and clears the `-ci` report:
+      `dir/*`, `dir/**` and a trailing negation all measured identical to `dir`, because
+      gitignore cannot re-include anything under an excluded parent.
+
+    `-z` and the BYTES accessor, unlike the sibling above. This reads the output's TEXT
+    rather than only its emptiness, so the sibling's reason for never looking —
+    `core.quotePath` mangling non-ASCII names — becomes this function's problem instead.
+    NUL-delimited output is never quoted, and comparing `os.fsencode(rel)` keeps a POSIX
+    name that is undecodable in the locale codec comparable rather than raising (#377).
+
+    Raises GitError like every other probe in this module; the shield's caller degrades
+    by KEEPING the pattern, since a leaked seed file in a story commit is the worse of
+    the two failures."""
+    proc = git_bytes(repo, "ls-files", "-z", "--", *_literal_specs([rel]))
+    if proc.returncode != 0:
+        merged = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
+        raise GitError(f"git ls-files -z -- {rel} failed in {repo}: {merged}")
+    return {entry for entry in proc.stdout.split(b"\0") if entry} == {os.fsencode(rel)}
 
 
 def commits_above(repo: Path, baseline: str) -> list[str]:
@@ -307,7 +625,7 @@ def _prune_refs(
     for name in refs[keep:]:
         try:
             delete(name)
-        except Exception as exc:  # noqa: BLE001 - a git timeout/OSError on one ref
+        except Exception as exc:  # a git timeout/OSError on one ref
             # must not wedge the tail behind it any more than a GitError does; the
             # per-ref best-effort contract holds for the whole subprocess surface
             failed.append(f"{name} ({exc})")
@@ -411,10 +729,16 @@ def snapshot_worktree(
     Returns ``ref_name`` on success, or ``None`` when the tree is clean relative
     to HEAD (nothing to preserve — the intended non-destructive uncommitted-revert
     case). Raises :class:`GitError` on any git failure — the raise *surfaces* the
-    capture failure so the caller can decide: the commit-preservation caller
-    refuses to reset past unpreserved work, while the best-effort worktree caller
-    journals the failure and proceeds (the recovery ref is a safety net, not a
-    gate)."""
+    capture failure so the caller can decide. Since #340 the recovery ref is a
+    gate, not a safety net: the worktree caller's old best-effort "journal the
+    failure and proceed" contract is gone, and a plain rollback now refuses to
+    reset past work it could not park (only a re-drive, whose caller contract
+    forbids pausing, still journals and lets the human-directed reset run).
+
+    Not every failure here is a :class:`GitError`: spawn faults arrive typed as
+    :class:`GitSpawnError` since #343, but the ``TemporaryDirectory`` below can
+    raise a plain ``OSError`` outright (ENOSPC/EMFILE) — a filesystem fault no
+    git chokepoint can translate. Callers keep guarding ``(GitError, OSError)``."""
     head = rev_parse_head(repo)
     with tempfile.TemporaryDirectory() as td:
         env = {**os.environ, "GIT_INDEX_FILE": str(Path(td) / "index")}
@@ -487,8 +811,11 @@ def safe_rollback(
     resolve workflow just corrected. The `git reset --hard` would otherwise
     revert them (keep only guards untracked deletion). We snapshot the current
     tree with `git stash create`, reset, then restore those paths from the
-    snapshot. Untracked artifacts need no special handling: the reset leaves them
-    alone and the cleanup below skips `keep` dirs.
+    snapshot. If that snapshot cannot be taken we raise *before* the reset rather
+    than proceed with an empty one: skipping the restore would revert exactly what
+    `preserve` names, and it would do so silently. Untracked artifacts need no
+    special handling: the reset leaves them alone and the cleanup below skips
+    `keep` dirs.
 
     `policy.toml` (the operator's orchestration config) is *always* restored,
     regardless of `preserve`. It lives inside the kept `.bmad-loop` dir but is
@@ -507,6 +834,15 @@ def safe_rollback(
     policy_content = policy_path.read_bytes() if policy_path.is_file() else None
 
     rc, out = _git(repo, "stash", "create")
+    # A failed `stash create` silently empties `snapshot`, which disables the whole
+    # preserve restore below — the reset would then revert the very paths the caller
+    # asked to keep (a resolved re-drive's corrected spec), with no error anywhere.
+    # Raise before the reset, and only when a restore was actually requested: with
+    # no `preserve` the snapshot is unused, so the degrade stays correct there (both
+    # sweep callers rely on it). A clean tree is not a failure — it exits rc 0 with
+    # empty output, which the line below keeps handling as "nothing to restore from".
+    if rc != 0 and preserve:
+        raise GitError(f"git stash create failed in {repo}: {out}")
     snapshot = out.strip() if rc == 0 else ""
     rc, out = _git(repo, "reset", "--hard", baseline)
     if rc != 0:
@@ -518,8 +854,18 @@ def safe_rollback(
         # only untracked files). Any other failure means a protected path wasn't
         # restored: raise instead of silently dropping a resolved re-drive's
         # corrected spec (which would regress the re-drive into a recovery loop).
+        # `_run_git` pins LC_ALL=C, so this English substring is stable under a
+        # localized git (#236) — never translated out from under the match.
+        #
+        # The operand is LITERAL (#423 item 5). `preserve` carries operator-configured
+        # dirs, and this is a WRITE: a glob-matching neighbour is not merely restored
+        # alongside the target, it is reverted to the snapshot — measured, a plain
+        # `checkout <snap> -- 'doc*'` reverts an unrelated `docsa/f.md` edit, which is
+        # the operator's own uncommitted work destroyed by a step whose entire job is
+        # to preserve. `:(literal)` still matches a directory prefix, so each preserve
+        # dir restores everything beneath it exactly as before.
         for d in preserve:
-            rc, out = _git(repo, "checkout", snapshot, "--", d)
+            rc, out = _git(repo, "checkout", snapshot, "--", *_literal_specs([d]))
             if rc != 0 and "did not match" not in out:
                 raise GitError(f"git checkout {snapshot[:12]} -- {d} failed: {out}")
     if policy_content is not None:
@@ -594,13 +940,19 @@ def worktree_add(
 ) -> None:
     """Check `branch` out in a new worktree at `path` (which must not exist).
 
-    create=True (default) cuts a fresh `branch` at `base`. create=False mounts an
+    create=True (default) cuts a fresh `branch` at `base`, or from HEAD when
+    `base` is None (git's own default start-point). create=False mounts an
     existing `branch` (used to re-mount a shared run branch across serial units);
     `base` is ignored. Either way the branch must not already be checked out in
     another worktree — git refuses that.
     """
     if create:
-        rc, out = _git(repo, "worktree", "add", "-b", branch, str(path), base)
+        # `git worktree add -b <branch> <path> [<base>]`: cut the new branch at the
+        # caller's start-point, or from HEAD when none is given (git's own default).
+        cmd = ["worktree", "add", "-b", branch, str(path)]
+        if base is not None:
+            cmd.append(base)
+        rc, out = _git(repo, *cmd)
     else:
         rc, out = _git(repo, "worktree", "add", str(path), branch)
     if rc != 0:
@@ -612,6 +964,17 @@ def checkout_branch(repo: Path, name: str) -> None:
     rc, out = _git(repo, "checkout", name)
     if rc != 0:
         raise GitError(f"git checkout {name} failed in {repo}: {out}")
+
+
+def checkout_detach(repo: Path) -> None:
+    """Detach HEAD at its current commit, leaving working tree + index untouched.
+
+    Frees a shared branch name held by a kept worktree so a sibling worktree can
+    check that branch out (git refuses a branch checked out in another worktree).
+    """
+    rc, out = _git(repo, "checkout", "--detach")
+    if rc != 0:
+        raise GitError(f"git checkout --detach failed in {repo}: {out}")
 
 
 def worktree_remove(repo: Path, path: Path, force: bool = False) -> None:
@@ -626,8 +989,17 @@ def worktree_remove(repo: Path, path: Path, force: bool = False) -> None:
 
 def worktree_prune(repo: Path) -> None:
     """Drop administrative entries for worktrees whose directories are gone.
-    Best-effort housekeeping — never raises."""
-    _git(repo, "worktree", "prune")
+    Best-effort housekeeping — never raises. The return code is already ignored,
+    but `_git` can *raise* — GitError on a timeout (#156) or GitSpawnError on a
+    spawn fault (#343) — which would bypass this never-raise contract (and the
+    teardown degrade paths that lean on it — close_unit_workspace /
+    discard_worktree call prune from inside their own GitError guards). The
+    OSError in the net predates the #343 translation and stays as the belt for
+    any non-spawn fault: the contract holds at its source."""
+    try:
+        _git(repo, "worktree", "prune")
+    except (GitError, OSError):
+        pass
 
 
 def worktree_list(repo: Path) -> list[Path]:
@@ -744,7 +1116,12 @@ def _tree_dirty_vs_head(repo: Path) -> bool:
 
 
 def merge_branch(
-    repo: Path, branch: str, *, strategy: str = "merge", message: str | None = None
+    repo: Path,
+    branch: str,
+    *,
+    strategy: str = "merge",
+    message: str | None = None,
+    allow_empty_squash: bool = False,
 ) -> None:
     """Merge `branch` into the branch currently checked out in `repo`.
 
@@ -755,6 +1132,11 @@ def merge_branch(
     Editor-induced dirt first via `clean_incoming_collisions`. When git refuses
     a merge at pre-flight (no MERGE_HEAD created) the tree was never touched, so
     no abort/reset is attempted and the raw git error is raised verbatim.
+
+    ``allow_empty_squash`` is recovery-only: re-running a squash that committed
+    before a host loss stages nothing because the target already has the merged
+    tree. That clean result confirms the replay without manufacturing an empty
+    commit; ordinary squash calls keep commit failures strict.
     """
     if strategy == "ff":
         rc, out = _git(repo, "merge", "--ff-only", branch)
@@ -783,6 +1165,8 @@ def merge_branch(
                 if reset_rc != 0:
                     detail += f"; AND git reset --hard HEAD failed (tree not restored): {reset_out}"
             raise GitError(detail)
+        if allow_empty_squash and not _tree_dirty_vs_head(repo):
+            return
         msg = message or f"Squash-merge branch '{branch}'"
         rc, out = _git(repo, "commit", "-m", msg)
         if rc != 0:
@@ -804,12 +1188,7 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
     size, so a stray build dir or huge log can't balloon the patch. None lifts the
     cap (capture everything regardless of size).
     """
-    proc = subprocess.run(
-        ["git", "-C", str(repo), "diff", baseline, "--"],
-        capture_output=True,
-        text=True,
-        timeout=GIT_TIMEOUT_S,
-    )
+    proc = _run_git(["git", "-C", str(repo), "diff", baseline, "--"], repo)
     if proc.returncode != 0:
         raise GitError(f"git diff {baseline} failed in {repo}: {proc.stderr.strip()}")
     parts = [proc.stdout]
@@ -837,12 +1216,7 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
         # it exits 1 precisely because the files differ — expected here. Any other
         # non-zero code is a real failure (bad path, internal error), not "files
         # differ", so don't silently fold it into the patch.
-        u = subprocess.run(
-            ["git", "-C", str(repo), "diff", "--no-index", "--", os.devnull, rel],
-            capture_output=True,
-            text=True,
-            timeout=GIT_TIMEOUT_S,
-        )
+        u = _run_git(["git", "-C", str(repo), "diff", "--no-index", "--", os.devnull, rel], repo)
         if u.returncode not in (0, 1):
             raise GitError(
                 f"git diff --no-index for untracked {rel!r} failed in {repo}: {u.stderr.strip()}"
@@ -851,66 +1225,45 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
     return "".join(parts)
 
 
-def read_frontmatter(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    text = path.read_text(encoding="utf-8")
-    if not text.startswith("---"):
-        return {}
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return {}
-    try:
-        doc = yaml.safe_load(parts[1])
-    except yaml.YAMLError:
-        return {}
-    return doc if isinstance(doc, dict) else {}
+def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
+    """Rewrite (or insert) a scalar ``<key>:`` line in a spec's `---`…`---`
+    frontmatter block.
 
+    Same verified in-place line surgery as `set_frontmatter_status` (no YAML
+    round-trip) so the spec's formatting, comments, and field order survive, and
+    the same three-way return: True on a landed rewrite, False for **nothing to
+    change** (no file, no frontmatter block, already at the value), and
+    `FrontmatterWriteError` when the reader can see the key in a shape no line
+    edit can safely move. "Comments survive" includes a trailing inline comment
+    on the edited line itself: this shares `frontmatter._replace_value` with the
+    status helper, so it inherits that renderer's certified-boundary carry (and
+    its quote drop) rather than restating either.
 
-def status_of(fm: dict[str, Any]) -> str:
-    """Normalized spec status from a frontmatter dict: stripped + lowercased.
+    Unlike the status helper, a missing key is INSERTED as the block's last
+    line: callers assert a field's value whether or not the skill wrote one
+    (the patch-restore re-arm re-stamps ``baseline_revision``, which only the
+    skill's step-03 writes). The insert is now gated on what `read_frontmatter`
+    SEES rather than on a line-scan miss, which was a defect of its own — a
+    quoted ``"baseline_revision":`` was missed by the scan and a second one
+    appended, so the spec carried the key twice and the reader resolved the
+    wrong one.
 
-    The single point all spec-frontmatter status gates read through, so casing
-    never decides a gate — the spec template and sprint-status tokens are
-    lowercase, so a stray ``Done``/``In-Review`` from a hand-edited spec still
-    matches. (``devcontract`` keeps its own lowercasing; it parses skill-written
-    prose where casing genuinely varies.)
-    """
-    return str(fm.get("status", "")).strip().lower()
-
-
-def set_frontmatter_status(path: Path, status: str) -> bool:
-    """Rewrite the `status:` field in a spec's `---`…`---` frontmatter block.
-
-    A minimal in-place line replacement (not a YAML round-trip) so the spec's
-    formatting, comments, and field order survive — only the status value
-    changes. Returns True when the file was rewritten, False when it has no
-    frontmatter or already carries `status`. Idempotent.
+    Byte-preserving on the same terms as its sibling: ``read_bytes().decode`` in,
+    ``write_bytes`` out, so a CRLF spec is not relaid to LF (nor an LF one to
+    CRLF on Windows) by a write contracted to move one field. The INSERTED line
+    takes the block's own ending, not a bare ``\\n``.
     """
     if not path.is_file():
         return False
-    text = path.read_text(encoding="utf-8")
-    if not text.startswith("---"):
+    text = path.read_bytes().decode("utf-8")
+    split = _split_frontmatter(text)
+    if split is None:
         return False
-    parts = text.split("---", 2)
-    if len(parts) < 3:
+    before, block, after = split
+    edited = _edit_frontmatter_block(block, key, value, insert=True)
+    if edited is None:
         return False
-    block_lines = parts[1].splitlines(keepends=True)
-    replaced = False
-    for i, line in enumerate(block_lines):
-        stripped = line.lstrip()
-        if stripped.startswith("status:") and not stripped.startswith("status_"):
-            indent = line[: len(line) - len(stripped)]
-            newline = "\n" if line.endswith("\n") else ""
-            block_lines[i] = f"{indent}status: {status}{newline}"
-            replaced = True
-            break
-    if not replaced:
-        return False
-    rebuilt = parts[0] + "---" + "".join(block_lines) + "---" + parts[2]
-    if rebuilt == text:  # already at the target value — idempotent no-op
-        return False
-    path.write_text(rebuilt, encoding="utf-8")
+    path.write_bytes((before + edited + after).encode("utf-8"))
     return True
 
 
@@ -938,7 +1291,9 @@ def artifact_relpaths(paths: ProjectPaths) -> tuple[str, ...]:
     return tuple(out)
 
 
-def verify_dev_exclude_relpaths(paths: ProjectPaths, spec_path: Path) -> tuple[str, ...]:
+def verify_dev_exclude_relpaths(
+    paths: ProjectPaths, spec_path: Path, restore_patch: str | None = None
+) -> tuple[str, ...]:
     """Repo-relative posix paths the dev/bundle proof-of-work gate excludes from
     `has_changes_since` — file-granularity, unlike `artifact_relpaths`' whole-folder
     exclusion (still used as-is by `Engine._protected_relpaths` for rollback
@@ -957,15 +1312,25 @@ def verify_dev_exclude_relpaths(paths: ProjectPaths, spec_path: Path) -> tuple[s
     reconciliation registers as real work instead of a permanent false "no changes
     since baseline".
 
+    `restore_patch` (the task's latched intent-gap patch file, BMAD-METHOD #2564)
+    is excluded too when set: the patch is untracked halt residue under the
+    protected artifact dirs that survives every reset, so counting it would let a
+    restore re-drive whose session produced nothing pass the gate on the patch
+    file's mere presence — the gate must key on the APPLIED work (the tracked diff
+    from baseline), not on the orchestrator-owned patch that carried it.
+
     `spec_path` comes from a session-reported (untrusted) `spec_file` string, so
     it is `.resolve()`d before deriving the relpath, same as `spec_within_roots`:
     an un-normalized `..`/`.` segment would still resolve to the real on-disk
     file (the OS resolves it), but as a raw string it wouldn't match git's own
     normalized path output, silently defeating this exclude and letting a bare
     status flip on the session's own spec count as real work."""
+    candidates: list[Path] = [paths.sprint_status, spec_path]
+    if restore_patch:
+        candidates.append(resolve_restore_path(restore_patch, paths.project))
     out: list[str] = []
     project = paths.project.resolve()
-    for path in (paths.sprint_status, spec_path):
+    for path in candidates:
         try:
             rel = path.resolve().relative_to(project).as_posix()
         except ValueError:
@@ -1002,6 +1367,29 @@ def resolve_spec_path(spec_file: str, paths: ProjectPaths) -> Path:
     return paths.implementation_artifacts / p
 
 
+def _gate_frontmatter(spec_path: Path) -> dict[str, Any] | VerifyOutcome:
+    """Read a spec's frontmatter for a verify gate, degrading an unreadable spec
+    to a retryable :class:`VerifyOutcome` instead of a whole-run crash.
+
+    Every verify gate reads the spec back while the dev skill may still be
+    rewriting it, so an OSError here (a TOCTOU truncation, a transient lock, a
+    momentarily unsearchable parent) is a fault with a *designed* transient
+    producer — not a broken orchestrator. `read_frontmatter` itself keeps raising
+    (repair callers depend on that); only these observation gates degrade.
+
+    The reason is deliberately distinct from a status mismatch: returning ``{}``
+    here would read as status ``""`` and let a read fault masquerade as "the
+    skill forgot to set the status", sending a repair session after a bug that
+    is not there. Retries are not silent — the reason lands in the journal via
+    `dev-decision` / `review-verify-failed`, and a persistent fault is bounded
+    into DEFER (or PAUSE) by `escalation.decide_dev` / `decide_review_session`.
+    """
+    try:
+        return read_frontmatter(spec_path)
+    except OSError as e:
+        return VerifyOutcome.retry(f"spec unreadable ({e.__class__.__name__}: {e}): {spec_path}")
+
+
 def _verify_shared_gates(
     spec_path: Path,
     rj: dict[str, Any],
@@ -1009,39 +1397,79 @@ def _verify_shared_gates(
     paths: ProjectPaths,
     *,
     expected_status: str,
-    proof_exclude: tuple[str, ...] | None,
+    extra_exclude: tuple[str, ...] | None,
+    allow_ancestor_baseline: bool = False,
+    fm: dict[str, Any] | None = None,
 ) -> VerifyOutcome | None:
     """The workflow-tag, expected-status, baseline-match, and proof-of-work gates
     shared verbatim by :func:`verify_dev`, :func:`verify_dev_bundle`, and
     :func:`verify_dev_stories` — factored out so the sprint-mode and stories-mode
-    gates can't silently drift. Reads frontmatter once (callers must not re-read
-    it). Returns a failing :class:`VerifyOutcome`, or ``None`` when every gate
-    passes and the caller may run its mode-specific tail. ``proof_exclude=None``
-    skips the proof-of-work gate (a plan-halt leg produced only its own spec)."""
+    gates can't silently drift. Reads frontmatter once; a caller that had to read
+    it first to *choose* ``expected_status`` passes what it read as ``fm`` so the
+    single-read contract still holds (no caller re-reads it).  Returns a failing
+    :class:`VerifyOutcome`, or ``None`` when every gate passes and the caller may
+    run its mode-specific tail.
+
+    The proof-of-work exclude is derived here from the `task` this gate already
+    receives (`verify_dev_exclude_relpaths`, which needs the latched restore patch);
+    ``extra_exclude`` carries only what a mode adds on top — ``()`` for sprint and
+    bundle, the story record + manifest for stories. Threading the restore patch in
+    from three call sites instead left a default-None foot-gun for a future fourth
+    mode, which would silently let a restore re-drive pass proof-of-work on the
+    patch file's mere presence. ``extra_exclude=None`` still skips the gate outright
+    (a plan-halt leg produced only its own spec)."""
     workflow = rj.get("workflow")
     if workflow != DEV_WORKFLOW:
         return VerifyOutcome.retry(
             f"dev result.json workflow is {workflow!r}, expected {DEV_WORKFLOW!r}"
         )
 
-    fm = read_frontmatter(spec_path)
+    if fm is None:
+        read = _gate_frontmatter(spec_path)
+        if isinstance(read, VerifyOutcome):
+            return read
+        fm = read
     status = status_of(fm)
     if status != expected_status:
         return VerifyOutcome.retry(
             f"spec status is {status!r}, expected {expected_status!r}: {spec_path}"
         )
 
-    claimed_baseline = str(fm.get("baseline_commit", "")).strip()
+    # The generic bmad-dev-auto skill stamps `baseline_revision`, never
+    # `baseline_commit` — that name exists only in the result.json devcontract
+    # synthesizes, which this gate does not consult (it re-reads frontmatter).
+    # An absent key skips the check below, so reading `baseline_commit` alone
+    # made this gate dead code for every generic-skill session. Read both, the
+    # same idiom as `devcontract.synthesize_result`.
+    claimed_baseline = str(fm.get("baseline_commit", fm.get("baseline_revision", ""))).strip()
     if task.baseline_commit and claimed_baseline not in ("", "NO_VCS"):
         if not same_commit(claimed_baseline, task.baseline_commit):
-            return VerifyOutcome.retry(
-                f"spec baseline_commit {claimed_baseline[:12]} does not match "
-                f"orchestrator-recorded baseline {task.baseline_commit[:12]}"
-            )
+            # A deferred-work bundle may legitimately adopt a pre-existing story
+            # spec: bmad-dev-auto routes a "follow-up review of story X" bundle
+            # into that story's done spec, whose baseline_revision is the
+            # story's original dev baseline — necessarily older than the unit
+            # worktree cut for the bundle (#161). An *ancestor* baseline means
+            # the session diffed from an earlier commit on the unit's own
+            # history (a superset of the unit's changes), which is sound; a
+            # diverged or unknown baseline still fails.
+            if not (
+                allow_ancestor_baseline
+                and is_ancestor(paths.project, claimed_baseline, task.baseline_commit)
+            ):
+                return VerifyOutcome.retry(
+                    f"spec baseline {claimed_baseline[:12]} does not match "
+                    f"orchestrator-recorded baseline {task.baseline_commit[:12]}"
+                )
 
-    if proof_exclude is not None and task.baseline_commit:
+    if extra_exclude is not None and task.baseline_commit:
+        exclude = verify_dev_exclude_relpaths(paths, spec_path, task.restore_patch) + extra_exclude
         try:
-            if not has_changes_since(paths.project, task.baseline_commit, exclude=proof_exclude):
+            if not has_changes_since(
+                paths.project,
+                task.baseline_commit,
+                exclude=exclude,
+                baseline_untracked=task.baseline_untracked,
+            ):
                 return VerifyOutcome.retry("no changes in worktree since baseline commit")
         except GitError as e:
             return VerifyOutcome.escalate(str(e))
@@ -1049,11 +1477,46 @@ def _verify_shared_gates(
     return None
 
 
+# The terminal spec status of a story whose agent-doable work is finished but
+# whose acceptance criteria include external actions only a human can perform
+# (#335). Mirrors devcontract.AWAITING_OPERATOR, kept literal here for the same
+# reason PLAN_HALT_STATUS is: devcontract imports verify, never the reverse.
+AWAITING_OPERATOR = "awaiting-operator"
+
+
+def _operator_actions_gate(fm: dict[str, Any], story_key: str) -> VerifyOutcome | None:
+    """Refuse a park that enumerates nothing, with feedback a repair session can
+    act on. ``None`` when the spec declares at least one usable action.
+
+    A park is *defined* by owing external work: a spec at ``awaiting-operator``
+    with no readable ``operator_actions:`` names no obligation, so confirming it
+    later would be a human acknowledging a blank. Every malformed shape reaches
+    here as an empty reading (:func:`frontmatter.operator_actions_of`), and all
+    of them have the same remedy, so one message covers them: name the actions,
+    or finalize the status that matches reality. ``fixable=True`` — the tree is
+    real work and the defect is one frontmatter block, so the reason goes to a
+    repair session as feedback rather than throwing the attempt away.
+    """
+    if operator_actions_of(fm):
+        return None
+    return VerifyOutcome.retry(
+        f"spec for {story_key} is 'awaiting-operator' but declares no usable "
+        f"operator_actions: add a YAML list of strings naming each external "
+        f"action a human must perform, or finalize the status the work actually "
+        f"reached ('done' when nothing is owed, 'blocked' when the story cannot "
+        f"proceed)",
+        fixable=True,
+    )
+
+
 def verify_dev(
     task: StoryTask,
     paths: ProjectPaths,
     result_json: dict[str, Any] | None,
     review_enabled: bool = True,
+    *,
+    operator_park: bool = False,
+    engine_written: tuple[str, ...] = (),
 ) -> VerifyOutcome:
     """Verify a dev session's on-disk artifacts against its result.json claims.
 
@@ -1063,6 +1526,20 @@ def verify_dev(
     orchestrator's, has produced changes since that baseline, and that the
     story's sprint-status was advanced to the matching stage. Returns a retryable
     VerifyOutcome on any mismatch, escalates on git failure, passes otherwise.
+
+    ``operator_park`` (``[operator] enabled``, engine-supplied) adds one more
+    accepted spec/sprint pair: ``(awaiting-operator, awaiting-operator)``, the
+    park a dev session declares when the story's remaining work is a human's
+    (#335). The OBSERVED spec status selects which pair is demanded — the skill
+    decides whether it parked, and the gate then holds it to the matching board
+    state and to a non-empty action list. Off by policy, the token is simply not
+    a terminal the gate knows, so it fails the ordinary status check and the
+    session is retried with that mismatch as feedback.
+
+    ``engine_written`` names project-relative paths the orchestrator itself
+    wrote above this gate during the attempt. They compose with the mode's normal
+    proof-of-work exclusions so engine bookkeeping cannot masquerade as session
+    work; see :meth:`Engine._harvest_gate_exclude`.
     """
     rj = result_json or {}
     spec_file = rj.get("spec_file")
@@ -1072,20 +1549,33 @@ def verify_dev(
     if not spec_path.is_file():
         return VerifyOutcome.retry(f"claimed spec file does not exist: {spec_path}")
 
+    fm = _gate_frontmatter(spec_path)
+    if isinstance(fm, VerifyOutcome):
+        return fm
+    parked = operator_park and status_of(fm) == AWAITING_OPERATOR
+    if parked:
+        actions = _operator_actions_gate(fm, task.story_key)
+        if actions is not None:
+            return actions
+
     # With review disabled, the dev session runs its own internal review and
-    # finalizes straight to done; otherwise it hands off at in-review.
+    # finalizes straight to done; otherwise it hands off at in-review. A park
+    # short-circuits both: the story is finished as far as any agent can take it.
     gate = _verify_shared_gates(
         spec_path,
         rj,
         task,
         paths,
-        expected_status="in-review" if review_enabled else "done",
-        proof_exclude=verify_dev_exclude_relpaths(paths, spec_path),
+        expected_status=(
+            AWAITING_OPERATOR if parked else ("in-review" if review_enabled else "done")
+        ),
+        extra_exclude=engine_written,
+        fm=fm,
     )
     if gate is not None:
         return gate
 
-    expected_sprint = "review" if review_enabled else "done"
+    expected_sprint = AWAITING_OPERATOR if parked else ("review" if review_enabled else "done")
     sprint = story_status(paths.sprint_status, task.story_key)
     if sprint != expected_sprint:
         return VerifyOutcome.retry(
@@ -1101,13 +1591,17 @@ def verify_dev_bundle(
     paths: ProjectPaths,
     result_json: dict[str, Any] | None,
     review_enabled: bool = True,
+    *,
+    engine_written: tuple[str, ...] = (),
 ) -> VerifyOutcome:
     """verify_dev for a deferred-work bundle: bundles have no sprint-status
     entry. The orchestrator owns the bundle→dw-id binding (``task.dw_ids``,
     marked done by ``SweepEngine``'s ledger sync); the generic ``bmad-dev-auto``
     primitive never authors dw ids. So the dw_ids cross-check is enforced only
     when the session actually claims them — an empty/absent claim is the normal
-    generic path and passes."""
+    generic path and passes.
+
+    ``engine_written`` has the same contract as :func:`verify_dev`."""
     rj = result_json or {}
     spec_file = rj.get("spec_file")
     if not spec_file:
@@ -1117,13 +1611,16 @@ def verify_dev_bundle(
         return VerifyOutcome.retry(f"claimed spec file does not exist: {spec_path}")
 
     # With review disabled, the dev session finalizes the bundle straight to done.
+    # allow_ancestor_baseline: a bundle that adopts a pre-existing story spec
+    # (follow-up review) carries that spec's older-but-ancestral baseline (#161).
     gate = _verify_shared_gates(
         spec_path,
         rj,
         task,
         paths,
         expected_status="in-review" if review_enabled else "done",
-        proof_exclude=verify_dev_exclude_relpaths(paths, spec_path),
+        extra_exclude=engine_written,
+        allow_ancestor_baseline=True,
     )
     if gate is not None:
         return gate
@@ -1154,6 +1651,7 @@ def verify_dev_stories(
     spec_folder: Path,
     review_enabled: bool = True,
     plan_halt: bool = False,
+    engine_written: tuple[str, ...] = (),
 ) -> VerifyOutcome:
     """verify_dev for stories mode: the story spec lives at the id-keyed path
     ``<spec-folder>/stories/<id>-<slug>.md`` and there is no sprint-status entry.
@@ -1169,12 +1667,12 @@ def verify_dev_stories(
     ``plan_halt`` verifies a spec_checkpoint story's plan-halt leg instead of an
     implementation: the expected status is ``ready-for-dev`` (the plan is done,
     not the code) and the proof-of-work gate is skipped — a plan writes only its
-    own spec, so requiring code changes would spuriously fail every plan leg. The
-    spec-resolution, id-prefix, workflow, and baseline gates still run, and
-    ``task.spec_file`` is still recorded. A ``plan_halt`` leg also requires the
-    ``result_json`` to carry the ``plan_halt`` marker ``devcontract`` emits on a
-    clean plan-halt, so a died-mid-flight ``ready-for-dev`` can't be mistaken for
-    a successful plan.
+    own spec, which proof-of-work already excludes, so requiring code changes
+    would spuriously fail every plan leg. The spec-resolution, id-prefix, workflow,
+    and baseline gates still run, and ``task.spec_file`` is still recorded. A
+    ``plan_halt`` leg also requires the ``result_json`` to carry the ``plan_halt``
+    marker ``devcontract`` emits on a clean plan-halt, so a died-mid-flight
+    ``ready-for-dev`` can't be mistaken for a successful plan.
     """
     # Deferred to avoid a verify<->stories import cycle: stories imports
     # read_frontmatter/status_of from this module at top level, so verify must not
@@ -1220,21 +1718,43 @@ def verify_dev_stories(
     else:
         expected = "in-review" if review_enabled else "done"
 
-    # A plan-halt leg produced only its own spec (the plan), so proof-of-work
-    # would spuriously fail; skip it (proof_exclude=None) and record the plan spec.
+    # A plan-halt leg produced only its own spec (the plan), which proof-of-work
+    # already excludes; skip it (extra_exclude=None) and record the plan spec.
+    # Otherwise stories mode adds the spec folder's stories/ subdir + stories.yaml
+    # on top of the gate's own file-granular exclude — NOT the whole-folder
+    # artifact_relpaths, so a story whose entire authorized scope is ledger/spec
+    # reconciliation doesn't register as a false "no changes". Engine-written
+    # paths compose only on that live-gate leg; ``None`` must remain ``None`` for
+    # plan halt rather than being combined with a tuple.
     gate = _verify_shared_gates(
         spec_path,
         rj,
         task,
         paths,
         expected_status=expected,
-        proof_exclude=None if plan_halt else artifact_relpaths(paths),
+        extra_exclude=(
+            None if plan_halt else _stories_relpaths(paths.project, spec_folder) + engine_written
+        ),
     )
     if gate is not None:
         return gate
 
     task.spec_file = str(spec_path)
     return VerifyOutcome.passed()
+
+
+def _stories_relpaths(project: Path, spec_folder: Path) -> tuple[str, ...]:
+    """Proof-of-work exclude prefixes for the story record + manifest: the spec
+    folder's ``stories/`` subdir and its ``stories.yaml``, project-relative. Empty
+    when the spec folder is outside the project tree (nothing to exclude there)."""
+    from .stories import STORIES_FILENAME, STORIES_SUBDIR
+
+    try:
+        rel = spec_folder.resolve().relative_to(project.resolve()).as_posix()
+    except ValueError:
+        return ()
+    base = "" if rel == "." else f"{rel}/"
+    return (f"{base}{STORIES_SUBDIR}", f"{base}{STORIES_FILENAME}")
 
 
 @dataclass(frozen=True)
@@ -1244,7 +1764,155 @@ class CommandResult:
     output_tail: str
 
 
+# sh launcher convention (verify commands run shell=True): 126 = command found
+# but not executable, 127 = command not found. Both are environment faults —
+# deterministic for a given tree, unfixable by a repair session (issue #126:
+# seeded worktrees that lost +x burned dev attempts on no-op repairs).
+ENV_FAULT_RCS = frozenset({126, 127})
+
+# cmd has no such convention (issue #302): `cmd /c
+# <missing tool>` exits 1 — the same code an ordinary test failure uses — and
+# 9009 surfaces only as %ERRORLEVEL% *inside* a batch file, so it reaches us
+# only when the verify command is itself a .cmd/.bat propagating it. Worse,
+# handing cmd a file it cannot execute (extension not in PATHEXT: a .sh, a
+# .txt) exits 0 without running it, so the check silently "passes". The win32
+# arm therefore classifies on three independent signals instead of the rc.
+_CMD_ENV_FAULT_RC = 9009
+
+# Matched against the tail's last two non-empty lines only, because cmd writes its
+# message to stderr and ``run_verify_commands`` builds the tail as stdout + stderr —
+# so the message lands at the end, and it wraps ("… is not recognized as an internal
+# or external command,\noperable program or batch file."). Note what that ordering
+# does *not* buy: stderr is appended wholesale, not interleaved, so a command whose
+# own stderr ends with the phrase is read as a fault too. That is the accepted edge —
+# a verify command whose last stderr line is "X is not recognized" has a missing X
+# either way. Localized Windows prints neither phrase; the token probe covers those.
+_CMD_NOT_RECOGNIZED = "is not recognized as an internal or external command"
+_CMD_ACCESS_DENIED = "access is denied"
+_CMD_MESSAGE_LINES = 2
+
+# cmd's *internal* commands: shutil.which cannot resolve them, so without this
+# allowlist every failing `if exist …` / `exit 1` would classify as an env
+# fault. External tools (findstr, robocopy, …) resolve through which as usual.
+_CMD_BUILTINS = frozenset(
+    "assoc break call cd chdir cls color copy date del dir echo endlocal erase exit for"
+    " ftype goto if md mkdir mklink move path pause popd prompt pushd rd rem ren rename"
+    " rmdir set setlocal shift start time title type ver verify vol".split()
+)
+
+
+_CMD_METACHARS = ("%", "!", "<", ">", "&", "|", ";", "^")
+
+
+def _leading_token(command: str) -> str | None:
+    """The executable part of a shell command string, or None when nothing about
+    it can be probed. ``posix=False`` keeps Windows backslashes intact (posix mode
+    eats them), at the cost of leaving quotes on the token — hence the strip.
+
+    Returning None is the safe answer: it drops the probe, which can only ever
+    *add* an env fault. A token cmd would expand before running (``%VAR%``,
+    delayed ``!VAR!``) is unprobeable for that reason — resolving the literal
+    would report "not found" for a tool that is right there."""
+    try:
+        parts = shlex.split(command, posix=False)
+    except ValueError:  # unbalanced quotes — no reliable token to probe
+        return None
+    if not parts:
+        return None
+    # `(pytest -q)` tokenizes to `(pytest`, `(pytest)` to `(pytest)` — cmd's
+    # grouping parens and echo-suppressing `@` are shell syntax, not the name.
+    token = parts[0].strip('"').strip("()@")
+    # Anything the shell would still act on is not a name to probe: expansion
+    # (%VAR%, delayed !VAR!), redirection, or an operator shlex left attached
+    # (`pytest|findstr x` splits to one token). Probing those reports "not found"
+    # for a tool that is right there, so drop the probe instead.
+    if not token or any(char in token for char in _CMD_METACHARS):
+        return None
+    return token
+
+
+def _cmd_executable(path: Path) -> bool:
+    """Whether cmd resolves this path directly or by appending PATHEXT."""
+    pathext = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    extensions = tuple(ext.strip().lower() for ext in pathext.split(";") if ext.strip())
+    return (path.is_file() and path.suffix.lower() in extensions) or any(
+        Path(f"{path}{ext}").is_file() for ext in extensions
+    )
+
+
+def _win32_env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
+    """Windows env-fault evidence, cheapest signal first, or None. Each signal is
+    independently sufficient; see the _CMD_* constants for why the rc alone isn't."""
+    if result.returncode < 0:
+        # the timeout sentinel: the command ran and hung, so it was found and it
+        # was runnable — none of the signals below can apply to it.
+        return None
+    if result.returncode == _CMD_ENV_FAULT_RC:
+        return f"rc={_CMD_ENV_FAULT_RC} — cmd reported the command as not found"
+    lines = [line.strip() for line in result.output_tail.splitlines() if line.strip()]
+    if result.returncode != 0 and lines:
+        closing = " ".join(lines[-_CMD_MESSAGE_LINES:])
+        if _CMD_NOT_RECOGNIZED in closing.lower():
+            return f"cmd: {closing}"
+        if _CMD_ACCESS_DENIED in lines[-1].lower():
+            return f"cmd: {lines[-1]}"
+    token = _leading_token(result.command)
+    if token is None:
+        return None
+    token_path = cwd / token
+    try:
+        names_a_file = token_path.is_file()
+        local_executable = _cmd_executable(token_path)
+    except OSError:  # a token no filesystem call can even ask about
+        return None
+    if names_a_file and not local_executable and token.lower() not in _CMD_BUILTINS:
+        # The builtin guard is the same one the PATH branch carries, for the other
+        # half of cmd's resolution order: an *unqualified* internal name is answered
+        # internally, before any directory is searched, so a file that happens to be
+        # named `echo` / `set` / `start` is never what runs and must not be read as a
+        # broken one. Only the bare name is exempt — `.\echo`, `C:\…\echo` are file
+        # references cmd does try to run, and they still classify below.
+        #
+        # PATHEXT is cmd's contract for what it *runs*; anything else it hands to
+        # the file association. For the extensions this is about (.sh, .txt) that
+        # association executes nothing and returns 0, so a green rc means nothing
+        # was verified. An extension with a console association outside PATHEXT
+        # (.rb, .pl on a host that registered them) does run — and is escalated
+        # here anyway, deliberately: what an association returns is the *app's*
+        # convention, not the script's, so it is not an exit code to gate on.
+        # The message names the token, so the fix ("ruby check.rb") is obvious.
+        return f"{token} is not executable by cmd (extension not in PATHEXT)"
+    if (
+        result.returncode != 0
+        and not local_executable  # cmd searches the run's own directory before PATH
+        and token.lower() not in _CMD_BUILTINS
+        and shutil.which(token) is None
+    ):
+        return f"{token} not found on PATH"
+    return None
+
+
+def env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
+    """Why this verify command is an environment fault rather than a story
+    failure, or None if it is not one. Per-shell: verify commands run through
+    the host shell, and sh and cmd signal a broken environment differently."""
+    if result.returncode in ENV_FAULT_RCS:
+        return f"rc={result.returncode}"
+    if sys.platform != "win32":
+        return None
+    return _win32_env_fault_reason(result, cwd)
+
+
 def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
+    """Run each of the policy's verify commands, one CommandResult apiece.
+
+    Output decodes with ``errors="replace"`` (#378): the children are arbitrary
+    operator tools whose bytes are not ours to constrain, the captured tail is
+    display-only feedback for a human or a repair session (already lossy at
+    ``[-2000:]``), and one undecodable byte must not raise mid-loop and lose
+    *every* command's result. Decoding stays on the locale codec (``text=True``)
+    precisely because these are host tools — contrast tui/launch.py, which pins
+    ``encoding="utf-8"`` because its child is our own UTF-8 CLI."""
     results = []
     for command in policy.verify.commands:
         try:
@@ -1256,6 +1924,7 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
                 cwd=cwd,
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=COMMAND_TIMEOUT_S,
             )
             output = (proc.stdout + proc.stderr)[-2000:]
@@ -1267,8 +1936,26 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
 
 def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
     """Run the policy's deterministic verify commands. Failures are fixable:
-    the captured output is concrete feedback a repair session can act on."""
-    for result in run_verify_commands(policy, cwd):
+    the captured output is concrete feedback a repair session can act on —
+    except environment faults (see env_fault_reason), which escalate so the run
+    pauses for an environment fix instead of burning story budgets. An env
+    fault anywhere in the run wins over earlier ordinary failures: a repair
+    session dispatched for the ordinary failure would still run in the
+    broken environment. Note the first loop inspects rc=0 results too — on
+    Windows an unrunnable command is a silent pass, not a failure (#302)."""
+    results = run_verify_commands(policy, cwd)
+    for result in results:
+        reason = env_fault_reason(result, cwd)
+        if reason is not None:
+            return VerifyOutcome.escalate(
+                f"verify environment fault ({reason}): {result.command}\n"
+                "command not found / not executable — this is the run environment, "
+                "not the story; fix the environment, then re-arm the escalation "
+                "(the attempt budget resets on re-arm)\n"
+                f"{result.output_tail}",
+                env_fault=True,
+            )
+    for result in results:
         if result.returncode != 0:
             return VerifyOutcome.retry(
                 f"verify command failed (rc={result.returncode}): {result.command}\n"
@@ -1278,20 +1965,110 @@ def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
     return VerifyOutcome.passed()
 
 
-def verify_review(task: StoryTask, paths: ProjectPaths, policy: Policy) -> VerifyOutcome:
+def verify_review(
+    task: StoryTask,
+    paths: ProjectPaths,
+    policy: Policy,
+    *,
+    sprint_reached_done: bool = False,
+    operator_park: bool = False,
+) -> VerifyOutcome:
+    """Gate a completed review pass: spec at ``done``, sprint-status at ``done``,
+    deterministic verify commands green.
+
+    ``sprint_reached_done`` tells the gate that the orchestrator had already
+    advanced this story's sprint-status to ``done`` before the review ran (it is
+    the sole ``sprint_advance`` caller, ``verify_dev`` asserted the write landed,
+    and ``advance`` never regresses). A board now sitting *earlier* than ``done``
+    is therefore not a stage the story never reached — it is a review session
+    deliberately revoking the sign-off. Nothing in the review loop re-advances
+    the board, so retrying only replays the same failure until the budget runs
+    out and the work is rolled back; under
+    ``review.on_status_contradiction = "escalate"`` (the default) the gate
+    escalates instead, naming both sides. See #334.
+
+    ``(awaiting-operator, awaiting-operator)`` is the second accepted pair, on
+    the same observed-spec-status selection ``verify_dev`` uses: this is the gate
+    the park path runs before committing (``Engine._park_awaiting_operator``), so
+    parked work clears exactly the deterministic checks every other commit path
+    clears — the pair, a non-empty action list, and the verify commands. The
+    sign-off-regression arm stays scoped to the ``done`` pair: a board short of
+    ``awaiting-operator`` is a stage never reached, not a revoked sign-off.
+
+    ``operator_park`` is the SAME engine-supplied flag ``verify_dev`` takes, not a
+    second reading of ``policy.operator.enabled``, so the two gates cannot
+    disagree about whether this run parks. They would: the engine's
+    ``_operator_park_enabled`` is an override seam, and a mode that opts out of
+    parking while still reaching this gate would otherwise find it accepting a
+    park the engine itself refuses to take."""
     if not task.spec_file:
         return VerifyOutcome.retry("no spec file recorded for task")
-    fm = read_frontmatter(Path(task.spec_file))
+    fm = _gate_frontmatter(Path(task.spec_file))
+    if isinstance(fm, VerifyOutcome):
+        return fm
+    status = status_of(fm)
+    expected = AWAITING_OPERATOR if (operator_park and status == AWAITING_OPERATOR) else "done"
+    if status != expected:
+        return VerifyOutcome.retry(f"spec status is {status!r}, expected {expected!r}")
+    if expected == AWAITING_OPERATOR:
+        actions = _operator_actions_gate(fm, task.story_key)
+        if actions is not None:
+            return actions
+
+    sprint = story_status(paths.sprint_status, task.story_key)
+    if sprint != expected:
+        if expected == "done" and _is_signoff_regression(sprint, sprint_reached_done, policy):
+            return VerifyOutcome.escalate(
+                f"review revoked the sprint sign-off for {task.story_key}: the "
+                f"orchestrator advanced the board to 'done' after dev verified, "
+                f"and the review session wrote it back to {sprint!r} while leaving "
+                f"the spec frontmatter at 'done'. The two sides disagree about "
+                f"whether the story is finished, and no further review cycle can "
+                f"reconcile them — the review loop never re-advances the board, so "
+                f"the remaining cycles would burn down onto a defer that rolls the "
+                f"work back. Resolve by either completing the outstanding work and "
+                f"re-arming the escalation (the attempt budget resets on re-arm), "
+                f"or accepting the story and advancing the board yourself; set "
+                f'review.on_status_contradiction = "retry" to restore the legacy '
+                f"retry-until-budget behavior.",
+                contradiction=True,
+            )
+        return VerifyOutcome.retry(
+            f"sprint-status for {task.story_key} is {sprint!r}, expected {expected!r}"
+        )
+
+    return verify_commands_outcome(policy, paths.project)
+
+
+def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool, policy: Policy) -> bool:
+    """Whether a non-``done`` sprint status is a review deliberately walking the
+    board backward, as opposed to a stage the story simply never reached.
+
+    Conservative on every uncertainty: without the launch-time guarantee, with
+    the knob set to ``retry``, or when the fresh read yields no status at all
+    (missing story entry) or a token outside the known lifecycle (a hand-edited
+    or future board), the caller falls through to the ordinary retry — a wrong
+    escalation halts an otherwise healthy run."""
+    if not sprint_reached_done or policy.review.on_status_contradiction != "escalate":
+        return False
+    if sprint is None or sprint not in STATUS_ORDER:
+        return False
+    return STATUS_ORDER.index(sprint) < STATUS_ORDER.index("done")
+
+
+def verify_review_stories(task: StoryTask, paths: ProjectPaths, policy: Policy) -> VerifyOutcome:
+    """verify_review for stories mode: same spec-done + verify-commands gates,
+    minus the sprint-status gate (stories mode has no sprint board — the story
+    spec's own frontmatter status is authoritative). ``task.spec_file`` is the
+    id-keyed story spec ``verify_dev_stories`` recorded on the dev pass."""
+    if not task.spec_file:
+        return VerifyOutcome.retry("no spec file recorded for task")
+    fm = _gate_frontmatter(Path(task.spec_file))
+    if isinstance(fm, VerifyOutcome):
+        return fm
     status = status_of(fm)
     if status != "done":
         return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
-
-    sprint = story_status(paths.sprint_status, task.story_key)
-    if sprint != "done":
-        return VerifyOutcome.retry(
-            f"sprint-status for {task.story_key} is {sprint!r}, expected 'done'"
-        )
-
     return verify_commands_outcome(policy, paths.project)
 
 
@@ -1304,13 +2081,22 @@ def verify_review_bundle(task: StoryTask, paths: ProjectPaths, policy: Policy) -
     can trust it happened."""
     if not task.spec_file:
         return VerifyOutcome.retry("no spec file recorded for task")
-    fm = read_frontmatter(Path(task.spec_file))
+    fm = _gate_frontmatter(Path(task.spec_file))
+    if isinstance(fm, VerifyOutcome):
+        return fm
     status = status_of(fm)
     if status != "done":
         return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
 
     ledger = paths.deferred_work
-    text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+    # Same TOCTOU class as the spec read above: the ledger is rewritten by the
+    # orchestrator's own mark_done between the dev and review gates.
+    try:
+        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+    except OSError as exc:
+        return VerifyOutcome.retry(
+            f"deferred-work ledger unreadable ({exc.__class__.__name__}: {exc}): {ledger}"
+        )
     entries = {e.id: e for e in deferredwork.parse_ledger(text)}
     not_done = sorted(
         i for i in task.dw_ids if i not in entries or not entries[i].status.startswith("done")
@@ -1353,6 +2139,15 @@ def finalize_commit(repo: Path, baseline: str | None, message: str) -> str | Non
     keeping the index (`reset --soft`), then commit the accumulated index. The
     working tree is never touched, so a failure leaves the chain intact.
 
+    Residual-artifacts note (BMAD-METHOD #2563): the skill now commits every file
+    of the reviewed diff and deliberately leaves unrelated `git status` residue
+    uncommitted (files outside the change's scope). The `add -A` here sweeps that
+    residue into the story commit too — an intentional divergence from the skill's
+    scoped commit. The loop must end each story on a clean tree because story
+    N+1's step-01 HALTs on a dirty tree, so the orchestrator squashes EVERYTHING
+    since baseline (skill commits + its own bookkeeping + any residue) into the one
+    story commit rather than leaving the tree dirty for the next story to trip on.
+
     Returns the new HEAD sha, or None when there is nothing to finalize: no
     version control (`baseline` falsy or NO_VCS) or the tree already equals
     `baseline` (no skill commits and no bookkeeping delta)."""
@@ -1384,31 +2179,166 @@ def finalize_commit(repo: Path, baseline: str | None, message: str) -> str | Non
     return rev_parse_head(repo)
 
 
+def resolve_restore_path(raw: str, root: Path) -> Path:
+    """The latched intent-gap patch (`StoryTask.restore_patch`) as a concrete path:
+    absolute values pass through, relative ones are anchored on `root`.
+
+    `model.StoryTask.restore_patch` documents the field as repo-relative-or-absolute,
+    and every consumer must resolve it against the base it actually reads the tree
+    from — the engine's live workspace root (the unit worktree under isolation),
+    `paths.project` for the proof-of-work exclude, the CLI's `--project`. Hence the
+    caller-supplied `root` rather than one baked-in base.
+
+    In practice `cli._resolve_restore_patch` always latches an already-`.resolve()`d
+    absolute path, so the relative branch is exercised only by a hand-written state
+    file or a future non-CLI latcher; it is kept because the field's contract
+    promises it. Deliberately does NOT `.resolve()` the result — callers that need
+    symlink/`..` normalization (path containment checks) do it themselves, and the
+    apply/exclude paths match the pre-existing behavior byte-for-byte without it.
+    """
+    p = Path(raw)
+    return p if p.is_absolute() else root / p
+
+
+def apply_patch(repo: Path, patch_path: Path) -> None:
+    """Apply a saved patch to `repo`'s working tree (`git apply`), raising on failure.
+
+    The intent-gap patch-restore re-drive (BMAD-METHOD #2564) uses this to re-lay
+    the attempted change bmad-dev-auto saved before reverting. New files in the
+    patch are created (they land untracked, matching how the original attempt sat
+    before its revert).
+
+    A clean apply is likely but NOT guaranteed: the patch was diffed from the
+    story's ORIGINAL baseline, while re-arm advances the re-drive's baseline to the
+    project's post-resolve HEAD (runs.rearm_escalation) — so the apply holds only
+    while the resolve session left the patched files untouched. A resolve session
+    that committed changes to those files makes `git apply` fail, deliberately
+    loudly: silently merging the human's resolution with the stale attempt could
+    reproduce the very gap being resolved. A non-zero `git apply` — that overlap, a
+    missing/corrupt patch, any other drift — raises `GitError` with git's output;
+    the caller escalates rather than dispatch a session onto a half-applied tree,
+    and the human re-resolves (typically re-arming without a restore, since the
+    resolution commits already carry the overlapping work).
+    """
+    if not patch_path.is_file():
+        raise GitError(f"restore patch not found: {patch_path}")
+    rc, out = _git(repo, "apply", str(patch_path))
+    if rc != 0:
+        raise GitError(f"git apply {patch_path} failed: {out}")
+
+
+def patch_new_files(patch_path: Path) -> set[str]:
+    """Repo-relative posix paths the saved patch *creates* — the untracked residue
+    an `apply_patch` leaves behind (see `runs.rearm_escalation`).
+
+    Text-parse, not `git apply --numstat`: the caller runs after the tree has moved
+    on, so the patch may no longer apply, and a creation list must still come back.
+    Within each `diff --git` block, an old-side `---` header naming `_DIFF_ABSENT`
+    marks a creation, and the `+++ <prefix>/<path>` after it names the file. The
+    prefix is stripped by mirroring what `apply_patch`'s plain `git apply` (default
+    -p1) did when it laid the residue down: drop the first path component whatever
+    it is — `b/` standard, `w/`/`i/`/`c/` under diff.mnemonicPrefix, `2/` from
+    --no-index. A target -p1 cannot strip (no `/`, e.g. --no-prefix output) is
+    skipped: that apply failed outright, so no residue exists. Deletions (the
+    absent token on the *new* side) are never returned — the caller feeds this to an
+    *exclusion* set, and excluding a path the human later re-created would make the
+    next rollback delete their file. For the same reason every ambiguous entry is
+    skipped rather than guessed: quoted paths (`+++ "b/wéird"`, core.quotePath),
+    renames, and non-`git diff` unified diffs with no `diff --git` header yield fewer
+    results, never wrong ones. Under-reporting degrades to the pre-#90 behavior;
+    over-reporting deletes user data.
+
+    Raises OSError / UnicodeDecodeError when the patch cannot be read; the caller
+    decides (rearm treats it as best-effort and journals `stale-restore-unparseable`).
+    """
+    new_files: set[str] = set()
+    in_hunk = False  # past the first `@@`, a `--- x` line is content, not a header
+    creating = False
+    for line in patch_path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("diff --git "):
+            in_hunk = creating = False
+        elif line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk:
+            continue
+        elif line.startswith("--- "):
+            creating = line[4:].strip() == _DIFF_ABSENT
+        elif line.startswith("+++ ") and creating:
+            creating = False
+            target = line[4:].split("\t", 1)[0].strip()
+            if target == _DIFF_ABSENT or target.startswith('"') or "/" not in target:
+                continue  # delete-then-create pair, quoted path, or un-strippable target
+            rel = target.split("/", 1)[1]  # mirror `git apply`'s default -p1
+            if rel:
+                new_files.add(rel)
+    return new_files
+
+
 def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     """Commit exactly `paths` (and nothing else), leaving any unrelated working
     or staged changes untouched. Unlike commit_story's `add -A`, this is safe to
     call out of band (e.g. `bmad-loop decisions`) when the tree may hold the
     user's own uncommitted work. Returns the new HEAD sha, or None when the
-    given paths had no changes to commit. Paths outside the repo are ignored."""
+    given paths had no changes to commit. Paths outside the repo are ignored —
+    and so is a path git has never seen (absent from both the working tree and
+    the index): `git add` hard-fails on a pathspec matching nothing, and one
+    optional path would otherwise sink the whole commit (a swallowed `GitError`
+    in `confirm` silently losing the spec+board commit over a park record that
+    was never committed). A missing-but-TRACKED path stays in: that is a
+    deletion to stage."""
     rels: list[str] = []
     repo_root = repo.resolve()
     for p in paths:
         try:
-            rels.append(str(Path(p).resolve().relative_to(repo_root)))
+            # `.as_posix()`, not `str()`: every rel here becomes a git pathspec and is
+            # compared against git-derived output, and git speaks posix separators on
+            # every platform. `str()` yields backslashes on Windows, which git reads as
+            # wildmatch ESCAPES rather than separators.
+            rels.append(Path(p).resolve().relative_to(repo_root).as_posix())
         except ValueError:
             continue
+    missing = [r for r in rels if not ((repo_root / r).exists() or (repo_root / r).is_symlink())]
+    if missing:
+        rc, out = _git_raw(repo, "ls-files", "-z", "--", *_literal_specs(missing))
+        if rc != 0:
+            raise GitError(f"git ls-files failed: {out}")
+        tracked = {t for t in out.split("\0") if t}
+        rels = [r for r in rels if r not in missing or r in tracked]
     if not rels:
         return None
-    rc, out = _git(repo, "add", "--", *rels)
+    # Every operand is forced LITERAL: git reads a positional operand as a PATHSPEC,
+    # and `implementation_artifacts` reaches here verbatim out of the operator's
+    # `_bmad/bmm/config.yaml` (`bmadconfig._resolve` substitutes and resolves it, and
+    # nothing sanitizes it), so a `[`, `]`, `*` or `?` in a configured path is a
+    # wildmatch metacharacter. Unescaped, this function breaks its own first promise —
+    # "commit exactly `paths` (and nothing else)": `add -- docs[a]/f.md` also stages
+    # `docsa/f.md`, and the operator's unrelated edit is committed under a story's
+    # name. The operand is a SUPERSET (git compares literally before falling through
+    # to fnmatch), which is why the over-match direction is the only one possible.
+    #
+    # A second, quieter harm with the ledger GITIGNORED — the shape
+    # `_carry_harvested_deferrals` is built to hit: `git add` refuses an explicitly
+    # named ignored path (rc 1) but SKIPS a globbed one, so the plain form could exit
+    # rc 0 having staged nothing, `status` find no change, and the carry report success
+    # having committed no ledger and journalled no `harvest-carry-uncommitted` — a
+    # silent loss where the literal form leaves a record. Note the `ls-files` operands
+    # above are literalised too: that leg reads membership rather than acting, so its
+    # failure direction is to DROP a rel (the glob returns the neighbour's name, which
+    # never equals `r`), but leaving one bare operand beside three fixed ones is the
+    # next reader's trap. It is also why the `r.replace("\\", "/")` that used to guard
+    # this comparison is gone: `.as_posix()` above fixes the separator at the source,
+    # and a dead normalizer beside a glob operand reads as protection that isn't there.
+    specs = _literal_specs(rels)
+    rc, out = _git(repo, "add", "--", *specs)
     if rc != 0:
         raise GitError(f"git add failed: {out}")
-    rc, out = _git(repo, "status", "--porcelain", "--", *rels)
+    rc, out = _git(repo, "status", "--porcelain", "--", *specs)
     if rc != 0:
         raise GitError(f"git status failed: {out}")
     if not out:
         return None  # nothing changed in these paths
     # pathspec form commits only `rels`, ignoring any other staged changes
-    rc, out = _git(repo, "commit", "-m", message, "--", *rels)
+    rc, out = _git(repo, "commit", "-m", message, "--", *specs)
     if rc != 0:
         raise GitError(f"git commit failed: {out}")
     return rev_parse_head(repo)

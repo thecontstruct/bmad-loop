@@ -32,6 +32,36 @@ def test_load_classifies_keys(project):
     assert ss.unknown_keys == ("weird-key",)
 
 
+def test_load_split_story_keys(project):
+    # BMAD splits an oversized story into 2-6a / 2-6b (issue #144); both halves
+    # must parse as stories — not fall into unknown_keys — and keep file order.
+    write_sprint(
+        project,
+        {
+            "2-5-intact": "done",
+            "2-6a-build-structure": "backlog",
+            "2-6b-extend-structure": "backlog",
+            "2-7-later": "backlog",
+            "2-6ab-not-a-split": "backlog",  # multi-letter: not the convention
+            "2-6A-not-lower": "backlog",  # uppercase: not the convention
+        },
+    )
+    ss = sprintstatus.load(project.sprint_status)
+    assert [s.key for s in ss.stories] == [
+        "2-5-intact",
+        "2-6a-build-structure",
+        "2-6b-extend-structure",
+        "2-7-later",
+    ]
+    a, b = ss.stories[1], ss.stories[2]
+    assert (a.epic, a.num, a.suffix, a.slug) == (2, 6, "a", "build-structure")
+    assert (b.epic, b.num, b.suffix, b.slug) == (2, 6, "b", "extend-structure")
+    assert ss.stories[0].suffix == ""  # whole stories carry no suffix
+    assert ss.unknown_keys == ("2-6ab-not-a-split", "2-6A-not-lower")
+    # the split halves are picked in file order, before later stories
+    assert sprintstatus.next_actionable(ss).key == "2-6a-build-structure"
+
+
 def test_load_classifies_retro_items(project):
     write_sprint(
         project,
@@ -82,6 +112,51 @@ def test_next_actionable_order_and_skip(project):
     assert sprintstatus.next_actionable(ss, skip={"1-2-b", "1-3-c"}) is None
 
 
+def test_awaiting_operator_is_ordered_just_below_done():
+    """The token's whole contract is its POSITION: last stop before `done`, so
+    confirming a parked story is a forward advance and nothing can regress `done`
+    back into it. Asserting the index relationships rather than the literal tuple
+    keeps this from breaking every time a status is added elsewhere."""
+    order = sprintstatus.STATUS_ORDER
+    assert order.index("awaiting-operator") == order.index("done") - 1
+    assert order.index("review") < order.index("awaiting-operator")
+
+
+def test_parked_story_is_never_picked_as_next_actionable(project):
+    """A parked story's agent-doable work is already committed — picking it up
+    again would redo finished work while the human's external actions stay
+    outstanding. The board must walk straight past it to the next real story.
+
+    Ablation (repo rule, inverse form — the gate here is an ABSENCE, so the
+    ablation ADDS rather than deletes): put "awaiting-operator" into
+    ACTIONABLE_STATUSES and this test must fail on the first assert. It does —
+    which is what proves the assertions gate on actionability rather than on
+    file order (1-1-a is first in the file, so a test that merely returned the
+    first pickable story would pass either way).
+    """
+    write_sprint(
+        project,
+        {"1-1-a": "awaiting-operator", "1-2-b": "ready-for-dev"},
+    )
+    ss = sprintstatus.load(project.sprint_status)
+    assert sprintstatus.next_actionable(ss).key == "1-2-b"
+    # and with the only other story taken, there is nothing left to run — the
+    # parked story is not a fallback either
+    assert sprintstatus.next_actionable(ss, skip={"1-2-b"}) is None
+
+
+def test_parked_story_cannot_be_targeted_by_a_selector(project):
+    """`--story` naming a parked story is a user error with a specific message,
+    not a silent re-drive: select_actionable filters on the same set."""
+    write_sprint(project, {"1-1-a": "awaiting-operator"})
+    ss = sprintstatus.load(project.sprint_status)
+    with pytest.raises(
+        sprintstatus.SprintStatusError,
+        match=r"story 1-1 matched 1-1-a but its status is 'awaiting-operator'",
+    ):
+        sprintstatus.select_actionable(ss, None, "1-1")
+
+
 def test_next_actionable_epic_filter(project):
     # document order (epic 5 before epic 9), not numeric; the epic filter returns
     # epic 9's first actionable story even though 5-1 is earlier in the file.
@@ -121,6 +196,21 @@ def test_parse_selector_forms():
     assert sel.epic == 3 and not sel.is_targeted
 
 
+def test_parse_selector_split_suffix():
+    # every numeric form carries the split suffix through to the selector
+    sel = sprintstatus.parse_selector(None, "2-6a-build-structure")
+    assert (sel.epic, sel.num, sel.suffix, sel.key) == (2, 6, "a", "2-6a-build-structure")
+    for ref in ("2-6a", "2.6a"):
+        sel = sprintstatus.parse_selector(None, ref)
+        assert (sel.epic, sel.num, sel.suffix, sel.key, sel.slug) == (2, 6, "a", None, None)
+    sel = sprintstatus.parse_selector(2, "6a")
+    assert (sel.epic, sel.num, sel.suffix) == (2, 6, "a")
+    # suffix-less forms leave suffix None — the whole-family wildcard
+    for epic, ref in [(None, "2-6"), (None, "2.6"), (2, "6"), (None, "2-6-whole-slug")]:
+        sel = sprintstatus.parse_selector(epic, ref)
+        assert sel.suffix is None, ref
+
+
 def test_parse_selector_bare_number_needs_epic():
     with pytest.raises(sprintstatus.SprintStatusError, match="ambiguous story '1'"):
         sprintstatus.parse_selector(None, "1")
@@ -147,6 +237,49 @@ def test_select_actionable_short_ref_and_epic_story(project):
         "3-1-user-auth",
         "3-2-foo",
     ]
+
+
+def test_select_actionable_split_suffix(project):
+    write_sprint(
+        project,
+        {
+            "2-6a-build-structure": "backlog",
+            "2-6b-extend-structure": "backlog",
+            "2-7-later": "backlog",
+        },
+    )
+    ss = sprintstatus.load(project.sprint_status)
+    # a suffixed ref selects exactly its half — never the sibling
+    for epic, story in [(None, "2-6a"), (None, "2.6a"), (2, "6a")]:
+        got = sprintstatus.select_actionable(ss, epic, story)
+        assert [s.key for s in got] == ["2-6a-build-structure"]
+    assert [s.key for s in sprintstatus.select_actionable(ss, None, "2.6b")] == [
+        "2-6b-extend-structure"
+    ]
+    # the plain short ref selects the whole split family, in file order
+    assert [s.key for s in sprintstatus.select_actionable(ss, None, "2-6")] == [
+        "2-6a-build-structure",
+        "2-6b-extend-structure",
+    ]
+    # a suffix that doesn't exist matches nothing
+    with pytest.raises(sprintstatus.SprintStatusError, match="no story matches '2-6c'"):
+        sprintstatus.select_actionable(ss, None, "2-6c")
+
+
+def test_select_actionable_split_suffix_not_actionable(project):
+    write_sprint(
+        project,
+        {"2-6a-build-structure": "done", "2-6b-extend-structure": "backlog"},
+    )
+    ss = sprintstatus.load(project.sprint_status)
+    with pytest.raises(
+        sprintstatus.SprintStatusError,
+        match=r"story 2-6a matched 2-6a-build-structure but its status is 'done'",
+    ):
+        sprintstatus.select_actionable(ss, None, "2-6a")
+    # the family ref still finds the remaining actionable half
+    got = sprintstatus.select_actionable(ss, None, "2-6")
+    assert [s.key for s in got] == ["2-6b-extend-structure"]
 
 
 def test_select_actionable_targeted_not_actionable(project):

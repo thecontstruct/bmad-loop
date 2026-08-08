@@ -26,6 +26,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Callable
 
+from . import envvars
+
 # SIGKILL is absent on Windows; fall back to SIGTERM so attribute access never
 # raises. The POSIX host references this rather than ``signal.SIGKILL`` directly.
 SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)  # portability: SIGKILL absent on Windows
@@ -103,6 +105,28 @@ class ProcessHost(ABC):
             return "unknown"
         return "dead"
 
+    def descendants(self, pid: int) -> dict[int, float | None]:
+        """Transitive descendants of ``pid`` (children, grandchildren, …) as a
+        pid → :meth:`identity` snapshot, for the teardown reap that must chase a
+        session's whole process tree, not just the pane root — a detached straggler
+        (setsid, a double-fork survivor) escapes the pane pgid the window kill
+        signals. The identity is captured DURING enumeration — from the same
+        ``/proc`` read (Linux) or the same enumerated psutil ``Process`` object —
+        so a pid reaped-and-reused after enumeration can never be authenticated by
+        a later lookup; a member whose identity can't be captured is OMITTED, never
+        returned unstamped. ``None`` values are reserved for platforms that
+        genuinely can't stamp one — consumers must treat ``None`` as unconfirmable
+        (never signal it).
+
+        NEVER raises: ``{}`` on an unsupported platform, a missing psutil, a gone
+        pid, or any read error — this feeds the kill escalation, which must never be
+        the thing that raises. The default enumerates via psutil (macOS/Windows);
+        the Linux host overrides it with a psutil-free ``/proc`` scan so the core
+        stays dep-free there."""
+        if pid <= 0:
+            return {}
+        return _psutil_descendants(pid)
+
     def shell_quote(self, arg: str) -> str:
         """Quote ``arg`` for the shell that runs this host's hook commands, so the
         argument-quoting axis sits behind the same seam as ``hook_interpreter``. Not
@@ -151,6 +175,13 @@ class PosixProcessHost(ProcessHost):
             return _psutil().Process(pid).create_time()
         except Exception:
             return None
+
+    def descendants(self, pid: int) -> dict[int, float | None]:
+        if pid <= 0:
+            return {}
+        if sys.platform.startswith("linux"):
+            return _linux_descendants(pid)  # psutil-free: keeps the Linux core dep-free
+        return super().descendants(pid)  # macOS: psutil, guarded by the seam's never-raise
 
     def hook_interpreter(self) -> str:
         return "python3"
@@ -218,18 +249,100 @@ def _proc_starttime(pid: int) -> float | None:
         return None
 
 
-def _psutil():
-    """Lazily import psutil (the optional ``non-linux`` extra), used only for the
-    non-destructive Windows/macOS liveness + identity probes. The dep-free core
-    never imports it on Linux; raise a clear, actionable error if it's missing where
-    it's needed."""
+def _linux_descendants(pid: int) -> dict[int, float | None]:
+    """Transitive descendants of ``pid``, with their pid-reuse identities, from a
+    single pass over ``/proc/*/stat`` (Linux only, psutil-free). Each entry's ppid
+    (field 4, index 1 after the comm token) AND starttime identity (field 22,
+    index 19 — the very value :func:`_proc_starttime` reads) come from ONE read of
+    the same ``stat`` line, split on the last ``)`` exactly as
+    :func:`_proc_starttime` does — so ancestry and identity are captured atomically
+    per process and a pid reused after the scan can never be authenticated by a
+    later lookup. BFS out from ``pid``. Best-effort: a process that exits mid-scan
+    simply drops out of the map, an unparsable line is omitted (never
+    authenticated), and any error yields ``{}`` so the kill seam never raises. A
+    ``seen`` set guards against a pid-reuse race fabricating a cycle."""
     try:
-        import psutil  # noqa: PLC0415  (intentional lazy import — keeps the core dep-free)
+        children: dict[int, list[int]] = {}
+        identities: dict[int, float] = {}
+        for entry in Path("/proc").iterdir():  # portability: Linux-only, guarded by caller
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = (entry / "stat").read_text(encoding="utf-8")
+                after_comm = stat[stat.rindex(")") + 1 :].split()
+                ppid = int(after_comm[1])  # field 4 = ppid
+                starttime = float(after_comm[19])  # field 22 = starttime, the identity
+            except (OSError, ValueError, IndexError):
+                continue  # vanished mid-scan / unparsable line — just skip it
+            child = int(entry.name)
+            children.setdefault(ppid, []).append(child)
+            identities[child] = starttime
+    except OSError:
+        return {}
+    out: dict[int, float | None] = {}
+    seen: set[int] = set()
+    stack = list(children.get(pid, ()))
+    while stack:
+        child = stack.pop()
+        if child in seen:
+            continue
+        seen.add(child)
+        out[child] = identities[child]
+        stack.extend(children.get(child, ()))
+    return out
+
+
+def _psutil_descendants(pid: int) -> dict[int, float | None]:
+    """Transitive descendants via psutil (non-Linux POSIX + Windows), each stamped
+    with the ``create_time()`` of the SAME enumerated ``Process`` object and then
+    REVALIDATED against that object's construction-bound identity before it is
+    recorded.
+
+    The revalidation is load-bearing, not belt-and-braces — ``create_time()`` alone
+    is NOT reuse-safe here. Per ``psutil.Process._get_ident`` (7.2.2), only the
+    ``WINDOWS`` branch pre-populates the epoch cache (``self._create_time =
+    create_time(fast_only=True)``); the ``LINUX or NETBSD or OSX`` branch binds a
+    *monotonic* starttime and leaves ``self._create_time`` unset. So on macOS our
+    ``create_time()`` is the FIRST call — a raw call-time kernel read, and
+    ``create_time()`` does not consult ``_raise_if_pid_reused()``. A pid reaped and
+    reused between ``children()`` and the stamp would therefore hand back the
+    NEWCOMER's identity, which teardown would then authenticate successfully and
+    signal (#184 review). ``is_running()`` closes that window: it compares the
+    ident captured at construction against a freshly built ``Process``, so a
+    generation change reads as not-running and the member is omitted.
+
+    Order matters — read the identity, THEN validate, THEN record; validating first
+    would reopen the same TOCTOU gap. A member whose identity can't be confirmed is
+    OMITTED, never returned unstamped. Blanket-except → ``{}`` so a missing psutil
+    or an already-gone pid degrades silently — the never-raise contract the kill
+    escalation depends on."""
+    out: dict[int, float | None] = {}
+    try:
+        for child in _psutil().Process(pid).children(recursive=True):
+            try:
+                identity = child.create_time()
+                if not child.is_running():  # generation changed under us — don't stamp it
+                    continue
+                out[child.pid] = identity
+            except Exception:  # nosec B112 - gone/reused mid-walk: omit it
+                continue
+    except Exception:  # the kill-path seam must never raise
+        return {}
+    return out
+
+
+def _psutil():
+    """Lazily import psutil — a core dep on Windows, the ``non-linux`` extra on
+    macOS — used only for the non-destructive Windows/macOS liveness + identity
+    probes. The dep-free core never imports it on Linux; raise a clear, actionable
+    error if it's missing where it's needed."""
+    try:
+        import psutil  # intentional lazy import — keeps the core dep-free
     except ImportError as exc:  # pragma: no cover - exercised only off Linux
         raise ProcessHostError(
             f"process_host: pid operations on {sys.platform!r} need psutil; "
-            "install the optional extra (pip install 'bmad-loop[non-linux]') or run "
-            "under Linux/WSL"
+            "on Windows reinstall bmad-loop (psutil is a required dependency there), "
+            "on macOS run `pip install 'bmad-loop[non-linux]'`"
         ) from exc
     return psutil
 
@@ -280,7 +393,7 @@ def get_process_host() -> ProcessHost:
     otherwise the first host whose ``matches(sys.platform)`` is true wins. POSIX is
     the default fallback, so behavior on Linux/macOS is unchanged. Cached — tests
     that flip the env var must call ``get_process_host.cache_clear()``."""
-    forced = os.environ.get("BMAD_LOOP_PROCESS_HOST")
+    forced = envvars.process_host()
     _load_builtin_hosts()
     for name, matches, factory in _HOSTS:
         if name == forced or (not forced and matches(sys.platform)):

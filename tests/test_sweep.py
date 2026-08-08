@@ -2,24 +2,35 @@
 
 import json
 import re
+from pathlib import Path
 
+import pytest
 from conftest import (
+    _file_exists_cmd,
+    attach_profile,
     bundle_dev_effect,
+    bundle_dev_escalates,
     bundle_review_effect,
+    crash_at_merge_back,
+    fault_read_text,
     git,
+    ignore_before_commit,
+    install_build_auto_skill,
     migrate_effect,
+    passes_once,
     triage_effect,
     write_ledger,
     write_legacy_ledger,
     write_spec,
 )
 
-from bmad_loop import deferredwork
+from bmad_loop import deferredwork, runs, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
-from bmad_loop.journal import Journal, load_state
+from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import Phase, RunState, StoryTask, TokenUsage
 from bmad_loop.policy import (
+    AdapterPolicy,
     DevPolicy,
     GatesPolicy,
     LimitsPolicy,
@@ -27,9 +38,21 @@ from bmad_loop.policy import (
     Policy,
     ReviewPolicy,
     ScmPolicy,
+    StageAdapterPolicy,
     SweepPolicy,
+    VerifyPolicy,
 )
-from bmad_loop.sweep import DecisionPrompter, SweepEngine, validate_migration, validate_triage
+from bmad_loop.sweep import (
+    Decision,
+    DecisionOption,
+    DecisionPrompter,
+    ResolvedEntry,
+    SweepEngine,
+    TriagePlan,
+    validate_migration,
+    validate_triage,
+)
+from bmad_loop.tui import launch
 from bmad_loop.verify import worktree_clean
 
 QUIET = NotifyPolicy(desktop=False, file=True)
@@ -180,6 +203,118 @@ def test_validate_triage_bad_fields():
     assert "needs intent" in joined
     assert "at least 2 options" in joined
     assert "recommendation" in joined
+
+
+# --------------------------------- line breaks in ledger-bound text (#305)
+#
+# validate_triage deliberately does NOT gate on line breaks. The sanitizer in
+# deferredwork already neutralizes them losslessly, so a rejection here would buy
+# no integrity — it would only spend a triage attempt, and the second failure
+# escalates the run to a human who has nothing to resolve. Acceptance is the
+# behavior under test; the two live writer paths below are where it lands.
+
+
+@pytest.mark.parametrize("field", ["evidence", "label", "resolution"])
+def test_validate_triage_accepts_multiline_free_text(field):
+    """A formatting-only defect must never cost a triage attempt or pause a run.
+    Deleting the plan over one line break trains nothing — the feedback file dies
+    with the session — and the escalation pages a human whose only remedy is to
+    re-roll the same dice."""
+    injected = "fixed in abc123\n### DW-99: fake\nstatus: open"
+    if field == "evidence":
+        rj = triage_result(["DW-1"], already_resolved=[{"id": "DW-1", "evidence": injected}])
+    else:
+        option = {"key": "1", "label": "build it", "effect": "build", "intent": "do x"}
+        option[field] = injected
+        rj = triage_result(
+            ["DW-1"],
+            decisions=[
+                {
+                    "id": "DW-1",
+                    "question": "renegotiate?",
+                    "context": "ctx",
+                    "options": [option, {"key": "2", "label": "keep", "effect": "keep-open"}],
+                    "recommendation": "1",
+                }
+            ],
+        )
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert errors == []
+    assert plan is not None
+
+
+def test_close_resolved_sanitizes_an_injected_evidence(project):
+    """First live writer path (`evidence` -> the `resolution:` note). The run
+    completes and the ledger keeps its shape — no raise into `_cycle`'s bare
+    call, which would end the sweep as crashed."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _adapter = make_sweep(project, [])
+    before = len(ledger_entries(project))
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        already_resolved=(ResolvedEntry("DW-1", "fixed\n### DW-99: fake\nstatus: open"),),
+    )
+
+    assert engine._close_resolved(plan) == 1
+
+    entries = ledger_entries(project)
+    assert len(entries) == before  # no phantom entry minted
+    assert set(entries) == {"DW-1", "DW-2"}
+    assert entries["DW-1"].status.startswith("done ")
+    assert entries["DW-2"].open
+    assert "already resolved: fixed ### DW-99: fake status: open" in entries["DW-1"].body
+
+
+@pytest.mark.parametrize(
+    ("resolution", "intent", "expected_detail"),
+    [
+        ("close it\n### DW-99: fake", "unused\nintent", "close it ### DW-99: fake"),
+        ("", "widen the field.\nThen backfill.", "widen the field. Then backfill."),
+    ],
+    ids=["resolution-wins", "intent-when-no-resolution"],
+)
+def test_apply_decision_effect_sanitizes_the_ledger_detail(
+    project, resolution, intent, expected_detail
+):
+    """Second live writer path, and the one that carries an option's `intent` to
+    the ledger. Pins `detail = option.resolution or option.intent`: the
+    resolution wins when present, the intent is the fallback, and either way
+    `append_decision` flattens it — which is why gating `intent` upstream would
+    prevent nothing while flattening the brief that drives a dev bundle."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _adapter = make_sweep(project, [])
+    option = DecisionOption(
+        key="1", label="Keep\ncap", effect="keep-open", intent=intent, resolution=resolution
+    )
+    decision = Decision(id="DW-1", question="?", context="", options=(option,), recommendation="1")
+
+    engine._apply_decision_effect(decision, option)
+
+    text = project.deferred_work.read_text(encoding="utf-8")
+    decision_lines = [line for line in text.splitlines() if line.startswith("decision:")]
+    assert len(decision_lines) == 1
+    assert decision_lines[0].endswith(f"Keep cap — {expected_detail}")
+    assert ledger_entries(project)["DW-1"].open  # keep-open does not close
+
+
+def test_apply_decision_effect_close_sanitizes_the_close_note(project):
+    write_ledger(project, {"DW-1": "open"})
+    engine, _adapter = make_sweep(project, [])
+    option = DecisionOption(
+        key="1", label="Close", effect="close", resolution="superseded\n### DW-99: fake"
+    )
+    decision = Decision(id="DW-1", question="?", context="", options=(option,), recommendation="1")
+
+    engine._apply_decision_effect(decision, option)
+
+    entries = ledger_entries(project)
+    assert set(entries) == {"DW-1"}  # no phantom entry from the close note
+    assert entries["DW-1"].status.startswith("done ")
+    assert (
+        "resolution: closed by human decision: superseded ### DW-99: fake" in entries["DW-1"].body
+    )
 
 
 def test_validate_triage_unknown_id():
@@ -386,6 +521,408 @@ def test_sweep_worktree_bundle_merges_to_target(project):
     assert worktree_clean(project.project)
 
 
+# ------------------------------------- isolated bundle ledger carry + replay
+#
+# The shape every test below shares: the ledger is GITIGNORED and named in
+# `scm.worktree_seed`, so the unit worktree carries a copy the orchestrator
+# closes, `finalize_commit`'s `git add -A` skips it, and the merge brings
+# nothing back. Without `SweepEngine._carry_isolated_ledger_writes` the main
+# checkout's entries stay `open` and every later sweep re-triages resolved work.
+
+_BUNDLE_HARVEST = {
+    "summary": "Bundle left the retry ceiling unbounded",
+    "evidence": "the backoff still doubles forever",
+    "location": "src/retry.py:88",
+    "severity": "medium",
+}
+
+
+def journal_kinds(engine):
+    return [entry["kind"] for entry in engine.journal.entries()]
+
+
+def ledger_rel(project) -> str:
+    return project.deferred_work.relative_to(project.project).as_posix()
+
+
+def ignored_ledger(project, statuses: dict[str, str]) -> str:
+    """Gitignore the ledger, then write and commit it in that order.
+
+    Order matters both ways: committing the rule first leaves `write_ledger`'s
+    `git add -A` with nothing to stage (empty-index commit failure), and writing
+    the ledger first would track it, which is the shape that needs no carry at
+    all. `check-ignore` is the oracle — a pattern that is present is not
+    necessarily effective."""
+    ignore_before_commit(project, "deferred-work.md")
+    write_ledger(project, statuses)
+    rel = ledger_rel(project)
+    assert git(project.project, "check-ignore", rel).strip() == rel
+    assert not verify.path_tracked(project.project, rel)
+    return rel
+
+
+def isolated_seeded_policy(project, **scm) -> Policy:
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="worktree", worktree_seed=(ledger_rel(project),), **scm),
+    )
+
+
+def wt_bundle_dev(project, name="fix", dw_ids=("DW-1",), deferred=None):
+    """Bundle dev session running inside the unit worktree (spec.cwd)."""
+
+    def effect(spec):
+        cwd = spec.cwd
+        wt = project.rebased(cwd)
+        baseline = verify.rev_parse_head(cwd)
+        src = cwd / "src.txt"
+        src.write_text(src.read_text() + f"change for dw-{name}\n")
+        sp = wt.implementation_artifacts / f"spec-dw-{name}.md"
+        # A real dev session creates its artifacts dir. A worktree that seeds
+        # nothing into it has none — git does not track the template's empty one —
+        # so without this the session dies on the spec write and no test of the
+        # unseeded shape could reach the gate it is about.
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        # mirror bmad-dev-auto: self-finalize the spec, leave the ledger to the
+        # orchestrator (single writer, marking inside the worktree)
+        write_spec(sp, "done", baseline, deferred=deferred)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": f"dw-{name}",
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "tasks_total": 1,
+                "tasks_done": 1,
+                "verification": [],
+                "escalations": [],
+                "dw_ids": list(dw_ids),
+                "followup_review_recommended": False,
+            },
+        )
+
+    return effect
+
+
+def bundle_plan(dw_ids=("DW-1",), name="fix"):
+    return triage_result(
+        list(dw_ids),
+        bundles=[{"name": name, "dw_ids": list(dw_ids), "intent": "fix it"}],
+    )
+
+
+def isolated_policy(**scm) -> Policy:
+    """`isolated_seeded_policy` without the seed — the SHIPPED default, since
+    `scm.worktree_seed` defaults to `()`."""
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="worktree", **scm),
+    )
+
+
+def test_isolated_bundle_lands_when_the_gitignored_ledger_was_never_seeded(project):
+    """#426, the default configuration: `worktree_seed` defaults to `()` and the
+    ledger's home is the artifacts dir, so a project that gitignores it gets a unit
+    worktree with NO ledger. The orchestrator writes the close through
+    `self.workspace.paths` — that absent file — `mark_done` returns False, and
+    `verify_review_bundle` reads the same absent file and fails `fixable=True`.
+    Without the auto-seed that leaves `phase=deferred`, `DW-1` still `open`, a
+    `review-verify-failed` naming the worktree's path, and `open_ids` re-bundling
+    the same work on every later sweep.
+
+    No DONE-leg carry can rescue that — the unit never reaches DONE — so the fix
+    is upstream of the carry: seed the ledger the checkout cannot deliver, which
+    moves the failure onto the leg `_carry_isolated_ledger_writes` already covers.
+
+    The extra dev effects are the repair round the gate's `fixable=True` buys.
+    They go unused on the fixed path; without them a regression would exhaust the
+    script and fail as a crash rather than as the defer it actually is."""
+    ignored_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "fix it"}],
+        skip=[{"id": "DW-2", "reason": "moot"}],
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan)] + [wt_bundle_dev(project)] * 6,
+        policy=isolated_policy(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed and summary.deferred == 0
+    task = engine.state.tasks["dw-fix"]
+    assert task.phase == Phase.DONE and task.isolated_ledger_carried
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")
+    assert entries["DW-2"].open
+    assert "review-verify-failed" not in journal_kinds(engine)
+    # The seeded copy is shielded from the unit's `git add -A` like every other
+    # seed, so the close still does not ride the merge: the carry is what lands
+    # it, and `git add -- <ignored path>` still refuses with rc 1.
+    carried = [e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-close-carried"]
+    assert [e["dw_ids"] for e in carried] == [["DW-1"]]
+    uncommitted = [
+        e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-close-carry-uncommitted"
+    ]
+    assert len(uncommitted) == 1 and uncommitted[0]["dw_ids"] == ["DW-1"]
+    assert worktree_clean(project.project)
+
+
+def test_isolated_bundle_with_a_tracked_ledger_seeds_nothing(project):
+    """A tracked ledger is delivered by the checkout, so auto-seeding it would
+    report `worktree-seed-skipped` — "a seed you asked for did nothing" — on every
+    isolated unit of every ordinary project, burying the real ones."""
+    write_ledger(project, {"DW-1": "open"})
+    assert verify.path_tracked(project.project, ledger_rel(project))
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan(["DW-1"]))] + [wt_bundle_dev(project)] * 6,
+        policy=isolated_policy(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert engine.state.tasks["dw-fix"].phase == Phase.DONE
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+    assert "worktree-seed-skipped" not in journal_kinds(engine)
+
+
+def test_isolated_bundle_carries_its_gitignored_ledger_close_to_the_main_checkout(project):
+    ignored_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "fix it"}],
+        skip=[{"id": "DW-2", "reason": "moot"}],
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), wt_bundle_dev(project)],
+        policy=isolated_seeded_policy(project),
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["dw-fix"]
+    assert not summary.paused and not summary.crashed
+    assert task.phase == Phase.DONE and task.isolated_ledger_carried
+    assert task.bundle_closes_intended == ["DW-1"]
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")
+    assert entries["DW-2"].open  # an untouched id is never swept up by the carry
+    carried = [e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-close-carried"]
+    assert [e["dw_ids"] for e in carried] == [["DW-1"]]
+    # `git add -- <ignored path>` refuses with rc 1, so the flips land but the
+    # commit cannot: best effort, and recorded rather than raised.
+    uncommitted = [
+        e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-close-carry-uncommitted"
+    ]
+    assert len(uncommitted) == 1 and uncommitted[0]["dw_ids"] == ["DW-1"]
+    assert [p.resolve() for p in verify.worktree_list(project.project)] == [
+        project.project.resolve()
+    ]
+    assert worktree_clean(project.project)
+
+
+def test_isolated_bundle_carry_files_the_harvest_before_closing_the_bundle(project):
+    """`super()` first: `append_entry`'s idempotence scan is open-only, so a close
+    applied ahead of the harvest would hide an already-filed row from it.
+
+    Pinned on the observable sequence rather than on a reproduced duplicate:
+    `_carry_harvested_deferrals` re-scans status-agnostically, which defends the
+    same hazard a second time, so reversing the two halves is silent on the ledger
+    today. A reviewer reasoning from "no duplicate appears" would ship the bug."""
+    ignored_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(bundle_plan(["DW-1"])),
+            wt_bundle_dev(project, deferred=[_BUNDLE_HARVEST]),
+        ],
+        policy=isolated_seeded_policy(project),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    kinds = journal_kinds(engine)
+    assert kinds.index("harvest-carried") < kinds.index("sweep-bundle-close-carried")
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")
+    # the harvest reached the MAIN checkout too, exactly once
+    titles = [e.title for e in deferredwork.parse_ledger(project.deferred_work.read_text())]
+    assert titles.count(_BUNDLE_HARVEST["summary"]) == 1
+
+
+def test_isolated_bundle_close_replays_after_a_crash_between_the_carry_and_its_latch(project):
+    """`isolated_ledger_carried` is latched by the CALL SITE, never by the base
+    hook. A hook-side latch would be durable the moment the base half returned, so
+    a subclass half that had not run yet would look carried and never replay."""
+    ignored_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan(["DW-1"])), wt_bundle_dev(project)],
+        policy=isolated_seeded_policy(project),
+    )
+    crash_at_merge_back(engine, after="carry")
+
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["dw-fix"]
+    assert crashed.phase == Phase.DONE
+    assert not crashed.isolated_ledger_carried
+    assert crashed.bundle_closes_intended == ["DW-1"]
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions == []  # no re-triage: the close left the open set first
+    assert "resume-ledger-carry" in journal_kinds(resumed)
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+    assert load_state(resumed.run_dir).tasks["dw-fix"].isolated_ledger_carried
+    # the replay re-ran an already-applied carry: idempotent, no second row
+    assert len(ledger_entries(project)) == 1
+
+
+def test_resumed_sweep_replays_a_close_only_carry_before_it_re_triages(project):
+    """A bundle whose only ledger payload is closures still replays.
+
+    Two things fail together if either half regresses: gating the replay on
+    `harvested_deferrals` alone strands the close, and running the replay after
+    `_loop` lets `deferredwork.open_ids` re-bundle an id that already landed."""
+    ignored_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan(["DW-1"])), wt_bundle_dev(project)],
+        policy=isolated_seeded_policy(project),
+    )
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["dw-fix"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert not crashed.harvested_deferrals  # close-only payload
+    assert crashed.bundle_closes_intended == ["DW-1"]
+    assert ledger_entries(project)["DW-1"].open  # the merge brought nothing over
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions == []
+    kinds = journal_kinds(resumed)
+    assert "resume-ledger-carry" in kinds and "sweep-bundle-close-carried" in kinds
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+    assert load_state(resumed.run_dir).tasks["dw-fix"].isolated_ledger_carried
+
+
+def test_replayed_bundle_close_leaves_the_open_set_before_the_sweep_loop_reads_it(project):
+    """The replay pre-pass sits in `run()`, above `_loop`, and must stay there.
+
+    `SweepEngine` replaces `_loop` wholesale and does not override `run()`, and
+    `_loop` reads `deferredwork.open_ids` at the head of every cycle — so a close
+    replayed after it re-enters triage as open work. Pinned on the invariant (the
+    ledger state `_loop` is handed) rather than on a reproduced re-triage: a
+    resumed sweep finishes its persisted cycle's bundles and returns without
+    opening a fresh triage, so the consequence is latent on main today. Moving the
+    call below `_loop` reddens this and nothing else in the suite."""
+    ignored_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[
+            {"name": "one", "dw_ids": ["DW-1"], "intent": "fix one"},
+            {"name": "two", "dw_ids": ["DW-2"], "intent": "fix two"},
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), wt_bundle_dev(project, name="one", dw_ids=["DW-1"])],
+        policy=isolated_seeded_policy(project),
+    )
+    crash_at_merge_back(engine, after="merge")
+    assert engine.run().crashed
+    assert ledger_entries(project)["DW-1"].open  # the close never rode the merge
+
+    resumed, _ = resume_sweep(
+        project, engine, [wt_bundle_dev(project, name="two", dw_ids=["DW-2"])]
+    )
+    at_loop_entry: list[list[str]] = []
+    real_loop = resumed._loop
+
+    def recording_loop() -> None:
+        text = project.deferred_work.read_text(encoding="utf-8")
+        at_loop_entry.append(sorted(deferredwork.open_ids(text)))
+        real_loop()
+
+    resumed._loop = recording_loop
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert at_loop_entry == [["DW-2"]], "the landed bundle's id must already be closed"
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+
+
+def test_bundle_close_carry_is_a_no_op_when_no_close_was_recorded(project):
+    """`bundle_closes_intended` IS the guard, and it is keyed on the record rather
+    than on `task.dw_ids`: only `_close_bundle_ledger_when_spec_status` writes it,
+    so an empty record means this bundle closed nothing and the carry must leave no
+    trace — including no journal line claiming a carry happened, which would read as
+    "the carry ran" when diagnosing a run."""
+    write_ledger(project, {"DW-1": "open"})
+    before = project.deferred_work.read_text(encoding="utf-8")
+    engine, _ = make_sweep(project, [], policy=isolated_seeded_policy(project))
+    task = StoryTask(story_key="dw-fix", epic=0)
+    task.dw_ids = ["DW-1"]  # ids the bundle owns, but no close was ever recorded
+
+    engine._carry_isolated_ledger_writes(task)
+
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+    assert "sweep-bundle-close-carried" not in journal_kinds(engine)
+
+
+def test_deferred_bundle_replay_carries_the_harvest_without_closing_its_ids(project):
+    """The DEFERRED replay leg mirrors `_defer`: harvest only, never the hook.
+
+    A defer discarded the code the close claims to have resolved, and `open_ids`
+    re-bundles only `open` entries — so a close carried here would hide real work
+    from every later sweep."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [], policy=isolated_seeded_policy(project))
+    task = StoryTask(story_key="dw-fix", epic=0)
+    task.phase = Phase.DEFERRED
+    task.worktree_path = str(project.project / ".bmad-loop" / "worktrees" / "dw-fix")
+    task.dw_ids = ["DW-1"]
+    task.bundle_closes_intended = ["DW-1"]
+    task.harvest_carry_commit_pending = True
+    task.harvested_deferrals = [
+        {
+            "origin": "spec-deferred abc123",
+            "title": _BUNDLE_HARVEST["summary"],
+            "reason": _BUNDLE_HARVEST["evidence"],
+            "location": _BUNDLE_HARVEST["location"],
+            "severity": _BUNDLE_HARVEST["severity"],
+            "source_spec": "spec-dw-fix.md",
+        }
+    ]
+    engine.state.tasks["dw-fix"] = task
+
+    engine._replay_unlatched_ledger_carries()
+
+    entries = ledger_entries(project)
+    assert entries["DW-1"].open, "a discarded bundle's close must not be carried"
+    assert [e.title for e in entries.values()] == ["item DW-1", _BUNDLE_HARVEST["summary"]]
+    kinds = journal_kinds(engine)
+    assert "resume-ledger-carry" in kinds and "harvest-carried" in kinds
+    assert "sweep-bundle-close-carried" not in kinds
+
+
 def test_sweep_happy_path(project):
     write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
     plan = triage_result(
@@ -430,8 +967,9 @@ def test_sweep_happy_path(project):
 
 def test_generic_skill_bundle_orchestrator_closes_ledger(project):
     """B4: on the generic bmad-dev-auto path the bundle session never edits the
-    ledger; the orchestrator marks each owned dw id done (in _post_dev_state_sync)
-    and verify_review_bundle confirms its own write. The invocation is freeform."""
+    ledger; the orchestrator marks each owned dw id done only after the dev attempt
+    is accepted, and verify_review_bundle confirms its own write. The invocation is
+    freeform."""
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     plan = triage_result(
         ["DW-1", "DW-2"],
@@ -465,8 +1003,400 @@ def test_generic_skill_bundle_orchestrator_closes_ledger(project):
     dev_prompt = adapter.sessions[1].prompt
     assert dev_prompt.startswith("/bmad-dev-auto Implement the deferred-work bundle")
     assert "--dw-bundle" not in dev_prompt
+    events = engine.journal.entries()
+    close_at = next(i for i, e in enumerate(events) if e["kind"] == "sweep-bundle-closed")
+    decision_at = next(
+        i for i, e in enumerate(events) if e["kind"] == "dev-decision" and e["action"] == "proceed"
+    )
+    assert decision_at < close_at
+    # Review-disabled still calls `_verify_review`, so this flow invokes the close
+    # twice. The second call marks nothing and must not erase the durable carry
+    # receipt recorded from task.dw_ids.
+    assert "sweep-bundle-reclosed" not in {e["kind"] for e in events}
+    saved = load_state(engine.run_dir).tasks["dw-fix-things"]
+    assert saved.bundle_closes_intended == ["DW-1", "DW-2"]
+
+
+def test_resume_dev_verify_bundle_replays_accepted_sync_before_review(project, monkeypatch):
+    """A persisted PROCEED decision must finish accepted bookkeeping before review."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False),
+        ],
+        policy=pol,
+    )
+
+    def crash_before_accepted_sync(task, result_json):
+        persisted = load_state(engine.run_dir).tasks[task.story_key]
+        assert persisted.accepted_dev_session_index == len(task.sessions) - 1
+        raise RuntimeError("host died before accepted sync")
+
+    monkeypatch.setattr(engine, "_post_dev_accepted_sync", crash_before_accepted_sync)
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["dw-fix"]
+    assert crashed.phase == Phase.DEV_VERIFY and crashed.spec_file
+    assert crashed.accepted_dev_session_index == len(crashed.sessions) - 1
+    assert crashed.pre_harvest_ledger_captured is True
+    assert ledger_entries(project)["DW-1"].open
+
+    seen_at_review = []
+    review = bundle_review_effect(project, "fix")
+
+    def review_after_sync(spec):
+        seen_at_review.append(ledger_entries(project)["DW-1"].status)
+        return review(spec)
+
+    resumed, adapter = resume_sweep(project, engine, [review_after_sync])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert [s.role for s in adapter.sessions] == ["review"]
+    assert seen_at_review[0].startswith("done")
+    saved = load_state(engine.run_dir).tasks["dw-fix"]
+    assert saved.bundle_closes_intended == ["DW-1"]
+    accepted = saved.accepted_dev_session_index
+    assert accepted is not None and saved.sessions[accepted].role == "dev"
+    assert saved.pre_harvest_ledger_captured is False
+
+
+def test_resume_dev_verify_bundle_after_repair_preserves_acceptance(project, monkeypatch):
+    """A verify-green repair remains accepted across a DEV_VERIFY crash."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    marker = project.project / "verify-green"
+    dev = bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False)
+    review = bundle_review_effect(project, "fix")
+
+    def dev_with_marker(spec):
+        result = dev(spec)
+        marker.write_text("ok\n", encoding="utf-8")
+        return result
+
+    def breaking_review(spec):
+        marker.unlink()
+        return review(spec)
+
+    def repair(spec):
+        marker.write_text("repaired\n", encoding="utf-8")
+        return SessionResult(
+            status="completed", result_json={"workflow": "auto-dev", "escalations": []}
+        )
+
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), dev_with_marker, breaking_review, repair],
+        policy=pol,
+    )
+    original_save = engine._save
+    crashed = False
+
+    def crash_after_repair_dev_verify_save():
+        nonlocal crashed
+        original_save()
+        task = engine.state.tasks.get("dw-fix")
+        if (
+            not crashed
+            and task is not None
+            and task.phase == Phase.DEV_VERIFY
+            and task.attempt == 2
+            and task.sessions[-1].role == "dev"
+        ):
+            crashed = True
+            raise RuntimeError("host died after repair DEV_VERIFY save")
+
+    monkeypatch.setattr(engine, "_save", crash_after_repair_dev_verify_save)
+    assert engine.run().crashed
+
+    persisted = load_state(engine.run_dir).tasks["dw-fix"]
+    assert persisted.phase == Phase.DEV_VERIFY
+    assert persisted.attempt == 2 and persisted.review_cycle == 1
+    assert [session.role for session in persisted.sessions] == ["dev", "review", "dev"]
+    assert persisted.accepted_dev_session_index == len(persisted.sessions) - 1
+    assert persisted.sessions[-1].task_id.endswith("-dev-2")
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+    fix_decisions = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"]
+    assert fix_decisions[-1]["ok"] is True
+
+    seen_at_review = []
+    final_review = bundle_review_effect(project, "fix")
+
+    def review_repaired_tree(spec):
+        seen_at_review.append(marker.read_text(encoding="utf-8"))
+        return final_review(spec)
+
+    resumed, adapter = resume_sweep(project, engine, [review_repaired_tree])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert [session.role for session in adapter.sessions] == ["review"]
+    assert seen_at_review == ["repaired\n"]
+    saved = load_state(engine.run_dir).tasks["dw-fix"]
+    assert saved.phase == Phase.DONE
+    assert saved.accepted_dev_session_index == len(persisted.sessions) - 1
+
+
+def test_bundle_ledger_close_withheld_on_a_non_fixable_retry(project):
+    """A rejected attempt must not close the ids whose code it rolls back."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    seen = []
+
+    def capture_then_die(spec):
+        seen.append(project.deferred_work.read_text(encoding="utf-8"))
+        return SessionResult(status="died")
+
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(max_dev_attempts=2),
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-99"], mark_ledger=False, followup_review=False),
+            capture_then_die,
+        ],
+        policy=pol,
+    )
+
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert decisions[0]["action"] == "retry" and "do not match" in decisions[0]["reason"]
+    assert "rollback-auto" in journal_text(engine)
+    assert "sweep-bundle-closed" not in {e["kind"] for e in engine.journal.entries()}
+    assert "status: open" in seen[0]
+    assert "resolved by sweep bundle dw-fix" not in seen[0]
+    assert summary.deferred == 1 and not summary.paused
+    assert ledger_entries(project)["DW-1"].open
+
+
+def test_bundle_ledger_close_withheld_when_a_completed_attempt_defers(project):
+    """A completed but rejected final attempt reaches DEFER with the ids still open."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+
+    def mismatching_attempt():
+        return bundle_dev_effect(
+            project, "fix", ["DW-99"], mark_ledger=False, followup_review=False
+        )
+
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(max_dev_attempts=2),
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), mismatching_attempt(), mismatching_attempt()],
+        policy=pol,
+    )
+
+    summary = engine.run()
+
+    actions = [e["action"] for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert actions == ["retry", "defer"]
+    assert summary.deferred == 1 and not summary.paused
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert "resolved by sweep bundle dw-fix" not in text
+    assert deferredwork.open_ids(text) == {"DW-1"}
+    assert "change for dw-fix" not in (project.project / "src.txt").read_text()
     kinds = {e["kind"] for e in engine.journal.entries()}
+    assert "sweep-bundle-closed" not in kinds
+    assert "sweep-bundle-reopened" not in kinds
+
+
+def test_bundle_ledger_close_withheld_when_critical_preempts_a_passing_gate(project):
+    """PROCEED, not outcome.ok, authorizes the close."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    clean = bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False, followup_review=False)
+
+    def clean_but_critical(spec):
+        result = clean(spec)
+        assert result.result_json is not None
+        result.result_json["escalations"] = [
+            {"type": "bundle-item-blocked", "severity": "CRITICAL", "detail": "intent gap"}
+        ]
+        return result
+
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_sweep(project, [triage_effect(plan), clean_but_critical], policy=pol)
+
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert len(decisions) == 1
+    assert decisions[0]["action"] == "pause" and "CRITICAL" in decisions[0]["reason"]
+    assert summary.paused
+    assert ledger_entries(project)["DW-1"].open
+    assert "sweep-bundle-closed" not in {e["kind"] for e in engine.journal.entries()}
+
+
+def test_bundle_ledger_close_reopened_when_the_review_leg_defers(project):
+    """A later review failure undoes the accepted close after rollback."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(max_review_cycles=1),
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False),
+            lambda spec: SessionResult(status="died"),
+        ],
+        policy=pol,
+    )
+
+    summary = engine.run()
+
+    kinds = [e["kind"] for e in engine.journal.entries()]
     assert "sweep-bundle-closed" in kinds
+    assert summary.deferred == 1 and not summary.paused
+    assert "change for dw-fix" not in (project.project / "src.txt").read_text()
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert deferredwork.open_ids(text) == {"DW-1"}
+    assert "resolved by sweep bundle dw-fix" not in text
+    reopened = [e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-reopened"]
+    assert len(reopened) == 1 and reopened[0]["dw_ids"] == ["DW-1"]
+    assert worktree_clean(project.project)
+
+
+def test_bundle_ledger_close_reopened_when_review_disabled_defers_at_gate(project, tmp_path):
+    """The no-review path also reopens when its post-accept verify gate defers."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+        verify=VerifyPolicy(commands=(passes_once(tmp_path / "verify-ran"),)),
+        limits=LimitsPolicy(max_dev_attempts=1),
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False, followup_review=False),
+        ],
+        policy=pol,
+    )
+
+    summary = engine.run()
+
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "sweep-bundle-closed" in kinds
+    assert summary.deferred == 1 and not summary.paused
+    assert "change for dw-fix" not in (project.project / "src.txt").read_text()
+    assert deferredwork.open_ids(project.deferred_work.read_text(encoding="utf-8")) == {"DW-1"}
+    assert "sweep-bundle-reopened" in kinds
+
+
+def test_bundle_pre_gate_state_sync_is_a_noop(project):
+    """The sweep override must not retain the old pre-gate close."""
+    write_ledger(project, {"DW-1": "open"})
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+    )
+    engine, _ = make_sweep(project, [], policy=pol)
+    spec = project.implementation_artifacts / "spec-dw-fix.md"
+    write_spec(spec, "done", git(project.project, "rev-parse", "HEAD"))
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"])
+
+    engine._post_dev_state_sync(task, {"spec_file": str(spec)})
+
+    assert ledger_entries(project)["DW-1"].open
+    assert task.bundle_closes_intended == []
+    assert "sweep-bundle-closed" not in {e["kind"] for e in engine.journal.entries()}
+
+
+def test_bundle_ledger_close_skips_on_unreadable_spec(project, monkeypatch):
+    """The bundle counterpart of the sprint-board sync: an unreadable bundle spec
+    must not close any dw id (the ledger write is a repair — it must never fire off
+    an observation the orchestrator could not make) and must not crash the sweep."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_sweep(project, [], policy=pol)
+    sp = project.implementation_artifacts / "spec-dw-fix-things.md"
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123")
+    task = StoryTask(story_key="dw-fix-things", epic=0, dw_ids=["DW-1", "DW-2"])
+    fault_read_text(monkeypatch, sp)
+
+    engine._post_dev_accepted_sync(task, {"spec_file": str(sp)})
+
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status == "open" and entries["DW-2"].status == "open"
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "sweep-bundle-closed" not in kinds
+    events = [e for e in engine.journal.entries() if e["kind"] == "spec-read-failed"]
+    assert len(events) == 1 and events[0]["site"] == "bundle-ledger-close"
+    assert events[0]["story_key"] == "dw-fix-things"
 
 
 def test_generic_bundle_review_verify_recloses_ledger_after_review_rewrites_it(project):
@@ -507,7 +1437,7 @@ def test_generic_bundle_reconcile_closes_ledger_on_stale_frontmatter(project):
     """Regression for the DW-159/160/162 false-defer: the bundle session finalized
     in prose (## Auto Run Result: Status done) but left the bundle spec frontmatter
     at the template default `draft`. The orchestrator reconciles the frontmatter
-    before the ledger sync, so the bundle CLOSES — its dw ids are marked done and
+    before accepted bookkeeping, so the bundle CLOSES — its dw ids are marked done and
     not stranded in failed_ids — instead of falsely deferring completed work."""
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     plan = triage_result(
@@ -555,7 +1485,7 @@ def test_generic_bundle_reconcile_closes_ledger_on_in_review_frontmatter(project
     prose (## Auto Run Result: Status done) but left the bundle spec frontmatter at
     the transient `in-review` marker. in-review is never a deliberate terminal on
     the generic path (the legacy review-handoff fork is retired), so the
-    orchestrator reconciles it to done before the ledger sync — the bundle CLOSES
+    orchestrator reconciles it to done before accepted bookkeeping — the bundle CLOSES
     instead of false-deferring + rolling back into an endless re-sweep loop."""
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     plan = triage_result(
@@ -612,6 +1542,82 @@ def test_triage_validation_failure_retries_with_feedback_then_escalates(project)
     assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
     feedback_path = prompts[1].split("--feedback ", 1)[1]
     assert "not triaged: DW-1" in open(feedback_path).read()
+
+
+def test_triage_session_env_fault_escalates_then_resume_restores_budget(project):
+    """A triage session whose CLI lost its API connection (#194) escalates on the
+    first attempt instead of retrying up to max_triage_attempts; the decision
+    carries env_fault, and the ESCALATED-resume restores the budget (attempt -> 0)
+    so a resume after the outage re-drives triage cleanly."""
+    write_ledger(project, {"DW-1": "open"})
+    evidence = "API Error: Unable to connect (ECONNREFUSED)"
+    engine, adapter = make_sweep(
+        project,
+        [SessionResult(status="timeout", env_fault=True, env_fault_evidence=evidence)],
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    task = engine.state.tasks["sweep-triage"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1  # only the one session — no retry budget spent
+    assert "environment fault: triage session timeout" in engine.state.paused_reason
+    assert evidence in engine.state.paused_reason
+    assert len(adapter.sessions) == 1  # no feedback-retry session
+    dec = [e for e in engine.journal.entries() if e["kind"] == "triage-decision"][-1]
+    assert dec["env_fault"] is True
+
+    # resume once the outage clears: the ESCALATED-resume resets attempt to 0
+    # (fresh budget) and re-drives triage to completion
+    good = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "moot"}])
+    resumed, radapter = resume_sweep(project, engine, [triage_effect(good)])
+    assert not resumed.run().paused
+    assert resumed.state.tasks["sweep-triage"].phase == Phase.DONE
+    assert len(radapter.sessions) == 1
+
+
+def test_triage_plain_timeout_still_retries_to_cap(project):
+    """Guard: a NON-env-fault triage timeout keeps today's behavior — retries up to
+    max_triage_attempts (2) then escalates. The env-fault branch must not swallow
+    ordinary transient failures on the first attempt."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(
+        project,
+        [SessionResult(status="timeout"), SessionResult(status="timeout")],
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    assert engine.state.tasks["sweep-triage"].phase == Phase.ESCALATED
+    assert len(adapter.sessions) == 2  # both attempts spent, not escalated on the first
+    dec = [e for e in engine.journal.entries() if e["kind"] == "triage-decision"]
+    assert all(d["env_fault"] is False for d in dec)
+
+
+def test_migration_session_env_fault_escalates_without_consuming_attempts(project):
+    """A migration session whose CLI lost its API connection (#194) escalates on the
+    first attempt instead of charging a migration retry; migrate-decision carries
+    env_fault, and the legacy ledger is left untouched (no half-rewrite lands)."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    evidence = "API Error: Unable to connect (ECONNREFUSED)"
+    engine, adapter = make_sweep(
+        project,
+        [SessionResult(status="timeout", env_fault=True, env_fault_evidence=evidence)],
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    task = engine.state.tasks["sweep-migrate"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1  # only the one session — no migration retry spent
+    assert "environment fault: migration session timeout" in engine.state.paused_reason
+    assert evidence in engine.state.paused_reason
+    assert len(adapter.sessions) == 1
+    dec = [e for e in engine.journal.entries() if e["kind"] == "migrate-decision"][-1]
+    assert dec["env_fault"] is True
+    # the legacy ledger is intact and the tree clean: no half-rewrite escaped
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert worktree_clean(project.project)
 
 
 def test_triage_escalation_resume_retries_triage(project):
@@ -719,16 +1725,17 @@ def _close_decision_plan():
     )
 
 
-def test_interactive_decisions_return_client_goes_unattended(project, monkeypatch):
-    """When a client was attached to answer, the sweep hands the terminal back
-    after the decisions and goes unattended so later cycles don't block on a
-    detached window."""
-    returned: list[bool] = []
+def _stub_return(monkeypatch, outcome):
+    """Pin return_attached_client's answer and record how often it was asked."""
+    asked: list[object] = []
     monkeypatch.setattr(
         "bmad_loop.tui.launch.return_attached_client",
-        lambda: bool(returned.append(True)) or True,
+        lambda: (asked.append(outcome), outcome)[1],
     )
-    write_ledger(project, {"DW-1": "open"})
+    return asked
+
+
+def _run_one_decision_sweep(project):
     engine, _adapter = make_sweep(
         project,
         [triage_effect(_close_decision_plan())],
@@ -737,7 +1744,17 @@ def test_interactive_decisions_return_client_goes_unattended(project, monkeypatc
     )
     summary = engine.run()
     assert not summary.paused
-    assert returned == [True]  # asked exactly once, after the decisions phase
+    return engine
+
+
+def test_interactive_decisions_return_client_goes_unattended(project, monkeypatch):
+    """When a client was attached to answer, the sweep hands the terminal back
+    after the decisions and goes unattended so later cycles don't block on a
+    detached window."""
+    asked = _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+    write_ledger(project, {"DW-1": "open"})
+    engine = _run_one_decision_sweep(project)
+    assert len(asked) == 1  # asked exactly once, after the decisions phase
     assert engine.prompting is False
     assert '"sweep-returned-after-decisions"' in journal_text(engine)
 
@@ -745,17 +1762,24 @@ def test_interactive_decisions_return_client_goes_unattended(project, monkeypatc
 def test_interactive_decisions_no_attach_stays_attended(project, monkeypatch):
     """A plain foreground sweep (nobody attached, no return target) keeps
     prompting and never emits the return event."""
-    monkeypatch.setattr("bmad_loop.tui.launch.return_attached_client", lambda: False)
+    _stub_return(monkeypatch, launch.ReturnOutcome.ATTENDED)
     write_ledger(project, {"DW-1": "open"})
-    engine, _adapter = make_sweep(
-        project,
-        [triage_effect(_close_decision_plan())],
-        answers=["1"],
-        prompting=True,
-    )
-    summary = engine.run()
-    assert not summary.paused
+    engine = _run_one_decision_sweep(project)
     assert engine.prompting is True
+    assert '"sweep-returned-after-decisions"' not in journal_text(engine)
+
+
+def test_interactive_decisions_unreachable_goes_unattended(project, monkeypatch):
+    """A failed detach is not the same non-return as a failed switch: it means
+    there was no client to hand back, so nobody can answer here any more. The
+    sweep must go unattended anyway — keeping `prompting` would leave a
+    --repeat cycle blocked on input() in a window no one is viewing — but it
+    must not claim a hand-back that did not happen."""
+    _stub_return(monkeypatch, launch.ReturnOutcome.UNREACHABLE)
+    write_ledger(project, {"DW-1": "open"})
+    engine = _run_one_decision_sweep(project)
+    assert engine.prompting is False
+    assert '"sweep-return-no-client"' in journal_text(engine)
     assert '"sweep-returned-after-decisions"' not in journal_text(engine)
 
 
@@ -793,6 +1817,46 @@ def test_unattended_skips_decisions(project):
     assert entries["DW-1"].open  # untouched, waits for an interactive sweep
     assert entries["DW-2"].status.startswith("done")
     assert not (engine.run_dir / "decisions.json").is_file()
+
+
+def test_triage_session_stamps_resolved_adapter_identity(project):
+    """#153 phase 1: the sweep triage session's session-start entry and persisted
+    SessionRecord carry the resolved triage adapter profile + model. A triage-stage
+    name override switches the profile and resets the model to the CLI default ""."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"],
+        already_resolved=[{"id": "DW-1", "evidence": "already guarded at src.txt:1"}],
+    )
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+        adapter=AdapterPolicy(
+            name="claude",
+            model="opus",
+            triage=StageAdapterPolicy(name="gemini"),
+        ),
+    )
+    engine, adapter = make_sweep(project, [triage_effect(plan)], policy=policy)
+    summary = engine.run()
+    assert not summary.paused
+    assert [s.role for s in adapter.sessions] == ["triage"]
+
+    expected = policy.adapter.resolved("triage")
+    assert (expected.name, expected.model) == ("gemini", "")  # client switch resets model
+
+    entries = [json.loads(line) for line in journal_text(engine).splitlines()]
+    starts = [e for e in entries if e["kind"] == "session-start" and e.get("role") == "triage"]
+    assert len(starts) == 1
+    assert starts[0]["adapter"] == "gemini"
+    assert starts[0]["model"] == ""
+    assert starts[0]["story_key"] == "sweep-triage"
+
+    saved = load_state(engine.run_dir)
+    rec = saved.tasks["sweep-triage"].sessions[-1]
+    assert rec.role == "triage"
+    assert (rec.adapter, rec.model) == ("gemini", "")
 
 
 def test_bundle_review_disabled_skips_review_session(project):
@@ -1023,6 +2087,202 @@ def test_escalated_bundle_resume_skips_it_and_runs_rest(project):
     # triage was NOT re-run: only the two bundle sessions
     assert len(adapter.sessions) == 2
     assert ledger_entries(project)["DW-1"].open  # escalated bundle untouched
+
+
+# ------------------------------ intent-gap patch-restore re-drive (#75)
+
+
+def _run_to_dev_escalation(project, policy=None):
+    """Drive a one-bundle sweep until its dev session escalates on an intent gap.
+    Returns the paused engine; the bundle task is ESCALATED with spec_file set and
+    DW-1 still open (blocked spec is not synced done)."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), bundle_dev_escalates(project, "fix", ["DW-1"])],
+        policy=policy,
+    )
+    summary = engine.run()
+    assert summary.paused
+    task = engine.state.tasks["dw-fix"]
+    assert task.phase == Phase.ESCALATED
+    assert task.spec_file  # latched by _record_dev_spec on the dev escalation
+    assert ledger_entries(project)["DW-1"].open  # blocked spec not synced done
+    return engine
+
+
+def test_generic_bundle_prompt_restore_branch_points_at_spec(project):
+    # T-A: the restore-aware prompt (Change A) — no run needed.
+    engine, _ = make_sweep(project, [])
+    spec = str(project.implementation_artifacts / "spec-dw-fix.md")
+    task = StoryTask(
+        story_key="dw-fix",
+        epic=0,
+        dw_ids=["DW-1"],
+        bundle_file="/run/bundles/fix/intent.md",
+        spec_file=spec,
+        restore_patch="/run/artifacts/attempt-dw-fix.patch",
+    )
+    restore_prompt = engine._generic_bundle_prompt(task, None)
+    assert "Resume review of the in-review spec" in restore_prompt
+    assert spec in restore_prompt
+    assert "Do NOT edit the deferred-work ledger" in restore_prompt
+    # without a latched patch the fresh-implement prompt is unchanged
+    task.restore_patch = None
+    fresh_prompt = engine._generic_bundle_prompt(task, None)
+    assert "Implement the deferred-work bundle" in fresh_prompt
+    assert "Resume review of the in-review spec" not in fresh_prompt
+
+
+def test_bundle_dev_prompt_has_no_board_clause_but_the_review_prompt_does(project):
+    """A bundle has no sprint-status row, so the board-ownership clause the story dev
+    prompt carries is not appended here — `SweepEngine` overrides `_dev_prompt`, and
+    `_generic_bundle_prompt` never reaches the seam.
+
+    The inherited REVIEW prompt does carry it, both halves, and that is a decision
+    rather than an accident: a sweep runs inside a project whose sprint board exists
+    and is just as revertible from a bundle session as from a story one, so unlike
+    `StoriesEngine` — which has no board at all and empties the clause — `SweepEngine`
+    never overrides `_review_prompt`. Note the deliberate asymmetry with
+    `_operator_park_enabled`, which IS False here: the clause still names
+    `awaiting-operator`, because the row it defends was written by an earlier *story*
+    run, not by this bundle.
+
+    Coverage gap, deliberate: this asserts on `_dev_prompt`'s return value, so moving
+    the injection into `_run_session` would leave it green while bundle prompts
+    silently gained the clause. The builder is the correct layer today."""
+    engine, _ = make_sweep(project, [])
+    task = StoryTask(
+        story_key="dw-fix", epic=0, dw_ids=["DW-1"], bundle_file="/run/bundles/fix/intent.md"
+    )
+    assert engine._operator_park_enabled() is False
+
+    dev = engine._dev_prompt(task, None)
+    assert "sprint-status.yaml is owned by the orchestrator" not in dev
+    assert "status: blocked and say why" not in dev
+
+    task.spec_file = str(project.implementation_artifacts / "spec-dw-fix.md")
+    review = engine._review_prompt(task)
+    assert "sprint-status.yaml is owned by the orchestrator" in review
+    assert "done or awaiting-operator" in review
+    assert "status: blocked and say why" in review
+
+
+def test_generic_bundle_prompt_spells_the_post_rename_primitive(project):
+    """All three bundle legs (restore, fresh implement, repair) spell the dev
+    primitive resolved off the dev adapter's skill tree, not a hardcoded name —
+    upstream renamed it bmad-dev-auto -> bmad-build-auto (BMAD-METHOD #2651).
+
+    Both setup lines are load-bearing: the `project` fixture installs no skills
+    and `MockAdapter` carries no profile, so dropping either one resolves every
+    leg through `dev_primitive_or_default`'s legacy fallback — which the sibling
+    tests above already pin, and which would make this one pass for the wrong
+    reason."""
+    install_build_auto_skill(project.project, ".claude/skills")
+    engine, adapter = make_sweep(project, [])
+    attach_profile(adapter)  # claude -> .claude/skills, where the new name now lives
+    spec = str(project.implementation_artifacts / "spec-dw-fix.md")
+    task = StoryTask(
+        story_key="dw-fix",
+        epic=0,
+        dw_ids=["DW-1"],
+        bundle_file="/run/bundles/fix/intent.md",
+        spec_file=spec,
+        restore_patch="/run/artifacts/attempt-dw-fix.patch",
+    )
+
+    assert engine._generic_bundle_prompt(task, None).startswith(
+        "/bmad-build-auto Resume review of the in-review spec"
+    )
+    task.restore_patch = None
+    assert engine._generic_bundle_prompt(task, None).startswith(
+        "/bmad-build-auto Implement the deferred-work bundle"
+    )
+    feedback = project.implementation_artifacts / "feedback.md"
+    assert engine._generic_bundle_prompt(task, feedback).startswith(
+        "/bmad-build-auto Resume the autonomous dev session"
+    )
+
+
+def test_sweep_bundle_restore_redrive_reaches_done_and_clears_latch(project, monkeypatch):
+    # T-C + T-D: rearm with a restore patch, resume, land done; assert the dispatched
+    # prompt pointed at the in-review spec, the patch apply seam fired, the dw id
+    # closed, and both latches cleared on commit (inherited Engine._commit).
+    monkeypatch.setattr(verify, "apply_patch", lambda repo, patch: None)
+    engine = _run_to_dev_escalation(project)
+    patch = project.implementation_artifacts / "attempt-dw-fix.patch"
+    patch.parent.mkdir(parents=True, exist_ok=True)
+    patch.write_text("dummy\n")
+
+    runs.rearm_escalation(engine.run_dir, "dw-fix", restore_patch=str(patch))
+
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [bundle_dev_effect(project, "fix", ["DW-1"]), bundle_review_effect(project, "fix")],
+    )
+    summary = resumed.run()
+
+    assert not summary.paused
+    task = resumed.state.tasks["dw-fix"]
+    assert task.phase == Phase.DONE
+    # Change A: the re-drive dev session was pointed at the in-review spec
+    spec = str(project.implementation_artifacts / "spec-dw-fix.md")
+    assert "Resume review of the in-review spec" in adapter.sessions[0].prompt
+    assert spec in adapter.sessions[0].prompt
+    # the restore apply seam fired
+    assert "attempt-restored" in journal_text(resumed)
+    # latches cleared on commit
+    assert task.restore_patch is None
+    assert task.resolved_redrive is False
+    # the deferred-work id was closed
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+
+
+def test_sweep_restore_redrive_exhaustion_pauses_not_defers(project, monkeypatch):
+    # T-B (restore): a non-critical exhaustion mid-restore-re-drive must PAUSE
+    # (re-escalate for the human), not silently DEFER the resolved escalation.
+    monkeypatch.setattr(verify, "apply_patch", lambda repo, patch: None)
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(max_dev_attempts=1),
+    )
+    engine = _run_to_dev_escalation(project, policy=policy)
+    patch = project.implementation_artifacts / "attempt-dw-fix.patch"
+    patch.parent.mkdir(parents=True, exist_ok=True)
+    patch.write_text("dummy\n")
+    runs.rearm_escalation(engine.run_dir, "dw-fix", restore_patch=str(patch))
+
+    resumed, _ = resume_sweep(project, engine, [lambda spec: SessionResult(status="died")])
+    summary = resumed.run()
+
+    assert summary.paused
+    assert resumed.state.tasks["dw-fix"].phase == Phase.ESCALATED
+
+
+def test_sweep_from_scratch_redrive_exhaustion_pauses_not_defers(project):
+    # T-B (from-scratch twin): the resolved_redrive latch also protects a plain
+    # `resolve` re-drive (no --restore-patch) — the pre-existing sweep defer bug
+    # Change B closes. Without the fix this exhaustion would DEFER, not PAUSE.
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(max_dev_attempts=1),
+    )
+    engine = _run_to_dev_escalation(project, policy=policy)
+    runs.rearm_escalation(engine.run_dir, "dw-fix")  # from-scratch, no restore
+
+    resumed, _ = resume_sweep(project, engine, [lambda spec: SessionResult(status="died")])
+    summary = resumed.run()
+
+    assert summary.paused
+    assert resumed.state.tasks["dw-fix"].phase == Phase.ESCALATED
 
 
 # ----------------------------------------------------------- repeat cycles
@@ -1541,10 +2801,18 @@ def test_sweep_bundle_budget_exhausted_commits_and_refiles(project):
         ["DW-1"],
         bundles=[{"name": "fix-it", "dw_ids": ["DW-1"], "intent": "fix it"}],
     )
+    # pin the damping cap high so this exercises the max_review_cycles exhaustion
+    # path (the damped force-converge has its own sweep test below).
     engine, _ = make_sweep(
         project,
         [triage_effect(plan), bundle_dev_effect(project, "fix-it", ["DW-1"])]
         + [bundle_review_effect(project, "fix-it", clean=False) for _ in range(3)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            scm=ScmPolicy(rollback_on_failure=True),
+            limits=LimitsPolicy(max_followup_reviews=99),
+        ),
     )
     summary = engine.run()
 
@@ -1575,6 +2843,84 @@ def test_sweep_bundle_budget_followup_not_refiled_twice(project):
         ["DW-1"],
         bundles=[{"name": "fix-it", "dw_ids": ["DW-1"], "intent": "fix it"}],
     )
+    # pin the damping cap high so this exercises the max_review_cycles exhaustion
+    # re-review cap (the damped re-review cap has its own sweep test below).
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), bundle_dev_effect(project, "fix-it", ["DW-1"])]
+        + [bundle_review_effect(project, "fix-it", clean=False) for _ in range(3)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            scm=ScmPolicy(rollback_on_failure=True),
+            limits=LimitsPolicy(max_followup_reviews=99),
+        ),
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 0 and not summary.paused
+    assert engine.state.tasks["dw-fix-it"].phase == Phase.DONE
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")  # the worked entry still closes
+    open_followups = [
+        e for e in entries.values() if e.open and "origin: review-budget-followup" in e.body
+    ]
+    assert open_followups == []  # no second follow-up entry created
+    capped = [e for e in engine.journal.entries() if e["kind"] == "review-budget-committed"]
+    assert len(capped) == 1 and capped[0]["re_review_capped"] is True
+
+
+def test_sweep_bundle_followup_damped_commits_and_refiles(project):
+    """Default damping cap (1): a bundle whose review keeps recommending a follow-up
+    converges after ONE honored round instead of burning the whole review budget.
+    The lingering follow-up is re-filed once, the work is committed, and — the
+    steady state — the damped converge stays quiet (no review-budget ATTENTION)."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"],
+        bundles=[{"name": "fix-it", "dw_ids": ["DW-1"], "intent": "fix it"}],
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), bundle_dev_effect(project, "fix-it", ["DW-1"])]
+        + [bundle_review_effect(project, "fix-it", clean=False) for _ in range(3)],
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 0 and not summary.paused
+    task = engine.state.tasks["dw-fix-it"]
+    assert task.phase == Phase.DONE
+    assert task.review_cycle == 2  # converged after one honored follow-up (3rd review unused)
+    assert task.followup_reviews_spent == 1
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")  # the worked item closed
+    refiled = [e for e in entries.values() if e.open and "origin: review-budget-followup" in e.body]
+    assert len(refiled) == 1
+    kinds = {e["kind"] for e in engine.journal.entries()}
+    assert "review-followup-damped" in kinds
+    assert "review-budget-committed" not in kinds and "story-deferred" not in kinds
+    attention = engine.run_dir / "ATTENTION"
+    assert not attention.exists() or "review budget reached" not in attention.read_text()
+
+
+def test_sweep_bundle_damped_re_review_capped_notifies_not_refiles(project):
+    """Re-review cap survives damping: when a bundle itself closes a
+    `review-budget-followup` entry and still won't converge, the damped force-
+    converge commits but does NOT re-file again — and, unlike an ordinary quiet
+    damped converge, it raises an ATTENTION notice so a human sees the repeat."""
+    ledger = (
+        "# Deferred Work\n\n"
+        "### DW-1: follow-up still recommended for dw-prior\n"
+        "origin: review-budget-followup\nsource_spec: `spec-dw-fix-it.md`\n"
+        "severity: low\nreason: a prior budget exhaustion.\nstatus: open\n"
+    )
+    project.deferred_work.write_text(ledger, encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ledger")
+    plan = triage_result(
+        ["DW-1"],
+        bundles=[{"name": "fix-it", "dw_ids": ["DW-1"], "intent": "fix it"}],
+    )
     engine, _ = make_sweep(
         project,
         [triage_effect(plan), bundle_dev_effect(project, "fix-it", ["DW-1"])]
@@ -1590,5 +2936,552 @@ def test_sweep_bundle_budget_followup_not_refiled_twice(project):
         e for e in entries.values() if e.open and "origin: review-budget-followup" in e.body
     ]
     assert open_followups == []  # no second follow-up entry created
-    capped = [e for e in engine.journal.entries() if e["kind"] == "review-budget-committed"]
+    capped = [e for e in engine.journal.entries() if e["kind"] == "review-followup-damped"]
     assert len(capped) == 1 and capped[0]["re_review_capped"] is True
+    # the loud re-review path fires even under damping — a human must see it
+    assert "review budget reached" in (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+
+
+# ------------------------------ in-flight bundle recovery on resume (#94)
+
+
+def _lose_triage(run_dir, corruption="missing"):
+    """Make the cached triage plan unusable the three ways a real run can: the
+    file vanished, it was truncated mid-write, or it holds something that is not
+    a triage result."""
+    path = run_dir / "triage.json"
+    if corruption == "missing":
+        path.unlink()
+    elif corruption == "invalid-json":
+        path.write_text("{{{", encoding="utf-8")
+    else:
+        path.write_text("{}", encoding="utf-8")
+
+
+def _run_two_bundle_dev_escalation(project):
+    """Drive a two-bundle sweep until the first bundle's dev session escalates.
+    Returns the paused engine; `dw-fix` is ESCALATED, `dw-other` never started,
+    both dw ids still open."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[
+            {"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"},
+            {"name": "other", "dw_ids": ["DW-2"], "intent": "resolve DW-2"},
+        ],
+    )
+    engine, _ = make_sweep(
+        project, [triage_effect(plan), bundle_dev_escalates(project, "fix", ["DW-1"])]
+    )
+    assert engine.run().paused
+    assert engine.state.tasks["dw-fix"].phase == Phase.ESCALATED
+    assert "dw-other" not in engine.state.tasks
+    return engine
+
+
+def _redrive_script(project):
+    return [bundle_dev_effect(project, "fix", ["DW-1"]), bundle_review_effect(project, "fix")]
+
+
+def test_rearmed_bundle_redrives_when_triage_json_lost(project):
+    # The regression: a human-resolved bundle used to re-drive only because the
+    # cached triage plan reloaded and re-emitted its name. Recovery now keys on
+    # the persisted task, so losing the cache changes nothing.
+    engine = _run_to_dev_escalation(project)
+    runs.rearm_escalation(engine.run_dir, "dw-fix")
+    _lose_triage(engine.run_dir)
+
+    resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
+    summary = resumed.run()
+
+    assert not summary.paused
+    assert resumed.state.tasks["dw-fix"].phase == Phase.DONE
+    # no triage session: the re-drive never consulted a plan
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    journal = journal_text(resumed)
+    assert "sweep-inflight-redrive" in journal
+    assert "sweep-nothing-open" in journal  # recovery closed the only open id
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+
+
+@pytest.mark.parametrize("corruption", ["missing", "invalid-json", "wrong-shape"])
+def test_fresh_triage_different_bundle_name_no_double_drive(project, corruption):
+    # The fresh triage renames the surviving bundle, so a name-matched recovery
+    # would orphan the re-armed one. It must re-drive by identity, and its ids
+    # must have left the open set before the fresh triage sees them.
+    engine = _run_two_bundle_dev_escalation(project)
+    runs.rearm_escalation(engine.run_dir, "dw-fix")
+    _lose_triage(engine.run_dir, corruption)
+
+    fresh = triage_result(
+        ["DW-2"], bundles=[{"name": "renamed-fix", "dw_ids": ["DW-2"], "intent": "resolve DW-2"}]
+    )
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [
+            *_redrive_script(project),
+            triage_effect(fresh),
+            bundle_dev_effect(project, "renamed-fix", ["DW-2"]),
+            bundle_review_effect(project, "renamed-fix"),
+        ],
+    )
+    summary = resumed.run()
+
+    assert not summary.paused
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "triage", "dev", "review"]
+    assert resumed.state.tasks["dw-fix"].phase == Phase.DONE
+    assert resumed.state.tasks["dw-renamed-fix"].phase == Phase.DONE
+    # each id was closed exactly once, by the bundle that owned it
+    closed = [e for e in resumed.journal.entries() if e["kind"] == "sweep-bundle-closed"]
+    owners = [(i, e["story_key"]) for e in closed for i in e["dw_ids"]]
+    assert sorted(owners) == [("DW-1", "dw-fix"), ("DW-2", "dw-renamed-fix")]
+    if corruption != "missing":
+        # a truncated / wrong-shape cache degrades to a fresh triage, never a crash
+        assert "sweep-triage-reload-failed" in journal_text(resumed)
+
+
+def test_restore_patch_latch_honored_when_triage_json_lost(project, monkeypatch):
+    monkeypatch.setattr(verify, "apply_patch", lambda repo, patch: None)
+    engine = _run_to_dev_escalation(project)
+    patch = project.implementation_artifacts / "attempt-dw-fix.patch"
+    patch.parent.mkdir(parents=True, exist_ok=True)
+    patch.write_text("dummy\n")
+    runs.rearm_escalation(engine.run_dir, "dw-fix", restore_patch=str(patch))
+    _lose_triage(engine.run_dir)
+
+    resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
+    summary = resumed.run()
+
+    assert not summary.paused
+    task = resumed.state.tasks["dw-fix"]
+    assert task.phase == Phase.DONE
+    # the recovery pass preserved the restore semantics _run_bundle used to own
+    assert "Resume review of the in-review spec" in adapter.sessions[0].prompt
+    assert "attempt-restored" in journal_text(resumed)
+    assert task.restore_patch is None and task.resolved_redrive is False
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+
+
+def test_escalated_unresolved_still_skipped_when_triage_json_lost(project):
+    # An escalation nobody resolved is terminal: recovery must not touch it, and
+    # the fresh triage's overlapping bundle is still dropped by the failed-ids filter.
+    engine = _run_two_bundle_dev_escalation(project)
+    _lose_triage(engine.run_dir)
+
+    fresh = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[
+            {"name": "retry-fix", "dw_ids": ["DW-1"], "intent": "a"},
+            {"name": "other", "dw_ids": ["DW-2"], "intent": "b"},
+        ],
+    )
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [
+            triage_effect(fresh),
+            bundle_dev_effect(project, "other", ["DW-2"]),
+            bundle_review_effect(project, "other"),
+        ],
+    )
+    summary = resumed.run()
+
+    assert not summary.paused
+    assert "sweep-inflight-redrive" not in journal_text(resumed)
+    assert [s.role for s in adapter.sessions] == ["triage", "dev", "review"]
+    assert resumed.state.tasks["dw-fix"].phase == Phase.ESCALATED
+    assert "dw-retry-fix" not in resumed.state.tasks
+    assert "sweep-bundle-skipped" in journal_text(resumed)
+    entries = ledger_entries(project)
+    assert entries["DW-1"].open  # escalated bundle untouched
+    assert entries["DW-2"].status.startswith("done")
+
+
+def test_interrupted_bundle_redrives_by_identity_after_triage_loss(project):
+    # Not a re-arm: the host just died mid-dev. The restart arm rolls the attempt
+    # back against its own baseline (cause="stopped") and re-runs the bundle.
+    engine = _run_to_dev_escalation(project)
+    state = load_state(engine.run_dir)
+    task = state.tasks["dw-fix"]
+    assert task.baseline_commit
+    task.phase = Phase.DEV_RUNNING
+    save_state(engine.run_dir, state)
+    _lose_triage(engine.run_dir)
+
+    resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
+    summary = resumed.run()
+
+    assert not summary.paused
+    assert resumed.state.tasks["dw-fix"].phase == Phase.DONE
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    redrive = [e for e in resumed.journal.entries() if e["kind"] == "sweep-inflight-redrive"]
+    assert len(redrive) == 1
+    assert redrive[0]["phase"] == "dev-running" and redrive[0]["rearmed"] is False
+    journal = journal_text(resumed)
+    assert "rollback-auto" in journal  # a stopped attempt, rolled back to baseline
+    assert "attempt-restored" not in journal  # not a resolved re-drive
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+
+
+def test_resume_committing_bundle_finishes_commit(project):
+    """#115, sweep flavor: a bundle whose host died in the commit window
+    (COMMITTING persisted, DONE save never landed) is finished on resume —
+    the recovery arm mirrors the base engine's resume-commit, not the
+    rollback+restart the recovery used to apply to every non-DEV_VERIFY phase."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"]),
+            bundle_review_effect(project, "fix"),
+        ],
+    )
+
+    def crashing_emit(stage, *args, **kwargs):
+        if stage == "pre_commit":
+            raise RuntimeError("host died in the commit window")
+        return original_emit(stage, *args, **kwargs)
+
+    original_emit = engine._emit
+    engine._emit = crashing_emit
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["dw-fix"]
+    assert crashed.phase == Phase.COMMITTING
+    assert not crashed.commit_sha  # stamped only by the DONE save that never ran
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    task = resumed.state.tasks["dw-fix"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    assert adapter.sessions == []  # no triage, dev, review, or gate session re-run
+    journal = journal_text(resumed)
+    assert "resume-commit" in journal
+    assert "resume-restart" not in journal
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+
+
+def test_regenerated_intent_when_bundle_file_missing(project):
+    # The triage session's authored prose is the one unrecoverable piece; the
+    # verbatim ledger entries are re-attached and become the contract.
+    engine = _run_to_dev_escalation(project)
+    runs.rearm_escalation(engine.run_dir, "dw-fix")
+    _lose_triage(engine.run_dir)
+    intent = Path(engine.state.tasks["dw-fix"].bundle_file)
+    intent.unlink()
+
+    resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
+    summary = resumed.run()
+
+    assert not summary.paused
+    assert resumed.state.tasks["dw-fix"].phase == Phase.DONE
+    regen = [e for e in resumed.journal.entries() if e["kind"] == "sweep-intent-regenerated"]
+    assert len(regen) == 1 and regen[0]["dw_ids"] == ["DW-1"]
+    assert regen[0]["path"] == str(intent)
+    text = intent.read_text(encoding="utf-8")
+    assert "bundle_name: fix" in text
+    assert "### DW-1" in text and "reason: test entry." in text  # verbatim ledger entry
+    assert "authoritative" in text
+    assert str(intent) in adapter.sessions[0].prompt  # the dev session got the rebuilt file
+
+
+def test_stranded_bundle_task_warns_loudly(project):
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    engine.state.tasks["dw-ghost"] = StoryTask(
+        story_key="dw-ghost", epic=0, dw_ids=["DW-1"], phase=Phase.DEV_RUNNING
+    )
+
+    engine._warn_stranded_bundles()
+
+    stranded = [e for e in engine.journal.entries() if e["kind"] == "sweep-inflight-stranded"]
+    assert len(stranded) == 1 and stranded[0]["story_keys"] == ["dw-ghost"]
+    assert "dw-ghost" in (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+
+    # a terminal bundle and a non-bundle task are not stranded
+    engine.state.tasks["dw-ghost"].phase = Phase.DONE
+    engine.state.tasks["sweep-triage"] = StoryTask(
+        story_key="sweep-triage", epic=0, phase=Phase.TRIAGE_RUNNING
+    )
+    engine._warn_stranded_bundles()
+    assert len([e for e in engine.journal.entries() if e["kind"] == "sweep-inflight-stranded"]) == 1
+
+
+# ------------------------------------------------------------- graceful stop
+#
+# A graceful stop is delivered out-of-band via the stop-request.json control
+# file (Phase 1's runs helpers). SweepEngine overrides _loop, so it carries its
+# own boundary checks: the first statement of the while body, and before every
+# _run_bundle. These tests lodge the control file directly (an existence read is
+# all the engine checks) so the request lands at a chosen boundary, then prove
+# the in-flight item still runs to completion and the next never starts.
+
+
+def _lodge_stop_request(run_dir: Path) -> None:
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "2026-07-20T00:00:00", "mode": "graceful"}', encoding="utf-8"
+    )
+
+
+def _lodge_after(inner, run_dir: Path):
+    """Wrap a scripted effect so the graceful-stop request lands as ``inner``
+    returns — proving the in-flight item still runs to completion, because the
+    boundary check only fires at the next loop head / next bundle."""
+
+    def effect(spec):
+        result = inner(spec)
+        _lodge_stop_request(run_dir)
+        return result
+
+    return effect
+
+
+def test_graceful_stop_between_bundles_finishes_current_then_stops(project):
+    """A request lodged while bundle 1 runs lets it finish through commit; the
+    boundary check before bundle 2 raises, so bundle 2 never starts and the run
+    ends `stopped` + resumable. A re-run completes bundle 2."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "sweep-run"
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[
+            {"name": "first-fix", "dw_ids": ["DW-1"], "intent": "a"},
+            {"name": "second-fix", "dw_ids": ["DW-2"], "intent": "b"},
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "first-fix", ["DW-1"]),
+            _lodge_after(bundle_review_effect(project, "first-fix"), run_dir),
+        ],
+    )
+    summary = engine.run()
+
+    assert not summary.paused
+    tasks = engine.state.tasks
+    assert tasks["dw-first-fix"].phase == Phase.DONE and tasks["dw-first-fix"].commit_sha
+    assert "dw-second-fix" not in tasks  # bundle 2 never dispatched
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False
+    assert not runs.graceful_stop_requested(engine.run_dir)  # control file consumed
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-complete" not in kinds
+    stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["graceful"] is True
+    assert stops[-1]["remaining"] == 1  # DW-2 still open, never bundled
+
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done") and entries["DW-2"].open
+
+    # resume: bundle 2 runs to completion and the run finishes
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [
+            bundle_dev_effect(project, "second-fix", ["DW-2"]),
+            bundle_review_effect(project, "second-fix"),
+        ],
+    )
+    summary = resumed.run()
+    assert not summary.paused
+    assert resumed.state.tasks["dw-second-fix"].phase == Phase.DONE
+    assert len(adapter.sessions) == 2  # triage reloaded from cache, bundle 1 skipped
+    assert ledger_entries(project)["DW-2"].status.startswith("done")
+    assert worktree_clean(project.project)
+
+
+def test_graceful_stop_during_triage_runs_zero_bundles(project):
+    """A request landing during the triage session completes triage (artifacts
+    written, resolved entries closed) but the very first bundle-loop check raises,
+    so zero bundles run."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "sweep-run"
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        already_resolved=[{"id": "DW-1", "evidence": "already guarded at src.txt:1"}],
+        bundles=[{"name": "fix-it", "dw_ids": ["DW-2"], "intent": "fix"}],
+    )
+    engine, _ = make_sweep(project, [_lodge_after(triage_effect(plan), run_dir)])
+    summary = engine.run()
+
+    assert not summary.paused
+    tasks = engine.state.tasks
+    assert tasks["sweep-triage"].phase == Phase.DONE
+    assert (engine.run_dir / "triage.json").is_file()  # triage completed
+    assert "dw-fix-it" not in tasks  # zero bundles started
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False
+    assert not runs.graceful_stop_requested(engine.run_dir)
+    stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["graceful"] is True
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")  # resolved-close still ran
+    assert entries["DW-2"].open
+    assert stops[-1]["remaining"] == 1  # only DW-2 left open
+
+
+def test_graceful_stop_between_cycles_skips_next_triage(project):
+    """In repeat mode a request lodged during cycle 1 lets that cycle finish, then
+    the while-head check fires before cycle 2 re-triages — cycle 2 never runs."""
+    write_ledger(project, {"DW-1": "open"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "sweep-run"
+    plan1 = triage_result(
+        ["DW-1"], bundles=[{"name": "first-fix", "dw_ids": ["DW-1"], "intent": "a"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan1),
+            appending_dev(project, bundle_dev_effect(project, "first-fix", ["DW-1"]), "DW-2"),
+            _lodge_after(bundle_review_effect(project, "first-fix"), run_dir),
+        ],
+        policy=repeat_policy(),
+    )
+    summary = engine.run()
+
+    assert not summary.paused
+    tasks = engine.state.tasks
+    assert tasks["dw-first-fix"].phase == Phase.DONE
+    assert "sweep-triage-2" not in tasks  # cycle 2 never triaged
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False
+    assert not runs.graceful_stop_requested(engine.run_dir)
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "sweep-cycle" not in kinds  # the cycle-2 header never printed
+    stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["graceful"] is True
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done") and entries["DW-2"].open
+    assert stops[-1]["remaining"] == 1  # DW-2, generated in cycle 1, still open
+
+
+def test_bundle_dispatch_does_not_pin_expected_spec(project, tmp_path):
+    """A sweep bundle's fresh dispatch points at `intent.md`, never at a spec — the
+    session is free to CREATE one, and #161 has it legitimately adopting a
+    pre-existing story spec under a different name. So the #261 read-back must stay
+    on the scan here even when a prior attempt recorded `task.spec_file`; pinning
+    would poll a path this dispatch never promised to rewrite.
+
+    Falls out of the naming rule rather than a sweep-specific carve-out, which is
+    exactly why it needs pinning down: nothing in sweep.py mentions expected_spec."""
+    engine, adapter = make_sweep(project, [SessionResult(status="crashed")])
+    intent = tmp_path / "bundles" / "fix" / "intent.md"
+    intent.parent.mkdir(parents=True)
+    intent.write_text("# bundle intent\n")
+    task = StoryTask(
+        story_key="dw-fix",
+        epic=0,
+        bundle_file=str(intent),
+        spec_file=str(project.implementation_artifacts / "spec-adopted-elsewhere.md"),
+    )
+
+    prompt = engine._dev_prompt(task, None)
+    assert str(intent) in prompt and task.spec_file not in prompt
+    engine._run_session(task, role="dev", prompt=prompt, seq=1)
+    assert adapter.sessions[-1].expected_spec is None
+
+
+# ---------------- frontmatter `deferred:` harvest parity (BMAD-METHOD #2640)
+
+SWEEP_FINDING = {
+    "summary": "The retry cap should be configurable",
+    "evidence": "hardcoded while fixing DW-1",
+    "location": "src/retry.py:88",
+    "severity": "low",
+}
+
+
+def _harvest_bundle_policy(*, attempts: int = 3) -> Policy:
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        limits=LimitsPolicy(max_dev_attempts=attempts),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+
+
+def test_generic_bundle_harvests_new_spec_deferrals_alongside_its_ids(project):
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "fix-things", "dw_ids": ["DW-1", "DW-2"], "intent": "fix both"}],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(
+                project,
+                "fix-things",
+                ["DW-1", "DW-2"],
+                mark_ledger=False,
+                followup_review=False,
+                deferred=[SWEEP_FINDING],
+            ),
+        ],
+        policy=_harvest_bundle_policy(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused
+    assert engine.state.tasks["dw-fix-things"].phase == Phase.DONE
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")
+    assert entries["DW-2"].status.startswith("done")
+    assert entries["DW-3"].open
+    assert entries["DW-3"].title == SWEEP_FINDING["summary"]
+    assert "origin: spec-deferred " in entries["DW-3"].body
+    assert "location: src/retry.py:88" in entries["DW-3"].body
+    assert "source_spec: `spec-dw-fix-things.md`" in entries["DW-3"].body
+    assert engine.state.tasks["dw-fix-things"].dw_ids == ["DW-1", "DW-2"]
+    harvested = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvested) == 1 and harvested[0]["dw_ids"] == ["DW-3"]
+
+
+def test_bundle_harvest_alone_is_not_proof_of_work(project):
+    """A bundle session that files a spec deferral but changes nothing still reads
+    as "no changes": the harvest's own ledger write is not the session's proof of
+    work. The harvest itself still lands, so what this pins is the gate's action,
+    not a lost harvest."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"],
+        bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "fix it"}],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(
+                project,
+                "fix-things",
+                ["DW-1"],
+                mark_ledger=False,
+                followup_review=False,
+                deferred=[SWEEP_FINDING],
+                write_src=False,
+            ),
+        ],
+        policy=_harvest_bundle_policy(attempts=1),
+    )
+
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [decision["action"] for decision in decisions] == ["defer"]
+    assert "no changes" in decisions[0]["reason"]
+    assert summary.deferred == 1
+    assert engine.state.tasks["dw-fix-things"].phase == Phase.DEFERRED
+    harvested = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvested) == 1 and harvested[0]["dw_ids"] == ["DW-2"]

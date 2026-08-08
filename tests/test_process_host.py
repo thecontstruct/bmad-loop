@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
 import sys
+import time
 
 import pytest
 
@@ -137,6 +140,170 @@ def test_liveness_of_legacy_identity_degrades_to_is_alive(host, monkeypatch):
     assert host.liveness_of(4242, None) == "alive"
     assert host.liveness_of(9999, None) == "dead"
     assert host.liveness_of(0, None) == "dead"
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="descendants /proc walk is exercised on Linux"
+)
+def test_descendants_enumerates_transitively(host, tmp_path):
+    """A child-of-child (grandchild) is found: the /proc walk is transitive, not
+    just direct children. The outer sh backgrounds an inner sh that itself
+    backgrounds a sleep and records that grandchild's pid; descendants(outer) must
+    contain it. The whole tree runs in its own session so the finally can nuke it
+    with a single killpg even if the assertion fails."""
+    gc_file = tmp_path / "gc.pid"
+    # outer sh -> inner sh (stays a shell: compound body, not exec'd) -> grandchild sleep
+    script = f"sh -c 'sleep 300 & echo $! > {gc_file}; wait' & sleep 300"
+    proc = subprocess.Popen(["sh", "-c", script], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 10
+        while not gc_file.is_file() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert gc_file.is_file(), "grandchild pid was never recorded"
+        gc_pid = int(gc_file.read_text(encoding="utf-8").strip())
+        kids = host.descendants(proc.pid)
+        assert gc_pid in kids, f"grandchild {gc_pid} not in transitive descendants {kids}"
+        # The identity rides along from the SAME /proc read the ancestry came from
+        # and must equal the canonical per-pid stamp (the /proc starttime).
+        assert kids[gc_pid] == process_host._proc_starttime(gc_pid)
+    finally:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="descendants /proc walk is exercised on Linux"
+)
+def test_descendants_dead_or_unknown_pid_is_empty(host):
+    """The seam contract: a reaped pid, a never-allocated high pid, and a
+    non-positive pid all enumerate to {} rather than raising."""
+    proc = subprocess.Popen(["true"])
+    proc.wait(timeout=10)  # reap it — its pid is now gone
+    assert host.descendants(proc.pid) == {}
+    assert host.descendants(2**31 - 1) == {}  # never allocated
+    assert host.descendants(0) == {}
+    assert host.descendants(-1) == {}
+
+
+def test_psutil_descendants_maps_children_and_never_raises(monkeypatch):
+    """The non-Linux/Windows descendant path maps ``Process.children(recursive=True)``
+    to a pid → create_time identity snapshot stamped from the SAME enumerated
+    ``Process`` objects, and any failure (a raising Process, or a missing-psutil
+    ProcessHostError from ``_psutil()`` itself) degrades to {} — the never-raise
+    seam contract that the Linux ``/proc`` walk cannot exercise on Linux CI."""
+
+    class _FakeChild:
+        def __init__(self, pid, created):
+            self.pid = pid
+            self._created = created
+
+        def create_time(self):
+            return self._created
+
+        def is_running(self):
+            return True  # same generation we enumerated — identity confirmed
+
+    class _FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def children(self, recursive=False):
+            assert recursive is True  # transitive tree, not just direct children
+            return [_FakeChild(11, 111.0), _FakeChild(22, 222.0)]
+
+    class _FakePsutil:
+        Process = _FakeProc
+
+    monkeypatch.setattr(process_host, "_psutil", lambda: _FakePsutil)
+    assert process_host._psutil_descendants(123) == {11: 111.0, 22: 222.0}
+
+    class _BoomProc:
+        def __init__(self, pid):
+            raise RuntimeError("no such process")  # psutil.NoSuchProcess analogue
+
+    class _BoomPsutil:
+        Process = _BoomProc
+
+    monkeypatch.setattr(process_host, "_psutil", lambda: _BoomPsutil)
+    assert process_host._psutil_descendants(123) == {}
+
+    def _missing():
+        raise process_host.ProcessHostError("psutil missing")
+
+    monkeypatch.setattr(process_host, "_psutil", _missing)
+    assert process_host._psutil_descendants(123) == {}
+
+
+def test_psutil_descendants_omits_pid_reused_before_identity_capture(monkeypatch):
+    """PID-generation rollover between enumeration and the identity stamp, in BOTH
+    shapes psutil actually produces — the snapshot must OMIT any member it cannot
+    authenticate, keep confirmable siblings, and never raise.
+
+    ``_GoneChild`` is the easy shape: the pid vanished and was not reused, so
+    ``create_time()`` raises a ``NoSuchProcess`` analogue.
+
+    ``_ReusedChild`` is the shape that actually bites on macOS and the reason the
+    ``is_running()`` revalidation exists (#184 review). Per
+    ``psutil.Process._get_ident``, the ``LINUX or NETBSD or OSX`` branch binds a
+    *monotonic* ident and leaves ``self._create_time`` unset, so ``create_time()``
+    is a raw call-time read that happily returns the RECYCLED process's stamp — no
+    exception at all. Stamping that would let teardown authenticate and signal an
+    unrelated process. Only ``is_running()`` (construction-bound ident vs. a fresh
+    ``Process``) reports the generation change. An exception-only fake would pass
+    against the buggy code, so this case is what makes the test a regression test."""
+
+    class _GoneChild:
+        pid = 11
+
+        def create_time(self):
+            raise RuntimeError("process no longer exists")  # NoSuchProcess analogue
+
+        def is_running(self):  # pragma: no cover - create_time raises first
+            raise AssertionError("must not be reached: identity read comes first")
+
+    class _ReusedChild:
+        """Enumerated as generation A; the pid was recycled before the stamp, so
+        ``create_time()`` returns generation B's identity WITHOUT raising."""
+
+        pid = 33
+
+        def create_time(self):
+            return 999.0  # generation B's stamp — plausible, and utterly wrong
+
+        def is_running(self):
+            return False  # construction-bound ident no longer matches this pid
+
+    class _OkChild:
+        pid = 22
+
+        def create_time(self):
+            return 222.0
+
+        def is_running(self):
+            return True
+
+    class _FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def children(self, recursive=False):
+            return [_GoneChild(), _ReusedChild(), _OkChild()]
+
+    class _FakePsutil:
+        Process = _FakeProc
+
+    monkeypatch.setattr(process_host, "_psutil", lambda: _FakePsutil)
+    snapshot = process_host._psutil_descendants(123)
+    assert snapshot == {22: 222.0}
+    # The recycled pid must be absent outright, not stamped with the newcomer's
+    # identity — a stamped entry authenticates at teardown and gets signalled.
+    assert 33 not in snapshot
 
 
 def test_default_host_matches_platform(monkeypatch):

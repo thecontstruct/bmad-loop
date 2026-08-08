@@ -28,7 +28,7 @@ back into this module's internals.
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -216,6 +216,33 @@ def _plugin_fields(name: str, specs: tuple[PluginSettingSpec, ...]) -> tuple[Set
     )
 
 
+def _inject_mux_backends(sections: tuple[SectionSpec, ...], policy: Any) -> tuple[SectionSpec, ...]:
+    """Populate the ``mux.backend`` select with the backends registered on THIS host.
+
+    Registered backends are a runtime fact (not a policy enum set), so the option
+    list is built per screen-open from ``detect_multiplexers()`` rather than baked
+    into ``core.toml``. Any value already present in policy is unioned in, so a
+    backend forced via ``bmad-loop mux set --force <name>`` on a host where it is not
+    registered is never silently dropped when the settings screen saves (a blank
+    Select would collect to ``None`` = delete the key). The empty string (auto-select)
+    stays the implicit blank choice and is not listed."""
+    from .adapters.multiplexer import detect_multiplexers
+
+    current = getattr(getattr(policy, "mux", None), "backend", "") or ""
+    names = [info.name for info in detect_multiplexers()]
+    options = tuple(name for name in dict.fromkeys([*names, current]) if name)
+    out: list[SectionSpec] = []
+    for section in sections:
+        if section.name != "mux":
+            out.append(section)
+            continue
+        fields = tuple(
+            replace(f, options=options) if f.key == "backend" else f for f in section.fields
+        )
+        out.append(replace(section, fields=fields))
+    return tuple(out)
+
+
 def build_registry(project: Path | None = None, policy: Any = None) -> SettingsRegistry:
     """Core schema, plus a PluginInfo for every *discovered* plugin.
 
@@ -226,7 +253,7 @@ def build_registry(project: Path | None = None, policy: Any = None) -> SettingsR
     (the screen greys them until enabled), so ``plugin_schemas`` covers every
     plugin that contributes settings, making each ``[plugins.<name>]`` table
     typed on save regardless of toggle state."""
-    sections = load_core_schema()
+    sections = _inject_mux_backends(load_core_schema(), policy)
     enabled = set(getattr(getattr(policy, "plugins", None), "enabled", ()) or ())
     manifests = load_plugins(project)
     plugins: list[PluginInfo] = []

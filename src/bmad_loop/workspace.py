@@ -16,11 +16,14 @@ lives in the main repo and is passed separately — it never moves.
 
 from __future__ import annotations
 
+import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import verify
 from .bmadconfig import ProjectPaths
+from .platform_util import safe_ref_segment, safe_segment
 
 # Per-unit worktrees live under the run dir (.bmad-loop/runs/<run_id>/worktrees/),
 # which `bmad-loop init` already gitignores — so unit checkouts never show up as
@@ -34,6 +37,27 @@ WORKTREE_DIRNAME = "worktrees"
 def unit_worktrees_dir(run_dir: Path) -> Path:
     """The parent dir holding this run's per-unit worktrees."""
     return run_dir / WORKTREE_DIRNAME
+
+
+def _rmtree_confined(wt: Path, run_dir: Path) -> bool:
+    """rmtree `wt` only when it resolves to a strict descendant of this run's
+    worktrees dir; returns whether deletion was attempted. The teardown fallbacks
+    reach for rmtree with paths that can arrive from persisted task state
+    (`task.worktree_path` via discard_worktree and `_reopen_unit`), and rmtree —
+    unlike `git worktree remove` — performs no validation of its own, so a
+    corrupt or hand-edited state entry must not be able to point it at the repo
+    root or anywhere else outside the run's scaffolding (same doctrine as
+    runs.reconcile_orphan_worktrees / resolve_run_dir)."""
+    try:
+        root = unit_worktrees_dir(run_dir).resolve()
+        target = wt.resolve()
+        target.relative_to(root)
+    except (ValueError, OSError):
+        return False
+    if target == root:
+        return False
+    shutil.rmtree(target, ignore_errors=True)
+    return True
 
 
 @dataclass(frozen=True)
@@ -61,10 +85,19 @@ class UnitWorkspace:
 
 def unit_branch_name(run_id: str, unit_key: str, branch_per: str) -> str:
     """branch_per=run shares one branch across the whole run; branch_per=story
-    gives each unit its own branch."""
+    gives each unit its own branch.
+
+    Both segments are ref-sanitized: `--run-id` is user-suppliable and a unit key is
+    a sprint-board / ledger id, so either can carry ref-illegal sequences (`:`, `..`,
+    `@{`, a trailing `.lock`) that git rejects at branch-creation time. Clean ids —
+    every auto-generated run id and every conventional story key — pass through
+    byte-identical. This is the single source of the name: `open_unit_workspace` is
+    the sole caller and stores the result on `task.branch`, which every consumer
+    (`_merge_local`, `discard_worktree`, `close_unit_workspace`) reuses.
+    """
     if branch_per == "run":
-        return f"bmad-loop/{run_id}"
-    return f"bmad-loop/{run_id}/{unit_key}"
+        return f"bmad-loop/{safe_ref_segment(run_id)}"
+    return f"bmad-loop/{safe_ref_segment(run_id)}/{safe_ref_segment(unit_key)}"
 
 
 def open_unit_workspace(
@@ -85,7 +118,7 @@ def open_unit_workspace(
     keeps the commits earlier units already landed on it.
     """
     branch = unit_branch_name(run_id, unit_key, branch_per)
-    wt = (unit_worktrees_dir(run_dir) / unit_key).resolve()
+    wt = (unit_worktrees_dir(run_dir) / safe_segment(unit_key)).resolve()
     wt.parent.mkdir(parents=True, exist_ok=True)
     if verify.branch_exists(repo_root, branch):
         verify.worktree_add(repo_root, wt, branch, create=False)
@@ -109,7 +142,9 @@ def close_unit_workspace(
     run_dir: Path,
     unit_key: str,
     delete_branch: bool = True,
+    detach_kept: bool = False,
     diff_max_file_bytes: int | None = None,
+    on_teardown_degraded: Callable[[str], None] | None = None,
 ) -> Path | None:
     """Tear down (or preserve) a unit's worktree.
 
@@ -120,51 +155,138 @@ def close_unit_workspace(
     and, if delete_branch, the branch deleted. Returns the patch path it wrote,
     or None.
 
+    Invariant: the teardown tail is post-merge/post-capture housekeeping — the
+    unit's content is already safe (merged on success, patch-captured on failure)
+    before it runs, so no git teardown failure escapes it. Every `GitError` from
+    the worktree removal or branch deletion degrades to a call of
+    on_teardown_degraded (given the failure message) instead of crashing the run;
+    a clean or force-retried removal is silent (see the teardown tail below). A
+    failed diff *capture* breaks the tail's premise instead — the worktree would
+    then hold the only copy of the unit's changes — so it is reported the same
+    way but preserves the worktree + branch rather than tearing them down. The
+    callback itself is the caller's (the engine's `journal.append`, whose OSError
+    is engine-wide journal semantics, deliberately unguarded here).
+
+    detach_kept (branch_per=run only): when keep_failed preserves the worktree,
+    detach its HEAD so the shared run branch it holds is freed for the next unit
+    to mount — otherwise every later unit's `git worktree add` collides on the
+    already-checked-out branch. Best effort; see the keep_failed branch below.
+
     diff_max_file_bytes caps the per-untracked-file size in that forensic patch
     (None = no cap); see verify.capture_diff.
     """
     patch: Path | None = None
     if not success:
+        capture_err: verify.GitError | None = None
         try:
             diff = (
                 verify.capture_diff(unit.path, unit.baseline, max_file_bytes=diff_max_file_bytes)
                 if unit.baseline
                 else ""
             )
-        except verify.GitError:
+        except verify.GitError as e:
+            capture_err = e
             diff = ""
         if diff:
-            patch = run_dir / "failed" / unit_key / "changes.patch"
+            patch = run_dir / "failed" / safe_segment(unit_key) / "changes.patch"
             patch.parent.mkdir(parents=True, exist_ok=True)
             patch.write_text(diff, encoding="utf-8")
-        if keep_failed:
-            return patch  # leave the worktree + branch mounted
+        if capture_err is not None and on_teardown_degraded is not None:
+            # the forensic patch is the only copy of a dropped unit's changes; a
+            # failed capture means the teardown below would destroy them, so the
+            # unit is preserved as if keep_failed (the `or` on the branch below).
+            on_teardown_degraded(
+                f"diff capture failed for {unit.path}: {capture_err}; "
+                "worktree and branch preserved (uncaptured changes)"
+            )
+        if keep_failed or capture_err is not None:
+            if detach_kept:
+                # branch_per=run shares one branch across the run; a kept worktree
+                # left checked out on it blocks every later unit's `git worktree
+                # add` (git refuses a branch checked out elsewhere). Detach HEAD to
+                # free the shared branch name while preserving the working tree,
+                # uncommitted changes, and the branch ref (still at the kept commit)
+                # for inspection. Best effort: on failure the later unit still
+                # surfaces the collision via the worktree-open-failed defer path.
+                try:
+                    verify.checkout_detach(unit.path)
+                except verify.GitError:
+                    pass
+            return patch  # leave the worktree mounted (branch detached if shared)
 
     # success, or a failure we are not keeping: remove the worktree. A failed
     # tree is dirty, so force; a successful unit was committed + merged, so its
     # tree is clean, but force is harmless and tolerant of stray artifacts.
     try:
         verify.worktree_remove(unit.repo_root, unit.path, force=not success)
-    except verify.GitError:
-        verify.worktree_remove(unit.repo_root, unit.path, force=True)
-    if delete_branch and verify.branch_exists(unit.repo_root, unit.branch):
-        # the unit's content is already on the target branch (success) or saved
-        # to a patch (failure), so a force delete loses nothing — and squash
-        # merges leave the branch looking "unmerged" to `git branch -d`.
-        verify.delete_branch(unit.repo_root, unit.branch, force=True)
+    except verify.GitError as first_err:
+        try:
+            # Ordinary dirty-tree case: the plain remove refused stray untracked
+            # artifacts, which --force clears. Not a degradation — stay silent.
+            verify.worktree_remove(unit.repo_root, unit.path, force=True)
+        except verify.GitError as retry_err:
+            # gh-139 fingerprint the retry CAN'T fix: a process the just-ended
+            # session left running (e.g. pytest recreating `.pytest_cache`) makes
+            # the plain remove fail with ENOTEMPTY (first_err), and by then git has
+            # already deleted its admin entry `.git/worktrees/<id>` — so the --force
+            # retry fails with "is not a working tree" (retry_err). Force can't
+            # restore a dropped admin entry, so fall back to git's own reclaim path
+            # (plain rmtree + prune) and degrade to a warning: the content already
+            # landed, so this is housekeeping, not a run failure. Both git errors
+            # go into the message — each half of the fingerprint is diagnostic.
+            # The rmtree is confined to the run's worktrees dir: on resume the
+            # path comes from persisted state (_reopen_unit), which git validates
+            # but rmtree would not.
+            removed = _rmtree_confined(unit.path, run_dir)
+            verify.worktree_prune(unit.repo_root)
+            msg = (
+                f"worktree remove failed for {unit.path} ({first_err}); "
+                f"force retry failed ({retry_err}); fell back to rmtree+prune"
+            )
+            if not removed:
+                msg += f" (rmtree refused: {unit.path} resolves outside this run's worktrees dir)"
+            elif unit.path.exists():
+                # rmtree lost the race too (the writer recreated files under it):
+                # the dir survives under the gitignored run dir and is reclaimed
+                # later by trim_run_dir / clean — note it, don't block on it.
+                msg += f" (dir still present: {unit.path})"
+            if on_teardown_degraded is not None:
+                on_teardown_degraded(msg)
+    try:
+        if delete_branch and verify.branch_exists(unit.repo_root, unit.branch):
+            # the unit's content is already on the target branch (success) or saved
+            # to a patch (failure), so a force delete loses nothing — and squash
+            # merges leave the branch looking "unmerged" to `git branch -d`.
+            # prune above frees a branch whose worktree dir was rmtree'd, so this
+            # still runs after a degraded removal.
+            verify.delete_branch(unit.repo_root, unit.branch, force=True)
+    except verify.GitError as e:
+        # second crash door in this teardown tail: branch deletion is likewise
+        # post-merge housekeeping, so degrade it rather than raise past here.
+        if on_teardown_degraded is not None:
+            on_teardown_degraded(f"branch delete failed for {unit.branch}: {e}")
     return patch
 
 
-def discard_worktree(repo_root: Path, worktree_path: str, branch: str) -> None:
+def discard_worktree(repo_root: Path, worktree_path: str, branch: str, *, run_dir: Path) -> None:
     """Best-effort force teardown of a worktree + branch by path/name, for
-    resume-restart of a crashed/interrupted unit. Tolerant of partial state."""
+    resume-restart of a crashed/interrupted unit. Tolerant of partial state.
+    `worktree_path` arrives from persisted task state, so the rmtree fallback is
+    confined to `run_dir`'s worktrees dir (see _rmtree_confined)."""
     if worktree_path:
         wt = Path(worktree_path)
         try:
             if wt.exists():
                 verify.worktree_remove(repo_root, wt, force=True)
         except verify.GitError:
-            pass
+            # same gh-139 hazard as close_unit_workspace: a stray process (or a
+            # dropped admin entry) can keep `git worktree remove` from clearing
+            # the dir. A leftover dir breaks the resume re-mount at this same path
+            # (`git worktree add` refuses a non-empty target), so drop to rmtree.
+            _rmtree_confined(wt, run_dir)
+        # prune git's admin entry regardless (harmless when nothing is stale) so a
+        # half-removed worktree can't block that re-mount.
+        verify.worktree_prune(repo_root)
     if branch:
         try:
             if verify.branch_exists(repo_root, branch):

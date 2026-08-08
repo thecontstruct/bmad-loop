@@ -221,11 +221,29 @@ def test_assert_no_leak_clean_text():
         ("contact me@example.com", "email"),
         ("see https://user:pass@host/x", "url-credentials"),
         ("path /home/alice/x", "absolute-home-path"),
+        # Every arm of _ABS_HOME_RE, not just the Linux one. The macOS and root
+        # arms were correct but unpinned; so was the drive-letter-plus-FORWARD-
+        # slash form (`C:/Users/...`, what Path.as_posix and MSYS-ish tooling
+        # produce), which the `/Users/` arm already subsumes as a substring —
+        # the Windows arm exists for BACKSLASHES only. Reviewers have read the
+        # rule as "Windows is handled solely by the drive-letter arm" and
+        # proposed widening it to `[\\/]`; these cases show why that is a no-op.
+        ("path /Users/alice/x", "absolute-home-path"),
+        ("path /root/x", "absolute-home-path"),
+        ("path C:/Users/alice/x", "absolute-home-path"),
         ("key ghp_CANARYxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx01", "secret"),
     ],
 )
 def test_assert_no_leak_fires(text, rule):
     assert rule in sanitize.assert_no_leak(text)
+
+
+@pytest.mark.parametrize("text", ["path D:/data/alice/x", "path /var/lib/alice/x"])
+def test_assert_no_leak_home_rule_is_not_any_absolute_path(text):
+    """The rule names *home* directories, and firing is fail-closed — diagnose
+    refuses to emit. Matching every absolute path would turn an ordinary dump
+    into a refusal, so the bound is load-bearing in the other direction too."""
+    assert "absolute-home-path" not in sanitize.assert_no_leak(text)
 
 
 def test_assert_no_leak_extra_word_boundary():
@@ -239,3 +257,145 @@ def test_assert_no_leak_extra_word_boundary():
     # values whose own edge is punctuation are still caught (the \b blind spot)
     assert sanitize.assert_no_leak("see .acme here", extra=[".acme"]) == ["sensitive[0]"]
     assert sanitize.assert_no_leak("use acme. now", extra=["acme."]) == ["sensitive[0]"]
+
+
+def test_assert_no_leak_labeled_extras():
+    # a (value, label) pair reports the label — printable by construction —
+    # instead of the opaque enumerate position, and never echoes the value
+    fired = sanitize.assert_no_leak(
+        "dir secretkey1 here", extra=[("secretkey1", "story:s1-ab12cd34ef56")]
+    )
+    assert fired == ["sensitive[story:s1-ab12cd34ef56]"]
+    assert "secretkey1" not in "".join(fired)
+    # mixed: bare items keep their position-based name
+    fired = sanitize.assert_no_leak("alpha beta", extra=[("alpha", "branch:b-1"), "beta"])
+    assert fired == ["sensitive[branch:b-1]", "sensitive[1]"]
+    # labeled values below the 4-char threshold never fire, same as bare ones
+    assert sanitize.assert_no_leak("a bc d", extra=[("bc", "story:s-x")]) == []
+
+
+# --------------------------------------------------------- replace_standalone
+
+
+@pytest.mark.parametrize(
+    "text,needle,expected,count",
+    [
+        ("dir proj here", "proj", "dir X here", 1),  # mid-text
+        ("proj at start", "proj", "X at start", 1),  # string edge (start)
+        ("ends with proj", "proj", "ends with X", 1),  # string edge (end)
+        ("the project root", "proj", "the project root", 0),  # embedded: untouched
+        ("see .acme here", ".acme", "see X here", 1),  # punctuation-edge needle
+        ("use acme. now", "acme.", "use X now", 1),
+        ("acme.acme", "acme", "X.X", 2),  # adjacent occurrences
+        ("no needle here", "zzzz", "no needle here", 0),  # absent
+        ("aaa", "aa", "aaa", 0),  # word-flanked overlap never matches
+    ],
+)
+def test_replace_standalone_table(text, needle, expected, count):
+    assert sanitize.replace_standalone(text, needle, "X") == (expected, count)
+
+
+def test_replace_standalone_terminates_and_is_idempotent():
+    # a replacement containing the needle is not rescanned within the call
+    out, n = sanitize.replace_standalone("ref key1 end", "key1", "x-key1-x")
+    assert (out, n) == ("ref x-key1-x end", 1)
+    # a replacement free of the needle: a second pass finds nothing
+    out, n = sanitize.replace_standalone("dir proj here", "proj", "p-1a2b")
+    assert n == 1
+    assert sanitize.replace_standalone(out, "proj", "p-1a2b") == (out, 0)
+    # replacement mirrors detection exactly: whatever fired assert_no_leak is
+    # gone after one substitution with a needle-free replacement
+    assert sanitize.assert_no_leak(out, extra=["proj"]) == []
+
+
+def test_pseudonymizer_entries_expose_ns():
+    p = sanitize.Pseudonymizer()
+    a_story = p.alias("1.2-secret", ns="story", epic=1)
+    a_branch = p.alias("feat/secret", ns="branch")
+    assert p.entries() == [
+        ("story", "1.2-secret", a_story),
+        ("branch", "feat/secret", a_branch),
+    ]
+    # legend keeps its shape: alias -> original, ns discarded
+    assert p.legend() == {a_story: "1.2-secret", a_branch: "feat/secret"}
+
+
+# ------------------------------------------------- guard / assert_clean
+# The fail-closed egress policy shared by diagnose and probe-adapter (#199).
+# STORY_KEY embeds a proprietary product name as a substring, so "the original
+# never appears in the exception" is asserted against the nastiest shape.
+
+STORY_KEY = "1.2-AcmeQuantumBillingEngine"
+
+
+def test_guard_clean_text_is_returned_verbatim():
+    pseudo = sanitize.Pseudonymizer()
+    pseudo.alias(STORY_KEY, ns="story", epic=1)
+    assert sanitize.guard("nothing sensitive here", pseudo) == ("nothing sensitive here", [])
+    # and a missing pseudonymizer still runs the hard rules
+    with pytest.raises(sanitize.LeakDetected) as exc:
+        sanitize.guard("contact victim.canary@example.com")
+    assert exc.value.rules == ["email"]
+
+
+def test_guard_repairs_stray_original_and_tallies():
+    pseudo = sanitize.Pseudonymizer()
+    alias = pseudo.alias(STORY_KEY, ns="story", epic=1)
+    text = f"path a/{STORY_KEY}/b and again {STORY_KEY}"
+    out, reps = sanitize.guard(text, pseudo)
+    assert STORY_KEY not in out
+    assert out.count(alias) == 2
+    assert reps == [(f"story:{alias}", 2)]
+    # the repaired text passes the same check that fired on the input
+    assert sanitize.assert_no_leak(out, extra=[STORY_KEY]) == []
+
+
+def test_guard_hard_rules_never_auto_repair():
+    pseudo = sanitize.Pseudonymizer()
+    with pytest.raises(sanitize.LeakDetected) as exc:
+        sanitize.guard("contact victim.canary@example.com", pseudo)
+    assert "email" in exc.value.rules
+    # a hard rule alongside a repairable one: refuse immediately, and the
+    # sensitive rule rides along under its printable ns:alias label
+    key_alias = pseudo.alias(STORY_KEY, ns="story", epic=1)
+    with pytest.raises(sanitize.LeakDetected) as exc:
+        sanitize.guard(f"{STORY_KEY} contact victim.canary@example.com", pseudo)
+    assert "email" in exc.value.rules
+    assert f"sensitive[story:{key_alias}]" in exc.value.rules
+    assert STORY_KEY not in str(exc.value)
+
+
+class _CyclicPseudo(sanitize.Pseudonymizer):
+    """Adversarial stand-in: each alias embeds the OTHER original at a "-"
+    boundary, so every substitution reintroduces the other value — a cycle a
+    real Pseudonymizer could only produce by hash-output coincidence."""
+
+    def entries(self):
+        return [
+            ("story", "alpha-key", "s1-beta-key"),
+            ("branch", "beta-key", "branch-alpha-key"),
+        ]
+
+
+def test_guard_repair_bound_terminates_and_fails_closed():
+    with pytest.raises(sanitize.LeakDetected):
+        sanitize.guard("ref alpha-key end", _CyclicPseudo())
+
+
+def test_assert_clean_raises_and_never_repairs():
+    pseudo = sanitize.Pseudonymizer()
+    alias = pseudo.alias(STORY_KEY, ns="story", epic=1)
+    with pytest.raises(sanitize.LeakDetected) as exc:
+        sanitize.assert_clean(f"stray {STORY_KEY} here", pseudo)
+    assert exc.value.rules == [f"sensitive[story:{alias}]"]
+    sanitize.assert_clean("all clean", pseudo)  # no raise on clean input
+
+
+def test_embeds_current_username(monkeypatch):
+    monkeypatch.setattr(sanitize.getpass, "getuser", lambda: "alice")
+    assert sanitize.embeds_current_username("pytest-of-alice")
+    assert sanitize.embeds_current_username("alice")
+    assert not sanitize.embeds_current_username("someone-else")
+    # below the ≥5 threshold shared with the assert_no_leak username rule
+    monkeypatch.setattr(sanitize.getpass, "getuser", lambda: "bob")
+    assert not sanitize.embeds_current_username("bob-dir")

@@ -304,7 +304,7 @@ def _local_url(worktree: Path) -> str | None:
         return override.strip()
     cfg = worktree / ".mcp.json"
     try:
-        data = json.loads(cfg.read_text())
+        data = json.loads(cfg.read_text(encoding="utf-8-sig"))
         servers = data.get("mcpServers", {})
         entry = servers.get(_MCP_SERVER_NAME) or next(iter(servers.values()), {})
         url = entry.get("url")
@@ -425,10 +425,10 @@ def _verify_agent_isolation(agent: str, worktree: Path, url: str) -> bool:
     port = url.rsplit(":", 1)[-1].strip("/")
     cfg = worktree / rel
     try:
-        text = cfg.read_text()
-    except OSError:
+        text = cfg.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
         print(
-            f"unity_setup: agent {agent!r} MCP config {rel} missing after setup; "
+            f"unity_setup: agent {agent!r} MCP config {rel} missing or unreadable after setup; "
             "cannot guarantee per-worktree isolation",
             file=sys.stderr,
         )

@@ -13,12 +13,40 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import date as calendar_date
 from pathlib import Path
+
+from .platform_util import atomic_write_text
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
 ANY_HEADING_RE = re.compile(r"^#{1,6} ", re.MULTILINE)
+# The flat appender's opening line, in the two forms this module needs it: as a
+# bullet in the raw ledger (FLAT_ENTRY_RE, the canonical-span boundary in
+# parse_ledger) and as bullet *content* after `_BULLET_RE` has stripped the
+# marker (`_FLAT_SOURCE_RE`, legacy section). One shape, two anchors — they have
+# to agree, or a block the legacy parser recognizes stays invisible to it (#304).
+# Keyed on the opening line alone, deliberately: also requiring the block's
+# `summary:`/`evidence:` lines would narrow the boundary below the parser's own
+# recognition, leaving the bug in place for every partial shape it accepts.
+_FLAT_SOURCE_BODY = r"source_spec:[ \t]"
+FLAT_ENTRY_RE = re.compile(rf"^[-*][ \t]+{_FLAT_SOURCE_BODY}", re.IGNORECASE | re.MULTILINE)
 STATUS_RE = re.compile(r"^status:[ \t]*(.*)$", re.MULTILINE)
+# Everything `str.splitlines()` splits on, not `\n` alone (#305). The writers
+# below interpolate their arguments into a line-oriented file, so a break in a
+# value injects ledger lines. The C1/Unicode members are load-bearing rather
+# than decorative: `parse_legacy` scans with `splitlines()` while `parse_ledger`
+# matches with `re.MULTILINE`, so a U+2028 splits an entry for one reader and is
+# invisible to the other — the two then disagree about what the ledger says.
+LINE_BREAK_RE = re.compile(r"[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]+")
+# The writers' date shape. Deliberately a separate literal from the legacy
+# parser's `_DATE_TOKEN_RE`, which happens to look similar today: that one
+# decides whether a freeform heading is a dated section, and tightening what the
+# orchestrator will *write* must never quietly retune what `parse_legacy` reads.
+# Spelled `[0-9]` rather than `\d`, which also matches Arabic-Indic, fullwidth
+# and mathematical digit forms — the ledger's readers understand none of them.
+_ISO_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 
 @dataclass(frozen=True)
@@ -46,6 +74,18 @@ def parse_ledger(text: str) -> list[DWEntry]:
         other = ANY_HEADING_RE.search(text, m.end(), end)
         if other:
             end = other.start()
+        # ...and at a flat appender block, which belongs to no canonical entry
+        # (#304). This span is what parse_legacy() masks out before scanning, so
+        # absorbing the block hides the finding from every reader of the ledger.
+        # Searched from the entry's own `status:` line, never from above it:
+        # truncating over the status leaves the entry reading as neither open nor
+        # done (open_ids() drops it, classify() calls it malformed), which trades
+        # one lost flat block for one lost tracked entry. An entry with no status
+        # line has nothing to protect, so the whole span is fair game.
+        status_m = STATUS_RE.search(text, m.end(), end)
+        flat = FLAT_ENTRY_RE.search(text, status_m.end() if status_m else m.end(), end)
+        if flat:
+            end = flat.start()
         body = text[m.start() : end]
         status_m = STATUS_RE.search(body)
         entries.append(
@@ -62,6 +102,102 @@ def parse_ledger(text: str) -> list[DWEntry]:
 
 def open_ids(text: str) -> set[str]:
     return {e.id for e in parse_ledger(text) if e.open}
+
+
+def parse_declaration(raw: object) -> tuple[tuple[str, ...], str | None]:
+    """The single reading of a ``closes_deferred:`` declaration (#234), shared by
+    the ``stories.yaml`` parser, the engine's close hook, and ``validate``.
+
+    Returns the normalized ids plus an error describing a wrong *container*.
+    Missing / YAML-null is an empty declaration, not an error.
+
+    Strict about the container, lenient about each item. A bare
+    ``closes_deferred: DW-1`` is a schema error rather than a silently-wrapped
+    single id — a string is iterable, so a lenient reading would quietly turn one
+    id into a list of characters — while items are ``str()``-normalized and
+    stripped, because an LLM-authored manifest may emit an unquoted ``DW-1`` as a
+    string but a bare ``5`` as an int. Blanks drop and duplicates collapse
+    (order-preserving): both are noise, not a contradiction.
+
+    Callers decide the severity: the manifest parser raises, the engine journals,
+    ``validate`` warns. What they must NOT do is disagree — before this, a wrong
+    container was a hard schema error in ``stories.yaml`` and a silent empty
+    declaration in frontmatter, so the same mistake either failed the parse or
+    vanished depending on which file it was made in.
+
+    Whether an id names a real entry is not decided here; that needs the ledger
+    (:func:`classify`).
+    """
+    if raw is None:
+        return (), None
+    if not isinstance(raw, list):
+        return (), f"must be a list of deferred-work ids (got {type(raw).__name__})"
+    return tuple(dict.fromkeys(item for item in (str(x).strip() for x in raw) if item)), None
+
+
+@dataclass(frozen=True)
+class Declared:
+    """How declared ids line up against one ledger snapshot (#234).
+
+    Four outcomes, not two, because "not open" hides two very different cases.
+    ``already_done`` is a satisfied declaration — a resume re-driving a close that
+    already landed — and must stay silent. ``malformed`` is an entry that exists
+    but carries neither an ``open`` nor a ``done`` status: nothing can be marked,
+    and saying nothing would leave the operator believing it was.
+
+    ``duplicates`` cross-cuts the other four: it names the declared ids the ledger
+    carries more than once, whichever bucket they landed in. A duplicate id is a
+    corrupt ledger (#286), and the entry this classification describes is only one
+    of them — so the close is reported, never silent.
+    """
+
+    open_ids: tuple[str, ...] = ()
+    already_done: tuple[str, ...] = ()
+    unknown: tuple[str, ...] = ()
+    malformed: tuple[str, ...] = ()
+    duplicates: tuple[str, ...] = ()
+
+
+def classify(text: str, ids: Sequence[str]) -> Declared:
+    """Partition `ids` against a single ledger snapshot, preserving order.
+
+    Classifying from a snapshot rather than from :func:`mark_done`'s return value
+    is deliberate: that return conflates "already done" with "absent from the
+    ledger", and those need opposite treatment (silence vs. a warning).
+
+    **The FIRST entry of a duplicated id wins**, because that is the one
+    :func:`_find_entry` — and so every mutation in this module — acts on. Indexing
+    last-wins instead made the two disagree, and a ledger carrying one `DW-1` open
+    and another done then closed nothing while saying nothing, in either order: a
+    done-first ledger classified the id `open`, sent it to
+    :func:`mark_done_many`, and had :func:`_apply_done` refuse the done copy it
+    found first (marked nothing, so not even an unmatched warning); an open-first
+    ledger classified it `already_done` and never attempted the write at all
+    (#284 round-6 review, finding 4). The duplicate itself is reported through
+    ``duplicates`` rather than swallowed — one id naming two entries is a fault
+    about the ledger, not an answer about the work."""
+    by_id: dict[str, DWEntry] = {}
+    duplicated: set[str] = set()
+    for e in parse_ledger(text):
+        if e.id in by_id:
+            duplicated.add(e.id)
+            continue  # first wins: `_find_entry` mutates that one
+        by_id[e.id] = e
+    buckets: dict[str, list[str]] = {"open": [], "done": [], "unknown": [], "malformed": []}
+    for dw_id in ids:
+        entry = by_id.get(dw_id)
+        if entry is None:
+            buckets["unknown"].append(dw_id)
+            continue
+        word = entry.status.split()[0] if entry.status else ""
+        buckets[word if word in ("open", "done") else "malformed"].append(dw_id)
+    return Declared(
+        open_ids=tuple(buckets["open"]),
+        already_done=tuple(buckets["done"]),
+        unknown=tuple(buckets["unknown"]),
+        malformed=tuple(buckets["malformed"]),
+        duplicates=tuple(dw_id for dw_id in dict.fromkeys(ids) if dw_id in duplicated),
+    )
 
 
 def _find_entry(text: str, dw_id: str) -> DWEntry | None:
@@ -82,35 +218,299 @@ def _insert_after_status(text: str, entry: DWEntry, line: str) -> str:
     return text[:insert_at] + "\n" + line + text[insert_at:]
 
 
-def mark_done(path: Path, dw_id: str, date: str, note: str) -> bool:
-    """Flip one entry to `status: done <date>` and record a resolution note.
-    Returns False (no write) when the entry is missing or already done."""
-    if not path.is_file():
-        return False
-    text = path.read_text(encoding="utf-8")
+def _one_line(value: str) -> str:
+    """Collapse every run of line-break characters in `value` to a single space.
+
+    The whole of the #305 fix. These writers interpolate their arguments into a
+    line-oriented file, so a value carrying a break mints a phantom
+    `### DW-<n>` entry, truncates the entry's span at :data:`FLAT_ENTRY_RE` and
+    re-surfaces the tail as a legacy item, or leaves the entry carrying two
+    `status:` lines.
+
+    Note what the last shape does *not* do: `STATUS_RE` takes the first match, so
+    an injected `status:` never changes what `parse_ledger` reports. A test that
+    asserts on `entry.status` therefore passes with this guard deleted — the
+    observable is the line structure.
+
+    Sanitizes; never raises, and nothing upstream rejects on a break either. The
+    close paths call these writers bare (`sweep._close_resolved`,
+    `decisions.apply_pre_answer`), so a `ValueError` would end the sweep as
+    crashed; refusing the same text back at `validate_triage` only moved the
+    stoppage to a pause. Collapsing is lossless enough — the ledger wants one
+    line anyway — so this is the fix, and the skill docs are guidance that
+    reduces occurrences without gating on them.
+
+    A value with no break is returned **untouched**, so an existing ledger is
+    never reformatted and a clean write is byte-identical to before the guard.
+    The trailing `.strip()` removes all surrounding whitespace, not merely the
+    space a leading or trailing break left behind — which is why it must stay on
+    the far side of that fast path.
+
+    A break-only value therefore sanitizes to `""`. Keeping it non-empty *here*
+    could only yield bare whitespace, which trades an unfindable entry for an
+    unidentifiable one, so each caller handles its own empties — and by two
+    different strategies, which is why neither belongs in this helper.
+    :func:`append_entry` **substitutes**, naming a vanished title
+    `(untitled DW-<n>)` so the id it just burned stays findable.
+    :func:`append_decision` **drops**, shedding the ` — ` separator along with an
+    empty detail rather than promising one that is not there. Its `label` needs
+    neither: every member of :data:`LINE_BREAK_RE` is `str.isspace()`, and
+    `validate_triage` builds each `DecisionOption` with `.strip() or key`, so a
+    break-only label has already become the option key before it arrives."""
+    if not LINE_BREAK_RE.search(value):
+        return value
+    return LINE_BREAK_RE.sub(" ", value).strip()
+
+
+def _require_iso_date(value: str) -> None:
+    """Raise unless `value` is a strict ISO `YYYY-MM-DD` calendar date.
+
+    Raising is right here and wrong for free text: `date` is orchestrator-owned
+    (`Engine._today()`), never model-authored, so a bad value is a programmer
+    bug. Letting it through writes a `status:` line that reads as neither open
+    nor done, which `classify` reports as malformed and `open_ids` drops — the
+    entry silently leaves the sweep's world.
+
+    The regex is not redundant with `date.fromisoformat`: since 3.11 that also
+    accepts `20260611` and ISO week dates, neither of which the ledger's own
+    readers recognize, and it is the regex — via `[0-9]` — that pins the digits
+    to ASCII. `fromisoformat` in turn rejects the well-shaped impossible day
+    (`2026-02-30`) that no pattern can catch."""
+    if not _ISO_DATE_RE.fullmatch(value):
+        raise ValueError(f"date must be YYYY-MM-DD: {value!r}")
+    try:
+        calendar_date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"date must be YYYY-MM-DD: {value!r}") from exc
+
+
+def _require_canonical_status(status: str) -> None:
+    """Raise unless `status` is exactly `open` or `done YYYY-MM-DD`.
+
+    Two halves with two different dependents. The *first word* is what
+    :attr:`DWEntry.open` and :func:`classify` branch on, so anything but `open`
+    or `done` makes an entry unreadable to both. The *date* is invisible to them
+    — they read `status.split()[0]` and cannot tell `done 2026-02-30` from a real
+    day — but it is not invisible downstream: the whole status value is carried
+    verbatim to readers (the TUI's deferred pane, the `--json` projections), so a
+    malformed date is rendered to a human as though it were one."""
+    if status == "open":
+        return
+    if status.startswith("done "):
+        _require_iso_date(status.removeprefix("done "))
+        return
+    raise ValueError(f"status must be 'open' or 'done YYYY-MM-DD': {status!r}")
+
+
+def _operation_digest(operation_id: str) -> str:
+    """Encode a stable close-operation id as one ledger-safe token."""
+    if not operation_id:
+        raise ValueError("operation_id must not be empty")
+    return hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+
+
+def _apply_done(
+    text: str,
+    dw_id: str,
+    date: str,
+    note: str,
+    *,
+    undo_owner: str | None = None,
+) -> str | None:
+    """Flip one entry to `status: done <date>` + a resolution note *within* `text`.
+    None when the entry is missing or not open. The entry is re-located after the
+    status rewrite because that edit shifts every later span offset.
+
+    The note is sanitized here, at the point of interpolation, rather than on
+    :func:`mark_done`: that is a one-id wrapper over :func:`mark_done_many`, which
+    `Engine._apply_deferred_closes` calls directly, so a wrapper-side guard would
+    never see a story close (#305). `date` is validated by the sole caller, at its
+    entry, so the check does not depend on a ledger existing."""
+    note = _one_line(note)
     entry = _find_entry(text, dw_id)
     if entry is None or not entry.open:
-        return False
+        return None
     status_m = STATUS_RE.search(entry.body)
     assert status_m is not None  # open implies a status line
     start = entry.span[0] + status_m.start()
     end = entry.span[0] + status_m.end()
-    text = text[:start] + f"status: done {date}" + text[end:]
+    previous_status_line = status_m.group(0)
+    if undo_owner is not None and LINE_BREAK_RE.search(previous_status_line):
+        # An undo marker must never preserve a value that becomes more than one line
+        # under the ledger readers' shared splitlines semantics. Standard closes
+        # retain their existing behavior; the undo-capable path refuses the mark.
+        return None
+    done_status_line = f"status: done {date}"
+    text = text[:start] + done_status_line + text[end:]
     entry = _find_entry(text, dw_id)
     assert entry is not None
-    text = _insert_after_status(text, entry, f"resolution: {note}")
-    path.write_text(text, encoding="utf-8")
+    tail = f"resolution: {note}"
+    if undo_owner is not None:
+        # The owner digest makes this close distinguishable from an earlier run
+        # that reused its human-readable note. The encoded prior line makes the
+        # undo lossless for parser-accepted spacing and annotations. Hex keeps
+        # every payload on one ASCII line, including Unicode annotations.
+        previous_status_hex = previous_status_line.encode("utf-8").hex()
+        tail += f"\nresolution-undo: {undo_owner} {date} {previous_status_hex}"
+    return _insert_after_status(text, entry, tail)
+
+
+def _mark_done_many(
+    path: Path,
+    dw_ids: Sequence[str],
+    date: str,
+    note: str,
+    *,
+    operation_id: str | None = None,
+) -> list[str]:
+    """Shared atomic implementation for the public close operations."""
+    _require_iso_date(date)
+    undo_owner = _operation_digest(operation_id) if operation_id is not None else None
+    if not path.is_file():
+        return []
+    text = path.read_text(encoding="utf-8")
+    marked: list[str] = []
+    for dw_id in dw_ids:
+        updated = _apply_done(text, dw_id, date, note, undo_owner=undo_owner)
+        if updated is None:
+            continue
+        text = updated
+        marked.append(dw_id)
+    if not marked:
+        return []
+    atomic_write_text(path, text)
+    return marked
+
+
+def mark_done_many(path: Path, dw_ids: Sequence[str], date: str, note: str) -> list[str]:
+    """Flip every entry in `dw_ids` to `status: done <date>` + a resolution note,
+    in ONE read and ONE atomic write. Returns the ids actually flipped (missing
+    and already-done ids are skipped), in the order given.
+
+    All-or-nothing on purpose. A per-id read-modify-write loop leaves marks on
+    disk when it raises partway through several ids — a half-applied closure the
+    caller never gets to journal, so the ledger claims resolutions the run has no
+    record of. Here a failure writes nothing, and the returned list is exactly
+    what landed.
+
+    The write goes through :func:`~bmad_loop.platform_util.atomic_write_text`
+    rather than a bare tmp+replace: swapping a fresh inode over the ledger
+    otherwise resets its mode (a ``0600`` ledger silently becoming world-readable)
+    and turns a symlinked ledger into a regular file.
+
+    ``date`` is validated before the ``is_file`` short-circuit so a programmer bug
+    fails the same way whether or not a ledger happens to exist — a guard that
+    only fires when the file is present is one an absent fixture hides."""
+    return _mark_done_many(path, dw_ids, date, note)
+
+
+def mark_done_many_reopenable(
+    path: Path,
+    dw_ids: Sequence[str],
+    date: str,
+    note: str,
+    operation_id: str,
+) -> list[str]:
+    """Close entries atomically with a durable, operation-specific undo marker.
+
+    ``operation_id`` must be stable and recomputable across crash/replay from
+    already-persisted identity (for example ``run_id`` + ``story_key``), never an
+    ephemeral random value. Only entries actually flipped receive its marker;
+    skipped, already-done ids therefore cannot be reopened by this operation.
+
+    The ordinary :func:`mark_done_many` deliberately emits no marker and retains
+    its existing ledger format. Use this variant only for a transaction with a
+    later rollback leg.
+    """
+    return _mark_done_many(path, dw_ids, date, note, operation_id=operation_id)
+
+
+def mark_done(path: Path, dw_id: str, date: str, note: str) -> bool:
+    """Flip one entry to `status: done <date>` and record a resolution note.
+    Returns False (no write) when the entry is missing or already done."""
+    return bool(mark_done_many(path, [dw_id], date, note))
+
+
+_MARK_DONE_TAIL_RE = re.compile(
+    r"\nresolution:[ \t]*(.*)"
+    r"\nresolution-undo:[ \t]*([0-9a-f]{64})[ \t]+"
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2})[ \t]+([0-9a-f]+)$",
+    re.MULTILINE,
+)
+
+
+def mark_open(path: Path, dw_id: str, note: str, operation_id: str) -> bool:
+    """Undo one close written by :func:`mark_done_many_reopenable`.
+
+    The entry must still carry the operation's adjacent resolution and undo-marker
+    lines. A standard or earlier close has no matching marker and cannot be
+    reopened merely because it reused the same human-readable note.
+    """
+    undo_owner = _operation_digest(operation_id)
+    if not path.is_file():
+        return False
+    text = path.read_text(encoding="utf-8")
+    entry = _find_entry(text, dw_id)
+    if entry is None or entry.open:
+        return False
+    status_m = STATUS_RE.search(entry.body)
+    if status_m is None:
+        # parse_ledger deliberately tolerates status-less entries. This primitive
+        # is later called from _defer, where an AttributeError would crash the run
+        # instead of completing the deferral.
+        return False
+    try:
+        _require_canonical_status(entry.status)
+    except ValueError:
+        # Only a canonical status written by mark_done is eligible for undo.
+        # Preserve malformed or human-authored statuses for validation/reporting.
+        return False
+    res_m = _MARK_DONE_TAIL_RE.match(entry.body, status_m.end())
+    if res_m is None:
+        return False
+    if res_m.group(1).strip() != _one_line(note).strip() or res_m.group(2) != undo_owner:
+        return False
+    if status_m.group(0) != f"status: done {res_m.group(3)}":
+        return False
+    try:
+        previous_status_line = bytes.fromhex(res_m.group(4)).decode("utf-8")
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if LINE_BREAK_RE.search(previous_status_line):
+        return False
+    previous_status_m = STATUS_RE.fullmatch(previous_status_line)
+    previous_status = previous_status_m.group(1).strip() if previous_status_m else ""
+    if not previous_status or previous_status.split()[0] != "open":
+        return False
+    start = entry.span[0] + status_m.start()
+    end = entry.span[0] + res_m.end()
+    atomic_write_text(path, text[:start] + previous_status_line + text[end:])
     return True
 
 
 def append_decision(path: Path, dw_id: str, date: str, label: str, detail: str) -> bool:
-    """Record a human decision on an entry without changing its status."""
+    """Record a human decision on an entry without changing its status.
+
+    `label` and `detail` come from a triage session's `DecisionOption`, so they
+    are sanitized to one line rather than refused — see :func:`_one_line`. This
+    is also where a build option's `intent` gets flattened, since it reaches the
+    ledger only as `detail = option.resolution or option.intent`.
+
+    Precondition: `date` is ISO `YYYY-MM-DD`; anything else raises `ValueError`,
+    checked before the ``is_file`` short-circuit so an absent ledger cannot hide
+    the bug."""
+    _require_iso_date(date)
     if not path.is_file():
         return False
     text = path.read_text(encoding="utf-8")
     entry = _find_entry(text, dw_id)
     if entry is None:
         return False
+    label = _one_line(label)
+    # Sanitize before the emptiness test, never after: a break-only detail
+    # collapses to "" and must then drop the separator with it, or the entry
+    # carries a dangling `— ` promising a detail that is not there.
+    detail = _one_line(detail)
     detail_part = f" — {detail}" if detail else ""
     text = _insert_after_status(text, entry, f"decision: {date} {label}{detail_part}")
     path.write_text(text, encoding="utf-8")
@@ -144,6 +544,7 @@ def append_entry(
     origin: str,
     source_spec: str,
     reason: str,
+    location: str = "n/a",
     status: str = "open",
     severity: str | None = None,
 ) -> str | None:
@@ -153,7 +554,26 @@ def append_entry(
     Idempotent: returns None without writing when an open entry already carries
     the same `origin:` marker and `source_spec:` — so re-running the same defer
     (e.g. a second sweep of the same story) never duplicates the entry. Creates
-    the ledger (and parent dir) if it does not yet exist."""
+    the ledger (and parent dir) if it does not yet exist.
+
+    Free text is sanitized (:func:`_one_line`) **before** the idempotence scan,
+    which compares the caller's value against the stored one via
+    :func:`field_line_present`: sanitizing afterwards would compare a raw value
+    against a sanitized line, so every replay of the same multiline defer would
+    miss its own entry and append another. `status` and `severity` are
+    orchestrator-owned enumerations and raise instead."""
+    _require_canonical_status(status)
+    # The whitelist is derived from the legacy parser's alias table (defined
+    # below; resolved at call time) so what this writer emits and what
+    # `field_severity` normalizes to cannot drift apart.
+    if severity and severity not in _CANONICAL_SEVERITIES:
+        raise ValueError(f"severity must be one of {sorted(_CANONICAL_SEVERITIES)}: {severity!r}")
+    given_title = bool(title)
+    title = _one_line(title)
+    origin = _one_line(origin)
+    source_spec = _one_line(source_spec)
+    reason = _one_line(reason)
+    location = _one_line(location)
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
     for entry in parse_ledger(text):
         if (
@@ -163,7 +583,26 @@ def append_entry(
         ):
             return None
     dw_id = f"DW-{next_seq(text)}"
-    lines = [f"### {dw_id}: {title}", f"origin: {origin}", f"source_spec: `{source_spec}`"]
+    if given_title and not title.strip():
+        # A break-only title sanitizes to nothing, and `### DW-<n>: ` is a
+        # heading `HEADING_RE`'s `(.+?)` does not match: the caller is handed an
+        # id no reader can find while `next_seq` has already burned it.
+        #
+        # Tested with `.strip()`, not `not title`: a title of `"  "` carries no
+        # break at all, so `_one_line` returns it unchanged by the byte-identity
+        # fast path and it stays truthy. It parses, but renders blank in
+        # `status`, `--json` and the TUI — the unidentifiable half of the same
+        # problem, reached without ever touching the sanitizer.
+        #
+        # Scoped to a title that *had* content: an already-empty one keeps its
+        # long-standing behavior, and the invariant is about non-empty values.
+        title = f"(untitled {dw_id})"
+    lines = [
+        f"### {dw_id}: {title}",
+        f"origin: {origin}",
+        f"location: {location}",
+        f"source_spec: `{source_spec}`",
+    ]
     if severity:
         lines.append(f"severity: {severity}")
     lines.append(f"reason: {reason}")
@@ -206,6 +645,10 @@ SEVERITY_ALIASES = {
     "minor": "low",
     "trivial": "low",
 }
+# What every alias above normalizes to, and so the only values `append_entry` may
+# write. Derived rather than restated: a hand-copied whitelist drifts the moment
+# an alias is added for a new canonical level.
+_CANONICAL_SEVERITIES = frozenset(SEVERITY_ALIASES.values())
 
 SEVERITY_FIELD_RE = re.compile(
     r"^[ \t]*(?:[-*][ \t]+)?(?:\*\*)?(?:severity|priority)[ \t]*:[ \t]*(?:\*\*)?[ \t]*"
@@ -254,8 +697,10 @@ _LEAD_DONE_STRIP_RE = re.compile(
 #     summary: <one sentence>
 #     evidence: <why this is real>
 # We recognize it so the `summary` becomes the title (not the source_spec path)
-# and the entry migrates cleanly into the canonical `### DW-<seq>` shape.
-_FLAT_SOURCE_RE = re.compile(r"^source_spec:[ \t]", re.IGNORECASE)
+# and the entry migrates cleanly into the canonical `### DW-<seq>` shape. The
+# opening line comes from the same `_FLAT_SOURCE_BODY` as FLAT_ENTRY_RE, which
+# bounds canonical spans on it — see that constant for why they must not drift.
+_FLAT_SOURCE_RE = re.compile(rf"^{_FLAT_SOURCE_BODY}", re.IGNORECASE)
 _FLAT_SUMMARY_RE = re.compile(r"^[ \t]*summary:[ \t]*(.*)$", re.IGNORECASE | re.MULTILINE)
 _BULLET_RE = re.compile(r"^[-*][ \t]+(.*)$")
 _ITEM_ID_RE = re.compile(

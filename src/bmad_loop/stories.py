@@ -6,10 +6,10 @@ referenced from frontmatter). It is a flat list, one entry per story, in strict
 execution order — **there is no ``depends_on`` field**, so the schedule is a
 single left-to-right scan, not a DAG. Each entry pins a stable, prefix-free,
 machine-opaque ``id`` plus ``title``/``description`` and the caller-only knobs
-``spec_checkpoint`` / ``done_checkpoint`` / ``invoke_dev_with``. ``status`` is
-deliberately absent: bmad-spec is the sole writer of ``stories.yaml`` and
-bmad-dev-auto is the sole writer of each story spec's status — the orchestrator
-writes neither.
+``spec_checkpoint`` / ``done_checkpoint`` / ``invoke_dev_with`` /
+``closes_deferred``. ``status`` is deliberately absent: bmad-spec is the sole
+writer of ``stories.yaml`` and bmad-dev-auto is the sole writer of each story
+spec's status — the orchestrator writes neither.
 
 This module is the strict, typed parser the orchestrator reads it through. The
 upstream schema (validity rule 4) already says ids are quoted strings of
@@ -28,7 +28,8 @@ from pathlib import Path
 
 import yaml
 
-from .verify import read_frontmatter, status_of
+from . import deferredwork
+from .frontmatter import read_frontmatter, status_of
 
 # Fixed-name discovery, like SPEC.md / .memlog.md — never listed in companions.
 STORIES_FILENAME = "stories.yaml"
@@ -48,6 +49,14 @@ REQUIRED_FIELDS = ("id", "title", "description")
 RESUMABLE_STATUSES = frozenset({"draft", "ready-for-dev", "in-progress", "in-review"})
 DONE = "done"
 BLOCKED = "blocked"
+
+# Statuses that prove a spec_checkpoint story's plan already exists on disk: once
+# the plan reached (or passed) the Ready-for-Development gate the halt leg is
+# spent, so a re-dispatch is the plain implement leg. PENDING / draft (plan not
+# yet produced) and sentinel/ambiguous (a failed pre-planning halt) fall through
+# to a fresh halt leg. Shared by the engine (real dispatch) and the CLI dry-run
+# so the two agree on which leg a story is on.
+PLAN_PRODUCED_STATUSES = frozenset({"ready-for-dev", "in-progress", "in-review", "done", "blocked"})
 
 # resolve_story_spec state kinds.
 KIND_PENDING = "pending"  # no story spec on disk yet
@@ -76,7 +85,14 @@ class StoryEntry:
     """One story in the breakdown. ``id`` is stable once its spec file exists;
     the checkpoint flags are independent (a story may set both and pause twice).
     ``invoke_dev_with`` is free text appended verbatim to the dispatch prompt —
-    the single planner->dev channel, never interpreted here."""
+    the single planner->dev channel, never interpreted here.
+
+    ``closes_deferred`` names the deferred-work ledger ids this story closes
+    (#234). It is a *declaration channel*, not a status: the orchestrator marks
+    those entries resolved at clean close, and the ids are checked against the
+    ledger at preflight. It lives here as well as in the story spec's
+    frontmatter because the breakdown is written while the ledger is in view,
+    whereas the spec is generated later by a skill that knows nothing of it."""
 
     id: str
     title: str
@@ -84,6 +100,7 @@ class StoryEntry:
     spec_checkpoint: bool = False
     done_checkpoint: bool = False
     invoke_dev_with: str = ""
+    closes_deferred: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -109,7 +126,24 @@ def load_stories(spec_folder: Path | str) -> Stories:
     if not path.is_file():
         raise StoriesError("no stories.yaml found")
     try:
-        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        raw = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        # A binary/non-UTF-8 manifest raises UnicodeDecodeError (a ValueError, NOT a
+        # yaml.YAMLError), so surface it as StoriesError like every other manifest
+        # fault — every caller already catches that and prints a clean "stories mode:"
+        # error instead of crashing preflight/dry-run/status with a traceback.
+        raise StoriesError(f"stories.yaml is not valid UTF-8: {path}: {e}") from e
+    except OSError as e:
+        # Same rule for a manifest that is present but cannot be read (permissions,
+        # an I/O error, a dead mount). `is_file()` above only rules out absence, so
+        # this escaped as a bare OSError and crashed the run from whichever caller
+        # happened to hit it first — including the commit-boundary read of
+        # `closes_deferred`, whose whole contract is to journal an unreadable
+        # manifest and carry on with the spec channel (#284 round-5 review,
+        # finding 5).
+        raise StoriesError(f"stories.yaml could not be read: {path}: {e}") from e
+    try:
+        doc = yaml.safe_load(raw)
     except yaml.YAMLError as e:
         raise StoriesError(f"stories.yaml is not valid YAML: {path}: {e}") from e
     if doc is None or (isinstance(doc, list) and not doc):
@@ -158,6 +192,7 @@ def _parse_entry(raw: object, index: int) -> StoryEntry:
         spec_checkpoint=_bool_field(raw, "spec_checkpoint", story_id),
         done_checkpoint=_bool_field(raw, "done_checkpoint", story_id),
         invoke_dev_with=_text_field(raw, "invoke_dev_with", story_id),
+        closes_deferred=_id_list_field(raw, "closes_deferred", story_id),
     )
 
 
@@ -213,6 +248,25 @@ def _text_field(raw: dict, key: str, story_id: str) -> str:
     if not isinstance(value, str):
         raise StoriesError(f"stories.yaml story {story_id!r} field {key!r} must be a string")
     return value
+
+
+def _id_list_field(raw: dict, key: str, story_id: str) -> tuple[str, ...]:
+    """Optional list of ledger ids, defaulting empty when missing/null (#234).
+
+    The reading itself lives in :func:`deferredwork.parse_declaration`, shared
+    with the engine's close hook and ``validate`` so the same mistake cannot mean
+    different things in the manifest and in a story spec's frontmatter. Only the
+    *severity* differs: a manifest is a schema the parser owns, so a wrong
+    container raises here, where the engine journals and ``validate`` warns.
+
+    Whether an id names a real entry is not checked here: this module never reads
+    the ledger, and a stale reference is a `validate` warning and a journaled
+    close-time note — never a parse failure.
+    """
+    ids, error = deferredwork.parse_declaration(raw.get(key))
+    if error:
+        raise StoriesError(f"stories.yaml story {story_id!r} field {key!r} {error}")
+    return ids
 
 
 def _validate_prefix_free(ids: list[str]) -> None:
@@ -308,7 +362,15 @@ def resolve_story_spec(spec_folder: Path | str, story_id: str) -> StoryState:
     for sentinel_kind in SENTINEL_SLUGS:
         if path.name == f"{sid}-{sentinel_kind}.md":
             return StoryState(kind=KIND_SENTINEL, path=path, sentinel_kind=sentinel_kind)
-    return StoryState(kind=KIND_PRESENT, status=status_of(read_frontmatter(path)), path=path)
+    try:
+        status = status_of(read_frontmatter(path))
+    except (OSError, UnicodeDecodeError):
+        # An undecodable (binary/non-UTF-8) or mid-glob-vanished PRESENT spec has an
+        # unknown status: degrade rather than crash the scheduler / dry-run / status.
+        # status="" classifies as "wedged" (_classify) so the engine pauses for
+        # resolve — never silently skips — and state_label renders it as "present".
+        status = ""
+    return StoryState(kind=KIND_PRESENT, status=status, path=path)
 
 
 @dataclass(frozen=True)
@@ -335,6 +397,7 @@ def schedule(
     stories: Stories,
     states: dict[str, StoryState],
     selector: str | None = None,
+    skip: set[str] | None = None,
 ) -> Schedule:
     """Linear scheduler: the first list entry ready to (re)dispatch.
 
@@ -350,10 +413,20 @@ def schedule(
     ``selector`` restricts the scan to a single story id (raises when the id is
     unknown), for ``--story`` runs. A state missing from ``states`` is treated
     as PENDING (no spec on disk).
+
+    ``skip`` is the orchestrator's within-run memory: ids already driven to a
+    terminal phase *this run* (done, or plateau-deferred). They are passed over
+    like a ``done`` entry — the scan continues past them rather than stopping or
+    re-dispatching. This mirrors the sprint engine's ``base_skip`` and is what
+    keeps a deferred story (whose on-disk spec may still read as a resumable
+    non-terminal) from being re-picked forever within one run.
     """
+    skip = skip or set()
     entries: tuple[StoryEntry, ...]
     entries = (find_entry(stories, selector),) if selector is not None else stories.entries
     for entry in entries:
+        if entry.id in skip:
+            continue
         state = states.get(entry.id)
         if state is None:
             state = StoryState(kind=KIND_PENDING)
@@ -379,3 +452,144 @@ def _classify(state: StoryState) -> str:
         return "wedged"
     # AMBIGUOUS or SENTINEL — not actionable without dispatcher/human recovery.
     return "wedged"
+
+
+# ------------------------------------------------------------ table projection
+#
+# A read-only, disk-derived view of a stories manifest shared by the CLI (`status`
+# / `run --dry-run`) and the TUI stories table, so every surface agrees on the
+# same human-facing state string. Pure: no engine or RunState coupling.
+
+
+def resolve_spec_folder(project: Path, spec_folder: str) -> Path:
+    """The absolute spec folder for ``spec_folder`` (project-relative or already
+    absolute) under ``project`` — the one place the folder anchoring lives so
+    the CLI, dry-run, preflight and TUI resolve it identically."""
+    folder = Path(spec_folder)
+    return folder if folder.is_absolute() else project / folder
+
+
+def relativize_spec_folder(project: Path, spec_folder: str) -> str:
+    """The project-relative posix form of ``spec_folder`` — what the orchestrator
+    actually dispatches (``BMAD_LOOP_SPEC_FOLDER`` / the ``Spec folder:`` prompt).
+
+    An absolute path inside the project tree is rebased to the project root;
+    anything else is kept verbatim (the contract allows an absolute spec folder,
+    though we never author one). The one place this lives so the engine's real
+    dispatch and the CLI dry-run render the identical folder string."""
+    raw = Path(spec_folder)
+    if raw.is_absolute():
+        try:
+            return raw.resolve().relative_to(project.resolve()).as_posix()
+        except ValueError:
+            return raw.as_posix()  # outside the project tree — leave absolute
+    return raw.as_posix()
+
+
+def is_plan_halt_leg(spec_checkpoint: bool, state: StoryState) -> bool:
+    """Whether a ``spec_checkpoint`` story's next dispatch HALTs after planning
+    (leg 1) given its resolved on-disk ``state``.
+
+    True only for a spec_checkpoint story whose plan has not yet reached
+    ``ready-for-dev`` on disk; once the plan exists (leg 2 after the plan
+    checkpoint, or a repair that reset the spec to in-progress) it is the plain
+    implement leg. Pure predicate shared by the engine's ``_plan_halt_leg`` and
+    the CLI dry-run so both key off the same on-disk state."""
+    if not spec_checkpoint:
+        return False
+    if state.kind == KIND_PRESENT and state.status in PLAN_PRODUCED_STATUSES:
+        return False
+    return True
+
+
+_AUTO_RUN_RESULT_HEADING = "## Auto Run Result"
+
+
+def recorded_blocking_condition(sentinel_text: str) -> str:
+    """The blocking condition a pre-planning-halt sentinel records under its
+    ``## Auto Run Result`` heading — the reason planning could not proceed.
+
+    Returns the block body (heading dropped, collapsed to a single line), or ""
+    when the sentinel carries no such block. A write-only breadcrumb for the
+    ``sentinel-cleared`` / ``sentinel-detected`` journal events and the resolve
+    context; never parsed back into a decision."""
+    idx = sentinel_text.find(_AUTO_RUN_RESULT_HEADING)
+    if idx == -1:
+        return ""
+    body = sentinel_text[idx + len(_AUTO_RUN_RESULT_HEADING) :]
+    next_heading = body.find("\n## ")
+    if next_heading != -1:
+        body = body[:next_heading]
+    return " ".join(body.split())
+
+
+def state_label(state: StoryState) -> str:
+    """The single human-facing state string for a resolved story, matching the
+    dispatch-protocol read model: PRESENT shows its frontmatter status
+    (``draft`` / ``ready-for-dev`` / ``in-progress`` / ``in-review`` / ``done`` /
+    ``blocked``); PENDING / AMBIGUOUS show the kind; a SENTINEL shows
+    ``sentinel:<unresolved|ambiguous>`` so the recoverable-by-deletion anomaly
+    reads distinctly from a real ``ambiguous`` (two rival specs)."""
+    if state.kind == KIND_PRESENT:
+        return state.status or KIND_PRESENT
+    if state.kind == KIND_SENTINEL:
+        return f"sentinel:{state.sentinel_kind}" if state.sentinel_kind else KIND_SENTINEL
+    return state.kind  # pending / ambiguous
+
+
+@dataclass(frozen=True)
+class StoryRow:
+    """One row of a stories-mode status table: the manifest fields (id / title /
+    checkpoint flags) joined with the live on-disk state of the id-keyed story
+    spec. ``position`` is 1-based list order."""
+
+    position: int
+    id: str
+    title: str
+    spec_checkpoint: bool
+    done_checkpoint: bool
+    state: StoryState
+    label: str
+
+
+def story_rows(
+    spec_folder: Path | str,
+    *,
+    selector: str | None = None,
+    max_stories: int | None = None,
+) -> list[StoryRow]:
+    """Load ``stories.yaml`` and project every entry to a :class:`StoryRow`,
+    resolving each story's on-disk state. ``selector`` restricts to one id
+    (empty result when unknown — the caller decides how to report that);
+    ``max_stories`` truncates like the run limit: it counts only stories the run
+    would actually drive (the engine's durable dispatch count skips already-done
+    stories), so done rows before the cap stay in view as skipped context and a
+    non-positive cap previews an empty schedule, exactly like the run dispatches
+    nothing. Raises :class:`StoriesError` when the manifest is missing or
+    invalid, so a caller rendering a table can surface the same message the run
+    would HALT on."""
+    folder = Path(spec_folder)
+    story_set = load_stories(folder)
+    entries = story_set.entries
+    if selector is not None:
+        entries = tuple(e for e in entries if e.id == selector)
+    rows: list[StoryRow] = []
+    dispatchable = 0
+    for position, entry in enumerate(entries, 1):
+        if max_stories is not None and dispatchable >= max_stories:
+            break
+        state = resolve_story_spec(folder, entry.id)
+        if _classify(state) != "done":
+            dispatchable += 1
+        rows.append(
+            StoryRow(
+                position=position,
+                id=entry.id,
+                title=entry.title,
+                spec_checkpoint=entry.spec_checkpoint,
+                done_checkpoint=entry.done_checkpoint,
+                state=state,
+                label=state_label(state),
+            )
+        )
+    return rows

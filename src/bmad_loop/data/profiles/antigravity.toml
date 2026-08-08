@@ -2,8 +2,36 @@
 # and stays interactive (a bare `-p` would run headless and exit). `Stop` is agy's
 # turn-complete event, mapped to canonical Stop — agy fires no SessionStart/SessionEnd
 # hooks, so only Stop is registered. Skills live in .agents/skills/, hooks in
-# .agents/hooks.json. usage_parser is "none": the per-workspace transcript.jsonl schema
-# isn't captured yet, so a token parser is deferred. Verified against agy 1.0.16.
+# .agents/hooks.json. Verified against agy 1.1.3.
+#
+# usage_parser is "none" DELIBERATELY AND PERMANENTLY — not a deferral. agy's
+# transcript (~/.gemini/antigravity-cli/brain/<conversationId>/.system_generated/
+# logs/transcript_full.jsonl, the path its Stop hook reports as `transcriptPath`)
+# carries only step_index/source/type/status/created_at/content/thinking. There is
+# no usage block anywhere in it — verified by capturing a live turn and scanning
+# every key recursively. agy does count tokens (the TUI shows them), but only
+# inside conversations/<conversationId>.db, a SQLite store whose gen_metadata is
+# an undocumented protobuf blob — unreadable through the JSONL-shaped
+# `(transcript_path) -> TokenUsage` parser contract, and fragile against an
+# internal schema. Runs work; the token columns stay empty. Revisit only if agy
+# starts emitting usage in the transcript.
+#
+# Hook payloads are protojson: keys are camelCase (conversationId, transcriptPath,
+# workspacePaths) — NOT the snake_case claude/codex use. agy sends no `cwd`; the
+# relay reads workspacePaths[0] instead. Hook `timeout` is in SECONDS (default 30);
+# handlers for Stop are a FLAT list with no matcher wrapper, and the file is keyed
+# by hook-GROUP name at the top level with no "hooks" wrapper (see install.py).
+# A hook's cwd is the dir holding hooks.json (.agents/), not the project root —
+# the relay is registered by absolute path, so this never matters.
+#
+# TRUST (verified empirically against 1.1.3, 3-run matrix): agy gates every
+# workspace on settings.json `trustedWorkspaces` and blocks on an interactive
+# "Do you trust the contents of this project?" dialog until answered.
+# `--dangerously-skip-permissions` does NOT bypass it — that flag covers tool
+# permissions only. Matching is EXACT-PATH: trusting /tmp does not cover
+# /tmp/foo. Consequences: `isolation = "none"` (the default) works once the
+# project root is trusted; `isolation = "worktree"` does NOT — each worktree is
+# a fresh path under .bmad-loop/runs/, so every session would hang on the dialog.
 name = "antigravity"
 binary = "agy"
 prompt_template = "{prompt}"
@@ -11,7 +39,7 @@ launch_args = ["-i"]
 bypass_args = ["--dangerously-skip-permissions"]
 model_flag = "--model"
 usage_parser = "none"
-first_run_note = "run `agy` once in the project and authenticate + trust the workspace (settings.json trustedWorkspaces) before `bmad-loop run` — spawned sessions can't answer first-run dialogs; requires Antigravity CLI (agy >= 1.0.16). NOTE: worktree runs use a different path than the trusted one — verify during probe whether that re-triggers a trust prompt."
+first_run_note = "run `agy` once in the project and authenticate + answer 'Yes, I trust this folder' before `bmad-loop run` — spawned sessions can't answer first-run dialogs, and a pending one reads as a session timeout. Requires Antigravity CLI (agy >= 1.1.3). Trust is exact-path (settings.json trustedWorkspaces): trusting a parent does NOT cover subdirectories, and --dangerously-skip-permissions does not bypass it — so antigravity requires isolation = \"none\" (the default); isolation = \"worktree\" will hang, as each worktree is an untrusted path."
 skill_tree = ".agents/skills"
 # .agents/hooks.json is agy's lifecycle-hook config. Seeded first, then the Stop
 # relay is merged in, so a worktree checkout keeps any user/plugin hook groups

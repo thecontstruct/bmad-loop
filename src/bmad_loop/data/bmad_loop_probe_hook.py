@@ -29,6 +29,13 @@ import sys
 import time
 
 
+def _first_workspace(payload):
+    paths = payload.get("workspacePaths")
+    if isinstance(paths, list) and paths and isinstance(paths[0], str):
+        return paths[0]
+    return None
+
+
 def _atomic_write(path: str, obj) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -56,9 +63,17 @@ def main() -> int:
             "ts": ts,
             "event": event_name,
             "task_id": task_id,
-            "session_id": payload.get("session_id") or payload.get("conversation_id"),
-            "transcript_path": payload.get("transcript_path"),
-            "cwd": payload.get("cwd"),
+            # Casing varies by CLI, exactly as in bmad_loop_hook.py: snake_case
+            # (claude/codex), conversation_id (cursor), camelCase (copilot,
+            # agy). agy sends workspacePaths rather than a cwd.
+            "session_id": (
+                payload.get("session_id")
+                or payload.get("conversation_id")
+                or payload.get("sessionId")
+                or payload.get("conversationId")
+            ),
+            "transcript_path": payload.get("transcript_path") or payload.get("transcriptPath"),
+            "cwd": payload.get("cwd") or _first_workspace(payload),
         }
         _atomic_write(os.path.join(capture_dir, f"{ts}-{event_name}.signal.json"), signal)
         captured = dict(payload)

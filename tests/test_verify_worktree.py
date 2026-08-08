@@ -63,6 +63,18 @@ def test_worktree_add_list_remove(project, tmp_path):
     assert wt.resolve() not in [p.resolve() for p in verify.worktree_list(repo)]
 
 
+def test_worktree_add_create_defaults_to_head(project, tmp_path):
+    """create=True with no `base` cuts the branch from HEAD (git's own default)
+    instead of passing None into git and crashing."""
+    repo = project.project
+    head = verify.rev_parse_head(repo)
+    wt = tmp_path / "wt-head"
+
+    verify.worktree_add(repo, wt, "feat", create=True)
+    assert verify.branch_exists(repo, "feat")
+    assert verify.rev_parse_head(wt) == head
+
+
 def test_worktree_add_existing_path_raises(project, tmp_path):
     wt = tmp_path / "wt"
     wt.mkdir()
@@ -80,6 +92,57 @@ def test_worktree_remove_dirty_needs_force(project, tmp_path):
         verify.worktree_remove(repo, wt)  # refuses to drop unsaved work
     verify.worktree_remove(repo, wt, force=True)
     assert not wt.exists()
+
+
+def test_worktree_prune_swallows_git_error(project, monkeypatch):
+    """worktree_prune is best-effort and must never raise — the teardown degrade
+    paths (close_unit_workspace / discard_worktree) call it from inside their own
+    GitError guards. Since #156 `_git` can *raise* GitError on a timeout, so prune
+    must swallow it, not merely ignore the return code (gh-139)."""
+
+    def boom(*a, **k):
+        raise verify.GitError("git worktree prune timed out")
+
+    monkeypatch.setattr(verify, "_git", boom)
+    verify.worktree_prune(project.project)  # returns without raising
+
+
+def test_worktree_prune_swallows_os_error(project, monkeypatch):
+    """Since #343 a spawn failure arrives typed as GitSpawnError (a GitError),
+    but prune's never-raise contract keeps its own plain-OSError net as the belt
+    for any untyped fault — its callers invoke it from inside `except GitError`
+    guards and lean on it never raising, whatever the cause."""
+
+    def boom(*a, **k):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(verify, "_git", boom)
+    verify.worktree_prune(project.project)  # returns without raising
+
+
+def test_checkout_detach_frees_branch(project, tmp_path):
+    """A worktree checked out on a branch holds that branch — git refuses to mount
+    it elsewhere. Detaching the worktree's HEAD frees the branch name for a sibling
+    worktree while preserving the branch ref, the working tree, and uncommitted
+    changes (issue #138)."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    (wt / "dirty.txt").write_text("uncommitted\n")  # local edit that must survive
+
+    # while 'feat' is checked out in wt, a sibling mount of it is refused
+    wt2 = tmp_path / "wt2"
+    with pytest.raises(verify.GitError):
+        verify.worktree_add(repo, wt2, "feat", create=False)
+
+    verify.checkout_detach(wt)
+
+    assert verify.current_branch(wt) == "HEAD"  # detached
+    assert verify.branch_exists(repo, "feat")  # branch ref preserved
+    assert (wt / "dirty.txt").read_text() == "uncommitted\n"  # working tree preserved
+    # branch name is now free → the sibling mount succeeds
+    verify.worktree_add(repo, wt2, "feat", create=False)
+    assert wt2.is_dir()
 
 
 # ---------------------------------------------------------------- merge

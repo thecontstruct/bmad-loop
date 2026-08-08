@@ -8,7 +8,8 @@ Three layers, mirroring the hook-bus test split:
   * **engine integration** — a provided workflow injects an extra agent session at
     post_dev_phase through the generic ``_run_session`` path; the prompt
     substitutes; a *blocking* workflow whose session fails defers the unit; a
-    non-blocking one is advisory; a workflow-free run is byte-identical;
+    non-blocking one is advisory; a workflow-free run is byte-identical; the
+    board-ownership prohibition rides every injected prompt post-gate (#437);
   * **the example plugin** — ``examples/plugins/guardrails`` loads, enables, and
     exercises its setting, observe hook, veto gate, commit mutation, and provided
     workflow end-to-end.
@@ -19,14 +20,14 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from conftest import dev_effect, git, review_effect, write_sprint
+from conftest import committing_crash_state, dev_effect, git, review_effect, write_sprint
 
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
-from bmad_loop.journal import Journal
-from bmad_loop.model import RunState, TokenUsage
-from bmad_loop.plugins import PluginRegistry
+from bmad_loop.journal import Journal, load_state
+from bmad_loop.model import Phase, RunState, TokenUsage
+from bmad_loop.plugins import Plugin, PluginRegistry
 from bmad_loop.plugins.model import (
     LoadedPlugin,
     PluginManifest,
@@ -93,7 +94,7 @@ def workflow_effect(captured: list, status: str = "completed"):
     """A scripted session standing in for an injected workflow session: record the
     spec (to assert prompt substitution + task_id) and return ``status``."""
 
-    def effect(spec):  # noqa: ANN001
+    def effect(spec):
         captured.append(spec)
         return SessionResult(status=status, result_json={})
 
@@ -224,10 +225,12 @@ def test_workflow_injects_a_session_at_post_dev_phase(project):
 
 
 def test_dev_and_review_sessions_carry_no_workflow_contract(project):
-    """The completion contract + stall-nudge cap are workflow-session-only: the
-    main dev/review sessions (their skills own their result conventions, and a
-    slow background wait may legitimately need unbounded re-nudging) must stay
-    byte-identical — no appended contract, no cap."""
+    """The completion contract is workflow-session-only: the main dev/review
+    sessions (their skills own their result conventions) must stay
+    byte-identical — no appended contract. Their stall nudges are bounded by
+    the dev cap, not the workflow one: a session whose reply to the wake nudge
+    is itself a result-less Stop would otherwise refill the budget until
+    session timeout (#149)."""
     captured: list = []
     setup_story(project)
 
@@ -247,7 +250,7 @@ def test_dev_and_review_sessions_carry_no_workflow_contract(project):
     assert summary.done == 1
     assert len(captured) == 2
     for spec in captured:
-        assert spec.stall_nudges_cap is None
+        assert spec.stall_nudges_cap == engine.policy.limits.dev_stall_nudges_cap
         assert "Completion signal" not in spec.prompt
         assert "bmad-dev-auto-result-" not in spec.prompt
 
@@ -264,6 +267,31 @@ def test_blocking_workflow_failure_defers_the_unit(project):
     assert len(captured) == 1  # the workflow session ran; no review session followed
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "story-deferred" in kinds
+
+
+def test_blocking_workflow_env_fault_escalates_instead_of_deferring(project):
+    """A blocking workflow session classified an environment fault (#194) escalates
+    the run (re-arm restores the budget) instead of deferring the story as if its
+    code were broken; the workflow-end entry carries env_fault + evidence."""
+    setup_story(project)
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf", blocking=True))])
+    evidence = "API Error: Unable to connect (ECONNREFUSED)"
+    script = [
+        dev_effect(project, "1-1-a"),
+        SessionResult(status="timeout", env_fault=True, env_fault_evidence=evidence),
+    ]
+    engine, _ = make_engine(project, script, reg)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert "environment fault: blocking workflow" in engine.state.paused_reason
+    assert evidence in engine.state.paused_reason
+    end = [e for e in engine.journal.entries() if e["kind"] == "workflow-end"][-1]
+    assert end["env_fault"] is True
+    assert end["env_fault_evidence"] == evidence
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-deferred" not in kinds  # escalated, not deferred
 
 
 def test_nonblocking_workflow_failure_is_advisory(project):
@@ -326,6 +354,39 @@ def test_blocking_pre_commit_gate_failure_defers_the_unit(project):
     assert "story-deferred" in kinds and "story-done" not in kinds
 
 
+def test_pre_commit_gate_workflow_not_rerun_on_commit_resume(project):
+    """#115: a task persisted at COMMITTING already ran its pre_commit_gate
+    workflows — the phase save lands only after the gate loop returns clean.
+    The resume re-drive must not re-charge them (and could not legally unwind
+    a blocking failure anyway: COMMITTING has no move to DEFERRED)."""
+    reg = PluginRegistry(
+        [LoadedPlugin(manifest=wf_manifest("wf", stage="pre_commit_gate", blocking=True))]
+    )
+    engine, _ = make_engine(project, [], reg)
+    committing_crash_state(project, engine)
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    adapter = MockAdapter([])
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+        registry=reg,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1
+    assert load_state(resumed.run_dir).tasks["1-1-a"].phase == Phase.DONE
+    assert adapter.sessions == []  # the gate session was not re-charged
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "workflow-start" not in kinds
+    assert "resume-commit" in kinds and "story-done" in kinds
+
+
 def test_no_workflow_no_extra_session(project):
     # a plugin with hooks but no workflow injects nothing; the guard is O(1).
     reg = PluginRegistry([])
@@ -335,6 +396,154 @@ def test_no_workflow_no_extra_session(project):
     # only the dev + review sessions ran (no injected third session)
     assert len(adapter.sessions) == 2
     assert not any(e["kind"].startswith("workflow") for e in engine.journal.entries())
+
+
+# ============================================= board ownership (#437, phase 3)
+#
+# A workflow session is dispatched in the window between the orchestrator's own
+# sprint-status write (`_post_dev_state_sync`) and the story's single commit
+# (`finalize_commit`), so it opens on an uncommitted, unattributed board change —
+# the exact state a review session read as a defect in #437. `_run_session`
+# appends the prohibition AFTER the session-gate hooks, so a plugin prompt rewrite
+# cannot strip it.
+#
+# Every presence/ordering/junction constant below is a test-local LITERAL, never a
+# call to the code under test: `"" in s` is True and `s.index("")` is 0, so an
+# assertion built from `engine._sprint_board_instruction()` goes vacuous under
+# exactly the ablation it exists to catch. The junction literals span the END of
+# one section and the START of the next — the only shape that can detect a changed
+# separator or a reordering.
+
+BOARD_OWNED = (
+    "sprint-status.yaml is owned by the orchestrator: never write it, and never "
+    "revert a change to it. A row at done or awaiting-operator is the orchestrator's "
+    "own bookkeeping — not a defect to fix, and not proof that the work is verified."
+)
+BOARD_HEADING = "## Sprint board (orchestrator-owned)"
+# the review-only hand-back redirect, which a workflow prompt must NOT carry
+BLOCKED_INVITE = "status: blocked and say why"
+# junction: the plugin's own prompt -> the board section
+PROMPT_BOARD_JOIN = "/doc 1-1-a\n\n## Sprint board (orchestrator-owned)\n\nsprint-status.yaml"
+# junction: the board section -> the completion contract
+BOARD_CONTRACT_JOIN = "not proof that the work is verified.\n\n## Completion signal (required)"
+# the completion contract's last words — it stays the tail of every workflow prompt
+CONTRACT_TAIL = "stalled and its work may be discarded."
+
+
+def run_one_workflow(project, *, registry):
+    """Drive one story with a post_dev_phase workflow and return the injected
+    session's SessionSpec."""
+    captured: list = []
+    setup_story(project)
+    script = [
+        dev_effect(project, "1-1-a"),
+        workflow_effect(captured),
+        review_effect(project, "1-1-a", clean=True),
+    ]
+    engine, _ = make_engine(project, script, registry)
+    summary = engine.run()
+    assert summary.done == 1
+    assert len(captured) == 1
+    return captured[0]
+
+
+def test_workflow_prompt_names_the_sprint_boards_owner(project):
+    """The prohibition rides every injected workflow prompt as its own section,
+    ahead of the completion contract — which stays the tail, because a session that
+    ends its turn without writing the marker livelocks the orchestrator."""
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf"))])
+    spec = run_one_workflow(project, registry=reg)
+
+    assert BOARD_OWNED in spec.prompt
+    assert BOARD_HEADING in spec.prompt
+    # the plugin's own text still leads, and the two separators are exactly \n\n
+    assert spec.prompt.startswith("/doc 1-1-a")
+    assert PROMPT_BOARD_JOIN in spec.prompt
+    assert BOARD_CONTRACT_JOIN in spec.prompt
+    # board BEFORE contract, and the contract is the last thing said
+    assert spec.prompt.index(BOARD_OWNED) < spec.prompt.index("## Completion signal")
+    assert spec.prompt.endswith(CONTRACT_TAIL)
+
+
+def test_workflow_board_clause_rides_every_injection_stage(project):
+    """All three stages run inside the uncommitted-board window, so all three
+    carry it — post_review_result and pre_commit_gate as much as post_dev_phase."""
+    for stage in ("post_dev_phase", "post_review_result", "pre_commit_gate"):
+        reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf", stage=stage))])
+        captured: list = []
+        setup_story(project)
+        script = [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)]
+        # post_dev_phase fires between dev and review; the other two after it
+        script.insert(1 if stage == "post_dev_phase" else 2, workflow_effect(captured))
+        engine, _ = make_engine(project, script, reg)
+        assert engine.run().done == 1, stage
+        assert len(captured) == 1, stage
+        assert BOARD_OWNED in captured[0].prompt, stage
+
+
+def test_workflow_board_clause_survives_a_plugin_prompt_rewrite(project):
+    """The unstrippable property, and the reason the append sits after
+    `_emit_session_gate`: a plugin that replaces `proposed_prompt` wholesale — the
+    documented way to author a workflow's dispatch — still cannot drop the board
+    prohibition or the completion contract."""
+
+    class P(Plugin):
+        def on_pre_workflow_session(self, c):
+            c.proposed_prompt = "/rewritten-by-plugin"
+
+    # the workflow's provider is declarative; the rewriting plugin has to be
+    # in-process, since only an instance carries `on_*` hooks
+    m = PluginManifest(name="rw", api_version=1)
+    reg = PluginRegistry(
+        [LoadedPlugin(manifest=wf_manifest("wf")), LoadedPlugin(manifest=m, instance=P(m, {}))]
+    )
+    spec = run_one_workflow(project, registry=reg)
+
+    assert spec.prompt.startswith("/rewritten-by-plugin")  # the rewrite took effect
+    assert "/doc 1-1-a" not in spec.prompt  # ...wholesale
+    assert BOARD_OWNED in spec.prompt  # ...and could not strip this
+    assert spec.prompt.endswith(CONTRACT_TAIL)
+
+
+def test_workflow_prompt_withholds_the_blocked_handback(project):
+    """The `blocked` hand-back redirect is review-only: it synthesizes a CRITICAL
+    that halts the whole run, which is the wrong trade for a session that is not
+    the sign-off authority. Asserted against the redirect's own wording, not the
+    bare token — the completion contract legitimately carries `status: blocked` as
+    its own non-completion signal, which the second assertion pins so the first
+    cannot pass merely because the token vanished."""
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf"))])
+    spec = run_one_workflow(project, registry=reg)
+
+    assert BLOCKED_INVITE not in spec.prompt
+    assert "`status: blocked`" in spec.prompt
+
+
+def test_dev_and_review_prompts_carry_no_workflow_board_section(project):
+    """The workflow section is workflow-session-only. The dev and review prompts
+    already carry the same sentence from their own builders, so a leaked section
+    would say it twice — and a `label`-blind append would put it on sessions whose
+    prompt the orchestrator authors."""
+    captured: list = []
+    setup_story(project)
+
+    def capture(effect):
+        def inner(spec):
+            captured.append(spec)
+            return effect(spec)
+
+        return inner
+
+    script = [
+        capture(dev_effect(project, "1-1-a")),
+        capture(review_effect(project, "1-1-a", clean=True)),
+    ]
+    engine, _ = make_engine(project, script)
+    assert engine.run().done == 1
+    assert len(captured) == 2
+    for spec in captured:
+        assert BOARD_HEADING not in spec.prompt
+        assert spec.prompt.count(BOARD_OWNED) == 1  # from its own builder, exactly once
 
 
 # ========================================================= example plugin

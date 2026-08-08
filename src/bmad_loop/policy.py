@@ -1,23 +1,53 @@
 """Policy-as-data: .bmad-loop/policy.toml -> immutable Policy dataclasses."""
 
+# Strict-checked under #245 Stage 2, with the three "expression fully known"
+# rules below relaxed for this file only: the snapshot/TOML readers rebuild typed
+# Policy objects from loosely-typed persisted data — `tomllib.load` and a run's
+# json-round-tripped `asdict(Policy)` both hand back `dict[str, Any]`, and
+# isinstance-narrowing an `Any` yields `dict[Unknown, Unknown]` — so `.get(...)`
+# chains off those dicts read as Unknown. Clearing them would take a TypedDict
+# per persisted shape or runtime coercions (out of scope for a no-runtime-change
+# gate); every other strict rule stays on and still catches annotation drift.
+# pyright: reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
+import re
 import tomllib
 import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .platform_util import atomic_replace, has_parent_ref, is_absolute_path, names_tree_root
+
 POLICY_FILE = Path(".bmad-loop") / "policy.toml"
 
 GATE_MODES = {"none", "per-epic", "per-story-spec-approval"}
 RETRO_MODES = {"never", "notify", "auto"}
+SESSION_BUDGET_MODES = {"off", "warn", "enforce"}
 SWEEP_AUTO_MODES = {"never", "per-epic", "run-end"}
 REVIEW_TRIGGER_MODES = {"always", "recommended"}
+REVIEW_ON_TIMEOUT_MODES = {"retry", "salvage-if-done", "defer"}
+REVIEW_ON_STATUS_CONTRADICTION_MODES = {"escalate", "retry"}
+# Where the run gets its story queue. "sprint-status" (default) is the classic
+# flow — bmad-sprint-planning writes sprint-status.yaml from prose epics.
+# "stories" is the opt-in folder+id dispatch flow (BMAD-METHOD #2549): a typed,
+# human-reviewed stories.yaml sibling of SPEC.md drives the loop.
+STORIES_SOURCES = {"sprint-status", "stories"}
 ISOLATION_MODES = {"none", "worktree"}
 BRANCH_PER_MODES = {"story", "run"}
 MERGE_STRATEGIES = {"ff", "merge", "squash"}
 DEV_SKILLS = {"bmad-dev-auto"}
+
+# Backend names are registry keys (adapters/multiplexer.py), never paths or
+# shell input; the alphabet mirrors what built-in and plugin backends use.
+_MUX_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# write_mux_backend's line targets: a [section] header, and the (possibly
+# commented) `backend =` anchor line inside [mux]. Template prose comments must
+# never start with `backend =` or the anchor match would hit them first.
+_TOML_SECTION_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s*(?:#.*)?$")
+_MUX_KEY_RE = re.compile(r"^\s*#?\s*backend\s*=")
 
 # Deprecated [engine] keys, folded into [plugins.unity] at load time. The
 # game-engine layer is now a plugin; [engine] is a one-release compatibility
@@ -40,7 +70,30 @@ class GatesPolicy:
 class LimitsPolicy:
     max_review_cycles: int = 3
     max_dev_attempts: int = 2
+    # additional review rounds the orchestrator grants *solely* because a
+    # completed round finalized the story (status: done) yet still set
+    # `followup_review_recommended: true`. Once this many such self-recommended
+    # follow-ups have been honored, the next finalized-but-still-recommending
+    # round force-converges instead of burning another cycle: verify → refile the
+    # lingering recommendation to the deferred-work ledger → commit. Damps the
+    # structurally non-convergent step-04 rule (every review pass patches findings
+    # and therefore recommends another pass). max_review_cycles stays the hard
+    # outer bound. 0 = never honor a pass's own follow-up recommendation
+    # (converge + refile on the first finalized round that still recommends one).
+    max_followup_reviews: int = 1
     session_timeout_min: int = 90
+    # hard bound on any single git subprocess the orchestrator spawns (diff,
+    # reset, snapshot, …). The default is a sane normal-case ceiling, but a
+    # loaded host or a very large worktree can legitimately exceed it (#156) —
+    # exceeding it is a handled GitError, never a run crash, and raising the
+    # bound here is the fix when it fires spuriously.
+    git_timeout_s: int = 120
+    # bounded grace for verified session teardown (#157): after the first
+    # best-effort window kill the adapter polls liveness up to this many
+    # seconds; a window that survives it gets its pane pids force-killed and
+    # the window killed again. 0 = the old single unverified best-effort kill
+    # (the rollback lever if escalation ever misfires).
+    teardown_grace_s: int = 20
     stop_without_result_nudges: int = 1
     # how long a dev session may sit on a result-less Stop — i.e. it ended its
     # turn awaiting a long-running background process (a Unity PlayMode run, a
@@ -62,17 +115,53 @@ class LimitsPolicy:
     # the full grace, nudge after nudge, drains the budget and stalls. 0 = stall
     # on grace expiry.
     dev_stall_nudges: int = 2
-    # monotonic cap on stall wake-nudges for injected plugin-workflow sessions
-    # (SessionSpec.stall_nudges_cap). Dev/review sessions stay uncapped: their
-    # nudge budget is deliberately restored on every fresh Stop so a session
-    # awaiting a slow background process can wait up to session_timeout_min. A
-    # workflow session that keeps ending its turn without writing its completion
-    # marker would ride that refill forever; after this many total nudges it is
-    # declared stalled instead (non-blocking workflows then advance the phase).
+    # monotonic (never-restored) cap on total stall wake-nudges for a dev/review
+    # session (SessionSpec.stall_nudges_cap). The per-silence dev_stall_nudges
+    # budget is restored on every fresh Stop so a cooperative session awaiting a
+    # slow background process can keep waiting — but the wake nudge is itself a
+    # submitted turn, so a session that merely *answers* it ends in another
+    # result-less Stop and re-earns the budget: without this cap the loop rides
+    # the refill until session_timeout_min, burning a turn per cycle (#149).
+    # After this many total nudges the session is declared stalled instead
+    # (post-kill reconcile still rescues a finished one whose artifact is on
+    # disk). 0 = stall on first grace expiry.
+    dev_stall_nudges_cap: int = 6
+    # same monotonic cap for injected plugin-workflow sessions: one that keeps
+    # ending its turn without writing its completion marker is declared stalled
+    # after this many total nudges (non-blocking workflows then advance the
+    # phase).
     workflow_stall_nudges_cap: int = 3
+    # One targeted nudge per session (#276 M4) when a Stop finds a marker-less
+    # terminal-frontmatter spec (a review that finalized `status: done`/`blocked`
+    # without appending its required `## Auto Run Result` section): ask the skill
+    # to append that section now, then end its turn — repairing the omission at
+    # the source so the normal marker scan harvests it. Sent exactly once per
+    # session (a never-cleared set), never refilled, and touching no stall
+    # counters; the harness-side frontmatter synthesis (#224) stays the backstop
+    # for a session that never complies. True enables it; False keeps the pre-M4
+    # behavior (synthesis only).
+    dev_contract_nudge: bool = True
+    # advisory cost-weighted cap on a whole STORY's cumulative spend, re-checked
+    # at every session boundary and warned about once per story (#336). Nothing
+    # is terminated on the crossing — enforcement is max_tokens_per_session below.
     max_tokens_per_story: int = 2_000_000
     # weight of cache-read tokens in the budget check (1.0 = count raw)
     cache_read_weight: float = 0.1
+    # Mid-session token-budget guard (#158). "off" = no sampling; "warn" =
+    # ATTENTION + lifecycle breadcrumb once, session runs to its natural end;
+    # "enforce" = warn actions + wrap-up nudge + grace window, then the session
+    # ends over_budget (rides the ordinary retry→defer arm). Adapters with no
+    # mid-session usage signal (usage_parser "none", copilot's shutdown-only
+    # flush) leave the guard inert regardless of mode.
+    session_budget_mode: str = "warn"
+    # weighted (cache_read_weight-discounted) per-SESSION cap the adapter wait
+    # loops sample cumulative usage against every ~30s heartbeat tick. Distinct
+    # from the advisory per-story max_tokens_per_story: this one is per session
+    # and can end it; that one spans a story's sessions and only warns.
+    max_tokens_per_session: int = 4_000_000
+    # enforce mode: seconds a tripped session gets to wrap up after the nudge
+    # before it is terminated over_budget. 0 = terminate at trip, no nudge.
+    session_budget_grace_s: int = 240
 
 
 @dataclass(frozen=True)
@@ -102,9 +191,57 @@ class ReviewPolicy:
     #       and the story commits without a second review session.
     #   "always" — run the second-opinion review on every story (pre-PR-#2505
     #       behavior). The skill's recommendation flag is recorded but ignored.
-    # Either way the review loop is bounded by limits.max_review_cycles, which is
-    # the oscillation guard for orchestrator-applied follow-up review.
+    # Either way the review loop is bounded by two limits: limits.max_review_cycles
+    # is the hard outer cap on cycles, and limits.max_followup_reviews damps the
+    # structurally non-convergent case — a round that finalizes the story yet keeps
+    # recommending an independent follow-up — by converging + refiling once the
+    # damping grant is spent instead of looping to the outer cap.
     trigger: str = "recommended"
+    # What a timeout-like review verdict (timeout / stalled / over_budget — the
+    # same set the post-kill reconcile treats as rescue-eligible) costs (#271):
+    #   "retry" (default) — today's behavior: burn a review cycle per timeout
+    #       until limits.max_review_cycles, then defer.
+    #   "salvage-if-done" — when the spec's frontmatter shows the dev product
+    #       already finalized (`done`, or the `in-review` mid-review interrupt,
+    #       reset forward) and the deterministic verify gate passes, commit the
+    #       work and refile any outstanding follow-up review to deferred work
+    #       instead of burning another full review pass on an empty delta.
+    #   "defer" — give up on the first timeout-like verdict (no retries).
+    # `crashed` and env-fault (#194) verdicts keep their own routing in every mode.
+    on_timeout: str = "retry"
+    # What a review that revokes the story's sprint sign-off costs (#334). The
+    # orchestrator advances sprint-status to `done` at dev time; a review session
+    # that judges the story unfinished and writes the board back to an earlier
+    # stage contradicts that — and nothing in the review loop re-advances the
+    # board, so every remaining cycle re-reads the same failure and the story
+    # ends deferred + rolled back.
+    #   "escalate" (default) — pause the run naming both sides of the
+    #       disagreement, so a human resolves it instead of the budget burning
+    #       down onto a rollback.
+    #   "retry" — legacy behavior: treat it as an ordinary verify failure, burn
+    #       review cycles to limits.max_review_cycles, then defer.
+    # Keys on sprint-status only: the spec's own frontmatter status legitimately
+    # cycles (in-review/in-progress) while a review patches, and `status: blocked`
+    # remains the sanctioned way for a review to hand a story back to a human.
+    on_status_contradiction: str = "escalate"
+
+
+@dataclass(frozen=True)
+class StoriesPolicy:
+    """Story-queue source selection. Default reproduces sprint mode exactly.
+
+    ``source = "stories"`` opts a run into folder+id dispatch: the loop reads a
+    typed ``stories.yaml`` (Story Breakdown output, sibling of ``SPEC.md``) under
+    ``spec_folder`` and dispatches each entry by folder+id instead of walking
+    ``sprint-status.yaml``. ``spec_folder`` is the project-relative (or absolute)
+    path to the epic's spec folder; required and must parse when
+    ``source = "stories"``. There is deliberately **no** ``continue_independent``
+    knob — the manifest is strictly serial (no ``depends_on``), so a blocked
+    story always pauses the run for resolve rather than leapfrogging to later
+    work."""
+
+    source: str = "sprint-status"
+    spec_folder: str = ""
 
 
 @dataclass(frozen=True)
@@ -114,6 +251,15 @@ class DevPolicy:
     # it writes no result.json — the GenericDevAdapter synthesizes one from the
     # spec the session leaves on disk. The field is retained (rather than inlined)
     # as the seam for a future alternative dev skill; see DEV_SKILLS.
+    #
+    # NOT the name a session is dispatched with. Upstream renamed the primitive
+    # bmad-dev-auto -> bmad-build-auto (BMAD-METHOD#2651), so the invoked name is
+    # resolved from what is actually on disk (Engine._dev_skill, via
+    # install.dev_primitive_or_default) and a project on either era works with
+    # this field untouched. This value is the ADAPTER DISCRIMINATOR — it selects
+    # the decoupled generic-dev behaviour seams (engine._generic_dev,
+    # runsetup.py's result-synthesis switch) — so it keeps the pre-rename
+    # spelling as a stable key rather than tracking the upstream directory name.
     skill: str = "bmad-dev-auto"
 
 
@@ -124,6 +270,41 @@ class TuiPolicy:
     # repaint tearing/garbage when driving the TUI over a slow/high-latency
     # link (SSH, Tailscale) where a 60fps update stream can't drain in time.
     low_frame_rate: bool = False
+    # Persisted dashboard pane geometry, in terminal cells. 0 = unset: the layout
+    # keeps its built-in default proportions (so a fresh project looks unchanged
+    # and only user-resized panes land in the file). The TUI writes these when a
+    # pane is resized by mouse-drag or the Ctrl+W resize mode, and seeds them back
+    # on the next launch. Per-project, since policy.toml is project-scoped.
+    left_width: int = 0  # sidebar (#left) width, columns
+    runs_height: int = 0  # Runs pane height, rows (top of the left column)
+    deferred_height: int = 0  # Deferred pane height, rows (bottom of the left column)
+    tasks_height: int = 0  # Tasks table height, rows (detail column)
+
+
+@dataclass(frozen=True)
+class OperatorPolicy:
+    # Whether a dev session may park a story at `awaiting-operator` — the
+    # terminal state for a story whose agent-doable work is finished and
+    # committed but whose acceptance criteria include external actions only a
+    # human can perform (#335). Default-on: without it such a story has no honest
+    # outcome, and the two it would otherwise take are both wrong — `done` hides
+    # the outstanding work behind a green board, `blocked` halts a run over work
+    # the loop was never going to do. Off, the engine injects no park
+    # instruction, never targets the sprint token, and the verify gates do not
+    # know the status, so a session that writes it anyway is retried with that
+    # mismatch as feedback rather than silently committing.
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class MuxPolicy:
+    # Terminal-multiplexer backend for THIS machine (the transport axis — which
+    # tmux-like program hosts sessions; independent of [adapter], the coding-CLI
+    # axis). "" = auto-select. Whether the name is actually registered is checked
+    # at selection time (adapters/multiplexer.py), not here — policy stays
+    # data-only, and a plugin backend may not be importable in every context that
+    # parses policy. Machine-specific: `bmad-loop init` gitignores policy.toml.
+    backend: str = ""
 
 
 @dataclass(frozen=True)
@@ -228,6 +409,73 @@ class AdapterPolicy:
         )
 
 
+def _snapshot_extra_args(raw: Any) -> tuple[str, ...] | None:
+    # asdict() turns the extra_args tuple into a list and json keeps it a list;
+    # rebuild the tuple so a reconstructed AdapterPolicy compares equal to a
+    # freshly-parsed one (the #189 tuple-vs-list trap). None stays None.
+    if raw is None:
+        return None
+    return tuple(str(a) for a in raw)
+
+
+def _stage_from_snapshot(raw: Any) -> StageAdapterPolicy:
+    # A missing or non-dict stage entry rebuilds to the all-inherit default,
+    # matching StageAdapterPolicy()'s field defaults.
+    if not isinstance(raw, dict):
+        return StageAdapterPolicy()
+    name = raw.get("name")
+    model = raw.get("model")
+    return StageAdapterPolicy(
+        name=None if name is None else str(name),
+        model=None if model is None else str(model),
+        extra_args=_snapshot_extra_args(raw.get("extra_args")),
+        usage_grace_s=raw.get("usage_grace_s"),
+        stop_without_result_nudges=raw.get("stop_without_result_nudges"),
+    )
+
+
+def adapter_policy_from_snapshot(snapshot: dict[str, Any] | None) -> AdapterPolicy | None:
+    """Rebuild an :class:`AdapterPolicy` from a run's persisted policy snapshot.
+
+    ``snapshot`` is ``RunState.policy_snapshot`` — the json-round-tripped
+    ``asdict(Policy)``. This reconstructs the ``[adapter]`` sub-tree (the base
+    plus the dev/review/triage :class:`StageAdapterPolicy` stages) so display
+    paths can reuse the canonical :meth:`AdapterPolicy.resolved` instead of
+    re-deriving its stage-inheritance / client-switch rules against a raw dict.
+
+    Returns ``None`` when there is nothing trustworthy to rebuild: ``snapshot``
+    is ``None`` or not a dict, ``snapshot["adapter"]`` is not a dict, or it lacks
+    a non-empty string ``name`` — an all-defaults reconstruction would falsely
+    display "claude" for a run that predates adapter stamping. The rebuild is
+    wrapped so a malformed snapshot yields ``None`` rather than raising: this
+    feeds status/TUI display surfaces that must never crash.
+    """
+    try:
+        if not isinstance(snapshot, dict):
+            return None
+        adapter_d = snapshot.get("adapter")
+        if not isinstance(adapter_d, dict):
+            return None
+        name = adapter_d.get("name")
+        if not isinstance(name, str) or not name:
+            return None
+        return AdapterPolicy(
+            name=name,
+            model=str(adapter_d.get("model", AdapterPolicy.model)),
+            extra_args=_snapshot_extra_args(adapter_d.get("extra_args")),
+            cleanup_session_on_finish=bool(
+                adapter_d.get("cleanup_session_on_finish", AdapterPolicy.cleanup_session_on_finish)
+            ),
+            usage_grace_s=adapter_d.get("usage_grace_s"),
+            stop_without_result_nudges=adapter_d.get("stop_without_result_nudges"),
+            dev=_stage_from_snapshot(adapter_d.get("dev")),
+            review=_stage_from_snapshot(adapter_d.get("review")),
+            triage=_stage_from_snapshot(adapter_d.get("triage")),
+        )
+    except Exception:
+        return None
+
+
 @dataclass(frozen=True)
 class ScmPolicy:
     # isolation = none  -> work happens in place on the checked-out branch
@@ -321,6 +569,7 @@ class Policy:
     verify: VerifyPolicy = field(default_factory=VerifyPolicy)
     notify: NotifyPolicy = field(default_factory=NotifyPolicy)
     review: ReviewPolicy = field(default_factory=ReviewPolicy)
+    stories: StoriesPolicy = field(default_factory=StoriesPolicy)
     dev: DevPolicy = field(default_factory=DevPolicy)
     adapter: AdapterPolicy = field(default_factory=AdapterPolicy)
     sweep: SweepPolicy = field(default_factory=SweepPolicy)
@@ -328,6 +577,8 @@ class Policy:
     cleanup: CleanupPolicy = field(default_factory=CleanupPolicy)
     plugins: PluginsPolicy = field(default_factory=PluginsPolicy)
     tui: TuiPolicy = field(default_factory=TuiPolicy)
+    operator: OperatorPolicy = field(default_factory=OperatorPolicy)
+    mux: MuxPolicy = field(default_factory=MuxPolicy)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -364,6 +615,18 @@ def _opt_nudges(d: dict[str, Any], where: str) -> int | None:
     if value < 0:
         raise PolicyError(f"{where}.stop_without_result_nudges must be >= 0: got {value}")
     return value
+
+
+def _tui_dim(d: dict[str, Any], key: str) -> int:
+    """A persisted TUI pane dimension (cells). 0 = unset; negatives are rejected.
+    Strict like scm.max_parallel: a TOML bool or float would coerce silently and
+    corrupt the saved geometry, so require a real int."""
+    raw = d.get(key, 0)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise PolicyError(f"tui.{key} must be a non-negative integer: got {raw!r}")
+    if raw < 0:
+        raise PolicyError(f"tui.{key} must be >= 0: got {raw}")
+    return raw
 
 
 def _stage_adapter(adapter_d: dict[str, Any], key: str) -> StageAdapterPolicy:
@@ -408,11 +671,22 @@ def _validate_plugin_settings(name: str, raw: dict[str, Any], specs: Any) -> Non
 
 
 def load(path: Path | None) -> Policy:
-    """Load policy from a TOML file; a missing file yields all defaults."""
+    """Load policy from a TOML file; a missing file yields all defaults.
+
+    An undecodable file is a `PolicyError` like a malformed one. `read_text` raises
+    `UnicodeDecodeError`, which is a `ValueError` and not an `OSError`, so left raw it
+    escapes every `except (PolicyError, OSError)` handler in the codebase — and those
+    handlers are the ones whose whole job is to degrade to defaults rather than take
+    the process down. Converting here fixes them all at once instead of asking each
+    to name a second exception type it has no other reason to know about."""
     if path is None or not path.is_file():
         return loads("")
     try:
-        return loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise PolicyError(f"{path}: not valid UTF-8: {e}") from e
+    try:
+        return loads(text)
     except PolicyError as e:
         raise PolicyError(f"{path}: {e}") from e
 
@@ -436,6 +710,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     verify_d = _section(doc, "verify")
     notify_d = _section(doc, "notify")
     review_d = _section(doc, "review")
+    stories_d = _section(doc, "stories")
     dev_d = _section(doc, "dev")
     adapter_d = _section(doc, "adapter")
     sweep_d = _section(doc, "sweep")
@@ -444,6 +719,8 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     engine_d = _section(doc, "engine")  # deprecated; folded into [plugins] below
     plugins_d = _section(doc, "plugins")
     tui_d = _section(doc, "tui")
+    operator_d = _section(doc, "operator")
+    mux_d = _section(doc, "mux")
 
     gates = GatesPolicy(
         mode=str(gates_d.get("mode", GatesPolicy.mode)),
@@ -457,27 +734,74 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
             f"gates.retrospective must be one of {sorted(RETRO_MODES)}: got {gates.retrospective!r}"
         )
 
+    # the budget knobs gate enforce-mode termination, so a coerced bool/float
+    # (true -> 1 token) must be rejected, not silently accepted (same rule as
+    # scm.preserve_keep below). The per-story cap is checked here on the same
+    # terms even though it only warns: a coerced `true` caps a whole story at 1
+    # token, which now fires at the first session boundary of every story.
+    max_tokens_per_story = limits_d.get("max_tokens_per_story", LimitsPolicy.max_tokens_per_story)
+    if isinstance(max_tokens_per_story, bool) or not isinstance(max_tokens_per_story, int):
+        raise PolicyError(
+            f"limits.max_tokens_per_story must be an integer: got {max_tokens_per_story!r}"
+        )
+    max_tokens_per_session = limits_d.get(
+        "max_tokens_per_session", LimitsPolicy.max_tokens_per_session
+    )
+    if isinstance(max_tokens_per_session, bool) or not isinstance(max_tokens_per_session, int):
+        raise PolicyError(
+            f"limits.max_tokens_per_session must be an integer: got {max_tokens_per_session!r}"
+        )
+    session_budget_grace_s = limits_d.get(
+        "session_budget_grace_s", LimitsPolicy.session_budget_grace_s
+    )
+    if isinstance(session_budget_grace_s, bool) or not isinstance(session_budget_grace_s, int):
+        raise PolicyError(
+            f"limits.session_budget_grace_s must be an integer: got {session_budget_grace_s!r}"
+        )
+
     limits = LimitsPolicy(
         max_review_cycles=int(limits_d.get("max_review_cycles", LimitsPolicy.max_review_cycles)),
         max_dev_attempts=int(limits_d.get("max_dev_attempts", LimitsPolicy.max_dev_attempts)),
+        max_followup_reviews=int(
+            limits_d.get("max_followup_reviews", LimitsPolicy.max_followup_reviews)
+        ),
         session_timeout_min=int(
             limits_d.get("session_timeout_min", LimitsPolicy.session_timeout_min)
         ),
+        git_timeout_s=int(limits_d.get("git_timeout_s", LimitsPolicy.git_timeout_s)),
+        teardown_grace_s=int(limits_d.get("teardown_grace_s", LimitsPolicy.teardown_grace_s)),
         stop_without_result_nudges=int(
             limits_d.get("stop_without_result_nudges", LimitsPolicy.stop_without_result_nudges)
         ),
         dev_stall_grace_s=int(limits_d.get("dev_stall_grace_s", LimitsPolicy.dev_stall_grace_s)),
         dev_stall_nudges=int(limits_d.get("dev_stall_nudges", LimitsPolicy.dev_stall_nudges)),
+        dev_stall_nudges_cap=int(
+            limits_d.get("dev_stall_nudges_cap", LimitsPolicy.dev_stall_nudges_cap)
+        ),
         workflow_stall_nudges_cap=int(
             limits_d.get("workflow_stall_nudges_cap", LimitsPolicy.workflow_stall_nudges_cap)
         ),
-        max_tokens_per_story=int(
-            limits_d.get("max_tokens_per_story", LimitsPolicy.max_tokens_per_story)
+        dev_contract_nudge=bool(
+            limits_d.get("dev_contract_nudge", LimitsPolicy.dev_contract_nudge)
         ),
+        max_tokens_per_story=max_tokens_per_story,
         cache_read_weight=float(limits_d.get("cache_read_weight", LimitsPolicy.cache_read_weight)),
+        session_budget_mode=str(
+            limits_d.get("session_budget_mode", LimitsPolicy.session_budget_mode)
+        ),
+        max_tokens_per_session=max_tokens_per_session,
+        session_budget_grace_s=session_budget_grace_s,
     )
     if limits.max_review_cycles < 1 or limits.max_dev_attempts < 1:
         raise PolicyError("limits.max_review_cycles and limits.max_dev_attempts must be >= 1")
+    if limits.max_followup_reviews < 0:
+        raise PolicyError(
+            f"limits.max_followup_reviews must be >= 0: got {limits.max_followup_reviews}"
+        )
+    if limits.git_timeout_s < 1:
+        raise PolicyError(f"limits.git_timeout_s must be >= 1: got {limits.git_timeout_s}")
+    if limits.teardown_grace_s < 0:
+        raise PolicyError(f"limits.teardown_grace_s must be >= 0: got {limits.teardown_grace_s}")
     if not 0.0 <= limits.cache_read_weight <= 1.0:
         raise PolicyError(
             f"limits.cache_read_weight must be between 0 and 1: got {limits.cache_read_weight}"
@@ -486,9 +810,30 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         raise PolicyError(f"limits.dev_stall_grace_s must be >= 0: got {limits.dev_stall_grace_s}")
     if limits.dev_stall_nudges < 0:
         raise PolicyError(f"limits.dev_stall_nudges must be >= 0: got {limits.dev_stall_nudges}")
+    if limits.dev_stall_nudges_cap < 0:
+        raise PolicyError(
+            f"limits.dev_stall_nudges_cap must be >= 0: got {limits.dev_stall_nudges_cap}"
+        )
     if limits.workflow_stall_nudges_cap < 0:
         raise PolicyError(
             f"limits.workflow_stall_nudges_cap must be >= 0: got {limits.workflow_stall_nudges_cap}"
+        )
+    if limits.session_budget_mode not in SESSION_BUDGET_MODES:
+        raise PolicyError(
+            f"limits.session_budget_mode must be one of {sorted(SESSION_BUDGET_MODES)}: "
+            f"got {limits.session_budget_mode!r}"
+        )
+    if limits.max_tokens_per_story < 1:
+        raise PolicyError(
+            f"limits.max_tokens_per_story must be >= 1: got {limits.max_tokens_per_story}"
+        )
+    if limits.max_tokens_per_session < 1:
+        raise PolicyError(
+            f"limits.max_tokens_per_session must be >= 1: got {limits.max_tokens_per_session}"
+        )
+    if limits.session_budget_grace_s < 0:
+        raise PolicyError(
+            f"limits.session_budget_grace_s must be >= 0: got {limits.session_budget_grace_s}"
         )
 
     verify = VerifyPolicy(commands=tuple(str(c) for c in verify_d.get("commands", ())))
@@ -499,14 +844,47 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     review = ReviewPolicy(
         enabled=bool(review_d.get("enabled", ReviewPolicy.enabled)),
         trigger=str(review_d.get("trigger", ReviewPolicy.trigger)).strip(),
+        on_timeout=str(review_d.get("on_timeout", ReviewPolicy.on_timeout)).strip(),
+        on_status_contradiction=str(
+            review_d.get("on_status_contradiction", ReviewPolicy.on_status_contradiction)
+        ).strip(),
     )
     if review.trigger not in REVIEW_TRIGGER_MODES:
         raise PolicyError(
             f"review.trigger must be one of {sorted(REVIEW_TRIGGER_MODES)}: got {review.trigger!r}"
         )
+    if review.on_timeout not in REVIEW_ON_TIMEOUT_MODES:
+        raise PolicyError(
+            f"review.on_timeout must be one of {sorted(REVIEW_ON_TIMEOUT_MODES)}:"
+            f" got {review.on_timeout!r}"
+        )
+    if review.on_status_contradiction not in REVIEW_ON_STATUS_CONTRADICTION_MODES:
+        raise PolicyError(
+            "review.on_status_contradiction must be one of "
+            f"{sorted(REVIEW_ON_STATUS_CONTRADICTION_MODES)}:"
+            f" got {review.on_status_contradiction!r}"
+        )
+    stories = StoriesPolicy(
+        source=str(stories_d.get("source", StoriesPolicy.source)).strip(),
+        spec_folder=str(stories_d.get("spec_folder", StoriesPolicy.spec_folder)).strip(),
+    )
+    if stories.source not in STORIES_SOURCES:
+        raise PolicyError(
+            f"stories.source must be one of {sorted(STORIES_SOURCES)}: got {stories.source!r}"
+        )
+    # source="stories" needs a spec_folder to read stories.yaml from; the reverse
+    # (a spec_folder set under sprint-status mode) is a harmless leftover, ignored
+    # at run time — no error, so switching source back and forth keeps the path.
+    if stories.source == "stories" and not stories.spec_folder:
+        raise PolicyError('stories.source = "stories" requires stories.spec_folder to be set')
     dev = DevPolicy(skill=str(dev_d.get("skill", DevPolicy.skill)))
     if dev.skill not in DEV_SKILLS:
-        raise PolicyError(f"dev.skill must be one of {sorted(DEV_SKILLS)}: got {dev.skill!r}")
+        raise PolicyError(
+            f"dev.skill must be one of {sorted(DEV_SKILLS)}: got {dev.skill!r}. This is the "
+            f"adapter discriminator, not the invoked skill name — the name a session is "
+            f"dispatched with is resolved from the skill tree on disk, so a project on the "
+            f"post-rename bmad-build-auto needs no change here"
+        )
     for legacy, replacement in (
         ("model_dev", "[adapter.dev] model"),
         ("model_review", "[adapter.review] model"),
@@ -566,6 +944,17 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         raise PolicyError(f"scm.preserve_keep must be an integer: got {preserve_keep!r}")
     if preserve_keep < 0:
         raise PolicyError(f"scm.preserve_keep must be >= 0: got {preserve_keep}")
+    # Shape before entries, because `tuple(str(s) for s in raw)` silently accepts
+    # things that are not a list of paths. Measured: `worktree_seed = ""` yields an
+    # empty tuple (the config reads as applied and seeds nothing), `= "foo"` yields
+    # ('f','o','o') — three bogus one-character entries that each pass the
+    # per-entry guard below — and `= 5` raises a bare TypeError out of `loads`,
+    # untyped, where every other malformed value here raises PolicyError.
+    raw_seed = scm_d.get("worktree_seed", ())
+    if isinstance(raw_seed, (str, bytes)) or not isinstance(raw_seed, (list, tuple)):
+        raise PolicyError(f"scm.worktree_seed must be a list of paths: got {raw_seed!r}")
+    if not all(isinstance(s, str) for s in raw_seed):
+        raise PolicyError(f"scm.worktree_seed entries must be strings: got {list(raw_seed)!r}")
     scm = ScmPolicy(
         isolation=str(scm_d.get("isolation", ScmPolicy.isolation)),
         branch_per=str(scm_d.get("branch_per", ScmPolicy.branch_per)),
@@ -587,7 +976,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         seed_adapter_defaults=bool(
             scm_d.get("seed_adapter_defaults", ScmPolicy.seed_adapter_defaults)
         ),
-        worktree_seed=tuple(str(s) for s in scm_d.get("worktree_seed", ())),
+        worktree_seed=tuple(raw_seed),
     )
     if scm.isolation not in ISOLATION_MODES:
         raise PolicyError(
@@ -604,6 +993,40 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         )
     if scm.failed_diff_max_mb < 1:
         raise PolicyError(f"scm.failed_diff_max_mb must be >= 1: got {scm.failed_diff_max_mb}")
+    # The same rule the other two seed sources already apply to their own entries
+    # (adapters/profile.py `seed_files`, plugins/manifest.py `_check_relative_paths`).
+    # All three feed one list into provision_worktree's seed loop, and this was the
+    # only one arriving unvalidated.
+    #
+    # A ROOT-NAMING entry is why this is a guard rather than a tidy-up: it makes that
+    # loop resolve src to the repo ROOT and dst to the worktree, both of which pass
+    # its `is_relative_to` containment checks — a path IS relative to itself — so it
+    # copies the entire repo into the worktree, gitignored and untracked files
+    # included. And because a worktree mounts UNDER the repo (.bmad-loop/runs/...),
+    # that copy walks into its own destination: measured at 744 levels of nesting
+    # before the path length failed, silently, since the seed copy suppresses errors.
+    #
+    # `names_tree_root` and not a `not seed` emptiness check, because "" is only one
+    # spelling of the root. Measured: "" and "." produce a byte-identical
+    # (src, raw, dst) triple in that loop, and a run seeded with ["."] copied an
+    # untracked secret.env in and self-recursed until the path length failed, with
+    # provision_worktree returning no skip at all.
+    #
+    # The "/" it then renders is INERT, not a blanket exclusion — git strips a bare
+    # slash to a zero-length pattern that matches nothing (worktree_flow.py says the
+    # same at the write side). That is what makes this worth guarding rather than
+    # shrugging at: none of the copied surplus is shielded, so the unit's
+    # `git add -A` stages the main checkout's untracked files into the story.
+    #
+    # Absolute and `..` entries are already contained by those same checks (silently
+    # skipped); they are rejected here for consistency with the sibling sources, and
+    # because a silently-inert seed entry reads as applied configuration when it is
+    # not.
+    for seed in scm.worktree_seed:
+        if names_tree_root(seed) or is_absolute_path(seed) or has_parent_ref(seed):
+            raise PolicyError(
+                f"scm.worktree_seed entries must be project-relative paths: got {seed!r}"
+            )
     cleanup = CleanupPolicy(
         run_retention=int(cleanup_d.get("run_retention", CleanupPolicy.run_retention)),
         retention_days=int(cleanup_d.get("retention_days", CleanupPolicy.retention_days)),
@@ -636,13 +1059,26 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         for name, raw_settings in plugin_settings.items():
             _validate_plugin_settings(name, raw_settings, plugin_schemas.get(name))
     plugins = PluginsPolicy(enabled=tuple(enabled), settings=plugin_settings)
-    tui = TuiPolicy(low_frame_rate=bool(tui_d.get("low_frame_rate", TuiPolicy.low_frame_rate)))
+    tui = TuiPolicy(
+        low_frame_rate=bool(tui_d.get("low_frame_rate", TuiPolicy.low_frame_rate)),
+        left_width=_tui_dim(tui_d, "left_width"),
+        runs_height=_tui_dim(tui_d, "runs_height"),
+        deferred_height=_tui_dim(tui_d, "deferred_height"),
+        tasks_height=_tui_dim(tui_d, "tasks_height"),
+    )
+    operator = OperatorPolicy(enabled=bool(operator_d.get("enabled", OperatorPolicy.enabled)))
+    mux = MuxPolicy(backend=str(mux_d.get("backend", MuxPolicy.backend)).strip())
+    if mux.backend and not _MUX_NAME_RE.match(mux.backend):
+        raise PolicyError(
+            f"mux.backend must be a backend name (letters, digits, . _ -): got {mux.backend!r}"
+        )
     return Policy(
         gates=gates,
         limits=limits,
         verify=verify,
         notify=notify,
         review=review,
+        stories=stories,
         dev=dev,
         adapter=adapter,
         sweep=sweep,
@@ -650,6 +1086,8 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         cleanup=cleanup,
         plugins=plugins,
         tui=tui,
+        operator=operator,
+        mux=mux,
     )
 
 
@@ -692,20 +1130,28 @@ retrospective = "notify"     # never | notify | auto (auto unsupported in v1)
 [limits]
 max_review_cycles = 3
 max_dev_attempts = 2
+max_followup_reviews = 1     # additional review rounds granted solely because a finalized (status: done) round still recommended a follow-up; once spent, such a round converges + refiles the recommendation instead of burning another cycle. 0 = never honor a pass's own recommendation
 session_timeout_min = 90
+git_timeout_s = 120          # bound on any single git subprocess; exceeding it pauses/degrades (never crashes the run) — raise on a loaded host or a very large worktree
+teardown_grace_s = 20        # verified teardown: poll a killed session window up to this long, then force-kill its pane pids and re-kill (#157). 0 = single unverified best-effort kill
 stop_without_result_nudges = 1
 dev_stall_grace_s = 600      # grace for a dev session that ended its turn awaiting a background process (e.g. a slow PlayMode/test run) before it is called stalled; each re-invocation resets it. 0 = fail fast on the first result-less Stop
 dev_stall_nudges = 2         # times an idle dev session is nudged awake on grace expiry before it is called stalled (bmad-loop has no background-completion re-invocation); pane output re-arms the grace window and a fresh Stop restores the budget. 0 = stall on grace expiry
+dev_stall_nudges_cap = 6     # total (never-restored) stall nudges for a dev/review session before it is called stalled; bounds a session whose reply to the wake nudge is itself a result-less Stop that would refill the budget forever (#149). 0 = stall on first grace expiry
 workflow_stall_nudges_cap = 3 # total (never-restored) stall nudges for an injected plugin-workflow session before it is called stalled; bounds a session that finished its work but never wrote its completion marker. 0 = stall on first grace expiry
+dev_contract_nudge = true    # true: one targeted nudge per session (#276) when a Stop finds a spec finalized to a terminal frontmatter status but missing its `## Auto Run Result` marker, asking the skill to append it and end its turn; sent exactly once, never refilled, touches no stall counters. false: rely only on harness-side frontmatter synthesis
 max_tokens_per_story = 2000000
 cache_read_weight = 0.1      # cache reads bill at ~0.1x input on all vendors; 1.0 = count raw
+session_budget_mode = "warn"  # off | warn | enforce — weighted per-SESSION cap sampled every ~30s mid-session; warn = one ATTENTION + breadcrumb; enforce = wrap-up nudge (best-effort courtesy; the kill is the guarantee) then over_budget termination (retry→defer). Live-verified on claude; other transcript parsers sample best-effort (mid-turn flush unverified); inert where no mid-session usage signal exists (usage_parser "none", copilot's shutdown-only flush)
+max_tokens_per_session = 4000000 # weighted cap a single session may spend before the guard trips; healthy sessions run ~1-2.5M weighted, so the default trips only true runaways (#158)
+session_budget_grace_s = 240 # enforce mode: seconds a tripped session gets to wrap up after the nudge before over_budget termination. 0 = terminate at trip, no nudge
 
 [verify]
 # Deterministic gates run by the orchestrator after a clean review, before commit.
 commands = []                # e.g. ["pytest -q", "ruff check ."]
 
 [notify]
-desktop = true               # notify-send, best-effort
+desktop = true               # notify-send (Linux) / osascript (macOS) / PowerShell toast (Windows), best-effort
 file = true                  # ATTENTION file in the run dir
 
 [review]
@@ -719,12 +1165,37 @@ enabled = true
 #                    `followup_review_recommended: true` (it self-reviews inline
 #                    and flags this when its changes warrant an independent pass).
 #   "always"      -> run the second-opinion review on every story.
-# The loop is bounded by limits.max_review_cycles either way.
+# The loop is bounded by limits.max_review_cycles (hard cap) and damped by
+# limits.max_followup_reviews (a round that finalizes the story yet keeps
+# recommending a follow-up converges + refiles once the grant is spent) either way.
 trigger = "recommended"
+# What a timeout-like review verdict (timeout/stalled/over_budget) costs:
+#   "retry"           -> burn a review cycle per timeout until max_review_cycles (default).
+#   "salvage-if-done" -> if the dev product is already finalized and verify passes,
+#                        commit it and refile the outstanding follow-up to deferred work.
+#   "defer"           -> give up on the first timeout-like verdict.
+on_timeout = "retry"
+# What a review that writes sprint-status back off `done` (the sign-off the
+# orchestrator recorded at dev time) costs. Nothing in the review loop
+# re-advances the board, so every remaining cycle re-reads the same failure:
+#   "escalate" -> pause the run naming both sides of the disagreement (default).
+#   "retry"    -> legacy: burn review cycles to max_review_cycles, then defer.
+on_status_contradiction = "escalate"
+
+[stories]
+# Story-queue source. "sprint-status" (default) walks sprint-status.yaml written
+# by bmad-sprint-planning. "stories" opts into folder+id dispatch: the loop reads
+# a typed stories.yaml (Story Breakdown output, sibling of SPEC.md) and dispatches
+# each entry by spec-folder + story id. `bmad-loop run --spec <folder>` forces
+# stories mode for a single run regardless of this setting.
+source = "sprint-status"     # sprint-status | stories
+# Required (and must parse) when source = "stories": the project-relative path to
+# the epic's spec folder holding stories.yaml + SPEC.md. Ignored under sprint-status.
+spec_folder = ""
 
 [adapter]
-name = "claude"              # claude | codex | gemini | <custom .bmad-loop/profiles/*.toml>
-model = ""                   # empty = CLI default model
+name = "claude"              # claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | <custom .bmad-loop/profiles/*.toml>
+model = ""                   # empty = CLI default model (opencode-http wants "provider/model")
 cleanup_session_on_finish = true  # kill the run's tmux session when it finishes (false keeps it for inspection)
 # extra_args replaces the profile's default permission-bypass flags when set:
 # extra_args = ["--permission-mode", "bypassPermissions"]
@@ -820,4 +1291,103 @@ enabled = []                 # e.g. ["unity", "my-lint-plugin"]
 # over slow/high-latency links (SSH, Tailscale). Equivalent to launching with
 # `bmad-loop tui --low-frame-rate`. Takes effect the next time the TUI starts.
 low_frame_rate = false
+# Persisted dashboard pane sizes, in terminal cells. 0 = unset (use the built-in
+# default proportions). The TUI writes these when you resize a pane by mouse-drag
+# or the Ctrl+W resize mode; they are re-applied on the next launch. Usually you
+# won't hand-edit these — resize in the TUI instead.
+# left_width = 0        # sidebar width, columns
+# runs_height = 0       # Runs pane height, rows
+# deferred_height = 0   # Deferred pane height, rows
+# tasks_height = 0      # Tasks table height, rows
+
+[operator]
+# Let a dev session park a story at `awaiting-operator`: its agent-doable work is
+# finished and COMMITTED, but its acceptance criteria include external actions
+# only a human can perform (buy a domain, publish a DNS record, grant an API
+# key). The story commits, the run moves on to the next one, and what is owed is
+# recorded in the story spec's `operator_actions:` frontmatter. Complete such a
+# story with `bmad-loop confirm <story-key>` once you have done those actions.
+# Turn this off to hold sessions to the two older outcomes (done / blocked).
+enabled = true
+
+[mux]
+# Terminal-multiplexer backend for this machine (the transport axis — which
+# tmux-like program hosts sessions; independent of [adapter], the coding-CLI
+# axis). Machine-specific: `bmad-loop init` gitignores policy.toml, so this
+# choice never travels to teammates on other machines or OSes.
+# Unset = auto-select: the BMAD_LOOP_MUX_BACKEND env var wins, then this key,
+# then the platform default (win32: psmux, elsewhere: tmux) when installed,
+# then the first registered backend that matches this platform and is
+# available. Naming a backend that is not registered fails loudly at launch.
+# `bmad-loop mux` lists backends and shows the selection; `bmad-loop mux set
+# <name>` writes this key. Takes effect on the next bmad-loop invocation.
+# backend = "tmux"
 """
+
+
+def write_mux_backend(path: Path, name: str | None) -> None:
+    """Persist (``name``) or clear (``None``) the ``[mux] backend`` key in the
+    policy file at ``path``, preserving every other byte — devs hand-edit
+    policy.toml, and the core install has no comment-preserving TOML writer
+    (tomlkit ships only with the [tui] extra). A missing file is created from
+    :data:`POLICY_TEMPLATE` so the written file keeps the full documentation.
+
+    The template anchors the key as a single ``# backend = "tmux"`` line under
+    ``[mux]`` with all prose comments *above* it, so the rewrite is a targeted
+    line replace: the first (possibly commented) ``backend =`` line inside
+    ``[mux]`` is swapped for the new value, or re-commented on clear. A file
+    predating the ``[mux]`` table gets the table appended at EOF (TOML tables
+    are order-free, so appending is always safe)."""
+    if name is not None and not _MUX_NAME_RE.match(name):
+        raise PolicyError(
+            f"mux.backend must be a backend name (letters, digits, . _ -): got {name!r}"
+        )
+    # bytes in / bytes out: text mode would translate a CRLF file's endings.
+    text = path.read_bytes().decode("utf-8") if path.is_file() else POLICY_TEMPLATE
+    new_line = f'backend = "{name}"' if name is not None else '# backend = "tmux"'
+
+    section = ""
+    replaced = False
+    mux_header_at: int | None = None
+    out: list[str] = []
+    for line in text.splitlines(keepends=True):
+        header = _TOML_SECTION_RE.match(line)
+        if header:
+            section = header.group("name").strip()
+            out.append(line)
+            if section == "mux" and mux_header_at is None:
+                mux_header_at = len(out) - 1
+            continue
+        if not replaced and section == "mux" and _MUX_KEY_RE.match(line):
+            stripped = line.rstrip("\r\n")
+            ending = line[len(stripped) :] or "\n"
+            # backend names never contain '#' (_MUX_NAME_RE), so any '#' after
+            # '=' on this line is a hand-added trailing comment worth keeping.
+            hash_idx = stripped.find("#", stripped.index("="))
+            trailing = ("  " + stripped[hash_idx:]) if hash_idx != -1 else ""
+            out.append(new_line + trailing + ending)
+            replaced = True
+            continue
+        out.append(line)
+    if not replaced:
+        if mux_header_at is not None:  # [mux] table present but the key line was deleted
+            out.insert(mux_header_at + 1, new_line + "\n")
+        else:  # policy file predating the [mux] table
+            if out and not out[-1].endswith("\n"):
+                out.append("\n")
+            out.append(f"\n[mux]\n{new_line}\n")
+    result = "".join(out)
+
+    # Round-trip guard: never write a file this module can't read back to the
+    # intended value (catches an anchor/regex drift before it corrupts config).
+    parsed = loads(result)
+    if parsed.mux.backend != (name or ""):
+        raise PolicyError(
+            f"internal error: rewriting {path} would read back "
+            f"mux.backend = {parsed.mux.backend!r}, expected {(name or '')!r}"
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".toml.tmp")
+    tmp.write_bytes(result.encode("utf-8"))
+    atomic_replace(tmp, path)

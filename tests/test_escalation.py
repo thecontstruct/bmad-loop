@@ -2,9 +2,14 @@
 resolved-escalation guard that re-escalates instead of silently deferring."""
 
 from bmad_loop.adapters.base import SessionResult
-from bmad_loop.escalation import Action, decide_dev, decide_review_session
+from bmad_loop.escalation import (
+    Action,
+    decide_dev,
+    decide_review_session,
+    review_retry_or_exhaust,
+)
 from bmad_loop.model import StoryTask
-from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy
+from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy, ReviewPolicy
 from bmad_loop.verify import VerifyOutcome
 
 POLICY = Policy(
@@ -46,6 +51,69 @@ def test_noncompleted_session_reescalates_resolved_redrive():
     assert decide_dev(task, crashed, None, POLICY).action == Action.PAUSE
 
 
+def test_env_fault_outcome_pauses_even_with_budget_left():
+    """An environment-fault verify outcome (rc 126/127 → CRITICAL escalate)
+    pauses immediately — the attempt budget is never consulted for it."""
+    task = _task(attempt=1)  # 1 < 2 -> budget remains
+    env_fault = VerifyOutcome.escalate("verify environment fault (rc=127): pint", env_fault=True)
+    decision = decide_dev(task, COMPLETED, env_fault, POLICY)
+    assert decision.action == Action.PAUSE
+    assert "rc=127" in decision.reason
+
+
+def test_dev_env_fault_session_pauses_even_with_budget_left():
+    """A dev session classified as a transport/API environment fault (#194) PAUSEs
+    immediately — like the verify env-fault above, the attempt budget is never
+    consulted, and the reason carries the evidence line."""
+    task = _task(attempt=1)  # 1 < 2 -> budget remains
+    env_fault = SessionResult(
+        status="timeout", env_fault=True, env_fault_evidence="API Error: Connection refused"
+    )
+    decision = decide_dev(task, env_fault, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert "environment fault: dev session timeout" in decision.reason
+    assert "API Error: Connection refused" in decision.reason
+
+
+def test_dev_env_fault_session_pauses_even_when_budget_exhausted():
+    """The env-fault pause outranks budget exhaustion too — a spent budget must not
+    downgrade it to a defer (that would file a transport failure as deferred work)."""
+    task = _task(attempt=2)  # 2 == max_dev_attempts -> budget spent
+    env_fault = SessionResult(status="crashed", env_fault=True)
+    decision = decide_dev(task, env_fault, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert "environment fault" in decision.reason
+
+
+def test_dev_plain_noncompleted_still_retries_with_budget():
+    """Guard pin: a NON-env-fault timeout with budget left still RETRYs — the
+    env-fault branch must not swallow ordinary transient failures."""
+    task = _task(attempt=1)
+    plain = SessionResult(status="timeout")  # env_fault defaults False
+    decision = decide_dev(task, plain, None, POLICY)
+    assert decision.action == Action.RETRY
+    assert "environment fault" not in decision.reason
+
+
+def test_review_env_fault_session_pauses():
+    """The same classification pauses a review session (evidence in the reason),
+    where a plain non-completed review would RETRY/DEFER."""
+    task = _task(review_cycle=1)  # budget remains
+    env_fault = SessionResult(
+        status="stalled", env_fault=True, env_fault_evidence="API Error: ETIMEDOUT"
+    )
+    decision = decide_review_session(task, env_fault, POLICY)
+    assert decision.action == Action.PAUSE
+    assert "environment fault: review session stalled" in decision.reason
+    assert "ETIMEDOUT" in decision.reason
+
+
+def test_review_plain_noncompleted_still_retries_with_budget():
+    task = _task(review_cycle=1)
+    plain = SessionResult(status="crashed")
+    assert decide_review_session(task, plain, POLICY).action == Action.RETRY
+
+
 def test_review_exhausted_defers_normal_story():
     task = _task(review_cycle=2)  # 2 == max_review_cycles
     crashed = SessionResult(status="crashed")
@@ -58,3 +126,92 @@ def test_review_exhausted_reescalates_resolved_redrive():
     decision = decide_review_session(task, crashed, POLICY)
     assert decision.action == Action.PAUSE
     assert "re-escalating instead of deferring" in decision.reason
+
+
+# ------------------------------- review.on_timeout routing (#271)
+
+
+def _policy(on_timeout: str) -> Policy:
+    return Policy(
+        limits=LimitsPolicy(max_dev_attempts=2, max_review_cycles=2),
+        notify=NotifyPolicy(desktop=False, file=True),
+        review=ReviewPolicy(on_timeout=on_timeout),
+    )
+
+
+def test_review_timeout_default_retry_matches_legacy_decisions():
+    """on_timeout="retry" (the default) is byte-compatible with the pre-knob
+    routing for every timeout-like status."""
+    for status in ("timeout", "stalled", "over_budget"):
+        result = SessionResult(status=status)
+        with_budget = decide_review_session(_task(review_cycle=1), result, _policy("retry"))
+        assert with_budget.action == Action.RETRY
+        assert with_budget.reason == f"review session {status}"
+        spent = decide_review_session(_task(review_cycle=2), result, _policy("retry"))
+        assert spent.action == Action.DEFER
+
+
+def test_review_timeout_salvage_mode_routes_to_salvage():
+    for status in ("timeout", "stalled", "over_budget"):
+        result = SessionResult(status=status)
+        # budget state is irrelevant: the engine owns the fallback routing
+        for cycle in (1, 2):
+            decision = decide_review_session(
+                _task(review_cycle=cycle), result, _policy("salvage-if-done")
+            )
+            assert decision.action == Action.SALVAGE
+            assert decision.reason == f"review session {status}"
+
+
+def test_review_timeout_defer_mode_gives_up_immediately():
+    decision = decide_review_session(
+        _task(review_cycle=1), SessionResult(status="timeout"), _policy("defer")
+    )
+    assert decision.action == Action.DEFER
+    assert "review.on_timeout=defer" in decision.reason
+
+
+def test_review_timeout_defer_mode_reescalates_resolved_redrive():
+    """The resolved_redrive latch outranks the defer mode — same contract as
+    budget exhaustion (never silently downgrade a human's correction)."""
+    decision = decide_review_session(
+        _task(review_cycle=1, resolved_redrive=True),
+        SessionResult(status="timeout"),
+        _policy("defer"),
+    )
+    assert decision.action == Action.PAUSE
+    assert "re-escalating instead of deferring" in decision.reason
+
+
+def test_review_crashed_unaffected_by_on_timeout_modes():
+    """crashed is not a timeout-like verdict: every mode keeps the default
+    retry/exhaust routing for it."""
+    crashed = SessionResult(status="crashed")
+    for mode in ("retry", "salvage-if-done", "defer"):
+        assert decide_review_session(_task(review_cycle=1), crashed, _policy(mode)).action == (
+            Action.RETRY
+        )
+        assert decide_review_session(_task(review_cycle=2), crashed, _policy(mode)).action == (
+            Action.DEFER
+        )
+
+
+def test_review_env_fault_pauses_under_every_on_timeout_mode():
+    """env-fault (#194) short-circuits before the on_timeout branch."""
+    env_fault = SessionResult(status="timeout", env_fault=True)
+    for mode in ("retry", "salvage-if-done", "defer"):
+        decision = decide_review_session(_task(review_cycle=1), env_fault, _policy(mode))
+        assert decision.action == Action.PAUSE
+        assert "environment fault" in decision.reason
+
+
+def test_review_completed_proceeds_under_every_on_timeout_mode():
+    for mode in ("retry", "salvage-if-done", "defer"):
+        assert decide_review_session(_task(), COMPLETED, _policy(mode)).action == Action.PROCEED
+
+
+def test_review_retry_or_exhaust_helper_matches_budget_semantics():
+    assert review_retry_or_exhaust(_task(review_cycle=1), POLICY, "r").action == Action.RETRY
+    assert review_retry_or_exhaust(_task(review_cycle=2), POLICY, "r").action == Action.DEFER
+    latched = review_retry_or_exhaust(_task(review_cycle=2, resolved_redrive=True), POLICY, "r")
+    assert latched.action == Action.PAUSE

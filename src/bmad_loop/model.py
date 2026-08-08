@@ -1,7 +1,19 @@
 """Core data model: story lifecycle phases, per-task records, run state."""
 
+# Strict-checked under #245 Stage 2, with the two rules below relaxed for this
+# file only. `reportUnknownVariableType`: the dataclass collection fields use the
+# idiomatic `field(default_factory=list|dict)`, which pyright can only infer as
+# `list[Unknown]` / `dict[Unknown, Unknown]` (it does not fold the declared
+# annotation back into the factory) though the fields are correctly typed.
+# `reportUnknownArgumentType`: `from_dict` / snapshot readers pull values out of
+# run-persisted `dict[str, Any]`, so isinstance-narrowing an `Any` value yields
+# Unknown at that boundary. Both are inherent to the persistence edge, not
+# annotation drift; every other strict rule stays on.
+# pyright: reportUnknownArgumentType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -21,15 +33,32 @@ class Phase(StrEnum):
     DONE = "done"
     DEFERRED = "deferred"
     ESCALATED = "escalated"
+    # the story's agent-doable work is finished and COMMITTED, but its acceptance
+    # criteria include external actions only a human can perform (buy a domain,
+    # publish a DNS record). Terminal like DONE — the run moves on rather than
+    # halting — but not DONE: the outstanding actions are recorded on the task.
+    # Deliberately NOT a pause: an operator-owed story must never block the
+    # stories behind it (contrast the spec's `Block If:` -> blocked -> CRITICAL
+    # -> pause channel, which is run-halting by design).
+    AWAITING_OPERATOR = "awaiting-operator"
 
 
-TERMINAL_PHASES = frozenset({Phase.DONE, Phase.DEFERRED, Phase.ESCALATED})
+# Terminal = the orchestrator will not drive this story further in this run. It
+# says nothing about success: DONE and AWAITING_OPERATOR carry a commit, DEFERRED
+# and ESCALATED do not.
+TERMINAL_PHASES = frozenset({Phase.DONE, Phase.DEFERRED, Phase.ESCALATED, Phase.AWAITING_OPERATOR})
 
 # Pause stages recorded in RunState.paused_stage
 PAUSE_SPEC_APPROVAL = "spec-approval"
 PAUSE_EPIC_BOUNDARY = "epic-boundary"
 PAUSE_ESCALATION = "escalation"
 PAUSE_STORY_GATE = "story-gate"
+# stories-mode HITL checkpoints (independent per story). PLAN fires after a
+# spec_checkpoint story's plan-halt leg (ready-for-dev, awaiting human plan
+# review before implementation); STORY fires after a done_checkpoint story's
+# commit (skip-if-last). Both re-arm through the same resume path.
+PAUSE_PLAN_CHECKPOINT = "plan-checkpoint"
+PAUSE_STORY_CHECKPOINT = "story-checkpoint"
 
 
 @dataclass
@@ -88,6 +117,11 @@ class SessionRecord:
     task_id: str
     role: str  # "dev" | "review"
     status: str  # SessionResult.status
+    # resolved adapter identity for the session (#153 phase 1). adapter "" means
+    # the record predates identity stamping; adapter set with model "" means the
+    # session ran the CLI profile's default model (no explicit model override).
+    adapter: str = ""
+    model: str = ""
     session_id: str | None = None
     transcript_path: str | None = None
     usage: TokenUsage | None = None
@@ -100,6 +134,8 @@ class SessionRecord:
             "task_id": self.task_id,
             "role": self.role,
             "status": self.status,
+            "adapter": self.adapter,
+            "model": self.model,
             "session_id": self.session_id,
             "transcript_path": self.transcript_path,
             "usage": self.usage.to_dict() if self.usage else None,
@@ -113,6 +149,8 @@ class SessionRecord:
             task_id=d["task_id"],
             role=d["role"],
             status=d["status"],
+            adapter=str(d.get("adapter", "")),
+            model=str(d.get("model", "")),
             session_id=d.get("session_id"),
             transcript_path=d.get("transcript_path"),
             usage=TokenUsage.from_dict(usage) if usage else None,
@@ -127,6 +165,13 @@ class StoryTask:
     phase: Phase = Phase.PENDING
     attempt: int = 0
     review_cycle: int = 0
+    # count of review rounds granted *solely* because a completed round finalized
+    # the story (status: done) yet still set `followup_review_recommended: true`.
+    # Bounded by limits.max_followup_reviews: once spent, the next such round
+    # force-converges (verify → refile the recommendation to the ledger → commit)
+    # rather than burning another cycle. Reset to 0 by runs.rearm_escalation so a
+    # human-resolved re-drive gets a fresh damping budget. Survives the round-trip.
+    followup_reviews_spent: int = 0
     # set from the bmad-dev-auto session's `followup_review_recommended`
     # frontmatter (PR #2505): when True and review.trigger = "recommended", the
     # orchestrator runs a follow-up review pass (bmad-dev-auto re-invoked on the
@@ -138,9 +183,75 @@ class StoryTask:
     # user already had on disk are never deleted. None = pre-upgrade run (no
     # snapshot); rollback then removes no untracked files at all.
     baseline_untracked: list[str] | None = None
+    # Deferred-work bookkeeping is persisted before its readers land so an older
+    # state.json remains resumable throughout the forward-port.  The nullable
+    # snapshot text and its captured flag are deliberately separate: None means
+    # "no ledger existed", while False means "no snapshot was taken".
+    baseline_ledger_digest: str | None = None
+    pre_harvest_ledger: str | None = None
+    pre_harvest_ledger_captured: bool = False
+    harvest_wrote_ledger: bool = False
+    ledger_changed_before_harvest: bool = False
+    # JSON-native containers only; callers persist these through state.json.
+    harvested_deferrals: list[dict[str, Any]] = field(default_factory=list)
+    bundle_closes_intended: list[str] = field(default_factory=list)
+    # `append_entry` kwargs for review-budget follow-ups this task filed into the
+    # ACTIVE workspace's ledger, which under isolation is the unit worktree's.
+    refiled_followups: list[dict[str, Any]] = field(default_factory=list)
+    # Deferred-work ids a story DECLARED it closes (`closes_deferred:`), recorded at
+    # the commit boundary. Same ledger, same isolation problem: a gitignored path
+    # never merges out of the unit worktree, so the flip has to be re-applied.
+    story_closes_intended: list[str] = field(default_factory=list)
+    # Index of the append-only primary dev SessionRecord whose initial decision or
+    # later verify-repair result durably returned PROCEED. Attempt numbers can be
+    # reused after a human re-arm, so the exact record occurrence is the acceptance
+    # identity; None is legacy/unarmed.
+    accepted_dev_session_index: int | None = None
+    harvest_carry_commit_pending: bool = False
+    isolated_ledger_carried: bool = False
     spec_file: str | None = None
     commit_sha: str | None = None
+    # the external, human-only actions this story still owes when it parks at
+    # Phase.AWAITING_OPERATOR — one free-text instruction per entry, as the dev
+    # session enumerated them in the spec's `operator_actions:` frontmatter.
+    # Plain strings in v1: a per-action deterministic `check:` command is a
+    # deliberate v2 question, and strings-now/objects-later is the cheaper
+    # migration than the reverse. Empty on every other phase: owing at least one
+    # action is what selects AWAITING_OPERATOR over DONE when the park path picks
+    # a committing story's final phase. That choice is the only enforcement —
+    # nothing validates this field on load or on write, so a task carrying the
+    # phase with no actions is unreachable rather than rejected. Survives the
+    # resume serialization round-trip (it is the durable record of what the human
+    # owes, and nothing re-derives it once the session that wrote the spec is
+    # gone).
+    operator_actions: list[str] = field(default_factory=list)
     defer_reason: str | None = None
+    # the recovery ref this attempt's work was parked on by the last auto-rollback
+    # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree
+    # was also dirty, the `refs/attempt-preserve-dirty/*` snapshot, which is
+    # parented at the attempt's HEAD and therefore subsumes the branch (last
+    # writer wins, so one `git merge --ff-only <ref>` recovers the whole attempt
+    # — unless `preserve_partial` is set). Set by RecoveryFlow, cleared at the top
+    # of every auto-rollback so it can never name a *previous* attempt's ref; read
+    # by `_defer` (notification) and projected into `status`. None = the last
+    # auto-rollback parked nothing (no commits above baseline and a clean or
+    # uncapturable tree, or the ref failed to take). Isolation-INDEPENDENT: a unit
+    # worktree's own dev-retry rollback parks on the same shared refs, so a
+    # deferred isolated unit can carry BOTH a kept-failed branch (the final
+    # attempt) and a preserve_ref (an earlier, rolled-back one) — `_defer` names
+    # both. The unit branch itself is never written here: a live branch is not a
+    # parked snapshot. Not cleared on success — a mid-retry rollback's breadcrumb
+    # stays readable. Survives the resume serialization round-trip.
+    preserve_ref: str | None = None
+    # set when the auto-rollback's *worktree* snapshot was attempted and raised
+    # (journalled `attempt-worktree-preserve-failed`), so `preserve_ref` names an
+    # `attempt-preserve/*` commits branch ALONE and the reset that followed
+    # discarded the uncommitted half. False both when the snapshot succeeded (the
+    # dirty ref subsumes the branch) and when the tree was clean (nothing to
+    # capture, so the commits branch IS the whole attempt) — the ref name alone
+    # cannot tell those apart, which is why this is recorded rather than derived.
+    # Cleared with `preserve_ref`. Survives the resume serialization round-trip.
+    preserve_partial: bool = False
     # set by runs.rearm_escalation: this task was re-armed out of ESCALATED for a
     # clean rebuild against the corrected spec (not a failed attempt). Lets the
     # resume-time manual-recovery notice describe the real cause; cleared once the
@@ -152,6 +263,37 @@ class StoryTask:
     # tracked content, so a mid-re-drive retry/defer reset can't silently revert
     # the human correction. Survives the resume serialization round-trip.
     resolved_redrive: bool = False
+    # stories mode only: set when a spec_checkpoint story's plan-halt leg verified
+    # (spec at ready-for-dev) and the run paused for human plan review. On resume
+    # StoriesEngine._resume_after_dev_verify reads it to re-drive the implement leg
+    # (rather than the base review+commit) and clears it. Survives the round-trip.
+    plan_checkpoint_pending: bool = False
+    # stories mode only: the durable "a human plan review is still owed" obligation
+    # for a spec_checkpoint story. Latched at the story's first (leg-1) dispatch —
+    # BEFORE the session runs and keyed off the entry's spec_checkpoint flag, not
+    # the leg's on-disk status or result — so it survives a crash, a non-fixable
+    # retry, or a skill that overran `Halt after planning.`, none of which the
+    # on-disk-status-keyed _plan_halt_leg / result-keyed plan_checkpoint_pending
+    # carry across. Cleared ONLY when a plan-review pause actually raises (the
+    # obligation is discharged). While set after a dev leg that did not itself pause,
+    # StoriesEngine pauses before commit so the story can never commit un-reviewed.
+    plan_review_owed: bool = False
+    # stories mode only: the fixed slug ("unresolved" / "ambiguous") of a pre-planning
+    # halt sentinel this task was detected as — recorded at detection time (pick-time
+    # wedge or post-dev read-back), NOT re-derived from the spec_file basename at
+    # re-arm. runs.rearm_escalation deletes a sentinel only when this is set, so a real
+    # story spec that merely happens to be named `<key>-unresolved.md`, or a
+    # non-sentinel escalation whose spec matches the convention, is status-flipped and
+    # kept, never deleted. "" = not a sentinel. Survives the round-trip.
+    sentinel_kind: str = ""
+    # intent-gap patch-restore re-drive (BMAD-METHOD #2564): a repo-relative-or-
+    # absolute path to the patch file bmad-dev-auto saved of the reverted attempt.
+    # Latched by runs.rearm_escalation when the human confirms the attempted reading
+    # was correct; the engine re-applies it onto the baseline after every reset of
+    # the re-drive so the re-driven session resumes review (step-04) on the restored
+    # diff, and clears it once the corrected work commits. None = ordinary
+    # from-scratch re-drive. Survives the resume serialization round-trip.
+    restore_patch: str | None = None
     # sweep bundles only: the deferred-work ids this task closes and the
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
@@ -163,6 +305,14 @@ class StoryTask:
     branch: str = ""
     sessions: list[SessionRecord] = field(default_factory=list)
     tokens: TokenUsage = field(default_factory=TokenUsage)
+    # latched the first time this story's cost-weighted spend crossed
+    # limits.max_tokens_per_story at a session boundary, so the advisory notice
+    # fires once per STORY rather than once per session after the crossing
+    # (every later session of an overrunning story is over the cap too). Never
+    # cleared: the crossing is a fact about the story's spend, and the raw
+    # counts it was computed from stay in `tokens`. Persisted precisely so a
+    # resumed run does not re-notify what the pre-pause process already did.
+    token_budget_warned: bool = False
 
     @property
     def terminal(self) -> bool:
@@ -195,20 +345,41 @@ class StoryTask:
             "phase": str(self.phase),
             "attempt": self.attempt,
             "review_cycle": self.review_cycle,
+            "followup_reviews_spent": self.followup_reviews_spent,
             "followup_review_recommended": self.followup_review_recommended,
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
+            "baseline_ledger_digest": self.baseline_ledger_digest,
+            "pre_harvest_ledger": self.pre_harvest_ledger,
+            "pre_harvest_ledger_captured": self.pre_harvest_ledger_captured,
+            "harvest_wrote_ledger": self.harvest_wrote_ledger,
+            "ledger_changed_before_harvest": self.ledger_changed_before_harvest,
+            "harvested_deferrals": self.harvested_deferrals,
+            "bundle_closes_intended": self.bundle_closes_intended,
+            "refiled_followups": self.refiled_followups,
+            "story_closes_intended": self.story_closes_intended,
+            "accepted_dev_session_index": self.accepted_dev_session_index,
+            "harvest_carry_commit_pending": self.harvest_carry_commit_pending,
+            "isolated_ledger_carried": self.isolated_ledger_carried,
             "spec_file": self._serialized_spec_file(),
             "commit_sha": self.commit_sha,
+            "operator_actions": self.operator_actions,
             "defer_reason": self.defer_reason,
+            "preserve_ref": self.preserve_ref,
+            "preserve_partial": self.preserve_partial,
             "rearmed": self.rearmed,
             "resolved_redrive": self.resolved_redrive,
+            "plan_checkpoint_pending": self.plan_checkpoint_pending,
+            "plan_review_owed": self.plan_review_owed,
+            "sentinel_kind": self.sentinel_kind,
+            "restore_patch": self.restore_patch,
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
             "worktree_path": self.worktree_path,
             "branch": self.branch,
             "sessions": [s.to_dict() for s in self.sessions],
             "tokens": self.tokens.to_dict(),
+            "token_budget_warned": self.token_budget_warned,
         }
 
     def _serialized_spec_file(self) -> str | None:
@@ -233,6 +404,7 @@ class StoryTask:
             phase=Phase(d["phase"]),
             attempt=int(d.get("attempt", 0)),
             review_cycle=int(d.get("review_cycle", 0)),
+            followup_reviews_spent=int(d.get("followup_reviews_spent", 0)),
             followup_review_recommended=bool(d.get("followup_review_recommended", False)),
             baseline_commit=d.get("baseline_commit"),
             baseline_untracked=(
@@ -240,17 +412,49 @@ class StoryTask:
                 if d.get("baseline_untracked") is not None
                 else None
             ),
+            baseline_ledger_digest=(
+                str(d.get("baseline_ledger_digest"))
+                if d.get("baseline_ledger_digest") is not None
+                else None
+            ),
+            pre_harvest_ledger=(
+                str(d.get("pre_harvest_ledger"))
+                if d.get("pre_harvest_ledger") is not None
+                else None
+            ),
+            pre_harvest_ledger_captured=bool(d.get("pre_harvest_ledger_captured", False)),
+            harvest_wrote_ledger=bool(d.get("harvest_wrote_ledger", False)),
+            ledger_changed_before_harvest=bool(d.get("ledger_changed_before_harvest", False)),
+            harvested_deferrals=[deepcopy(dict(item)) for item in d.get("harvested_deferrals", [])],
+            bundle_closes_intended=[str(i) for i in d.get("bundle_closes_intended", [])],
+            refiled_followups=[deepcopy(dict(item)) for item in d.get("refiled_followups", [])],
+            story_closes_intended=[str(i) for i in d.get("story_closes_intended", [])],
+            accepted_dev_session_index=(
+                int(d["accepted_dev_session_index"])
+                if d.get("accepted_dev_session_index") is not None
+                else None
+            ),
+            harvest_carry_commit_pending=bool(d.get("harvest_carry_commit_pending", False)),
+            isolated_ledger_carried=bool(d.get("isolated_ledger_carried", False)),
             spec_file=d.get("spec_file"),
             commit_sha=d.get("commit_sha"),
+            operator_actions=[str(a) for a in d.get("operator_actions", [])],
             defer_reason=d.get("defer_reason"),
+            preserve_ref=d.get("preserve_ref"),
+            preserve_partial=bool(d.get("preserve_partial", False)),
             rearmed=bool(d.get("rearmed", False)),
             resolved_redrive=bool(d.get("resolved_redrive", False)),
+            plan_checkpoint_pending=bool(d.get("plan_checkpoint_pending", False)),
+            plan_review_owed=bool(d.get("plan_review_owed", False)),
+            sentinel_kind=str(d.get("sentinel_kind", "")),
+            restore_patch=d.get("restore_patch"),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
             worktree_path=str(d.get("worktree_path", "")),
             branch=str(d.get("branch", "")),
             sessions=[SessionRecord.from_dict(s) for s in d.get("sessions", [])],
             tokens=TokenUsage.from_dict(d.get("tokens", {})),
+            token_budget_warned=bool(d.get("token_budget_warned", False)),
         )
 
 
@@ -282,6 +486,14 @@ class RunState:
     crashed: bool = False
     crash_error: str | None = None
     run_type: str = "story"  # "story" | "sweep" — resume/status dispatch on it
+    # story-queue source (policy.StoriesPolicy.source), pinned at run start so
+    # resume/resolve rebuild the right engine (StoriesEngine vs the sprint Engine)
+    # without re-reading policy — a policy edit mid-run must not switch a live run's
+    # mode. `run_type` stays "story" for both; `source` selects the picker.
+    source: str = "sprint-status"
+    # stories mode only: the project-relative (or absolute) spec folder holding
+    # stories.yaml + SPEC.md. Empty under sprint-status.
+    spec_folder: str = ""
     # sweep runs only: the triage->bundles cycle in progress; 1 maps to the
     # legacy (unsuffixed) artifact names so old paused runs resume unchanged
     sweep_cycle: int = 1
@@ -318,7 +530,13 @@ class RunState:
         """The run's cache-read weight from its persisted policy snapshot; the
         product default (policy.LimitsPolicy.cache_read_weight = 0.1) when the
         snapshot predates the field or is malformed. Lets the TUI show the same
-        weighted total the engine's budget uses without importing Policy."""
+        weighted total the engine's budget uses without importing Policy.
+
+        The snapshot is re-stamped at every engine start (run, sweep, resume), so
+        on a resumed run this is the *resuming* process's weight, matching what
+        that process enforces. Edit the weight and resume and the run's whole
+        accumulated history re-weights — totals are recomputed from raw counts,
+        and the budget has always judged cumulative counts at the live weight."""
         limits = self.policy_snapshot.get("limits")
         if isinstance(limits, dict):
             try:
@@ -345,6 +563,8 @@ class RunState:
             "crashed": self.crashed,
             "crash_error": self.crash_error,
             "run_type": self.run_type,
+            "source": self.source,
+            "spec_folder": self.spec_folder,
             "sweep_cycle": self.sweep_cycle,
             "sweeps_triggered": self.sweeps_triggered,
             "target_branch": self.target_branch,
@@ -371,9 +591,58 @@ class RunState:
             crashed=bool(d.get("crashed", False)),
             crash_error=d.get("crash_error"),
             run_type=str(d.get("run_type", "story")),
+            source=str(d.get("source", "sprint-status")),
+            spec_folder=str(d.get("spec_folder", "")),
             sweep_cycle=int(d.get("sweep_cycle", 1)),
             sweeps_triggered=[str(s) for s in d.get("sweeps_triggered", [])],
             target_branch=str(d.get("target_branch", "")),
             plugin_shared=dict(d.get("plugin_shared", {})),
             tasks={k: StoryTask.from_dict(t) for k, t in d.get("tasks", {}).items()},
         )
+
+
+@dataclass(frozen=True)
+class VerifyOutcome:
+    ok: bool
+    reason: str = ""
+    severity: str = ""  # "" | "CRITICAL" | "PREFERENCE" — set when not retryable
+    # fixable failures carry concrete evidence (failing command output) that a
+    # feedback-driven repair session can act on; non-fixable retries start over
+    fixable: bool = False
+    # the failure is the run environment's, not the story's (verify command
+    # not found / not executable): no repair session can fix it and every
+    # story shares the same commands, so it must never charge attempt budgets
+    env_fault: bool = False
+    # a session deliberately contradicted a state the orchestrator had already
+    # established (a review revoking the sprint sign-off it advanced at dev
+    # time): no further session can reconcile it, so it routes to a pause with
+    # both sides named rather than to another cycle (#334)
+    contradiction: bool = False
+
+    @classmethod
+    def passed(cls) -> "VerifyOutcome":
+        return cls(ok=True)
+
+    @classmethod
+    def retry(cls, reason: str, fixable: bool = False) -> "VerifyOutcome":
+        return cls(ok=False, reason=reason, fixable=fixable)
+
+    @classmethod
+    def escalate(
+        cls,
+        reason: str,
+        severity: str = "CRITICAL",
+        env_fault: bool = False,
+        contradiction: bool = False,
+    ) -> "VerifyOutcome":
+        return cls(
+            ok=False,
+            reason=reason,
+            severity=severity,
+            env_fault=env_fault,
+            contradiction=contradiction,
+        )
+
+    @property
+    def retryable(self) -> bool:
+        return not self.ok and not self.severity

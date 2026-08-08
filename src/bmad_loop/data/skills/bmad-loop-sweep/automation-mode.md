@@ -65,6 +65,13 @@ field-by-field, and will kill this session after your final turn.
     `build|close|keep-open`, `intent` required when effect is `build`,
     `recommendation` must be one of the option keys.
 
+- Write `already_resolved[].evidence` and an option's `label` and `resolution`
+  as a **single line** — each is copied onto one line of the line-oriented
+  deferred-work ledger. This is guidance, not a validation rule: a break is
+  collapsed to a space rather than rejected, so it costs nothing but reads
+  worse. Both `intent` fields are exempt — keep them at the length the schema
+  asks above (2-6 sentences for a bundle), newlines and all.
+
 - **Migration sessions** (`--migrate`, see `./migration-mode.md`) use this
   result schema instead:
 

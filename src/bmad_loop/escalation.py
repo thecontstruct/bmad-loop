@@ -12,9 +12,8 @@ from enum import StrEnum
 from typing import Any
 
 from .adapters.base import SessionResult
-from .model import StoryTask
+from .model import StoryTask, VerifyOutcome
 from .policy import Policy
-from .verify import VerifyOutcome
 
 SEVERITY_CRITICAL = "CRITICAL"
 SEVERITY_PREFERENCE = "PREFERENCE"
@@ -25,6 +24,18 @@ class Action(StrEnum):
     RETRY = "retry"
     DEFER = "defer"
     PAUSE = "pause"
+    # review.on_timeout = "salvage-if-done" only (#271): the engine attempts to
+    # commit the already-finalized dev product instead of burning another review
+    # cycle; when salvage is not applicable it falls back through
+    # `review_retry_or_exhaust`. Produced only by `decide_review_session`.
+    SALVAGE = "salvage"
+
+
+# Timeout-like review verdicts review.on_timeout governs (#271): deliberately the
+# same set `_post_kill_reconcile` treats as rescue-eligible. `crashed` is excluded
+# — a hard window death is cheap to retry and already honors on-disk artifacts via
+# the crash-path read-back — and env-fault (#194) short-circuits before this.
+REVIEW_TIMEOUT_STATUSES = frozenset({"timeout", "stalled", "over_budget"})
 
 
 @dataclass(frozen=True)
@@ -53,6 +64,23 @@ def preference_escalations(result_json: dict[str, Any] | None) -> list[dict[str,
     ]
 
 
+def env_fault_detail(result: SessionResult) -> str:
+    """The evidence excerpt for an environment-fault pause reason, or a generic
+    fallback when the adapter classified a fault but kept no line (#194). Shared
+    by every site that pauses a transport-failed session — dev/review here, plus
+    fix/workflow/sweep in the engine — so the reason wording stays uniform:
+    ``environment fault: <role> session <status> (<detail>)``."""
+    return result.env_fault_evidence or "transport-failure pattern in session log"
+
+
+def env_fault_pause_reason(role: str, result: SessionResult) -> str:
+    """The uniform pause/escalation reason for a transport-failed session (#194).
+    `role` is the descriptor placed before "session" — e.g. "dev", "review",
+    "fix", "migration", "triage", or a richer "blocking workflow 'x' (y)". Keeps
+    the wording identical across escalation/engine/sweep (see env_fault_detail)."""
+    return f"environment fault: {role} session {result.status} ({env_fault_detail(result)})"
+
+
 def decide_dev(
     task: StoryTask,
     result: SessionResult,
@@ -69,6 +97,16 @@ def decide_dev(
     exhausted = _exhausted_action(task)
 
     if result.status != "completed":
+        if result.env_fault:
+            # A transport/API failure (the CLI never reached the API, #194): the
+            # attempt did no real work, so pause for a human instead of charging
+            # it — re-arm resets the budget, exactly like a verify env-fault (rc
+            # 126/127). The crits check above already ran (env-fault results carry
+            # result_json=None, so it found nothing).
+            return Decision(
+                Action.PAUSE,
+                env_fault_pause_reason("dev", result),
+            )
         reason = f"dev session {result.status}"
         if budget_left:
             return Decision(Action.RETRY, reason)
@@ -91,13 +129,46 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
         details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
         return Decision(Action.PAUSE, f"CRITICAL escalation from review session: {details}")
 
-    budget_left = task.review_cycle < policy.limits.max_review_cycles
     if result.status != "completed":
+        if result.env_fault:
+            # transport/API failure (#194): pause rather than charge a review
+            # cycle for a session that never reached the API (see decide_dev).
+            return Decision(
+                Action.PAUSE,
+                env_fault_pause_reason("review", result),
+            )
         reason = f"review session {result.status}"
-        if budget_left:
-            return Decision(Action.RETRY, reason)
-        return Decision(_exhausted_action(task), _exhaust_reason(task, reason))
+        if result.status in REVIEW_TIMEOUT_STATUSES:
+            mode = policy.review.on_timeout
+            if mode == "defer":
+                return Decision(
+                    _exhausted_action(task),
+                    _exhaust_reason(task, f"{reason} (review.on_timeout=defer)"),
+                )
+            if mode == "salvage-if-done":
+                return Decision(Action.SALVAGE, reason)
+        return review_retry_or_exhaust(task, policy, reason)
     return Decision(Action.PROCEED)
+
+
+def review_retry_or_exhaust(task: StoryTask, policy: Policy, reason: str) -> Decision:
+    """The default routing for a failed review session: RETRY while the outer
+    cycle budget lasts, then plateau-defer (or re-escalate mid re-drive). Module-
+    level so the engine can fall back through it when a SALVAGE attempt turns out
+    not to be applicable (#271)."""
+    if task.review_cycle < policy.limits.max_review_cycles:
+        return Decision(Action.RETRY, reason)
+    return review_exhausted(task, reason)
+
+
+def review_exhausted(task: StoryTask, reason: str) -> Decision:
+    """Terminal review-side failure routing without spending another session.
+
+    Used when a deterministic post-review repair has exhausted its own local
+    retry bound and launching another reviewer would be unsafe. It preserves the
+    same resolved-CRITICAL re-drive rule as ordinary review-budget exhaustion.
+    """
+    return Decision(_exhausted_action(task), _exhaust_reason(task, reason))
 
 
 def _exhausted_action(task: StoryTask) -> Action:

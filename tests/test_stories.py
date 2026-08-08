@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 import pytest
+from conftest import fault_read_text
 
 from bmad_loop import stories
 
@@ -48,6 +49,36 @@ def test_load_dogfooded_fixture():
 
 def test_load_missing_file_raises_pinned_message(tmp_path):
     with pytest.raises(stories.StoriesError, match=re.escape("no stories.yaml found")):
+        stories.load_stories(tmp_path)
+
+
+# A manifest / spec is agent- or human-authored, so it can hold non-UTF-8 bytes.
+# `read_text(encoding="utf-8")` raises UnicodeDecodeError (a ValueError, NOT a
+# yaml.YAMLError), so the stories-mode reads must surface it as a clean error / degrade
+# rather than crash preflight/dry-run/status. Mirrors the "non-UTF-8 robustness"
+# section of tests/test_resolve.py.
+_BAD_UTF8 = b"\xff\xfe\x00\x01 not utf-8 \x80\x81"
+
+
+def test_load_non_utf8_raises_stories_error(tmp_path):
+    # A binary/non-UTF-8 stories.yaml must become a StoriesError (which every caller
+    # catches into "stories mode: ..."), not an uncaught UnicodeDecodeError traceback.
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / stories.STORIES_FILENAME).write_bytes(_BAD_UTF8)
+    with pytest.raises(stories.StoriesError, match="not valid UTF-8"):
+        stories.load_stories(tmp_path)
+
+
+def test_load_unreadable_raises_stories_error(tmp_path, monkeypatch):
+    """A manifest that is present but unreadable — permissions, an I/O error, a
+    dead mount — must be a StoriesError like every other manifest fault. `is_file`
+    only rules out absence, so the OSError escaped raw and crashed the run from
+    whichever caller reached it first, including the commit-boundary read of
+    `closes_deferred`, whose contract is to journal and carry on
+    (#284 round-5 review, finding 5)."""
+    write_stories(tmp_path, "- id: 1\n  title: t\n  description: d\n")
+    fault_read_text(monkeypatch, tmp_path / stories.STORIES_FILENAME)
+    with pytest.raises(stories.StoriesError, match="could not be read"):
         stories.load_stories(tmp_path)
 
 
@@ -201,6 +232,41 @@ def test_invoke_dev_with_non_string_rejected(tmp_path):
         stories.load_stories(tmp_path)
 
 
+def test_closes_deferred_defaults_empty(tmp_path):
+    """The overwhelmingly common entry declares nothing — and an older manifest,
+    written before the field existed, must keep parsing unchanged (#234)."""
+    write_stories(tmp_path, '- id: "1"\n  title: t\n  description: d\n')
+    assert stories.load_stories(tmp_path).entries[0].closes_deferred == ()
+
+
+def test_closes_deferred_parses_ledger_ids(tmp_path):
+    write_stories(
+        tmp_path,
+        '- id: "1"\n  title: t\n  description: d\n  closes_deferred: [DW-5, DW-6]\n',
+    )
+    assert stories.load_stories(tmp_path).entries[0].closes_deferred == ("DW-5", "DW-6")
+
+
+def test_closes_deferred_normalizes_items(tmp_path):
+    """Items are str()-normalized, stripped, blank-dropped, and de-duplicated, the
+    same leniency ids get: an LLM-authored manifest may emit a bare `5` as an int
+    or repeat an id, and neither is a contradiction worth failing a run over."""
+    write_stories(
+        tmp_path,
+        '- id: "1"\n  title: t\n  description: d\n'
+        '  closes_deferred: ["  DW-5  ", 5, "DW-5", ""]\n',
+    )
+    assert stories.load_stories(tmp_path).entries[0].closes_deferred == ("DW-5", "5")
+
+
+def test_closes_deferred_non_list_rejected(tmp_path):
+    """Strict about the container: a bare string is a schema error, never silently
+    wrapped — a lenient reading would iterate it into single characters."""
+    write_stories(tmp_path, '- id: "1"\n  title: t\n  description: d\n  closes_deferred: DW-5\n')
+    with pytest.raises(stories.StoriesError, match="must be a list of deferred-work ids"):
+        stories.load_stories(tmp_path)
+
+
 def test_top_level_must_be_list(tmp_path):
     write_stories(tmp_path, "development_status:\n  a: b\n")
     with pytest.raises(stories.StoriesError, match="top-level list"):
@@ -341,6 +407,33 @@ def test_schedule_selector_unknown_raises():
         stories.schedule(s, {}, selector="99")
 
 
+def test_schedule_skip_passes_over_a_touched_story():
+    # story 1 was driven this run but its on-disk spec still reads resumable
+    # (e.g. it plateau-deferred). skip must pass over it, not re-pick it.
+    s = _stories("1", "2")
+    states = {"1": _present("in-progress")}
+    assert stories.schedule(s, states).entry.id == "1"  # without skip: re-picked
+    sched = stories.schedule(s, states, skip={"1"})
+    assert sched.outcome == stories.SCHEDULE_NEXT and sched.entry.id == "2"
+
+
+def test_schedule_skip_all_touched_is_complete():
+    # every story either done or already handled this run -> run finishes.
+    s = _stories("1", "2")
+    states = {"1": _present("done"), "2": _present("ready-for-dev")}
+    sched = stories.schedule(s, states, skip={"2"})
+    assert sched.is_complete
+
+
+def test_schedule_skip_does_not_leapfrog_a_blocked_story():
+    # a blocked story that is NOT in skip still stops the scan even when an
+    # earlier story was skipped.
+    s = _stories("1", "2", "3")
+    states = {"1": _present("done"), "2": _present("blocked")}
+    sched = stories.schedule(s, states, skip={"1"})
+    assert sched.is_wedged and sched.entry.id == "2"
+
+
 # --------------------------------------------------------------- resolve_story_spec
 
 
@@ -353,6 +446,19 @@ def test_resolve_present_reads_status(tmp_path):
     st = stories.resolve_story_spec(tmp_path, "1")
     assert st.kind == stories.KIND_PRESENT and st.status == "in-review"
     assert st.path.name == "1-user-auth.md"
+
+
+def test_resolve_non_utf8_present_degrades_to_unknown_status(tmp_path):
+    # An undecodable PRESENT spec must not raise UnicodeDecodeError out of the frontmatter
+    # read (which would crash the scheduler / dry-run / status); it degrades to an unknown
+    # status="" that _classify treats as wedged (-> pause for resolve, never silent skip).
+    d = tmp_path / stories.STORIES_SUBDIR
+    d.mkdir(parents=True)
+    (d / "1-user-auth.md").write_bytes(_BAD_UTF8)
+    st = stories.resolve_story_spec(tmp_path, "1")  # must not raise
+    assert st.kind == stories.KIND_PRESENT and st.status == ""
+    assert stories._classify(st) == "wedged"
+    assert stories.state_label(st) == "present"
 
 
 def test_resolve_ambiguous(tmp_path):
@@ -396,3 +502,91 @@ def test_resolve_charset_invalid_id_is_pending_not_glob(tmp_path, bad_id):
     # such id a clean PENDING ("no resolvable spec") instead of an injected match.
     write_story_spec(tmp_path, "1-x.md", status="done")
     assert stories.resolve_story_spec(tmp_path, bad_id).kind == stories.KIND_PENDING
+
+
+# --------------------------------------------------- state_label / table projection
+
+
+def test_state_label_present_shows_status(tmp_path):
+    write_story_spec(tmp_path, "1-slug.md", status="ready-for-dev")
+    assert stories.state_label(stories.resolve_story_spec(tmp_path, "1")) == "ready-for-dev"
+
+
+def test_state_label_pending_and_ambiguous(tmp_path):
+    assert stories.state_label(stories.resolve_story_spec(tmp_path, "1")) == "pending"
+    write_story_spec(tmp_path, "1-a.md", status="done")
+    write_story_spec(tmp_path, "1-b.md", status="done")
+    assert stories.state_label(stories.resolve_story_spec(tmp_path, "1")) == "ambiguous"
+
+
+def test_state_label_sentinel_carries_kind(tmp_path):
+    write_story_spec(tmp_path, "1-unresolved.md", status="blocked")
+    assert stories.state_label(stories.resolve_story_spec(tmp_path, "1")) == "sentinel:unresolved"
+
+
+def test_resolve_spec_folder_relative_and_absolute(tmp_path):
+    assert stories.resolve_spec_folder(tmp_path, "epic-1") == tmp_path / "epic-1"
+    abs_folder = tmp_path / "somewhere"
+    assert stories.resolve_spec_folder(tmp_path, str(abs_folder)) == abs_folder
+
+
+def test_story_rows_projects_manifest_and_disk_state(tmp_path):
+    write_stories(
+        tmp_path,
+        '- id: "1"\n  title: First\n  description: d\n  spec_checkpoint: true\n'
+        '- id: "2"\n  title: Second\n  description: d\n  done_checkpoint: true\n'
+        '- id: "3"\n  title: Third\n  description: d\n',
+    )
+    write_story_spec(tmp_path, "1-slug.md", status="done")
+    write_story_spec(tmp_path, "2-slug.md", status="in-progress")
+    rows = stories.story_rows(tmp_path)
+    assert [(r.position, r.id, r.label) for r in rows] == [
+        (1, "1", "done"),
+        (2, "2", "in-progress"),
+        (3, "3", "pending"),
+    ]
+    assert rows[0].spec_checkpoint and not rows[0].done_checkpoint
+    assert rows[1].done_checkpoint and not rows[1].spec_checkpoint
+    assert rows[0].title == "First"
+
+
+def test_story_rows_selector_and_limit(tmp_path):
+    write_stories(
+        tmp_path,
+        '- id: "1"\n  title: t\n  description: d\n'
+        '- id: "2"\n  title: t\n  description: d\n'
+        '- id: "3"\n  title: t\n  description: d\n',
+    )
+    assert [r.id for r in stories.story_rows(tmp_path, selector="2")] == ["2"]
+    assert [r.id for r in stories.story_rows(tmp_path, selector="nope")] == []
+    assert [r.id for r in stories.story_rows(tmp_path, max_stories=2)] == ["1", "2"]
+
+
+def test_story_rows_limit_counts_dispatchable_not_done(tmp_path):
+    """--max-stories parity with the engine: the run's durable dispatch count
+    skips already-done stories, so a preview that counted done rows against the
+    cap showed a DISJOINT story set from what the run drives (manifest [1..4]
+    with 1-2 done: dry-run said 1-2, the run dispatched 3-4). Done rows before
+    the cap stay in view as skipped context; a non-positive cap previews the
+    empty schedule the run would dispatch."""
+    write_stories(
+        tmp_path,
+        '- id: "1"\n  title: t\n  description: d\n'
+        '- id: "2"\n  title: t\n  description: d\n'
+        '- id: "3"\n  title: t\n  description: d\n'
+        '- id: "4"\n  title: t\n  description: d\n',
+    )
+    write_story_spec(tmp_path, "1-slug.md", status="done")
+    write_story_spec(tmp_path, "2-slug.md", status="done")
+    # the run with --max-stories 2 skips 1-2 (done) and drives 3 AND 4
+    assert [r.id for r in stories.story_rows(tmp_path, max_stories=2)] == ["1", "2", "3", "4"]
+    # cap 1 → drives only 3; 4 is beyond the cap
+    assert [r.id for r in stories.story_rows(tmp_path, max_stories=1)] == ["1", "2", "3"]
+    # a non-positive cap dispatches nothing
+    assert stories.story_rows(tmp_path, max_stories=0) == []
+    assert stories.story_rows(tmp_path, max_stories=-1) == []
+
+
+def test_story_rows_missing_manifest_raises(tmp_path):
+    with pytest.raises(stories.StoriesError, match=re.escape("no stories.yaml found")):
+        stories.story_rows(tmp_path)

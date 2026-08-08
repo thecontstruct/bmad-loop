@@ -12,25 +12,37 @@ an optional extra.
 There are two ways the skills land in a project. The orchestrator's wheel **bundles**
 the three skills, so the simplest path is **pip + `bmad-loop init`**, which installs them
 itself. Alternatively the **BMAD-method installer** copies them. Either way the
-`/bmad-loop-setup` skill registers the `_bmad/` config, ensures the tool is installed,
-picks which coding CLIs to drive, and bootstraps the project. For the one-page summary,
+`/bmad-loop-setup` skill installs the orchestrator tool, picks which coding CLIs to
+drive, and bootstraps the project. For the one-page summary,
 see the [Installing the skill module](../README.md#installing-the-skill-module) section
 of the README.
 
 ## Platform prerequisites
 
 - **Python 3.11+** and a supported coding CLI (`claude` by default).
-- **tmux** — the orchestrator drives agent sessions through a terminal multiplexer, and
-  tmux is the only backend shipped today. It is required for launching, attaching, and
-  driving runs (pure TUI observation works without it). The multiplexer sits behind a
-  pluggable seam (`TerminalMultiplexer`), so a native-Windows backend can be added later
-  without changing the engine — contributors should start with
-  [Porting bmad-loop to a new OS](porting-to-a-new-os.md).
+- **A terminal multiplexer** — the orchestrator drives agent sessions through a terminal
+  multiplexer: **tmux** (POSIX) and the experimental **psmux** (native Windows) ship
+  bundled, and further backends install as separate packages that register themselves
+  (e.g. the [herdr adapter](https://github.com/pbean/bmad-loop-adapter-herdr), then
+  `bmad-loop mux set herdr` — see
+  [Terminal multiplexer backends](multiplexer-backends.md)). A backend is required for
+  launching, attaching, and driving runs (pure TUI observation works without one). The
+  multiplexer sits behind a pluggable seam (`TerminalMultiplexer`), so a new backend slots
+  in without changing the engine — contributors should start with
+  [Porting bmad-loop to a new OS](porting-to-a-new-os.md). `bmad-loop mux` lists the
+  registered backends and shows which is selected (and why); `bmad-loop mux set <name>` —
+  or the `[mux] backend` policy key, or the `BMAD_LOOP_MUX_BACKEND` env var — forces the
+  choice per machine.
 - **OS** — Linux or macOS. **Windows is supported via WSL**, which _is_ Linux: tmux and
-  every POSIX path work unchanged there, so no special setup is needed. **Native Windows
-  is not yet shipped** — it awaits a non-tmux multiplexer backend (tracked in
+  every POSIX path work unchanged there, so no special setup is needed. **Native Windows is
+  experimental** — the bundled `psmux` backend (a ConPTY tmux re-implementation) drives runs
+  there and is selected automatically as the win32 default when its prerequisites are present:
+  the `psmux` and `pwsh` (PowerShell) binaries on `PATH`, with `psmux` newer than 3.3.6 (older
+  releases can force-kill a recycled PID during teardown and so read as unavailable). It is
+  not yet at the Linux/macOS/WSL support tier — the remaining native-Windows work (window
+  hosting, attach/detach, Unity cache paths) is tracked in
   [the roadmap](ROADMAP.md#native-windows-multiplexer-backend); the port path is in
-  [Porting bmad-loop to a new OS](porting-to-a-new-os.md)).
+  [Porting bmad-loop to a new OS](porting-to-a-new-os.md).
 
 ## Installed via the BMAD-method installer? (recommended)
 
@@ -50,19 +62,19 @@ claude "/bmad-loop-setup accept all defaults"
 
 `/bmad-loop-setup` handles both first-time setup and later upgrades — re-run it any time. It:
 
-1. Merges the module's config into `_bmad/config.yaml` (+ personal settings into the
-   gitignored `_bmad/config.user.yaml`) and registers its help entries in
-   `_bmad/module-help.csv`.
-2. Installs **or upgrades** the `bmad-loop` tool from Git (see
+1. Installs **or upgrades** the `bmad-loop` tool from Git (see
    [Installing the tool and TUI](#installing-the-tool-and-tui)). On an upgrade it runs
    `uv tool upgrade bmad-loop --reinstall`.
-3. Asks **which coding CLI(s)** the orchestrator should drive, then runs `bmad-loop init`
+2. Asks **which coding CLI(s)** the orchestrator should drive, then runs `bmad-loop init`
    to install the `bmad-loop-*` skills + register hooks + write the `.bmad-loop/policy.toml`
-   template + add gitignore entries (see [Choosing which CLIs to drive](#choosing-which-clis-to-drive)
+   template + add gitignore entries (including policy.toml itself — policy is per-machine; repos initialized before this run `git rm --cached .bmad-loop/policy.toml` once if theirs is already committed) (see [Choosing which CLIs to drive](#choosing-which-clis-to-drive)
    and [Initializing CLIs other than claude](#initializing-clis-other-than-claude)). On an
    upgrade it passes `--force-skills` so the per-project skill copies are refreshed.
-4. Runs `bmad-loop validate` as a preflight (see [Verify](#verify)).
-5. Cleans up the legacy installer package directories under `_bmad/`, leaving only config.
+3. Runs `bmad-loop validate` as a preflight (see [Verify](#verify)).
+4. Refreshes `_bmad/bmad-loop/module-help.csv`, the module's help entries. That is the
+   only file it writes under `_bmad/` — module registration, the central `config.toml`,
+   and the `/bmad-help` catalog are owned by the BMAD installer, which regenerates them
+   on every run.
 
 Run `/bmad-loop-setup` with plain prompts if you want to choose interactively — e.g.
 `claude "/bmad-loop-setup cli: claude, codex"` to preselect the CLIs.
@@ -76,7 +88,7 @@ If you are working from a clone of this repo, sync the project env and let
 ```bash
 uv sync --extra tui                                             # the orchestrator tool + TUI
 uv run bmad-loop init --project /path/to/project --cli claude   # installs skills + hooks + policy
-claude "/bmad-loop-setup accept all defaults"                   # register _bmad/ config + help
+claude "/bmad-loop-setup accept all defaults"                   # install the tool + wire the project
 ```
 
 Add `--cli codex --cli gemini` to also populate `.agents/skills/`. `init` always
@@ -85,13 +97,66 @@ installs all the bundled skills together (`bmad-loop-resolve`, `bmad-loop-sweep`
 the orchestrator normalizes the ledger to. The dev primitive `bmad-dev-auto` is
 **not** bundled: it is the upstream skill the orchestrator drives (for both
 implementation and the follow-up review), installed by the BMad Method (bmm)
-module. `bmad-loop validate` checks it — plus the two adversarial review hunters it
-invokes inline — are present before a run starts.
+module. `bmad-loop validate` checks it — plus the review layers it invokes
+inline — are present before a run starts.
+
+**Minimum BMAD-METHOD: v6.10.0** for sprint mode. Beyond `bmad-dev-auto` itself (with
+its `customize.toml`), `bmad-loop validate` holds you to no fixed list of review
+skills: it reads the `bmad-dev-auto` you actually have installed and requires the
+reviewers that copy will actually invoke.
+
+- **Layer-driven (post-6.10.0)** — `customize.toml` defines
+  `[[workflow.review_layers]]`, and each layer's `instruction` names the skill it hands
+  off to. Current sources define four layers: `blind-hunter`, `edge-case-hunter`, and
+  `verification-gap`, each invoking the merged `bmad-review` skill with one lens, plus
+  `intent-alignment`, a self-contained prompt that invokes no skill at all. Such a tree
+  needs `bmad-review` and none of the standalone hunters. An intermediate release whose
+  layers name the standalone hunters needs exactly those instead.
+- **v6.10.0** — no `review_layers` section at all; `step-04-review.md` names
+  `bmad-review-adversarial-general` and `bmad-review-edge-case-hunter` inline, so those
+  two are what is required.
+
+A layer disabled with an empty `instruction`, or replaced in
+`_bmad/custom/bmad-dev-auto.toml` by a recipe that runs something else, requires
+nothing. If the shape cannot be read at all, `validate` falls back to requiring the two
+v6.10.0 hunters — which a tree carrying `bmad-review` satisfies.
+
+`bmad-review-verification-gap` is no longer required unconditionally (#260): no tagged
+release ships it as a standalone skill, and on current sources it is only a thin
+forwarder to `bmad-review`. It is required exactly when your installed layers name it.
+
+### Customizing the review layers
+
+Your project overrides in `_bmad/custom/bmad-dev-auto.toml` (team) and
+`_bmad/custom/bmad-dev-auto.user.toml` (personal, gitignored by the bmm installer) are
+applied before the requirement is computed, using the same merge rules BMAD's own
+resolver uses: an array of tables merges by key only when _every_ entry — default and
+override alike — carries the same `code` or `id`; otherwise the override appends. So
+adding a layer with a new `id` adds a requirement, and replacing one by `id` moves it.
+
+Two things `validate` reports but never blocks on, because neither can be decided
+without running the review:
+
+- a layer gated by a `when` condition, which the model evaluates against the diff;
+- a layer naming a skill in a phrasing that is not recognizably a handoff (the
+  convention is ``Invoke the `skill-name` skill``).
+
+Both come back as `skills.review-layer-unresolved` warnings, so a customized layer can
+never block a run the way the old fixed catalog did. What _is_ a problem: every layer
+disabled at once (`skills.review-layers-empty`), which makes `bmad-dev-auto` HALT
+blocked with `no active review layers`.
+
+Under `isolation = "worktree"` the skills your layers name are copied into each unit's
+worktree along with `_bmad/custom/`, so an isolated run resolves the same layers
+`validate` checked — including from the gitignored `*.user.toml`, which a fresh checkout
+would not carry.
 
 ## Choosing which CLIs to drive
 
-The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`, and
-`antigravity` (Google's `agy`, experimental — probe before unattended use). You can pick more
+The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`,
+`antigravity` (Google's `agy`, experimental — `isolation = "none"` only), and `opencode`
+(OpenCode ≥ 1.18 over HTTP/SSE, profile `opencode-http` — no tmux window; needs the
+`bmad-loop[opencode]` extra and `model` set as `provider/model`). You can pick more
 than one — register every CLI you intend to use for dev, review, or sweep triage.
 
 There are **two layers** here, and confusing them is the usual stumbling block:
@@ -169,8 +234,10 @@ bmad-loop init --project <project-root> --cli claude --cli codex --cli gemini
 
 Run with no `--cli` and `init` registers hooks for every CLI the `policy.toml` references,
 so a dual-client setup that's already configured in policy needs no extra flags. Names must
-be exactly `claude`, `codex`, `gemini`, `copilot`, or `antigravity` — `init` errors on an unknown profile and
-lists the valid ones.
+be exactly `claude`, `codex`, `gemini`, `copilot`, `antigravity`, or `opencode-http` (alias
+`opencode`) — `init` errors on an unknown profile and lists the valid ones. A hookless
+profile like `opencode-http` installs its skills but registers no hooks (it signals over
+HTTP/SSE).
 
 ### First-run notes
 
@@ -189,12 +256,34 @@ them to whoever owns the machine:
   subscription). Requires the Copilot **CLI** GA (≥ 2026-02) — _not_ the VS Code extension.
   **Pin a capable model**: the free default (GPT-5 mini) silently skips steps in the
   multi-step dev/review skills; set `[adapter] model = "claude-sonnet-4-6"` (→ `--model`).
+- **antigravity** — run `agy` once in the project, authenticate, and answer
+  **"Yes, I trust this folder"** before `bmad-loop run`; spawned sessions can't answer that
+  dialog, and a pending one reads as a session timeout. Requires Antigravity CLI
+  (`agy` ≥ 1.1.3). Two limitations to know, both verified against 1.1.3:
+  - **Trust is exact-path.** `settings.json` `trustedWorkspaces` matches whole paths —
+    trusting a parent does _not_ cover its subdirectories, and
+    `--dangerously-skip-permissions` does not bypass the dialog (it covers tool
+    permissions only). So antigravity needs `isolation = "none"` (the default);
+    **`isolation = "worktree"` will hang**, because each worktree is a fresh untrusted
+    path under `.bmad-loop/runs/`. See [#169](https://github.com/bmad-code-org/bmad-loop/issues/169).
+  - **Token usage is not recorded** (`usage_parser = "none"`) — and this is permanent,
+    not a gap: agy's transcript carries no usage data at all (it counts tokens only in
+    an internal SQLite/protobuf store). Runs work; the token columns stay empty.
+- **opencode** — install the HTTP client extra (`pip install 'bmad-loop[opencode]'`) and
+  authenticate once, **globally**, with `opencode auth login` (not per-project — there is no
+  workspace-trust dialog to answer). Requires OpenCode ≥ 1.18. Set the model as
+  `provider/model` (e.g. `[adapter] model = "anthropic/claude-haiku-4-5"`). No hooks are
+  registered — the adapter drives a headless `opencode serve` over HTTP/SSE, so there is no
+  tmux window to attach to; watch a session via its `logs/<task-id>.log` — a curated
+  transcript of the agent's prose, tool calls, file edits and permission decisions — or the
+  TUI Log tab. The server's own stdout lands beside it in `<task-id>.server.out`, and a
+  structured trace of the raw SSE frames in `<task-id>.sse.jsonl`.
 
 ### Skill location
 
-`claude` reads skills from `.claude/skills/`; `codex` and `gemini` read from `.agents/skills/`.
-`init` installs the bundled `bmad-loop-*` skills into the right tree for each CLI you pass via
-`--cli`, so selecting `codex`/`gemini` populates `.agents/skills/` automatically. It skips skill
+`claude` reads skills from `.claude/skills/`; `codex`, `gemini`, `copilot`, and `antigravity`
+read from `.agents/skills/`. `init` installs the bundled `bmad-loop-*` skills into the right tree
+for each CLI you pass via `--cli`, so selecting any of the `.agents/skills/` CLIs populates it automatically. It skips skill
 dirs that already exist — pass `--force-skills` to overwrite a stale copy, or `--no-skills` to
 manage them yourself.
 
@@ -221,8 +310,8 @@ lines), then uninstall the tool. There is no `bmad-loop uninstall` command — t
 are the documented manual procedure. Work **inside the project root**, and reclaim disk
 **before** deleting state so no worktrees or archives are orphaned.
 
-Two paths overlap: every project does steps 1–5 and 7; only projects set up through the
-**BMAD-method installer** (i.e. that ran `/bmad-loop-setup`) also need step 6.
+Two paths overlap: every project does steps 1–5 and 7; only projects with a `_bmad/` tree
+also need step 6.
 
 ### 1. Reclaim run disk first
 
@@ -279,18 +368,21 @@ entries to strip; leave every other hook in place.
 
 ### 5. Drop the gitignore lines
 
-`init` appended `.bmad-loop/runs/` and `.bmad-loop/cache/` to `.gitignore`. Remove those two
-lines (skip any your project relies on for other reasons).
+`init` appended `.bmad-loop/runs/`, `.bmad-loop/cache/`, and `.bmad-loop/policy.toml` to
+`.gitignore`. Remove those three lines (skip any your project relies on for other reasons). If
+you had run `git rm --cached .bmad-loop/policy.toml` to stop sharing the per-machine policy, the
+file is untracked — re-add it (`git add .bmad-loop/policy.toml`) only if you want it back in version control.
 
-### 6. Unregister from `_bmad/` (BMAD-installer projects only)
+### 6. Remove the BMAD module (BMAD-installer projects only)
 
-If you ran `/bmad-loop-setup`, it registered the module in your BMAD config. Remove the
-bmad-loop (`bmad-loop`) entries from:
+There is nothing to hand-unregister: bmad-loop writes no BMAD config. If you installed the
+module through the BMAD installer, remove it there — the installer owns `_bmad/bmad-loop/`,
+the central `config.toml`, and the `/bmad-help` catalog, and regenerates all three on its
+next run.
 
-- `_bmad/config.yaml` and `_bmad/config.user.yaml` — drop the bmad-loop module config block
-- `_bmad/module-help.csv` — drop the bmad-loop help rows
-
-uv + `init`-only projects never write to `_bmad/` and can skip this step.
+If you only ever ran `/bmad-loop-setup`, delete `_bmad/bmad-loop/module-help.csv` (the one
+file it refreshes) — or the whole `_bmad/bmad-loop/` directory if the installer never
+created it. uv + `init`-only projects that have no `_bmad/` can skip this step.
 
 ### 7. Uninstall the tool
 
