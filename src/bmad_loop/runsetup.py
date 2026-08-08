@@ -61,6 +61,7 @@ ROLES = ("dev", "review", "triage")
 
 
 def make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIAdapter]:
+    from .adapters import adapter_kinds
     from .adapters.generic import GenericAdapter, GenericDevAdapter
     from .adapters.multiplexer import fold_version, get_multiplexer, mux_usable
     from .adapters.profile import ProfileError, get_profile
@@ -75,6 +76,18 @@ def make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIAd
     by_cfg: dict = {}
     for role in ROLES:
         cfg = policy.adapter.resolved(role)
+        kind = adapter_kinds.get_adapter_kind(cfg.name)
+        if kind is not None:
+            if kind.roles is not None and role not in kind.roles:
+                raise SystemExit(
+                    f"error: provider {cfg.name!r} does not support role {role!r} "
+                    f"(supported: {', '.join(kind.roles)})"
+                )
+            key = (cfg, f"kind:{kind.name}")
+            if key not in by_cfg:
+                by_cfg[key] = kind.build(run_dir=run_dir, policy=policy, cfg=cfg, project=project)
+            adapters[role] = by_cfg[key]
+            continue
         # Both the dev and review sessions are now bmad-dev-auto runs (the review
         # session re-invokes the dev skill on the done spec for a follow-up pass),
         # and the skill writes no result.json — its adapter synthesizes the result
