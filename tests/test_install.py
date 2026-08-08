@@ -42,6 +42,7 @@ from bmad_loop.install import (
     RENDERER_ENTRY_REL,
     RENDERER_SCRIPT_REL,
     SNAPSHOT_TOKEN_RE,
+    _cursor_trust_slug,
     _absent_renderer_sources,
     _copy_traversable,
     _is_dev_primitive_shim,
@@ -59,6 +60,7 @@ from bmad_loop.install import (
     resolve_dev_primitive,
     resolve_review_layers,
     strip_relay_hooks,
+    seed_workspace_trust,
 )
 from bmad_loop.worktree_flow import (
     _bmad_scripts_seed_incomplete,
@@ -144,6 +146,24 @@ def test_merge_hooks_adds_all_events():
     settings, changed = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
     assert changed
     assert set(profile.hooks.events) <= set(settings["hooks"])
+
+
+def test_merge_hooks_cursor_uses_bare_versioned_entries():
+    profile = get_profile("cursor")
+    settings, changed = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
+    assert changed is True
+    assert settings["version"] == 1
+    assert settings["hooks"]["stop"] == [{"command": "python3 /x/.bmad-loop/bmad_loop_hook.py Stop"}]
+
+
+def test_cursor_workspace_trust_is_copy_when_absent(tmp_path):
+    home, target = tmp_path / "home", tmp_path / "project"
+    target.mkdir()
+    marker = seed_workspace_trust(target, home=home)
+    real = os.path.realpath(str(target))
+    assert marker == home / ".cursor" / "projects" / _cursor_trust_slug(real) / ".workspace-trusted"
+    assert json.loads(marker.read_text(encoding="utf-8"))["workspacePath"] == real
+    assert seed_workspace_trust(target, home=home) is None
 
 
 def test_merge_hooks_idempotent():

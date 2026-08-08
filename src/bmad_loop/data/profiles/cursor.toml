@@ -1,0 +1,18 @@
+# Cursor CLI (cursor-agent), driven interactively in a tmux pane.  Cursor's
+# project hook file is versioned and emits the lower-cased events below; it does
+# not provide a reliable session-end event, so window-death remains the crash
+# fallback.  Its transcript does not expose token totals on disk.
+name = "cursor"
+binary = "cursor-agent"
+skill_tree = ".cursor/skills"
+prompt_template = "{prompt}"
+bypass_args = ["--force"]
+model_flag = "--model"
+usage_parser = "none"
+seed_workspace_trust = true
+first_run_note = "run `cursor-agent login` once (or set CURSOR_API_KEY); workspace trust is seeded automatically by init and worktree provisioning"
+
+[hooks]
+dialect = "cursor-hooks-json"
+config_path = ".cursor/hooks.json"
+events = { sessionStart = "SessionStart", stop = "Stop" }

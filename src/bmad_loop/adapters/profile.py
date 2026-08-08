@@ -51,6 +51,8 @@ HOOK_DIALECTS = {
     "gemini-settings-json",
     "copilot-settings-json",
     "antigravity-hooks-json",
+    "cursor-hooks-json",
+    "cursor-hooks-json",
     # hookless: the adapter observes completion itself (HTTP/SSE transport) —
     # no hook config is ever written, so config_path/events must stay empty.
     "none",
@@ -183,6 +185,10 @@ class CLIProfile:
     # Provenance is that boundary; it answers "who wrote this", which is the
     # question actually being asked.
     packaged: bool = False
+    # cursor-agent blocks interactive launches in an untrusted workspace.  The
+    # profile opts into seeding Cursor's workspace marker for the project and
+    # isolated worktrees before the session is spawned.
+    seed_workspace_trust: bool = False
 
     @property
     def hookless(self) -> bool:
@@ -445,6 +451,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         first_run_note=str(doc.get("first_run_note", "")),
         seed_files=str_list("seed_files"),
         env_fault_patterns=str_list("env_fault_patterns"),
+        seed_workspace_trust=bool(doc.get("seed_workspace_trust", False)),
     )
     _validate_profile(profile, source)
     return profile
