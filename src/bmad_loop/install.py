@@ -2455,6 +2455,30 @@ def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
     return skipped_any
 
 
+def seed_base_skills(project: Path, dest_tree: str) -> tuple[list[str], list[str]]:
+    """Copy existing bmm dev/review skills into a headless provider tree."""
+    try:
+        source_trees = [profile.skill_tree for profile in load_profiles(project).values()]
+    except ProfileError:
+        source_trees = []
+    copied: list[str] = []
+    missing: list[str] = []
+    for skill in BASE_SKILLS:
+        destination = project / dest_tree / skill
+        if destination.exists():
+            continue
+        source = next(
+            (project / tree / skill for tree in source_trees if (project / tree / skill).is_dir()),
+            None,
+        )
+        if source is None:
+            missing.append(skill)
+        else:
+            _copy_traversable(source, destination)
+            copied.append(skill)
+    return copied, missing
+
+
 def _warn_if_policy_tracked(project: Path) -> None:
     """One-time migration hint: a .gitignore entry does not untrack an
     already-committed policy.toml, so repos initialized before the file was
@@ -2488,11 +2512,18 @@ def install_into(
     skills: bool = True,
     force_skills: bool = False,
 ) -> int:
+    from .adapters import adapter_kinds
+
     project = project.resolve()
     try:
         available = load_profiles(project)
         profiles = []
+        kind_profiles = []
         for name in clis:
+            kind = adapter_kinds.get_adapter_kind(name)
+            if kind is not None:
+                kind_profiles.append(kind.profile)
+                continue
             key = ALIASES.get(name, name)
             if key not in available:
                 raise ProfileError(
@@ -2506,11 +2537,12 @@ def install_into(
     bmad_loop_dir = project / ".bmad-loop"
     bmad_loop_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. hook relay script (shared by all CLIs)
-    script_target = project / HOOK_SCRIPT_REL
-    script_source = resources.files("bmad_loop.data").joinpath("bmad_loop_hook.py")
-    script_target.write_text(script_source.read_text(encoding="utf-8"), encoding="utf-8")
-    print(f"  hook script: {script_target}")
+    # 1. only hook-driven profiles need the relay.
+    if profiles:
+        script_target = project / HOOK_SCRIPT_REL
+        script_source = resources.files("bmad_loop.data").joinpath("bmad_loop_hook.py")
+        script_target.write_text(script_source.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"  hook script: {script_target}")
 
     # 2. per-CLI hook registration
     for profile in profiles:
@@ -2521,7 +2553,7 @@ def install_into(
     #    .agents/skills)
     skills_skipped = False
     if skills:
-        trees = list(dict.fromkeys(p.skill_tree for p in profiles))
+        trees = list(dict.fromkeys([p.skill_tree for p in profiles + kind_profiles]))
         try:
             skills_skipped = _copy_skills(project, trees, force_skills)
         except ProfileError as e:
@@ -2566,12 +2598,19 @@ def install_into(
     if skills_skipped:
         print("  some skills already present; re-run with --force-skills to overwrite")
 
+    for profile in kind_profiles:
+        copied, missing = seed_base_skills(project, profile.skill_tree)
+        if copied:
+            print(f"  seeded base skills -> {profile.skill_tree}/: {', '.join(copied)}")
+        if missing:
+            print(f"  note: base skills not found to seed: {', '.join(missing)}")
+
     print(
         "init complete. One-time setup before `bmad-loop run` — spawned "
         "sessions cannot answer first-run dialogs, and a pending dialog reads "
         "as a session timeout:"
     )
-    for profile in profiles:
+    for profile in profiles + kind_profiles:
         if profile.first_run_note:
             print(f"  {profile.name}: {profile.first_run_note}")
     return 0
