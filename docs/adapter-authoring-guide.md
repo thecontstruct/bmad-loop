@@ -531,8 +531,15 @@ shipped non-tmux adapter: it drives [OpenCode](https://opencode.ai) entirely ove
 `opencode serve`'s HTTP API + SSE event stream (`injection = "http"`,
 `observation = "sse"`, `state = "remote"`). Every API fact it relies on was
 pinned live against a real 1.18.2 binary and is recorded in the module's
-API-contract docstring — start there when the upstream API drifts. The design
-decisions worth stealing:
+API-contract docstring — start there when the upstream API drifts. Its design
+
+`cursor-sdk` is the other shipped non-profile provider. It registers through
+[`adapters/adapter_kinds.py`](../src/bmad_loop/adapters/adapter_kinds.py), which is the narrow
+seam for transports that cannot use tmux hooks. Its Node sidecar emits an in-band terminal
+sentinel; `runsetup.make_adapters`, installation, validation, and worktree provisioning consume
+the kind's hookless `CLIProfile` metadata just as they do any other provider.
+
+OpenCode's implementation decisions worth stealing:
 
 - **One server per session.** The API has no per-session env, but the engine's
   `BMAD_LOOP_*` contract must reach tool subprocesses — so each session gets its
