@@ -68,6 +68,7 @@ from .entrypoints import record_load_error
 # never a literal). GENERIC is the `profile.adapter` default.
 GENERIC = "generic"
 OPENCODE_HTTP = "opencode-http"
+CURSOR_CLI_HEADLESS = "cursor-cli-headless"
 
 
 class AdapterError(Exception):
@@ -132,6 +133,16 @@ def _opencode_http_builder() -> AdapterBuilder:
     )
 
 
+def _cursor_cli_headless_builder() -> AdapterBuilder:
+    from .cursor_cli_headless import CursorCliHeadlessAdapter
+
+    return AdapterBuilder(
+        plain=CursorCliHeadlessAdapter,
+        dev=CursorCliHeadlessAdapter,
+        construct_error=(),
+    )
+
+
 # The bundled kinds, as (name, needs_mux, load-thunk). A module constant, not
 # mutable registry state, so detect_adapters can label a row builtin-vs-external
 # without the fixtures having to snapshot it. `generic` drives tmux + hooks and
@@ -139,6 +150,7 @@ def _opencode_http_builder() -> AdapterBuilder:
 _BUILTIN_ADAPTERS: tuple[tuple[str, bool, Callable[[], AdapterBuilder]], ...] = (
     (GENERIC, True, _generic_builder),
     (OPENCODE_HTTP, False, _opencode_http_builder),
+    (CURSOR_CLI_HEADLESS, False, _cursor_cli_headless_builder),
 )
 _BUILTIN_NAMES = frozenset(name for name, _, _ in _BUILTIN_ADAPTERS)
 

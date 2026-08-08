@@ -2696,11 +2696,12 @@ def install_into(
     bmad_loop_dir = project / ".bmad-loop"
     bmad_loop_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. hook relay script (shared by all CLIs)
-    script_target = project / HOOK_SCRIPT_REL
-    script_source = resources.files("bmad_loop.data").joinpath("bmad_loop_hook.py")
-    script_target.write_text(script_source.read_text(encoding="utf-8"), encoding="utf-8")
-    print(f"  hook script: {script_target}")
+    # 1. only hook-driven profiles need the relay.
+    if any(not profile.hookless for profile in profiles):
+        script_target = project / HOOK_SCRIPT_REL
+        script_source = resources.files("bmad_loop.data").joinpath("bmad_loop_hook.py")
+        script_target.write_text(script_source.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"  hook script: {script_target}")
 
     # 2. per-CLI hook registration
     for profile in profiles:

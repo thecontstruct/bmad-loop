@@ -1,0 +1,13 @@
+# Cursor Agent CLI in supervised print/stream-json mode.  The bundled adapter
+# observes the terminal result event and needs no terminal multiplexer or hooks.
+name = "cursor-cli-headless"
+binary = "cursor-agent"
+adapter = "cursor-cli-headless"
+skill_tree = ".cursor/skills"
+usage_parser = "none"
+first_run_note = "run `cursor-agent login` once (or set CURSOR_API_KEY) before starting a headless run"
+
+[hooks]
+dialect = "none"
+config_path = ""
+events = {}
