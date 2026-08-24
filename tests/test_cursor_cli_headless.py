@@ -63,7 +63,8 @@ def test_headless_cursor_adapter_kind_bypasses_multiplexer(project, monkeypatch)
         _policy(project.project),
     )
     assert isinstance(adapters["triage"], CursorCliHeadlessAdapter)
-    assert adapters["dev"] is adapters["review"] is adapters["triage"]
+    assert adapters["dev"] is adapters["review"]
+    assert adapters["triage"] is not adapters["dev"]
     assert adapters["dev"].profile.hookless
 
 

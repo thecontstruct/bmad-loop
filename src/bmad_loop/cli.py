@@ -351,14 +351,6 @@ def cmd_validate(args: argparse.Namespace) -> int:
             {"gates_mode": pol.gates.mode, "adapters": dict(role_names)},
         )
         for name in dict.fromkeys(role_names.values()):
-            kind = adapter_kinds.get_adapter_kind(name)
-            if kind is not None:
-                notes, problems = kind.validate(project)
-                for note in notes:
-                    report.ok("adapter.kind", f"{name}: {note}", {"provider": name})
-                for problem in problems:
-                    report.fail("adapter.kind", f"{name}: {problem}", {"provider": name})
-                continue
             try:
                 profile = get_profile(name, project)
                 profiles.append(profile)
@@ -977,17 +969,12 @@ def _skill_trees(project: Path, pol) -> list[str]:
     provisioned without the review profile has no completion signal for those
     sessions and stalls rather than merely missing a skill. See #424 for the narrow
     residue that IS real."""
-    from .adapters import adapter_kinds
     from .adapters.profile import ProfileError, get_profile
 
     trees = []
     for name in dict.fromkeys(
         pol.adapter.resolved(role).name for role in install.DEV_PRIMITIVE_ROLES
     ):
-        kind = adapter_kinds.get_adapter_kind(name)
-        if kind is not None:
-            trees.append(kind.profile.skill_tree)
-            continue
         try:
             trees.append(get_profile(name, project).skill_tree)
         except ProfileError:
@@ -1002,15 +989,11 @@ def _dev_skill_for_role(pol, project: Path, role: str) -> str:
     a pre-rename project previews ``/bmad-dev-auto``, a post-rename one
     ``/bmad-build-auto``. An unloadable profile falls back to the legacy name;
     the run itself would fail preflight before ever dispatching."""
-    from .adapters import adapter_kinds
     from .adapters.profile import ProfileError, get_profile
 
     try:
         name = pol.adapter.resolved(role).name
-        kind = adapter_kinds.get_adapter_kind(name)
-        tree = (
-            kind.profile.skill_tree if kind is not None else get_profile(name, project).skill_tree
-        )
+        tree = get_profile(name, project).skill_tree
     except ProfileError:
         tree = None
     return install.dev_primitive_or_default(project, tree)
@@ -1924,14 +1907,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
-    from .adapters import adapter_kinds
     from .adapters.profile import get_profile
 
     cfg = pol.adapter.resolved(role)
-    if adapter_kinds.is_adapter_kind(cfg.name):
-        model = f" model={cfg.model}" if cfg.model else ""
-        return f"{cfg.name} headless{model}: {prompt!r}"
     profile = get_profile(cfg.name, project)
+    if profile.adapter == "cursor-cli-headless":
+        model = f" model={cfg.model}" if cfg.model else ""
+        return f'{profile.binary} -p --force --trust --output-format stream-json "{prompt}"{model}'
     if profile.hookless:
         # HTTP/SSE transport — there is no shell invocation to print. Render
         # the real sequence (per-session server spawn + API prompt) instead of
