@@ -52,7 +52,6 @@ HOOK_DIALECTS = {
     "copilot-settings-json",
     "antigravity-hooks-json",
     "cursor-hooks-json",
-    "cursor-hooks-json",
     # hookless: the adapter observes completion itself (HTTP/SSE transport) —
     # no hook config is ever written, so config_path/events must stay empty.
     "none",
