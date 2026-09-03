@@ -39,7 +39,7 @@ from ... import policy as policy_mod
 from ... import sprintstatus, stories
 from ...model import RunState, StoryTask
 from ...runs import RUNS_DIR
-from .. import data
+from .. import data, launch
 from ..widgets import (
     DeferredEntryOption,
     JournalEntryOption,
@@ -647,7 +647,7 @@ class DashboardScreen(Screen[None]):
             doc.set("tui", "runs_height", self.runs_height if self._left_frozen else None)
             doc.set("tui", "deferred_height", self.deferred_height if self._left_frozen else None)
             doc.set("tui", "tasks_height", self.tasks_height if self._detail_frozen else None)
-            doc.save(path)
+            doc.save(path, confine_root=self.project)
         except (OSError, tomlkit.exceptions.TOMLKitError) as e:
             self.notify(f"could not save layout: {e}", severity="warning")
 
@@ -730,7 +730,8 @@ class DashboardScreen(Screen[None]):
         if self._pending_run is not None and time.monotonic() > self._pending_deadline:
             self._pending_run = None
             self.notify(
-                "launch may have failed — attach to control session bmad-loop-ctl",
+                "launch may have failed — attach to control session "
+                f"{launch.ctl_session(self.project)}",
                 severity="error",
                 timeout=15,
             )

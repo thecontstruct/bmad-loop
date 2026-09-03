@@ -537,8 +537,17 @@ class StoriesEngine(Engine):
 
     def _verify_review(self, task: StoryTask):
         # Drop the sprint-status gate (stories mode has no board); the id-keyed
-        # story spec's own `done` frontmatter is authoritative.
-        return verify.verify_review_stories(task, self.workspace.paths, self.policy)
+        # story spec's own `done` frontmatter is authoritative. The sink is the
+        # base engine's: stories mode runs the same verifier commands and its
+        # results belong in the same journal record kind (see
+        # `Engine._review_command_sink`), so a mode-specific one would only be a
+        # way for the three gates to drift apart on what they record.
+        return verify.verify_review_stories(
+            task,
+            self.workspace.paths,
+            self.policy,
+            on_results=self._review_command_sink(task),
+        )
 
     def _sprint_board_instruction(self) -> str:
         # Stories mode has no sprint-status.yaml: `_post_dev_state_sync` is a no-op
@@ -598,7 +607,8 @@ class StoriesEngine(Engine):
                 self.policy,
                 self.run_dir,
                 f"spec ready for approval: {task.story_key}",
-                f"review {task.spec_file}, then `bmad-loop resume {self.state.run_id}`",
+                f"review {self._operator_spec_path(task)}, then "
+                f"`bmad-loop resume {self.state.run_id}`",
             )
             raise RunPaused(
                 f"awaiting spec approval for {task.story_key}",
@@ -614,13 +624,16 @@ class StoriesEngine(Engine):
         :meth:`_resume_after_dev_verify` for the implement leg. Always raises."""
         task.plan_review_owed = False  # discharged: we are pausing for the review now
         self.journal.append(
-            "checkpoint-pause", story_key=task.story_key, checkpoint="plan", spec=task.spec_file
+            "checkpoint-pause",
+            story_key=task.story_key,
+            checkpoint="plan",
+            spec=self._operator_spec_path(task),
         )
         gates.notify(
             self.policy,
             self.run_dir,
             f"plan ready for review: {task.story_key}",
-            f"review the planned spec {task.spec_file}, then "
+            f"review the planned spec {self._operator_spec_path(task)}, then "
             f"`bmad-loop resume {self.state.run_id}`",
         )
         self._save()
@@ -647,7 +660,7 @@ class StoriesEngine(Engine):
             "checkpoint-pause",
             story_key=task.story_key,
             checkpoint="plan",
-            spec=task.spec_file,
+            spec=self._operator_spec_path(task),
             owed_after_implement=True,
         )
         gates.notify(
@@ -655,7 +668,7 @@ class StoriesEngine(Engine):
             self.run_dir,
             f"plan review owed (already implemented): {task.story_key}",
             f"the story was implemented before its plan checkpoint fired — review "
-            f"{task.spec_file}, then `bmad-loop resume {self.state.run_id}`",
+            f"{self._operator_spec_path(task)}, then `bmad-loop resume {self.state.run_id}`",
         )
         self._save()
         raise RunPaused(

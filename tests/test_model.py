@@ -2,6 +2,7 @@
 
 import binascii
 import json
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,7 @@ from bmad_loop.model import (
     SessionRecord,
     StoryTask,
     TokenUsage,
+    VerifyOutcome,
 )
 
 
@@ -36,6 +38,27 @@ def test_run_state_stories_fields_default_and_round_trip():
     back = RunState.from_dict(stories.to_dict())
     assert back.source == "stories"
     assert back.spec_folder == "_bmad-output/epic-1"
+
+
+def test_run_state_repo_root_round_trips_and_backs_code_root():
+    """The git root a run's code work happens in, persisted because
+    `runs.rearm_escalation` runs OUT OF PROCESS from the engine and had only
+    `project` to reach for."""
+    state = _state(repo_root="/code")
+    back = RunState.from_dict(state.to_dict())
+    assert back.repo_root == "/code"
+    assert back.code_root == Path("/code")
+
+
+def test_run_state_code_root_falls_back_to_project_for_legacy_state():
+    """A state.json written before the field existed reads back empty, and
+    `code_root` then answers `project` — exactly the pre-upgrade behavior, and the
+    correct answer for every run without a `repo_root:` override."""
+    d = _state().to_dict()
+    del d["repo_root"]  # state.json from before the field existed
+    back = RunState.from_dict(d)
+    assert back.repo_root == ""
+    assert back.code_root == Path("/p")
 
 
 def test_run_state_stories_fields_default_when_absent_from_dict():
@@ -165,6 +188,84 @@ def test_followup_review_recommended_defaults_false_for_legacy_state():
     assert StoryTask.from_dict(doc).followup_review_recommended is False
 
 
+def test_park_eligible_round_trips():
+    """The dispatch-time expectation gating the park's proof-of-work skip is
+    captured once per dev phase, so it has to survive the crash/resume boundary —
+    a replayed attempt that re-derived it would answer about the spec the session
+    it is replaying already parked."""
+    task = StoryTask(story_key="1-1-a", epic=1, park_eligible=True)
+    assert StoryTask.from_dict(task.to_dict()).park_eligible is True
+
+
+def test_park_eligible_defaults_false_for_legacy_state():
+    """And it defaults to the FAIL-CLOSED value, which is the load-bearing half: a
+    run resumed from a state.json written before the field existed has no recorded
+    answer, and the absent one must deny the skip rather than grant it. Defaulting
+    True would make every legacy resume the exact DW-1 hole this field closes."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["park_eligible"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).park_eligible is False
+
+
+@pytest.mark.parametrize(
+    "stored",
+    ["false", "true", "", 0, 1, None, [], ["x"], {}],
+    ids=["str-false", "str-true", "str-empty", "int-0", "int-1", "null", "list", "list-x", "dict"],
+)
+def test_park_eligible_only_a_real_boolean_true_authorizes_the_waiver(stored):
+    """`from_dict` reads this one field STRICTLY, and the asymmetry is the reason.
+    Every sibling bool on the task restores bookkeeping; this one authorizes the
+    dev gate's proof-of-work check to be WAIVED, so a wrong `False` costs one
+    retryable refusal while a wrong `True` re-opens the inheritance hole the field
+    exists to close.
+
+    Under the ordinary `bool(...)` spelling every truthy non-boolean grants that
+    waiver, and the likeliest one is the string `"false"` — a hand-edited
+    state.json, or any bridge that stringifies JSON scalars — for which
+    `bool("false")` is True. The `"true"`/`1` rows are here for the same reason
+    from the other side: reading them as authorization would be GUESSING that a
+    non-boolean meant yes, and fail-closed does not guess.
+
+    Ablation: restore `bool(d.get("park_eligible", False))` and the `str-false`,
+    `str-true`, `int-1` and `list-x` rows all fail."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    doc["park_eligible"] = stored
+    assert StoryTask.from_dict(doc).park_eligible is False
+
+
+def test_park_eligible_round_trips_the_authorized_value():
+    """The other direction, so strictness is not mistaken for "always False": a
+    real JSON `true` — the only value `to_dict` ever writes — survives."""
+    doc = StoryTask(story_key="1-1-a", epic=1, park_eligible=True).to_dict()
+    assert doc["park_eligible"] is True
+    assert StoryTask.from_dict(doc).park_eligible is True
+
+
+def test_verify_outcome_park_fields_are_absent_by_default():
+    """Both park fields are opt-in on the one leg that waives proof-of-work, and
+    every other outcome must leave them at the inert pair — `park_proof_skipped`
+    is what `Engine._verify_dev_artifacts` journals on, so a default of True
+    anywhere would file every ordinary story as a waived gate.
+
+    They are asserted TOGETHER because the whole point of splitting them is that
+    `park_zero_diff is None` no longer means "no waiver": on a waived leg whose
+    probe faulted it means "unknown", and only `park_proof_skipped` separates the
+    two."""
+    assert VerifyOutcome.passed().park_proof_skipped is False
+    assert VerifyOutcome.passed().park_zero_diff is None
+    assert VerifyOutcome.retry("nope").park_proof_skipped is False
+    assert VerifyOutcome.retry("nope").park_zero_diff is None
+    assert VerifyOutcome.escalate("boom").park_proof_skipped is False
+    assert VerifyOutcome.escalate("boom").park_zero_diff is None
+
+    # settable, and independently: the waived-but-unanswerable pair is a real
+    # state, not an unreachable combination
+    waived = VerifyOutcome.passed(park_proof_skipped=True, park_zero_diff=True)
+    assert waived.park_proof_skipped is True and waived.park_zero_diff is True
+    unknown = VerifyOutcome.passed(park_proof_skipped=True)
+    assert unknown.park_proof_skipped is True and unknown.park_zero_diff is None
+
+
 def test_followup_reviews_spent_round_trips():
     task = StoryTask(story_key="1-1-a", epic=1, followup_reviews_spent=2)
     assert StoryTask.from_dict(task.to_dict()).followup_reviews_spent == 2
@@ -174,6 +275,20 @@ def test_followup_reviews_spent_defaults_zero_for_legacy_state():
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
     del doc["followup_reviews_spent"]  # state.json from before the field existed
     assert StoryTask.from_dict(doc).followup_reviews_spent == 0
+
+
+def test_generation_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, generation=2)
+    assert StoryTask.from_dict(task.to_dict()).generation == 2
+
+
+def test_generation_defaults_zero_for_legacy_state():
+    """A run in flight across the upgrade must resume at generation 0, which is the
+    value `engine._session_task_id` renders as no suffix at all — so every task id
+    already on disk still matches and its `tasks/` directory is still found (#705)."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["generation"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).generation == 0
 
 
 def test_resolved_redrive_round_trips():
@@ -201,6 +316,52 @@ def test_dispatched_spec_file_defaults_none_for_legacy_state():
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
     del doc["dispatched_spec_file"]  # state.json from before the field existed
     assert StoryTask.from_dict(doc).dispatched_spec_file is None
+
+
+def test_rebase_spec_paths_on_reanchors_both_ownership_fields():
+    """The read-side inverse of `_serialized_worktree_path`, on both fields at once.
+
+    `to_dict` relativizes `spec_file` and `dispatched_spec_file` together, so a
+    re-anchor that moved only one would leave a task naming two trees. Absolute
+    values are already anchored (a spec outside the mount persists verbatim) and
+    must pass through, which is also what makes the call idempotent.
+    """
+    mount = Path("/repo/.bmad-loop/runs/r1/worktrees/1-1-a")
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file="_out/accepted.md",
+        dispatched_spec_file="_out/dispatched.md",
+    )
+
+    task.rebase_spec_paths_on(mount)
+
+    assert task.spec_file == str(mount / "_out/accepted.md")
+    assert task.dispatched_spec_file == str(mount / "_out/dispatched.md")
+
+    # idempotent: a second pass finds both absolute and leaves them alone
+    task.rebase_spec_paths_on(mount)
+    assert task.spec_file == str(mount / "_out/accepted.md")
+    assert task.dispatched_spec_file == str(mount / "_out/dispatched.md")
+
+
+def test_rebase_spec_paths_on_leaves_absolute_and_empty_values_untouched():
+    """An out-of-mount spec and an unbound field are both already correct.
+
+    `_serialized_worktree_path` keeps a path verbatim exactly when
+    `relative_to(worktree_path)` raises, so an absolute value beside a set
+    `worktree_path` is the out-of-mount shape — joining it onto the mount would
+    invent a path no tree contains. `None` must survive as `None` rather than
+    becoming the mount root: `Path("")` is `.`, so a bare join would answer the
+    tree root, which is a write target, not a spec.
+    """
+    outside = str(Path("/elsewhere/spec.md"))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=outside)
+
+    task.rebase_spec_paths_on(Path("/repo/wt"))
+
+    assert task.spec_file == outside
+    assert task.dispatched_spec_file is None
 
 
 def test_dispatched_spec_snapshot_round_trips_byte_exactly():
@@ -566,3 +727,66 @@ def test_cache_read_weight_defaults_when_limits_not_a_dict():
 def test_cache_read_weight_defaults_when_value_not_a_number():
     state = _state(policy_snapshot={"limits": {"cache_read_weight": "high"}})
     assert state.cache_read_weight() == 0.1
+
+
+def test_release_spec_paths_from_mount_relativizes_the_accepted_spec():
+    """The accepted spec goes back to the spelling the REPLACEMENT mount re-resolves.
+
+    `_discard_unit_for_restart` deletes the mount and the next attempt mounts a fresh
+    one carrying the same story's spec at the same relative place. An absolute path
+    into the deleted tree is what `verify.resolve_spec_path` passes through untouched,
+    so `_dispatched_spec_for_attempt` resolves it `strict=True` and the fresh attempt
+    starts unbound; the relative spelling is re-probed against the live workspace and
+    binds. `spec_file` outlives the attempt, so it is relativized rather than cleared.
+
+    Ablation: drop the `_serialized_worktree_path` call from
+    `release_spec_paths_from_mount` and this reddens on the absolute spelling.
+    """
+    task = StoryTask("1-1-a", 1)
+    task.worktree_path = "/runs/r1/worktrees/1"
+    task.spec_file = "/runs/r1/worktrees/1/_bmad-output/spec.md"
+
+    task.release_spec_paths_from_mount()
+
+    assert task.spec_file == "_bmad-output/spec.md"
+
+
+def test_release_spec_paths_from_mount_clears_the_attempt_binding():
+    """The attempt-owned pair died with its tree, and both halves go together.
+
+    `dispatched_spec_file`/`dispatched_spec_snapshot` are the authority pair
+    `recovery_flow` restores bytes through. A path without its snapshot is a shape
+    `_bind_dispatched_spec_for_attempt` never persists, so clearing one and not the
+    other would invent it.
+
+    Ablation: drop either `= None` and this reddens on that half.
+    """
+    task = StoryTask("1-1-a", 1)
+    task.worktree_path = "/runs/r1/worktrees/1"
+    task.dispatched_spec_file = "/runs/r1/worktrees/1/_bmad-output/spec.md"
+    task.dispatched_spec_snapshot = b"frozen bytes"
+
+    task.release_spec_paths_from_mount()
+
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+
+
+def test_release_spec_paths_from_mount_keeps_an_out_of_mount_spec_verbatim():
+    """A spec outside the mount was never the mount's to give up.
+
+    `_serialized_worktree_path` keeps such a path verbatim exactly when
+    `relative_to` raises — the shared-artifact-dir shape that survives the re-drive.
+    Relativizing it would be meaningless, and reusing that one helper is what makes
+    the discarded-mount spelling and the persisted one agree by construction.
+
+    Ablation: replace the helper call with an unconditional `relative_to`/join and
+    this reddens (or raises) while the in-mount row above stays green.
+    """
+    task = StoryTask("1-1-a", 1)
+    task.worktree_path = "/runs/r1/worktrees/1"
+    task.spec_file = "/shared-artifacts/spec.md"
+
+    task.release_spec_paths_from_mount()
+
+    assert task.spec_file == "/shared-artifacts/spec.md"

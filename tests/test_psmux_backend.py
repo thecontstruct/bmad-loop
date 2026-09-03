@@ -124,7 +124,7 @@ def test_new_window_rejects_malformed_command(rec, tmp_path):
     assert rec.calls == []
 
 
-def test_new_parked_window_rejects_empty_argv(rec, tmp_path):
+def test_parked_window_rejects_empty_argv(rec, tmp_path):
     with pytest.raises(MultiplexerError):
         PsmuxMultiplexer().new_parked_window("s", "n", tmp_path, [], "")
     assert rec.calls == []
@@ -318,6 +318,62 @@ def test_new_session_failure_raises_multiplexer_error(monkeypatch, tmp_path):
         PsmuxMultiplexer().new_session("s", tmp_path)
 
 
+# ------------------------------------------------------ PSMUX_BARE_ENV (unsupported)
+
+
+@pytest.fixture
+def _bare_env_unwarned(monkeypatch):
+    """Reset the once-per-process guard so each test grades its own firing."""
+    monkeypatch.setattr(psmux_backend, "_BARE_ENV_WARNED", False)
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE"])
+def test_bare_env_mode_warns_once_per_process(
+    rec, tmp_path, monkeypatch, capsys, _bare_env_unwarned, value
+):
+    """bmad-loop does not support `PSMUX_BARE_ENV` (psmux is on iff the value is
+    "1" or case-insensitive "true" — `src/pane.rs:890-892`, source-read at
+    v3.3.8): under it a session's window-0 shell and the TUI's parked engine
+    windows lose `BMAD_LOOP_STATE_DIR` by inheritance and derive their own
+    registry, so a run can read as gone. Said once per process, not per verb.
+
+    Ablate the warning out of `_warn_if_bare_env` and this fails; ablate the
+    `_BARE_ENV_WARNED` guard and the count reads two."""
+    monkeypatch.setenv("PSMUX_BARE_ENV", value)
+    mux = PsmuxMultiplexer()
+    mux._run(["list-sessions"], check=False)
+    mux._run(["list-sessions"], check=False)
+    err = capsys.readouterr().err
+    assert err.count("warning: PSMUX_BARE_ENV") == 1
+    assert "does not support" in err
+
+
+@pytest.mark.parametrize("value", [None, "0", "", "yes"])
+def test_bare_env_mode_off_stays_quiet(
+    rec, tmp_path, monkeypatch, capsys, _bare_env_unwarned, value
+):
+    """The predicate is psmux's own: any value psmux reads as off must not warn,
+    or the line becomes noise an operator learns to ignore. Ablate the
+    `_bare_env_on` condition (warn unconditionally) and this fails."""
+    if value is None:
+        monkeypatch.delenv("PSMUX_BARE_ENV", raising=False)
+    else:
+        monkeypatch.setenv("PSMUX_BARE_ENV", value)
+    PsmuxMultiplexer()._run(["list-sessions"], check=False)
+    assert "PSMUX_BARE_ENV" not in capsys.readouterr().err
+
+
+def test_bare_env_mode_detected_on_a_per_call_env(
+    rec, tmp_path, monkeypatch, capsys, _bare_env_unwarned
+):
+    """`_run` judges the EFFECTIVE env — a per-call `env=` carrying the switch is
+    what the spawned server would inherit, so it is what gets warned about."""
+    monkeypatch.delenv("PSMUX_BARE_ENV", raising=False)
+    env = {**os.environ, "PSMUX_BARE_ENV": "1"}
+    PsmuxMultiplexer()._run(["list-sessions"], check=False, env=env)
+    assert "PSMUX_BARE_ENV" in capsys.readouterr().err
+
+
 # --------------------------------------------------------------- kill_session
 
 
@@ -402,7 +458,7 @@ def test_return_target_bare_pane_on_unqualifiable_session_name(monkeypatch):
 # ------------------------------------------------------------- parked window
 
 
-def test_new_parked_window_composes_pwsh_source(rec, tmp_path):
+def test_parked_window_composes_pwsh_source(rec, tmp_path):
     PsmuxMultiplexer().new_parked_window("s", "n", tmp_path, ["claude", "--resume"], "%3")
 
     # calls[0]: the mint; the orphan-key sweep spawns after it (own test below)
@@ -617,7 +673,7 @@ def test_registry_selects_psmux_when_forced(monkeypatch):
 # The launcher/prune surfaces hand ids around from a process that is usually
 # OUTSIDE any pane, where a bare `@N` resolves through the most-recent-session
 # fallback instead of the session that minted it. kill-window on such an id is
-# destructive against the wrong server, so new_parked_window, the `window_id`
+# destructive against the wrong server, so parked_window, the `window_id`
 # columns of list_windows, and current_window_id all carry `session:@N`, and
 # every `-t` consumer replays that form verbatim.
 
@@ -632,13 +688,13 @@ def _rows_fake(monkeypatch, rows: str, *, new_window_id: str = "@2\n"):
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
 
 
-def test_new_parked_window_returns_session_qualified_id(monkeypatch, tmp_path):
+def test_parked_window_returns_session_qualified_id(monkeypatch, tmp_path):
     _window_fake(monkeypatch)
     win = PsmuxMultiplexer().new_parked_window("ctl", "run-x", tmp_path, ["prog"], "@ret")
     assert win == "ctl:@2"
 
 
-def test_new_parked_window_degrades_on_colon_session(monkeypatch, tmp_path):
+def test_parked_window_degrades_on_colon_session(monkeypatch, tmp_path):
     # Same #221 rule the engine-side mint follows: `a:b:@2` would split at the
     # wrong colon, so the id stays bare rather than becoming a wrong target.
     _window_fake(monkeypatch)
@@ -653,7 +709,7 @@ def test_qualified_window_id_degrades_on_empty_session():
     assert PsmuxMultiplexer()._qualified_window_id("", "@2") == "@2"
 
 
-def test_new_parked_window_falsy_id_passes_through(monkeypatch, tmp_path):
+def test_parked_window_falsy_id_passes_through(monkeypatch, tmp_path):
     # An empty id is start_detached's "window id not captured" sentinel; forging
     # "ctl:" out of it would turn a detected failure into a plausible target.
     _window_fake(monkeypatch, new_window_id="")
@@ -1166,8 +1222,8 @@ def test_failed_kill_leaves_ownership_readable_for_the_prune_retry(monkeypatch):
 def test_stranded_keys_after_cleanup_crash_are_reclaimed_by_the_sweep(monkeypatch):
     # The two halves of the strand-then-reclaim contract: a landed kill whose
     # key-free step dies strands the keys, and a later sweep claims them. The
-    # sweep is driven directly here; new_parked_window's wiring to it is pinned
-    # by test_new_parked_window_sweeps_orphan_keys.
+    # sweep is driven directly here; parked_window's wiring to it is pinned
+    # by test_parked_window_sweeps_orphan_keys.
     key = "@bmad_project__blw@3"
     state = {"healed": False}
     freed = []
@@ -1438,7 +1494,7 @@ def test_list_windows_option_fill_declines_on_unroutable_session(monkeypatch):
     assert len(rec_.calls) == 1  # the listing only — no show-options spawned
 
 
-def test_new_parked_window_sweeps_orphan_keys(monkeypatch, tmp_path):
+def test_parked_window_sweeps_orphan_keys(monkeypatch, tmp_path):
     # Enter-dismissing a parked window closes it without kill_window, so its
     # keys outlive it; launch reconciles. `__blw@7` has no window → freed.
     # `__blw@2` is live → kept. Foreign options are untouched — `@color_3`,
@@ -1637,20 +1693,45 @@ def test_ctl_prune_scan_discriminates_projects_end_to_end(monkeypatch, tmp_path)
     monkeypatch.setattr(runs, "engine_alive", lambda _dir: False)
 
     candidates = launch._ctl_window_candidates(tmp_path)
-    assert candidates == [("bmad-loop-ctl:@2", "run-20260726-1")]
+    # The scan resolves the per-registry ctl name (runs.ctl_session_for) on a
+    # namespacing backend, and the qualified candidate ids carry it.
+    ctl = runs.ctl_session_for(tmp_path, mux)
+    assert ctl.startswith("bmad-loop-ctl-")
+    assert candidates == [(f"{ctl}:@2", "run-20260726-1")]
 
 
 # ---------------------------------------- client verbs: observed effect (#317)
 
 
-def _client_fake(monkeypatch, *, attached, session="ctl", verb_rc=0, drains_on_switch=False):
+#: The one format the attached-count probe asks for. The session NAME rides
+#: along with the count so the answer identifies which session it is about —
+#: a `-t` read can be served by another server (gh-671).
+ATTACHED_FMT = "#{session_attached}|#{session_name}"
+
+
+def _client_fake(
+    monkeypatch,
+    *,
+    attached,
+    session="ctl",
+    verb_rc=0,
+    drains_on_switch=False,
+    answered_session=None,
+):
     """Script the two probes the client verbs measure with.
 
-    ``attached`` is the successive answers to ``#{session_attached}``, consumed
-    in call order. The delta verbs (``-l``, ``detach-client``) take two each — a
-    detach that worked is ["1", "0"] and psmux's rc-0 no-op is ["1", "1"] — while
-    ``switch-client -t`` takes ONE, the gate count read before it. Every verb
-    exits ``verb_rc`` (0 by default), which only the ``-t`` leg reads.
+    ``attached`` is the successive COUNTS the probe answers, consumed in call
+    order; the harness pairs each with the answering session name, exactly as
+    ``ATTACHED_FMT`` makes psmux do. The delta verbs (``-l``, ``detach-client``)
+    take two each — a detach that worked is ["1", "0"] and psmux's rc-0 no-op is
+    ["1", "1"] — while ``switch-client -t`` takes ONE, the gate count read before
+    it. Every verb exits ``verb_rc`` (0 by default), which only the ``-t`` leg
+    reads.
+
+    ``answered_session`` is the name the probe REPORTS, defaulting to the
+    session we are in. Setting it apart from ``session`` is the misrouted read
+    (gh-671): another server answering at rc 0 with a plausible count of its
+    own.
 
     ``drains_on_switch`` makes the count answer ``"0"`` from the moment a
     ``switch-client`` has been seen, i.e. the session empties BECAUSE the verb
@@ -1661,16 +1742,17 @@ def _client_fake(monkeypatch, *, attached, session="ctl", verb_rc=0, drains_on_s
     monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")  # inside a pane
     monkeypatch.setenv("TMUX_PANE", "%9")  # the pane the probes pin to (gh-669)
     counts = list(attached)
+    answered = session if answered_session is None else answered_session
     calls: list[list] = []
 
     def fake(argv, **kwargs):
         calls.append(list(argv))
         if argv[1] == "display-message" and argv[-1] == "#{session_name}":
             return subprocess.CompletedProcess(argv, 0, stdout=f"{session}\n", stderr="")
-        if argv[1] == "display-message" and argv[-1] == "#{session_attached}":
+        if argv[1] == "display-message" and argv[-1] == ATTACHED_FMT:
             drained = drains_on_switch and any(c[1] == "switch-client" for c in calls[:-1])
             answer = "0" if drained else counts.pop(0)
-            return subprocess.CompletedProcess(argv, 0, stdout=f"{answer}\n", stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{answer}|{answered}\n", stderr="")
         return subprocess.CompletedProcess(argv, verb_rc, stdout="", stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
@@ -1682,7 +1764,7 @@ def test_psmux_detach_reports_the_observed_drop(monkeypatch):
     assert PsmuxMultiplexer().detach_client() is True
     assert ["psmux", "detach-client"] in calls
     # both probes routed to the session, never left to the most-recent fallback
-    assert calls.count(["psmux", "display-message", "-p", "-t", "ctl", "#{session_attached}"]) == 2
+    assert calls.count(["psmux", "display-message", "-p", "-t", "ctl", ATTACHED_FMT]) == 2
 
 
 def test_psmux_detach_with_nothing_attached_is_false(monkeypatch):
@@ -1743,7 +1825,7 @@ def test_psmux_switch_reports_a_cross_session_move(monkeypatch):
     assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
     # One gate read, routed at this session — the #315-safe shape the detach
     # tests pin for the delta legs, and the arity a re-added `after` read breaks.
-    assert calls.count(["psmux", "display-message", "-p", "-t", "ctl", "#{session_attached}"]) == 1
+    assert calls.count(["psmux", "display-message", "-p", "-t", "ctl", ATTACHED_FMT]) == 1
 
 
 def test_psmux_switch_with_nothing_attached_cannot_vouch(monkeypatch):
@@ -2025,3 +2107,326 @@ def test_psmux_switch_fallback_transport_fault_on_an_empty_session_cannot_vouch(
     monkeypatch.setattr(tmux_base.subprocess, "run", boom)
     assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
     assert dispatched == [["psmux", "switch-client", "-l"]]
+
+
+# ------------------------------- attached-count identity (gh-671)
+
+
+def _count_fake(monkeypatch, *, rc=0, stdout=""):
+    """Answer whatever the attached-count probe asks with one canned reply, and
+    record every spawn — including the spawns that never happen, which is what
+    the pre-flight refusals are asserted on."""
+    calls: list[list] = []
+
+    def fake(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    return calls
+
+
+def test_attached_count_reads_its_own_session(monkeypatch):
+    calls = _count_fake(monkeypatch, stdout="2|ctl\n")
+    assert PsmuxMultiplexer()._attached_clients("ctl") == 2
+    assert calls == [["psmux", "display-message", "-p", "-t", "ctl", ATTACHED_FMT]]
+
+
+def test_attached_count_refuses_a_differently_named_sessions_answer(monkeypatch):
+    """A `-t` read resolves through the named port AND key files, so when that
+    pair addresses another LIVE server the answer is that server's: rc 0, a
+    plausible count, and a session nobody asked about. Measured on 3.3.8; both
+    files are needed, since a key mismatch is rejected before the command runs.
+    The name riding along with the count is the only thing that separates such
+    an answer from our own."""
+    _count_fake(monkeypatch, stdout="1|alive\n")
+    assert PsmuxMultiplexer()._attached_clients("ctl") is None
+
+
+def test_attached_count_refuses_an_unnamed_answer(monkeypatch):
+    """An empty name field is an absent identity, not a matching one."""
+    _count_fake(monkeypatch, stdout="2|\n")
+    assert PsmuxMultiplexer()._attached_clients("ctl") is None
+
+
+def test_attached_count_refuses_a_dead_server(monkeypatch):
+    """Both a removed port file and a stale one whose process was killed answer
+    `no server running on session` at rc 1 — measured, and the direction that
+    was already safe. Pinned so the identity compare cannot mask a regression
+    into rc 0 here.
+
+    The stdout is a WELL-FORMED matching answer on purpose: with an empty one
+    the parser refuses for its own reasons, so deleting the rc guard would leave
+    this test green and pin nothing."""
+    _count_fake(monkeypatch, rc=1, stdout="2|ctl\n")
+    assert PsmuxMultiplexer()._attached_clients("ctl") is None
+
+
+def test_attached_count_survives_a_separator_inside_the_session_name(monkeypatch):
+    """The count is all digits and so cannot contain the separator: splitting
+    once leaves the name whole, however many separators it carries."""
+    _count_fake(monkeypatch, stdout="2|we|ird\n")
+    assert PsmuxMultiplexer()._attached_clients("we|ird") == 2
+
+
+def test_attached_count_refuses_a_colon_bearing_session_without_spawning(monkeypatch):
+    """`a:b` parses as session `a`, window `b` (#221), so the read would address
+    something else entirely — the rule current_return_target already applies."""
+    calls = _count_fake(monkeypatch, stdout="2|foo\n")
+    assert PsmuxMultiplexer()._attached_clients("foo:bar") is None
+    assert calls == []
+
+
+def test_attached_count_refuses_an_empty_session_without_spawning(monkeypatch):
+    calls = _count_fake(monkeypatch, stdout="2|\n")
+    assert PsmuxMultiplexer()._attached_clients("") is None
+    assert calls == []
+
+
+def test_switch_client_will_not_vouch_with_another_sessions_count(monkeypatch):
+    """The gh-671 hazard at the verdict layer. Since #670 the gate count is read
+    in the NONZERO direction, so a borrowed nonzero count would vouch for an
+    rc-0 switch that moved nobody — a vacuous True that
+    tui.launch.return_attached_client turns into RETURNED and a cleared return
+    option. Unvouched must answer None, never True."""
+    _client_fake(monkeypatch, attached=["1"], answered_session="alive")
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is None
+
+
+def test_detach_verdict_refuses_a_borrowed_delta(monkeypatch):
+    """The same substitution one layer down: a drop read off another session's
+    counts is not our client leaving."""
+    _client_fake(monkeypatch, attached=["1", "0"], answered_session="alive")
+    assert PsmuxMultiplexer().detach_client() is False
+
+
+def test_attached_count_refuses_a_name_differing_only_by_whitespace(monkeypatch):
+    """`" ctl"` is not `"ctl"`: different registry entries, different servers.
+    The requested name arrives pre-`.strip()`ped (`current_session` is
+    `_display_message`), so this is the shape a whitespace-bearing session takes
+    when some OTHER server answers for the normalized name — refuse it, exactly
+    as any other differing name. The reverse direction needs no guard: a session
+    really named `" ctl"` has no `ctl.port`, so the read fails closed at rc 1
+    before any compare."""
+    _count_fake(monkeypatch, stdout="1| ctl\n")
+    assert PsmuxMultiplexer()._attached_clients("ctl") is None
+
+
+# ------------------------------------------------- registry namespace (#537)
+
+
+@pytest.mark.parametrize("bad", ["", "relative\\root", "."])
+def test_run_refuses_a_registry_root_psmux_would_panic_on(monkeypatch, bad):
+    """psmux asserts PSMUX_DATA_DIR absolute and non-empty and panics otherwise —
+    a Rust panic and a nonzero exit, which `has_session` and friends read as an
+    ordinary "no". A live session would read as gone for a reason nothing in the
+    output names. Ablate the gate in `_run` and this passes the value straight
+    through to the spawn, which is the whole defect."""
+    run = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", run)
+    monkeypatch.setenv("PSMUX_DATA_DIR", bad)
+
+    with pytest.raises(TmuxError) as exc:
+        PsmuxMultiplexer()._run(["has-session", "-t", "s"], check=False)
+    assert "PSMUX_DATA_DIR" in str(exc.value)
+    assert run.calls == []  # refused before the spawn, not after
+
+
+def test_run_refuses_a_bad_root_carried_by_an_explicit_per_call_env(monkeypatch):
+    """`new_session` builds its own env, so the gate reads the EFFECTIVE
+    environment rather than only the inherited one."""
+    run = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", run)
+    monkeypatch.delenv("PSMUX_DATA_DIR", raising=False)
+
+    with pytest.raises(TmuxError):
+        PsmuxMultiplexer()._run(["has-session"], check=False, env={"PSMUX_DATA_DIR": "rel"})
+    assert run.calls == []
+
+
+def test_run_passes_an_absolute_root_through_untouched(monkeypatch, tmp_path):
+    run = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", run)
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path))
+
+    PsmuxMultiplexer()._run(["has-session", "-t", "s"], check=False)
+    # env=None: the child inherits this process's environment, which is how the
+    # one export reaches every verb.
+    assert run.kwargs["env"] is None
+
+
+def test_run_never_shadows_an_explicit_per_call_env(monkeypatch, tmp_path):
+    """The seam's process-wide export must not overwrite what a caller passed —
+    the live suite's isolated fixture root is exactly such a caller."""
+    run = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", run)
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path / "process"))
+    theirs = {"PSMUX_DATA_DIR": str(tmp_path / "theirs")}
+
+    PsmuxMultiplexer()._run(["has-session"], check=False, env=theirs)
+    assert run.kwargs["env"] == theirs
+
+
+def test_default_registry_instance_spawns_with_the_variable_removed(monkeypatch, tmp_path):
+    """Unbinding is done by REMOVING the variable, so psmux computes its own
+    default root — never by respelling `%USERPROFILE%\\.psmux` in Python."""
+    run = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", run)
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path))
+
+    PsmuxMultiplexer(default_registry=True)._run(["list-sessions"], check=False)
+    env = run.kwargs["env"]
+    assert "PSMUX_DATA_DIR" not in env
+    # A copy of the parent env, not a fresh one: a Windows child needs SystemRoot.
+    assert set(env) == set(os.environ) - {"PSMUX_DATA_DIR"}
+
+
+def test_default_registry_instance_keeps_an_explicit_envs_other_scrubbing(monkeypatch, tmp_path):
+    """`new_session`'s claude-var scrub is the env this composes onto; unbinding
+    the registry must not undo it."""
+    run = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", run)
+    scrubbed = {"PSMUX_ALLOW_NESTING": "1", "PSMUX_DATA_DIR": str(tmp_path)}
+
+    PsmuxMultiplexer(default_registry=True)._run(["kill-session"], check=False, env=scrubbed)
+    assert run.kwargs["env"] == {"PSMUX_ALLOW_NESTING": "1"}
+
+
+def test_session_name_key_is_the_transports_answer():
+    """ "Are these the same session name?" belongs to the transport, never to
+    a constant in core: tmux compares exactly (measured on 3.4 —
+    `bmad-loop-ctl` and `bmad-loop-CTL` coexist), while psmux resolves names
+    through NTFS port files, which fold case (measured on 3.3.8 — the
+    uppercase target addresses, duplicates against, and kills the lowercase
+    session). A constant fold destroyed a tmux run dir under a live
+    case-variant agent; a constant exact-compare would blind psmux's
+    control-session discount.
+
+    Ablate the psmux override and its half fails; fold the base default and
+    the tmux half fails."""
+    assert TmuxMultiplexer().session_name_key("bmad-loop-CTL") == "bmad-loop-CTL"
+    assert PsmuxMultiplexer().session_name_key("bmad-loop-CTL") == "bmad-loop-ctl"
+
+
+def test_registry_root_reports_the_root_in_force(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path))
+    assert PsmuxMultiplexer().registry_root() == str(tmp_path)
+
+
+def test_registry_root_is_none_on_the_default_registry(monkeypatch, tmp_path):
+    """Nothing an operator would have to export to reach it — the same None a
+    namespace-less backend answers, and correctly so for the one caller."""
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path))
+    assert PsmuxMultiplexer(default_registry=True).registry_root() is None
+    monkeypatch.delenv("PSMUX_DATA_DIR")
+    assert PsmuxMultiplexer().registry_root() is None
+
+
+def test_tmux_has_no_registry_namespace(monkeypatch, tmp_path):
+    """tmux addresses a server by socket; there is no root to disclose, and the
+    variable being set for a psmux next door must not make one appear."""
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path))
+    assert TmuxMultiplexer().registry_root() is None
+    assert TmuxMultiplexer().legacy_registries() == []
+
+
+def test_legacy_registries_offers_psmuxs_default_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path))
+    legacy = PsmuxMultiplexer().legacy_registries()
+    assert len(legacy) == 1
+    assert legacy[0]._default_registry is True
+
+
+def test_legacy_registries_is_empty_when_this_process_is_already_on_the_default(monkeypatch):
+    """The primary pass already covers that registry; a second one would double
+    every kill's report."""
+    monkeypatch.delenv("PSMUX_DATA_DIR", raising=False)
+    assert PsmuxMultiplexer().legacy_registries() == []
+
+
+def test_legacy_registries_also_sweeps_the_displaced_ambient_root(monkeypatch, tmp_path):
+    """A machine whose operator exported an absolute `PSMUX_DATA_DIR` before the
+    upgrade kept its bmad-loop sessions in THAT registry — the old backend simply
+    inherited the variable. This branch overrides it, so returning only psmux's
+    default assumes a pre-upgrade world that machine never had: `stop`, `attach`
+    and `cleanup` would each see nothing while the coding processes ran on, and
+    cleanup would report a clean sweep.
+
+    Ablate the displaced arm of `legacy_registries` and only the default-registry
+    instance comes back."""
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", str(tmp_path / "theirs"))
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path / "ours"))
+
+    legacy = PsmuxMultiplexer().legacy_registries()
+    assert [x.registry_root() for x in legacy] == [None, str(tmp_path / "theirs")]
+    assert legacy[0]._default_registry is True
+
+
+def test_a_bound_instance_spawns_under_its_own_root(monkeypatch, tmp_path):
+    """The binding is per instance and lands in the CHILD's env, never in this
+    process's: the sweep runs on a TUI worker thread beside other threads issuing
+    ordinary verbs, and a global swap would aim one of those at the wrong
+    registry for as long as it was in place.
+
+    Ablate the `registry_root` arm of `_run` and the child inherits this
+    process's root instead — the sweep would then re-scan its own registry and
+    report the displaced one as empty."""
+    run = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", run)
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path / "ours"))
+
+    PsmuxMultiplexer(registry_root=str(tmp_path / "theirs"))._run(["list-sessions"], check=False)
+    assert run.kwargs["env"]["PSMUX_DATA_DIR"] == str(tmp_path / "theirs")
+    assert os.environ["PSMUX_DATA_DIR"] == str(tmp_path / "ours")  # untouched
+
+
+def test_a_bound_instance_still_refuses_a_root_psmux_would_panic_on(monkeypatch, tmp_path):
+    """The absoluteness gate covers the bound arm too — a relative bound root
+    would panic psmux exactly as an inherited one does, and the nonzero exit
+    reads to every observer as an ordinary "no sessions"."""
+    run = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", run)
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path))
+
+    with pytest.raises(TmuxError) as exc:
+        PsmuxMultiplexer(registry_root="relative\\root")._run(["list-sessions"], check=False)
+    assert "PSMUX_DATA_DIR" in str(exc.value)
+    assert run.calls == []
+
+
+def test_legacy_registries_skips_a_displaced_root_that_is_the_one_in_force(monkeypatch, tmp_path):
+    """Nothing moved, so there is nothing extra to sweep — the primary pass is
+    already addressing it. psmux's default is still offered, as always: this
+    process is pointed away from it either way."""
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", str(tmp_path))
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path))
+    assert [x._default_registry for x in PsmuxMultiplexer().legacy_registries()] == [True]
+
+
+@pytest.mark.parametrize("bad", ["", "relative\\root"])
+def test_legacy_registries_skips_a_displaced_root_psmux_would_panic_on(monkeypatch, tmp_path, bad):
+    """Same rule as the primary root: a sweep that appeared to work while the
+    registry was unreachable would read as "nothing to clean"."""
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", bad)
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path))
+    assert [x._default_registry for x in PsmuxMultiplexer().legacy_registries()] == [True]
+
+
+def test_note_displaced_registry_keeps_the_first_value(monkeypatch):
+    """The operator's own root is what the FIRST call carries — `_configure_mux`
+    runs once per process, ahead of dispatch. A later call would be handing back
+    a root this process itself exported, which is not a pre-upgrade world."""
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    psmux_backend.note_displaced_registry("")  # empty is nothing displaced
+    assert psmux_backend._DISPLACED_ROOT is None
+    psmux_backend.note_displaced_registry("C:\\theirs")
+    psmux_backend.note_displaced_registry("C:\\ours")
+    assert psmux_backend._DISPLACED_ROOT == "C:\\theirs"
+
+
+@pytest.mark.parametrize("bad", ["", "relative\\root"])
+def test_legacy_registries_is_empty_under_a_root_psmux_would_panic_on(monkeypatch, bad):
+    """The primary pass is not running either, and a sweep that appeared to work
+    while the real registry was unreachable would read as "nothing to clean"."""
+    monkeypatch.setenv("PSMUX_DATA_DIR", bad)
+    assert PsmuxMultiplexer().legacy_registries() == []

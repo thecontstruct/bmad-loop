@@ -80,15 +80,30 @@ fragments) — or implement
 seams of a full OS port are in
 [Porting bmad-loop to a new OS](porting-to-a-new-os.md). The contract groups into:
 
-- **Sessions** — `has_session`, `new_session` (geometry is optional: agent
-  sessions pin a fixed pane size because they are observed while detached; the
-  control session omits it), `kill_session`, `list_sessions`, `session_options`
-  (read a user option across all sessions), `set_session_option`.
+- **Sessions** — `has_session`, `new_session` (geometry is
+  optional: agent sessions pin a fixed pane size because they are observed
+  while detached; the control session omits it),
+  `kill_session`, `list_sessions`, `session_options` (read a user option
+  across all sessions), `set_session_option`.
+
+  One session method carries a default the seam cannot verify for your
+  transport: `session_name_key(name)`, the canonical comparison key — two
+  names denote the same live session exactly when their keys are equal. The
+  default is identity (exact comparison — correct for tmux, whose session
+  names are case-sensitive). **If your transport resolves session names
+  case-insensitively — or folds them any other way — you MUST override**
+  (psmux does: its NTFS port-file store opens names case-insensitively).
+  With the inherited identity key, a case-variant of the control session's
+  name is not discounted by the removal guard, so the documented recovery
+  `bmad-loop delete ctl` wedges behind a false live-session refusal on a
+  persisted `CTL` run.
+
 - **Windows** — `new_window` (run a command in a fresh window), `new_parked_window`
-  (run a command, then _park_ on a keypress so the exit status stays inspectable,
-  then return any attached client to its origin — the POSIX `sh -c` recipe is
-  composed from the base's overridable shell-dialect hooks, so a non-POSIX
-  backend swaps the dialect fragments, not the method body), `list_window_ids`
+  (run a command, then _park_ on a keypress so the exit
+  status stays inspectable, then return any attached client to its origin — the
+  POSIX `sh -c` recipe is composed from the base's overridable shell-dialect
+  hooks, so a non-POSIX backend swaps the dialect fragments, not the method
+  body), `list_window_ids`
   (which MUST emit the same id form your `new_window` returns — `window_alive` is
   a membership test over it, so qualifying one side and not the other reads every
   live window as dead), `list_windows` (selected fields per window),
@@ -106,6 +121,24 @@ seams of a full OS port are in
   `available` (is this backend usable on the current host), `version` (the
   binary's version string or `None` — **one bounded line**, folded with
   `fold_version()`; see [the porting guide](porting-to-a-new-os.md)).
+- **Registry namespace** (optional; all three default to "no namespace", so a
+  transport without one writes nothing) — `has_registry_namespace` (a property
+  of the transport: does it namespace sessions by registry at all? Answer
+  `True` on every instance if it does, even when no root is currently in
+  force: cleanup uses it to tell "no namespace exists" from "running on the
+  transport's shared default registry", and only the first lets an untagged
+  session be claimed on run-directory evidence — a namespaced backend that
+  leaves this at the inherited `False` keeps the pre-namespace historical
+  reach, which on a shared registry can kill another project's session),
+  `registry_root` (the root your verbs
+  currently resolve targets through, for `bmad-loop mux` to disclose; `None`
+  from a namespaced backend means "no root in force" — the shared default —
+  not "no namespace") and
+  `legacy_registries` (instances bound to roots your sessions may predate, for
+  the cleanup sweep). Only for a transport that addresses sessions through a
+  directory of per-session files, as psmux does through `PSMUX_DATA_DIR`; the
+  rules are in [the porting
+  guide](porting-to-a-new-os.md#registry-namespaces-only-if-your-transport-has-one).
 
   **Both client verbs report effect, not dispatch.** They answer what the
   parked-window return path trusts — a bool from `detach_client`, a tri-state
@@ -155,20 +188,17 @@ module-level `parse_target()` — or the backend's own **native id** (whatever y
 `target()`, precisely so the seam grammar never has to carry a pane or window
 id: the parked-window return target — `current_return_target`, above — and the
 native window id, which psmux qualifies to `session:@N` because its ids are
-per-server (falling back to the bare id where that grammar would not survive —
-the backend owns those conditions, and applies them uniformly, so the
-`new_window`/`list_window_ids` symmetry rule holds under the fallback too).
+per-server (falling back to the bare id where that grammar would not survive).
 Both are replayed opaquely; neither is parsed by core. psmux applies the same
 qualification to `new_parked_window`, the `window_id` columns of `list_windows`
-and `current_window_id`; the latter two must agree, since the ctl-window prune
-compares them to skip its own window. To preserve unambiguous lookup,
-`new_parked_window` must agree with the `list_windows` column too; a backend that
-qualifies one side only remains usable but falls back to resolving parked
-windows by name, which is ambiguous whenever several kinds share a run id
-(#482). tmux consumes the token natively (it coincides with tmux exact-match
-syntax), so `BaseTmuxBackend` passes it straight through. A native-id backend
-calls `parse_target()` first — `None` means "already a native id, use as-is",
-otherwise resolve `(session, window)` yourself; the herdr adapter's
+and `current_window_id`. To preserve unambiguous lookup, `new_parked_window` must
+agree with the `list_windows` column; a backend that qualifies one side only
+remains usable but falls back to resolving parked windows by name, which is
+ambiguous whenever several kinds share a run id (#482). tmux consumes the token
+natively (it coincides with tmux exact-match syntax), so `BaseTmuxBackend` passes
+it straight through. A native-id backend calls `parse_target()` first — `None`
+means "already a native id, use as-is", otherwise resolve `(session, window)`
+yourself; the herdr adapter's
 `_parse_target`
 ([backend.py](https://github.com/pbean/bmad-loop-adapter-herdr/blob/main/src/bmad_loop_adapter_herdr/backend.py))
 is the worked example (workspace-by-label → tab-by-name → root pane, resolved
@@ -176,6 +206,35 @@ lazily at use time). You MAY override `target()` to emit native ids, but the tok
 stay a stable _by-name_ reference: core formats targets ahead of use (a parked
 window's return target, for one), so eager resolution to a live id goes stale —
 inheriting the default and resolving lazily is almost always right.
+
+**The qualified-id obligation.** The psmux qualifications above are instances of
+one rule, and it is the rule — not the instances — a native-id backend needs:
+**if an id-minting seam returns anything other than a bare native id, every seam
+whose output core compares that id against must emit the identical form, and
+every verb the id is replayed through must accept it.** Where a verb cannot take
+that form — or cannot take a window scope at all — the backend translates inside
+that verb rather than exempting the id from qualification: psmux has no
+per-window _user_ options to write to (#310), so its option trio runs the
+qualified target through `_option_scope` and writes a session-scoped key carrying
+the window's id, refusing a bare id rather than guessing a server (the built-ins
+pass straight through to the base). It carried a second such translation on
+`select_window` until its 3.3.8 floor made the server resolve a scoped id itself
+(psmux/psmux#497). Where the composed grammar cannot carry the value at all, the
+backend degrades uniformly across every seam that mints or lists the id, so the
+pairings still line up under the fallback — but the fallback is lossy, not a free
+escape hatch: a bare psmux id routes by the _caller's_ server, so the degrade
+condition must stay the narrow one the grammar forces (#221), never a
+convenience. Those pairings are not a closed set: a new one appears whenever a
+caller compares two id-producing seams to each other, so treat the rule as the
+contract and each documented pairing as an instance of it. Every way of getting
+the _form_ wrong is quiet — these are id-shape faults, never transport faults,
+which `list_window_ids` must still raise: a mint/list split reads every live
+window as instantly dead; a `list_windows`/`current_window_id` split makes the
+ctl-window prune kill the window it is running in (#291); a
+`list_windows`/`list_window_ids` split reports every kill candidate as verifiably
+gone, survivors included (#435). And a verb handed a form it rejects fails or
+silently no-ops — the seam is best-effort or its caller swallows the raise, so no
+error reaches core either way.
 
 Operations that can race a window dying (`pipe_pane`) or a session already being
 gone (`kill_session`) must tolerate it rather than raise; everything else raises a
