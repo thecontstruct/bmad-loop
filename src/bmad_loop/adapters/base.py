@@ -7,7 +7,7 @@ treating every CLI as a dumb terminal:
 - injection:   how a prompt reaches the CLI
                "tmux-initial-prompt" | "launch-flag" | "http"
 - observation: how turn/session completion is detected
-               "hook-signal" | "sse" | "transcript-poll"
+               "hook-signal" | "sse" | "stream-json" | "transcript-poll"
 - state:       where session state is readable
                "local-jsonl" | "local-json-tree" | "remote"
 """

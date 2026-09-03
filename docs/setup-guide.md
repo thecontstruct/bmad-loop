@@ -183,8 +183,10 @@ The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`,
 `antigravity` (Google's `agy`, experimental — `isolation = "none"` only), and `opencode`
 (OpenCode ≥ 1.18 over HTTP/SSE, profile `opencode-http` — no tmux window; needs the
 `bmad-loop[opencode]` extra and `model` set as `provider/model`), plus `cursor-cli-headless`
-(Cursor's headless CLI; authenticate with `cursor-agent login` or `CURSOR_API_KEY`). You can
-pick more than one — register every CLI you intend to use for dev, review, or sweep triage.
+(Cursor's `cursor-agent` in one-shot print mode, experimental — no tmux window and no hooks;
+authenticate with `cursor-agent login` or `CURSOR_API_KEY`, and note that a stalled session
+cannot be nudged because `-p` accepts no mid-turn input). You can pick more than one —
+register every CLI you intend to use for dev, review, or sweep triage.
 
 There are **two layers** here, and confusing them is the usual stumbling block:
 

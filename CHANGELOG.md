@@ -9,6 +9,18 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **`cursor-cli-headless` provider.** Drives Cursor's `cursor-agent` as a supervised child
+  process in one-shot print mode (`-p --output-format stream-json`) — no terminal multiplexer
+  and no hooks. Registered as an adapter class through the adapter registry
+  (`needs_mux = False`) and selected by the profile's `adapter` field. The terminal `result`
+  frame maps onto the Stop hook and process exit onto window death, so completion still comes
+  from the deterministic artifact read-back; dev/review sessions reuse the shared
+  `_DevSynthesisMixin` rather than a forked synthesis path. Experimental: the flags are pinned
+  against `cursor-agent` 2026.08.04, but no live end-to-end turn has been run. `-p` accepts no
+  mid-turn input, so stall and contract nudges are disabled for this family and a stalled
+  session runs out its timeout. `bmad-loop init` no longer writes the hook relay script when
+  every selected CLI is hookless.
+
 - **Review-gate verify commands are journalled** (#656, partial). The three review gates
   (`verify_review`, `verify_review_stories`, `verify_review_bundle`) now emit one
   `verify-command-result` per command, `verification_stage: "review"`, sharing the story's

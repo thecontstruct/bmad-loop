@@ -1232,7 +1232,9 @@ def _confined_to(target: Path, root: Path) -> bool:
 
 def _register_hooks(project: Path, profile: CLIProfile) -> int:
     if profile.hookless:
-        print(f"  no hooks needed ({profile.name}): HTTP/SSE transport")
+        # Hooklessness is a property of the profile, not of one transport: the
+        # HTTP/SSE family and the supervised-subprocess family both land here.
+        print(f"  no hooks needed ({profile.name}): hookless transport")
         return 0
     config_path = project / profile.hooks.config_path
     if not _confined_to(config_path, project):

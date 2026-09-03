@@ -185,8 +185,12 @@ def test_builtin_kinds_registered_with_needs_mux(fresh_adapter_registry):
     generic drives tmux (needs_mux), opencode-http is hookless HTTP/SSE (does not)."""
     generic = fresh_adapter_registry.get_adapter_kind("generic")
     http = fresh_adapter_registry.get_adapter_kind("opencode-http")
+    cursor = fresh_adapter_registry.get_adapter_kind("cursor-cli-headless")
     assert generic.needs_mux is True
     assert http.needs_mux is False
+    # A supervised child process drives no multiplexer either, so the bootstrap
+    # must never resolve one for it (tests/test_cursor_cli_headless.py traps that).
+    assert cursor.needs_mux is False
     assert fresh_adapter_registry.known_adapter_kinds() == [
         "cursor-cli-headless",
         "generic",
