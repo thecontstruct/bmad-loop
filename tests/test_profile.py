@@ -46,17 +46,29 @@ def test_builtin_profiles_load():
     assert profiles["claude"].skill_tree == ".claude/skills"
     assert profiles["codex"].skill_tree == ".agents/skills"
     assert profiles["gemini"].skill_tree == ".agents/skills"
+    # cursor: lower-cased event names, its own project hook file, and `--trust` in
+    # the bypass flags. That flag is not decoration — measured against cursor-agent
+    # 2026.08.04, an interactive launch without it blocks on the workspace-trust
+    # dialog (`--force` alone does NOT clear it), which an unattended session can
+    # never answer and which therefore reads as a session timeout.
     cursor = profiles["cursor"]
     assert cursor.binary == "cursor-agent"
     assert cursor.skill_tree == ".cursor/skills"
     assert cursor.hooks.dialect == "cursor-hooks-json"
+    assert cursor.hooks.config_path == ".cursor/hooks.json"
     assert cursor.hooks.events == {"sessionStart": "SessionStart", "stop": "Stop"}
-    assert cursor.seed_workspace_trust is True
+    assert "--trust" in cursor.bypass_args
+    # the prompt is an argv positional, so a leading "/" never reaches Cursor's
+    # slash menu — the template names the SKILL.md outright, as codex/copilot do
+    assert cursor.prompt_template.startswith("LOAD the FULL .cursor/skills/{skill}/SKILL.md")
     # each profile carries the gitignored configs a worktree checkout omits
     assert ".mcp.json" in profiles["claude"].seed_files
     assert ".claude/settings.json" in profiles["claude"].seed_files
     assert profiles["codex"].seed_files == (".codex/config.toml",)
     assert profiles["gemini"].seed_files == (".gemini/settings.json",)
+    # cursor seeds its MCP config and its hook file, the latter because
+    # provision_worktree merges the relay into whatever the project already had
+    assert profiles["cursor"].seed_files == (".cursor/mcp.json", ".cursor/hooks.json")
     # copilot: turn-end is agentStop (Copilot 1.0.63 never fires PascalCase Stop),
     # no PreCompact equivalent, and its events.jsonl parser is wired up
     assert profiles["copilot"].hooks.events == {

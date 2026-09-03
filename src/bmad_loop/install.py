@@ -22,7 +22,6 @@ import os
 import re
 import shutil
 import tomllib
-from datetime import datetime, timezone
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import ExitStack
 from importlib import resources
@@ -1074,8 +1073,10 @@ def _hook_entry(dialect: str, command: str) -> dict:
         handler["timeoutSec"] = COPILOT_HOOK_TIMEOUT_SEC  # Copilot timeouts are seconds
         return handler  # Copilot stores the handler directly in the event list
     if dialect == "cursor-hooks-json":
-        # Cursor uses the same versioned top-level shape as Copilot, but its
-        # event entries are bare command objects (no type/matcher wrapper).
+        # Cursor's event entries are BARE command objects: no matcher wrapper, no
+        # nested "hooks" list, and no "type" key either — the shape read off a
+        # live ~/.cursor/hooks.json and matching Cursor's published example. It
+        # takes no timeout key, so the handler built above is discarded whole.
         return {"command": command}
     if dialect == "antigravity-hooks-json":
         handler["timeout"] = ANTIGRAVITY_HOOK_TIMEOUT_SEC  # agy timeouts are seconds
@@ -1144,9 +1145,9 @@ def strip_relay_hooks(config: dict, dialect: str) -> bool:
                 continue
             # claude/codex/gemini wrap commands in a nested "hooks" list, and a
             # user may have added their own command beside the relay inside ONE
-            # matcher entry — strip inside the list so theirs survives. copilot
-            # and agy store the command dict flat in the event list, so a marker
-            # match means the entry IS the relay and it drops whole.
+            # matcher entry — strip inside the list so theirs survives. copilot,
+            # cursor and agy store the command dict flat in the event list, so a
+            # marker match means the entry IS the relay and it drops whole.
             nested = handler.get("hooks") if isinstance(handler, dict) else None
             if isinstance(nested, list):
                 surviving = [c for c in nested if RELAY_MARKER not in json.dumps(c)]
@@ -1196,12 +1197,16 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
                 changed = True
         return config, changed
     if dialect in ("copilot-settings-json", "cursor-hooks-json"):
-        config.setdefault("version", 1)  # Copilot and Cursor configs are versioned
+        # Both are versioned. For cursor this is REQUIRED, not cosmetic: Cursor 3.x
+        # refuses a project-level .cursor/hooks.json with no numeric top-level
+        # `version` and loads NONE of its hooks, so omitting it would register a
+        # relay that never fires and read as a session timeout.
+        config.setdefault("version", 1)
     hooks = config.setdefault("hooks", {})
     for native_event, command in registrations.items():
         matchers = hooks.setdefault(native_event, [])
-        # claude/codex/gemini nest handlers under "hooks"; copilot stores the
-        # handler dict directly in the event list — the serialized scan covers
+        # claude/codex/gemini nest handlers under "hooks"; copilot and cursor store
+        # the handler dict directly in the event list — the serialized scan covers
         # both shapes so a re-run stays idempotent for every dialect.
         if not _managed_hook_in_handlers(matchers):
             matchers.append(_hook_entry(dialect, command))
@@ -2832,42 +2837,6 @@ def _warn_if_policy_tracked(project: Path) -> None:
         )
 
 
-CURSOR_TRUST_METHOD = "bmad-loop-seeded"
-
-
-def _cursor_trust_slug(real_path: str) -> str:
-    """Cursor's per-workspace directory name for an absolute workspace path."""
-    return real_path.lstrip("/").replace("/", "-")
-
-
-def seed_workspace_trust(target: Path, home: Path | None = None) -> Path | None:
-    """Create Cursor's trust marker for *target* when it is not already present.
-
-    Cursor resolves the working directory before looking up the marker, hence the
-    real path rather than the user-supplied spelling.  We deliberately leave an
-    existing marker untouched: it belongs to Cursor/the operator, not bmad-loop.
-    """
-    home = home or Path(os.path.expanduser("~"))
-    real = os.path.realpath(str(target))
-    marker = home / ".cursor" / "projects" / _cursor_trust_slug(real) / ".workspace-trusted"
-    if marker.is_file():
-        return None
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(
-        json.dumps(
-            {
-                "trustedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                "workspacePath": real,
-                "trustMethod": CURSOR_TRUST_METHOD,
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    return marker
-
-
 def install_into(
     project: Path,
     clis: Sequence[str] = ("claude",),
@@ -2903,12 +2872,6 @@ def install_into(
     for profile in profiles:
         if _register_hooks(project, profile) != 0:
             return 1
-
-    for profile in profiles:
-        if profile.seed_workspace_trust:
-            marker = seed_workspace_trust(project)
-            if marker is not None:
-                print(f"  workspace trust seeded ({profile.name}): {marker}")
 
     # 3. bundled skills into each CLI's skill tree (deduped: codex+gemini share
     #    .agents/skills)

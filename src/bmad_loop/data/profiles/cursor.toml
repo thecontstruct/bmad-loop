@@ -1,16 +1,67 @@
-# Cursor CLI (cursor-agent), driven interactively in a tmux pane.  Cursor's
-# project hook file is versioned and emits the lower-cased events below; it does
-# not provide a reliable session-end event, so window-death remains the crash
-# fallback.  Its transcript does not expose token totals on disk.
+# Cursor CLI (`cursor-agent`), driven interactively in a mux pane. Verified
+# against cursor-agent 2026.08.04 on macOS. EXPERIMENTAL: the hook dialect,
+# trust gate and skill tree below were each checked against a live binary, but no
+# full dev/review loop has been run end to end — finalize with
+# `bmad-loop probe-adapter cursor --probe` before trusting it unattended.
+#
+# TRUST (measured, 4-cell matrix, each in a fresh untrusted git dir launched
+# interactively under tmux — the shape bmad-loop actually spawns):
+#   bare                     -> blocks on a "Workspace Trust Required" dialog
+#   --force                  -> STILL blocks (the flag covers tool permissions only)
+#   --force --trust          -> passes straight through to the session
+#   seeded trust marker      -> STILL blocks
+# So `--trust` is the only thing that clears the gate for an unattended launch,
+# and it is in bypass_args for that reason, not merely for tidiness. The marker
+# row is the one worth writing down: `~/.cursor/projects/<path-slug>/
+# .workspace-trusted` is real and is what Cursor writes when a human answers the
+# dialog, but replaying a byte-correct copy of one does NOT satisfy the gate, so
+# seeding it is not a substitute. NOTE: `extra_args` in policy.toml REPLACES
+# bypass_args — set it and you drop `--trust`, and every session hangs on the
+# dialog until session_timeout_min. Unlike antigravity's exact-path trust (#169),
+# a per-launch flag costs nothing per worktree, so `isolation = "worktree"` works.
+#
+# HOOKS: project-level .cursor/hooks.json. The top-level `version` is REQUIRED —
+# Cursor 3.x refuses a project hook file without a numeric one and loads none of
+# its hooks, which would read as a session timeout rather than an error (see
+# merge_hooks). Event entries are bare {"command": ...} objects: no matcher
+# wrapper, no nested "hooks" list, no "type" key, and no timeout field.
+# `stop` fires when the agent loop ends and is the turn-end signal; `sessionStart`
+# marks liveness. Cursor also documents `sessionEnd` and `preCompact`, and they
+# are deliberately NOT registered: nothing derives completion from them, and
+# whether cursor-agent (as opposed to the IDE) fires them is unverified here.
+# Payload keys are snake_case (conversation_id, transcript_path), which the
+# shared relay already reads. Cursor sends no `cwd` — it sends `workspace_roots`,
+# a list the relay does not unpack, so the event's cwd is empty. Nothing consumes
+# that field, so this is recorded, not deferred work.
+#
+# PROMPT: the prompt is handed over as an argv positional, never typed into the
+# pane, so a leading "/" never reaches Cursor's slash menu and must not be relied
+# on to expand. The explicit LOAD form is used for the same reason codex and
+# copilot use it — it names the file and cannot depend on command expansion.
+#
+# usage_parser is "none": the Stop payload carries a `transcript_path`, but its
+# token schema has not been read, so nothing is claimed about it. Runs work; the
+# token columns stay empty until a probe supplies the schema.
 name = "cursor"
 binary = "cursor-agent"
 skill_tree = ".cursor/skills"
-prompt_template = "{prompt}"
-bypass_args = ["--force"]
+prompt_template = "LOAD the FULL .cursor/skills/{skill}/SKILL.md, read its entire contents and follow its directions exactly, using subagents as needed: {args}"
+bypass_args = ["--force", "--trust"]
 model_flag = "--model"
 usage_parser = "none"
-seed_workspace_trust = true
-first_run_note = "run `cursor-agent login` once (or set CURSOR_API_KEY); workspace trust is seeded automatically by init and worktree provisioning"
+first_run_note = "run `cursor-agent login` once (or set CURSOR_API_KEY). Requires Cursor CLI with a `--trust` flag (verified on 2026.08.04). Do not set [adapter] extra_args unless it also carries `--trust`: it replaces bypass_args, and without that flag every unattended session hangs on the workspace-trust dialog."
+# Gitignored configs a worktree checkout omits: project MCP servers
+# (.cursor/mcp.json) and the hook file itself. .cursor/hooks.json is also the
+# hook config_path — it is seeded first, then the relay is merged into it, so a
+# worktree keeps any hooks the project already had (see provision_worktree).
+seed_files = [
+  ".cursor/mcp.json",
+  ".cursor/hooks.json",
+]
+
+# No env_fault_patterns: no cursor-agent transport-failure line has been
+# captured, and on a pane capture that vocabulary is what a story implementing
+# error handling prints. Seed one only from a captured line, citing its run.
 
 [hooks]
 dialect = "cursor-hooks-json"

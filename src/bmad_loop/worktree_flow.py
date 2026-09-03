@@ -58,7 +58,6 @@ from .install import (
     renderer_stub_resolved,
     resolve_review_layers,
     strip_relay_hooks,
-    seed_workspace_trust,
 )
 from .model import Phase
 from .platform_util import atomic_write_text
@@ -1186,10 +1185,6 @@ def provision_worktree(
             pin_degrade = _pin_tracked_config_rewrite(worktree, profile.hooks.config_path)
             if pin_degrade is not None and on_degraded is not None:
                 on_degraded(pin_degrade)
-
-    for profile in profiles:
-        if profile.seed_workspace_trust:
-            seed_workspace_trust(worktree)
 
     # Shield exactly the paths we wrote (skill trees + hook configs + seeded
     # configs) from the unit's `git add -A`, in case a project doesn't gitignore

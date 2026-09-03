@@ -180,6 +180,7 @@ would not carry.
 ## Choosing which CLIs to drive
 
 The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`,
+`cursor` (Cursor's `cursor-agent`, experimental),
 `antigravity` (Google's `agy`, experimental — `isolation = "none"` only), and `opencode`
 (OpenCode ≥ 1.18 over HTTP/SSE, profile `opencode-http` — no tmux window; needs the
 `bmad-loop[opencode]` extra and `model` set as `provider/model`). You can pick more
@@ -260,7 +261,7 @@ bmad-loop init --project <project-root> --cli claude --cli codex --cli gemini
 
 Run with no `--cli` and `init` registers hooks for every CLI the `policy.toml` references,
 so a dual-client setup that's already configured in policy needs no extra flags. Names must
-be exactly `claude`, `codex`, `gemini`, `copilot`, `antigravity`, or `opencode-http` (alias
+be exactly `claude`, `codex`, `gemini`, `copilot`, `cursor`, `antigravity`, or `opencode-http` (alias
 `opencode`) — `init` errors on an unknown profile and lists the valid ones. A hookless
 profile like `opencode-http` installs its skills but registers no hooks (it signals over
 HTTP/SSE).
@@ -282,6 +283,18 @@ them to whoever owns the machine:
   subscription). Requires the Copilot **CLI** GA (≥ 2026-02) — _not_ the VS Code extension.
   **Pin a capable model**: the free default (GPT-5 mini) silently skips steps in the
   multi-step dev/review skills; set `[adapter] model = "claude-sonnet-4-6"` (→ `--model`).
+- **cursor** — authenticate once with `cursor-agent login` (or set `CURSOR_API_KEY`).
+  Verified against Cursor CLI 2026.08.04. Two things to know:
+  - **`--trust` is what makes unattended runs work.** An interactive `cursor-agent` in a
+    directory it has not been told to trust blocks on a "Workspace Trust Required" dialog,
+    and `-f`/`--force` alone does **not** clear it — measured, along with the fact that
+    hand-seeding Cursor's own `~/.cursor/projects/<slug>/.workspace-trusted` marker does not
+    either. The profile therefore launches with `--force --trust`. If you set
+    `[adapter] extra_args`, it **replaces** the profile's bypass flags, so keep `--trust` in
+    it or every session will hang until `session_timeout_min`. Because the flag applies per
+    launch, `isolation = "worktree"` works here — unlike antigravity.
+  - **Token usage is not recorded yet** (`usage_parser = "none"`). The Stop payload carries a
+    `transcript_path`, but its token schema has not been read, so the columns stay empty.
 - **antigravity** — run `agy` once in the project, authenticate, and answer
   **"Yes, I trust this folder"** before `bmad-loop run`; spawned sessions can't answer that
   dialog, and a pending one reads as a session timeout. Requires Antigravity CLI
@@ -307,8 +320,8 @@ them to whoever owns the machine:
 
 ### Skill location
 
-`claude` reads skills from `.claude/skills/`; `codex`, `gemini`, `copilot`, and `antigravity`
-read from `.agents/skills/`. `init` installs the bundled `bmad-loop-*` skills into the right tree
+`claude` reads skills from `.claude/skills/`; `cursor` reads from `.cursor/skills/`; `codex`,
+`gemini`, `copilot`, and `antigravity` read from `.agents/skills/`. `init` installs the bundled `bmad-loop-*` skills into the right tree
 for each CLI you pass via `--cli`, so selecting any of the `.agents/skills/` CLIs populates it automatically. It skips skill
 dirs that already exist — pass `--force-skills` to overwrite a stale copy, or `--no-skills` to
 manage them yourself.

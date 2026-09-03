@@ -9,6 +9,19 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Cursor CLI (`cursor-agent`) profile** — a packaged `cursor` profile plus a new
+  `cursor-hooks-json` hook dialect, so the generic adapter drives Cursor with no Python.
+  Skills live in `.cursor/skills/`; the relay registers `sessionStart` and `stop` in a project
+  `.cursor/hooks.json`. That file is versioned and its entries are bare `{"command": …}`
+  objects — Cursor 3.x loads no hooks from a project file lacking a numeric top-level
+  `version`, so `merge_hooks` always writes one. Launches with `--force --trust`: an
+  interactive launch in an untrusted directory blocks on a workspace-trust dialog no
+  unattended session can answer, and `--force` alone does not clear it. Setting
+  `[adapter] extra_args` replaces the bypass flags, so it must keep `--trust`. Trust is
+  granted per launch, so `isolation = "worktree"` works. `usage_parser = "none"` pending a
+  transcript-schema probe. Experimental — verified against cursor-agent 2026.08.04, not yet
+  run through a full loop; finalize with `probe-adapter cursor`.
+
 - **Review-gate verify commands are journalled** (#656, partial). The three review gates
   (`verify_review`, `verify_review_stories`, `verify_review_bundle`) now emit one
   `verify-command-result` per command, `verification_stage: "review"`, sharing the story's
