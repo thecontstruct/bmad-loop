@@ -69,7 +69,9 @@ from .sanitize import LeakDetected  # noqa: F401 — re-export
 # would falsely tell a consumer pinned to v1 that the fields it reads are gone,
 # while a consumer actually broken by the repackaging finds out immediately —
 # the fence is gone and json.loads fails. Bump only on a payload break.
-SCHEMA_VERSION = 1
+# v2 replaces journal-entry `patch` / `stashed_to` values with the presence keys
+# `patch_present` / `stashed_to_present`.
+SCHEMA_VERSION = 2
 DEFAULT_JOURNAL_CAP = 200
 
 # Subdirectories whose mere existence/size is diagnostic but whose CONTENTS are
@@ -111,6 +113,11 @@ _JOURNAL_ALIAS_FIELDS = {
     "target_branch": "branch",
     "commit": "commit",
     "baseline": "commit",
+    # The baseline a re-arm's re-stamp replaced (`rearm-baseline-restamped`). Its
+    # OWN entry rather than the `baseline` one beside it, because both shas ride a
+    # single record: alias one and leave the other and a dump pseudonymizes half a
+    # comparison, which is worse than either doing both or doing neither.
+    "overwritten": "commit",
     # A spec name IS the customer's feature name — `Pseudonymizer`'s own docstring
     # has always listed "spec filenames" among what it exists to alias, so the
     # omission here was a routing gap, not a policy. A producer that journals a
@@ -124,13 +131,69 @@ _JOURNAL_ALIAS_FIELDS = {
     # whose epic could not be resolved. See `_JOURNAL_BASENAME_NAMESPACES` for why
     # the value is normalized first: the producers do NOT agree on a bare basename.
     "spec": "spec",
+    # The same value also arrives under a second field NAME. `runs.rearm_escalation`
+    # is the only journal producer of `spec_file`, across FOUR kinds —
+    # `rearm-spec-write-unreachable`, `rearm-spec-flip-skipped`,
+    # `rearm-baseline-restamp-skipped` and `rearm-baseline-restamped`. Routing is by
+    # field NAME, not by kind, so the list is documentation rather than a gate — but an
+    # enumeration that undercounts is how the next reader concludes a kind is unrouted.
+    # `engine._park_awaiting_operator` passes
+    # `spec_file=` to `operatoractions.record_park`, which is a record file, not the
+    # journal. So the divergence is BETWEEN FIELDS, not between two producers of this
+    # one — but BOTH fields are mixed-shape, and neither is the reliable one:
+    # Both fields now journal an absolute path wherever they carry one: `spec_file`
+    # through `str(task_spec_path(...))` on all four kinds, and `spec` through
+    # `engine._operator_spec_path` (which anchors `checkpoint-pause` the same
+    # way) alongside engine's already-absolute reconcile and marker-repair kinds. Same
+    # value, same namespace. Do NOT read that convergence as "both fields are
+    # normalized, so the basename step is dead" — it is not a guarantee this module
+    # holds. `_operator_spec_path` still answers a bare STORY KEY for a spec-less task,
+    # nothing stops a future producer from journaling a raw `task.spec_file`, and
+    # `_JOURNAL_BASENAME_NAMESPACES` keys on the NAMESPACE rather than the field
+    # precisely so every spelling reduces to one alias whichever shape it carries.
+    "spec_file": "spec",
+}
+# Kind-scoped routing, consulted BEFORE the by-name table above and losing to
+# `_JOURNAL_DROP_FIELDS`, which is stricter than any alias.
+#
+# It exists for ONE field, and the by-name rule genuinely cannot express it: `target`
+# carries the target BRANCH on the three merge kinds below and a sprint STATUS on the
+# `board-advance-*` family (`board-advance-carried`, `-carry-failed`,
+# `-carry-foreign-dirt`, `-carry-uncommitted`). Aliasing it by NAME would pseudonymize
+# statuses as branches, turning a legible `"target": "done"` into `branch-3f2a` and
+# destroying the field a maintainer reads those kinds for; leaving it unrouted — what
+# happened until now — ships an identifier-shaped branch name VERBATIM. A normal run
+# journals the same string as `branch` first (`ensure_target_branch`), so the egress
+# backstop repairs it and discloses a `backstop_repairs` gap, but that is a defense in
+# depth that only works because the value is already in the legend: a journal truncated
+# past that event, or a `unit-merged` read out of a bundle on its own, has nothing to
+# repair from.
+#
+# Deliberately NOT fixed by renaming the producers to `target_branch`, which is the
+# obvious move and is unsafe: `engine._replay_unlatched_ledger_carries` correlates
+# `unit-merge-started` against `unit-merged` on a tuple that INCLUDES this field, and it
+# reads a journal written by an earlier process — and possibly an earlier version. A
+# rename would make a run started before the change and resumed after it fail to
+# correlate, silently skipping the carry replay so a resumed sweep re-triages work that
+# already landed. The scrub is what is wrong, so the scrub is where the fix belongs.
+#
+# A closed set, not a growing one: any NEW producer should pick a name the by-name table
+# already routes (`branch`, or `target_branch` — see `runs.rearm_escalation`) rather than
+# add a row here.
+_JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
+    "unit-merge-started": {"target": "branch"},
+    "unit-merged": {"target": "branch"},
+    "resume-unit-merge": {"target": "branch"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's
 # reconcile and marker-repair kinds journal `str(spec_path)` (absolute —
-# `verify.resolve_spec_path` returns an absolute path), while stories_engine's
-# `checkpoint-pause` journals `task.spec_file`, which `StoryTask` persists
-# worktree-relative (a bare basename for a spec at the worktree root). Aliasing
+# `verify.resolve_spec_path` returns an absolute path). Every producer is absolute
+# TODAY — `checkpoint-pause` moved to `_operator_spec_path` — but the reduction is
+# keyed on the NAMESPACE rather than on any producer precisely so that stays a
+# property this module does not have to trust: `_operator_spec_path` still answers a
+# bare STORY KEY for a spec-less task, and nothing stops a future producer journaling
+# a raw `task.spec_file`. Aliasing
 # the raw string would give ONE spec TWO aliases in a single dump, defeating the
 # correlation these fields are aliased rather than dropped to preserve, and would
 # park an absolute home path in the local `--legend` file (before `spec` was
@@ -151,7 +214,9 @@ _PATH_SEP_RE = re.compile(r"[\\/]")
 # The `verify-command-result` group at the end is the same convention applied to
 # the verifier records: `command` is operator-authored shell (`[verify] commands`),
 # `output_tail` is a build's own output, `capture_error` is an OSError string
-# carrying a path, and the two pointers embed the story key. Routing them here
+# carrying a path, `spawn_error` names the run's code root explicitly as its cwd
+# (and a cwd-related wrapped exception may name it again), and the two pointers
+# embed the story key. Routing them here
 # rather than leaving them to `scrub_json` is deliberate — that fallback fails
 # closed only by accident of shape, since `_IDENTIFIER_RE` forbids `/` and spaces
 # and so collapses paths, argv-ish commands and multi-line tails, while a
@@ -174,8 +239,41 @@ _JOURNAL_DROP_FIELDS = frozenset(
         "command",
         "output_tail",
         "capture_error",
+        "spawn_error",
         "stdout_path",
         "stderr_path",
+        # An absolute host path naming the run's code tree
+        # (`rearm-baseline-advance-failed`). Dropped rather than aliased: unlike a
+        # spec filename it correlates nothing across events — one run has one code
+        # root — while carrying the customer's directory layout. Dropped rather
+        # than left to the `scrub_json` fallback: that fallback happens to redact an
+        # absolute path (`_IDENTIFIER_RE` forbids `/`, `\` and `:`, so any real root
+        # collapses to `<redacted:str>`), but it fails closed only by accident of
+        # shape — a root that did parse as a bare identifier would pass verbatim, and
+        # nothing here should depend on a path never looking like one. The `error=`
+        # field on the very same record is dropped too, but under this set's
+        # free-text rule above (it is a `GitError` string quoting git's own stderr),
+        # not this identifier-shape argument — same set, different rationale.
+        "repo",
+        # An absolute host path naming the folder a sentinel's upstream correction has
+        # to land in (`rearm-upstream-write-unreachable`). Dropped for `repo`'s reason,
+        # not aliased for `spec_file`'s: it is a DIRECTORY, journalled by one kind, and
+        # one run has one spec folder — so it correlates nothing across events, while a
+        # `spec` alias would additionally be wrong, since that namespace reduces to a
+        # basename and every run we author would collapse onto the same `stories`-ish
+        # tail. `scrub_json` already redacts any real path (`_IDENTIFIER_RE` forbids
+        # `/`, `\` and `:`), so — exactly as for `repo` — only an assertion on the
+        # field's ABSENCE can grade this, and the canary sweep cannot.
+        "stories_root",
+        # A relative or absolute operator-selected or retained forensic patch path.
+        # `story_key` already correlates these records, so aliasing adds no value;
+        # drop it because the fallback redacts separator-bearing paths but lets a
+        # bare feature- or spec-named patch through verbatim.
+        "patch",
+        # The absolute deferred-stash target embeds the run directory, story key,
+        # and spec filename. Drop rather than create a second spec correlation;
+        # the fallback redacts it only by virtue of its current separators.
+        "stashed_to",
     }
 )
 # Journal fields whose value is a LIST of story keys (sprint unknown-keys).
@@ -247,6 +345,10 @@ class TaskDiag:
     deferred_with_reason: bool
     spec_present: bool
     worktree_isolated: bool
+    # The discriminator a #705-class replay turns on. Without it a collided re-drive
+    # dumps as `rearmed=True, attempt=1, n_sessions=2` — byte-identical to a HEALTHY
+    # post-re-arm task. A counter, so it carries no customer content.
+    generation: int
     dw_count: int
     n_sessions: int
     sessions: SessionTally
@@ -278,6 +380,13 @@ class RunDiag:
     paused: bool
     paused_stage: str | None
     paused_reason_present: bool
+    # Whether this run's code tree is a DIFFERENT directory from its project root.
+    # A presence flag in the `paused_reason_present` / `worktree_isolated` style, never
+    # the path — `_JOURNAL_DROP_FIELDS` drops `repo` as an absolute host path, and that
+    # drop otherwise removes the last trace of the split from a dump. The split layout
+    # is exactly the one in which the re-anchored baseline probes behave differently,
+    # so a bug report that cannot show it cannot be triaged.
+    repo_root_diverges: bool
     current_epic: int | None
     sweep_cycle: int
     sweeps_triggered: list[str]
@@ -396,9 +505,9 @@ def _category_roots(category: str, run_dir: Path, events_dir: Path | None) -> li
     maintainer is reading the dump to understand.
 
     Both are summed into ONE ``FileGroup`` named ``events``: the payload shape is
-    the schema, and splitting the category (or adding a field) would be a break
-    for a v1 consumer. Which root the events came from is not what the count is
-    for — "did the hooks fire at all" is.
+    the schema, and splitting the category (or adding a field) would be a payload
+    break requiring another schema bump. Which root the events came from is not
+    what the count is for — "did the hooks fire at all" is.
     """
     if category != _EVENTS_CATEGORY:
         return [run_dir / category]
@@ -520,6 +629,7 @@ def _task_diag(task: StoryTask, pseudo: sanitize.Pseudonymizer, weight: float) -
         deferred_with_reason=bool(task.defer_reason),
         spec_present=bool(task.spec_file),
         worktree_isolated=bool(task.worktree_path),
+        generation=task.generation,
         dw_count=len(task.dw_ids),
         n_sessions=len(task.sessions),
         sessions=_session_tally([task]),
@@ -608,16 +718,21 @@ def _scrub_entry(
         out["ts_offset"] = round(ts - first_ts, 3)
     kind = str(entry.get("kind", "?"))
     out["kind"] = kind if sanitize.looks_like_identifier(kind) else "<redacted:str>"
+    # Read off the RAW kind, not the redacted spelling above: a kind that failed
+    # `looks_like_identifier` is not one of the three below anyway, and keying on the
+    # placeholder would silently unroute every entry in a dump that had one.
+    by_kind = _JOURNAL_KIND_ALIAS_FIELDS.get(kind, {})
     for k, v in entry.items():
         if k in ("ts", "kind"):
             continue
+        kind_ns = by_kind.get(k)
         if k in _JOURNAL_DROP_FIELDS:
             out[f"{k}_present"] = v is not None and v != ""
         elif k in _JOURNAL_KEYLIST_FIELDS and isinstance(v, list):
             ns = "story" if k == "keys" else "dw"
             out[k] = [pseudo.alias(x, ns=ns, epic=epic_by_key.get(str(x))) for x in v]
-        elif k in _JOURNAL_ALIAS_FIELDS:
-            ns = _JOURNAL_ALIAS_FIELDS[k]
+        elif kind_ns is not None or k in _JOURNAL_ALIAS_FIELDS:
+            ns = kind_ns or _JOURNAL_ALIAS_FIELDS[k]
             v = _alias_input(v, ns)
             epic = epic_by_key.get(str(v)) if ns == "story" else None
             out[k] = pseudo.alias(v, ns=ns, epic=epic)
@@ -731,6 +846,7 @@ def collect_run(run_dir: Path, *, pseudo: sanitize.Pseudonymizer, cap: int) -> R
         paused=state.paused,
         paused_stage=state.paused_stage,
         paused_reason_present=state.paused_reason is not None,
+        repo_root_diverges=bool(state.repo_root) and Path(state.repo_root) != Path(state.project),
         current_epic=state.current_epic,
         sweep_cycle=state.sweep_cycle,
         sweeps_triggered=[
@@ -794,6 +910,7 @@ def _unreadable_run(run_dir: Path, err: Exception) -> RunDiag:
         paused=False,
         paused_stage=None,
         paused_reason_present=False,
+        repo_root_diverges=False,
         current_epic=None,
         sweep_cycle=0,
         sweeps_triggered=[],
@@ -884,6 +1001,13 @@ def render_markdown(
     for r in d.runs:
         out.append(f"## Run `{r.run_id}` ({r.run_type})")
         out.append(_fmt_kv("project", f"`{r.project_alias}`"))
+        # Rendered here and not only in `--json`: this is the report an operator
+        # produces by default and hands a maintainer, and the split layout is the
+        # one the re-anchored baseline probes behave differently in. A dump that
+        # cannot show it cannot be triaged — the whole warrant for the field.
+        out.append(
+            _fmt_kv("code root differs from project", "yes" if r.repo_root_diverges else "no")
+        )
         out.append(_fmt_kv("started", r.started_date or "—"))
         out.append(
             _fmt_kv(
@@ -918,16 +1042,21 @@ def render_markdown(
 
         out.append("### Tasks")
         if r.tasks:
+            # `gen` rides beside `att` because the pair is the discriminator: a
+            # #705-class replay and a healthy post-re-arm task agree on every other
+            # column here, so dropping it from the human report leaves the one field
+            # that separates them visible only under `--json`.
             out.append(
-                "| alias | epic | phase | att | rev | committed | spec | dw | sessions "
+                "| alias | epic | phase | att | gen | rev | committed | spec | dw | sessions "
                 "| weighted | raw |"
             )
-            out.append("|---|---|---|---|---|---|---|---|---|---|---|")
+            out.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
             for t in r.tasks:
                 out.append(
-                    f"| `{t.alias}` | {t.epic} | {t.phase} | {t.attempt} | {t.review_cycle} "
-                    f"| {t.committed} | {t.spec_present} | {t.dw_count} | {t.n_sessions} "
-                    f"| {t.tokens.get('weighted', 0)} | {t.tokens.get('total', 0)} |"
+                    f"| `{t.alias}` | {t.epic} | {t.phase} | {t.attempt} | {t.generation} "
+                    f"| {t.review_cycle} | {t.committed} | {t.spec_present} | {t.dw_count} "
+                    f"| {t.n_sessions} | {t.tokens.get('weighted', 0)} "
+                    f"| {t.tokens.get('total', 0)} |"
                 )
         else:
             out.append("_no tasks._")

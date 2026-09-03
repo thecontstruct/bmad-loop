@@ -2764,6 +2764,101 @@ async def test_cleanup_sessions_mux_error_notifies(project, monkeypatch, fault, 
         assert isinstance(app.screen, DashboardScreen)  # worker failed soft, no crash
 
 
+@pytest.mark.parametrize(
+    "fault, toast",
+    [
+        (MultiplexerError("PSMUX_DATA_DIR='' is not an absolute path"), "not an absolute path"),
+        (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), "invalid start byte"),
+    ],
+)
+async def test_cleanup_sessions_session_prune_error_notifies(project, monkeypatch, fault, toast):
+    """The session half is raiser-side too, and the worker must fail as soft.
+
+    The psmux backend refuses a registry root that would fail its pre-spawn
+    absoluteness gate, and that raise happens before the tolerant listing
+    wrapper can degrade it — so `prune_sessions` can raise where every other
+    caller has a backstop that names the error. A worker thread has none, and
+    an escape takes the whole dashboard down (Textual's `exit_on_error`).
+
+    The opposite conclusion to its ctl-window twin above, on purpose: nothing
+    has been killed yet, so there is no completed work to keep reporting and
+    the worker stops. A summary toast here would claim a sweep that never ran.
+
+    Ablate the guard (call `prune_sessions` outside the try) and the app is no
+    longer on the dashboard — the worker's exception took it down."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+
+    def boom(_p):
+        raise fault
+
+    monkeypatch.setattr(runs, "prune_sessions", boom)
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any(toast in m for m in notifications(app)))
+        assert isinstance(app.screen, DashboardScreen)  # worker failed soft, no crash
+        # nothing ran, so nothing is summarised as having run
+        assert not any("removed" in m and "session(s)" in m for m in notifications(app))
+
+
+async def test_cleanup_warns_about_sessions_left_in_the_legacy_registry(project, monkeypatch):
+    """The cli cleanup arm's stderr line, as a toast.
+
+    The summary below it counts only what this registry's sweep removed, so a
+    tagged pre-upgrade session the migration pass declined to claim is silently
+    absent from it — and a count that quietly excludes them reads as "all
+    clean". Read after the prune, so it names what is left standing.
+
+    Ablate the toast and this fails; the twin CLI assertion lives in
+    `test_cli.py`, and the reader itself is unit-tested in `test_runs.py`."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p: {
+            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+            r"D:	heir-own-registry": ["bmad-loop-old-1"],
+        },
+    )
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        # One toast per registry, each naming its own — the CLI arm's twin.
+        # A single toast calling both "the default registry" sent an operator
+        # whose sessions are in their own displaced root to the wrong place.
+        await until(
+            pilot,
+            lambda: any(
+                f"1 session(s) left in {runs.DEFAULT_REGISTRY_LABEL}" in m
+                and "bmad-loop-ctl" in m
+                and "bmad-loop-old-1" not in m
+                for m in notifications(app)
+            ),
+        )
+        await until(
+            pilot,
+            lambda: any(
+                r"1 session(s) left in D:	heir-own-registry" in m and "bmad-loop-old-1" in m
+                for m in notifications(app)
+            ),
+        )
+
+
 async def test_cleanup_warns_about_ctl_windows_that_survived_the_kill(project, monkeypatch):
     # The summary counts only verified removals now (#435), so a window that
     # outlived its kill would otherwise just be missing from the toast with
@@ -3327,6 +3422,7 @@ def _stories_paused_run(
     root: Path,
     *,
     stage: str,
+    run_id: str = "20260611-100000-aaaa",
     story_key: str = "1",
     spec_status: str = "ready-for-dev",
     spec_checkpoint: bool = True,
@@ -3335,10 +3431,30 @@ def _stories_paused_run(
     review_cycle: int = 0,
     blocked_result: str = "",
     sentinel: bool = False,
+    worktree_path: str = "",
+    spec_outside_worktree: bool = False,
 ) -> tuple[Path, Path]:
     """A stories-mode run paused at `stage`, with the id-keyed story spec on disk
-    and a StoryTask pointing at it. Returns (run_dir, spec_path)."""
+    and a StoryTask pointing at it. Returns (run_dir, spec_path).
+
+    `worktree_path` expresses the worktree-isolation shape: the run's own copy of the
+    spec is written under that tree while the main checkout keeps a TWIN at the same
+    relative path, and `task.spec_file` is the absolute worktree path — which
+    `StoryTask.to_dict` persists RELATIVE to the mount, so `load_state` hands the app
+    back the bare relpath production actually stores. The returned spec path is then
+    the worktree's copy; the twin is the decoy a cwd-anchored resolve lands on.
+
+    `spec_outside_worktree` keeps the mount but leaves the spec at the main-checkout
+    path — the shape a shared artifact dir produces, where
+    `_serialized_worktree_path`'s `relative_to` raises and the ABSOLUTE path is
+    persisted verbatim beside a set `worktree_path`."""
     import yaml
+
+    # The two parameters are one shape, not two: "outside the worktree" is meaningless
+    # without a worktree, and the combination silently built a non-isolated run that
+    # graded nothing while reading like an isolated row.
+    if spec_outside_worktree and not worktree_path:
+        raise ValueError("spec_outside_worktree requires worktree_path")
 
     folder = root / "epic-1"
     (folder / "stories").mkdir(parents=True, exist_ok=True)
@@ -3366,12 +3482,23 @@ def _stories_paused_run(
     spec.write_text(body, encoding="utf-8")
     task = StoryTask(story_key=story_key, epic=0, phase=Phase.DEV_VERIFY)
     task.spec_file = str(spec)
+    if worktree_path:
+        task.worktree_path = worktree_path
+    if worktree_path and not spec_outside_worktree:
+        # The isolated shape. The body differs per tree so "the worktree copy was
+        # read/written" is checkable against "the main-checkout twin was not" — with
+        # identical payloads either assertion could pass on the wrong file.
+        twin = spec  # the main checkout keeps today's body, at the same relpath
+        spec = Path(worktree_path) / twin.relative_to(root)
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text(body.replace("# plan for", "# worktree plan for"), encoding="utf-8")
+        task.spec_file = str(spec)  # to_dict re-persists this RELATIVE to the mount
     task.review_cycle = review_cycle
     if commit_sha:
         task.commit_sha = commit_sha
     run_dir = make_run(
         root,
-        "20260611-100000-aaaa",
+        run_id,
         source="stories",
         spec_folder="epic-1",
         paused_stage=stage,
@@ -3407,22 +3534,481 @@ async def test_plan_checkpoint_replan_resets_and_resumes(project, monkeypatch):
 
     calls: list[str] = []
     resets: list[tuple] = []
-    strips: list[Path] = []
+    strips: list[tuple[Path, Path]] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     monkeypatch.setattr(
-        devcontract, "reset_spec_status", lambda p, s: resets.append((p, s)) or True
+        devcontract,
+        "reset_spec_status",
+        lambda p, s, **kw: resets.append((p, s, kw["confine_root"])) or True,
     )
-    monkeypatch.setattr(devcontract, "strip_auto_run_result", lambda p: strips.append(p) or True)
+    monkeypatch.setattr(
+        devcontract,
+        "strip_auto_run_result",
+        lambda p, **kw: strips.append((p, kw["confine_root"])) or True,
+    )
     _run_dir, spec = _stories_paused_run(project.project, stage="plan-checkpoint")
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
         await pilot.click(await ready(pilot, "#act-replan"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
-        assert resets == [(spec, "draft")]
-        assert strips == [spec]
+        # the root is captured, not just the path: `_do_replan` has to pass the
+        # project it built `run_dir` from, and a `confine_root` naming the spec's
+        # own parent would be lexically confined and behaviourally inert (#593).
+        assert resets == [(spec, "draft", project.project)]
+        assert strips == [(spec, project.project)]
+
+
+def _unit_worktree(root: Path, run_id: str = "20260611-100000-aaaa", unit: str = "1") -> Path:
+    """The UNRESOLVED spelling of where `workspace.open_unit_workspace` mounts a unit.
+
+    Production stores `unresolved_wt.resolve()`, so on a symlinked temp root (macOS
+    `/tmp` -> `/private/tmp`) this and the real mount differ. Deliberately not resolved
+    here: that `.resolve()` divergence is the one way an isolated spec lands outside
+    `project`, which `runs.task_spec_root` treats as its own case, and pinning the
+    lexical spelling keeps these rows measuring the anchor rather than the sandbox.
+    """
+    return root / RUNS_DIR / run_id / "worktrees" / unit
+
+
+async def test_plan_checkpoint_replan_writes_the_worktree_spec_not_the_main_twin(
+    project, monkeypatch
+):
+    """Under isolation the replan must reset the spec the RUN owns, not its twin.
+
+    `StoryTask._serialized_worktree_path` persists an isolated unit's `spec_file`
+    RELATIVE to the mounted worktree and `from_dict` reads it back raw, so
+    `_paused_spec`'s bare `Path(task.spec_file)` resolved against the TUI process cwd
+    — the project root, which carries the very same `epic-1/stories/...` layout. Both
+    destructive writers then landed on the MAIN CHECKOUT's twin: `confine_root` (the
+    project) accepted it because it genuinely is under `project`, `reset_spec_status`
+    answered True, the operator got a "plan reset to draft" notice and the run
+    resumed — while the worktree's real spec kept its terminal status, so the next
+    dispatch did not re-plan, and an unrelated tracked file was rewritten.
+
+    The cwd is set EXPLICITLY: pytest does not run from the sandbox, so without the
+    `chdir` the reverted code would merely fail to resolve the relpath and this row
+    would pass for the wrong reason instead of reproducing the hazard. The two copies
+    carry distinguishable bodies for the same reason — "the right file was written"
+    has to be checkable against "the other one was not".
+
+    `confine_root` is captured as well as graded on bytes, because the two halves are
+    not one ablation: the worktree here is UNDER `project` (that is where
+    `workspace.open_unit_workspace` mounts it), so a root reverted to `self.project`
+    still lands on the right file — it just silently drops both writers off the
+    confined arm and loses its O_NOFOLLOW walk (#593), with no signal at all.
+
+    Ablations: revert `_paused_spec` to `Path(task.spec_file)` and this reddens on
+    the worktree copy's status AND on the twin's byte-identity; pass `self.project`
+    as `_do_replan`'s `confine_root` and it reddens on the captured roots.
+    """
+    from bmad_loop import devcontract
+
+    calls: list[str] = []
+    roots: list[Path] = []
+    real_reset, real_strip = devcontract.reset_spec_status, devcontract.strip_auto_run_result
+
+    def spy_reset(p, s, **kw):
+        roots.append(kw["confine_root"])
+        return real_reset(p, s, **kw)
+
+    def spy_strip(p, **kw):
+        roots.append(kw["confine_root"])
+        return real_strip(p, **kw)
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(devcontract, "reset_spec_status", spy_reset)
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", spy_strip)
+    wt = _unit_worktree(project.project)
+    _run_dir, spec = _stories_paused_run(
+        project.project, stage="plan-checkpoint", worktree_path=str(wt)
+    )
+    twin = project.project / spec.relative_to(wt)
+    untouched = twin.read_bytes()
+    monkeypatch.chdir(project.project)  # what the TUI actually runs from
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+    assert verify.read_frontmatter(spec)["status"] == "draft"
+    assert twin.read_bytes() == untouched
+    assert roots == [wt, wt]
+
+
+async def test_plan_checkpoint_replan_confines_on_the_project_for_an_out_of_mount_spec(
+    project, monkeypatch
+):
+    """Matrix row 5 end-to-end: the root is the tree that can CONFINE the spec.
+
+    An absolute `spec_file` beside a set `worktree_path` means the spec sits outside
+    the mount (`_serialized_worktree_path` keeps it verbatim exactly when
+    `relative_to` raises) — a shared artifact dir. The path passes through unchanged,
+    but the mount can never contain it, so a `confine_root` naming the worktree sends
+    both writers to the plain no-follow arm and drops #593's O_NOFOLLOW walk.
+
+    The captured root is the ONLY discriminator at this layer, and deliberately so:
+    both roots land the write here (the confined gate is lexical, and its else-branch
+    still writes), so the reset-to-draft assertion below cannot tell them apart. It is
+    kept because the replan must still actually work for this shape, not to grade the
+    root.
+
+    Ablation: revert `task_spec_root` to `Path(task.worktree_path or state.project)`
+    and this reddens on the captured roots — they become the mount.
+    """
+    from bmad_loop import devcontract
+
+    calls: list[str] = []
+    roots: list[Path] = []
+    real_reset, real_strip = devcontract.reset_spec_status, devcontract.strip_auto_run_result
+
+    def spy_reset(p, s, **kw):
+        roots.append(kw["confine_root"])
+        return real_reset(p, s, **kw)
+
+    def spy_strip(p, **kw):
+        roots.append(kw["confine_root"])
+        return real_strip(p, **kw)
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(devcontract, "reset_spec_status", spy_reset)
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", spy_strip)
+    _run_dir, spec = _stories_paused_run(
+        project.project,
+        stage="plan-checkpoint",
+        worktree_path=str(_unit_worktree(project.project)),
+        spec_outside_worktree=True,
+    )
+    assert not spec.is_relative_to(_unit_worktree(project.project))  # the shape under test
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+    assert roots == [project.project, project.project]
+    assert verify.read_frontmatter(spec)["status"] == "draft"
+
+
+async def test_plan_checkpoint_renders_the_worktree_spec_under_isolation(project, monkeypatch):
+    """The read half of the same anchor: the viewers show the spec the run used.
+
+    Pre-fix the raw relpath resolved against the TUI's cwd and the modal rendered the
+    main checkout's twin — same layout, different file, nothing on screen to say so.
+    The `chdir` and the per-tree bodies are load-bearing for the same reasons the
+    replan row documents.
+
+    Ablation: revert `_paused_spec` to `Path(task.spec_file)` and this reddens — the
+    body is the twin's "# plan for 1".
+    """
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _stories_paused_run(
+        project.project,
+        stage="plan-checkpoint",
+        worktree_path=str(_unit_worktree(project.project)),
+    )
+    monkeypatch.chdir(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        body = render(app.screen.query_one("#spec Static", Static).content)
+        assert "# worktree plan for 1" in body
+        assert "# plan for 1" not in body  # the main-checkout twin's body
+
+
+async def test_spec_approval_gate_renders_the_worktree_spec_under_isolation(project, monkeypatch):
+    """The same anchor on the surface the matrix row names: the GATE viewer.
+
+    `_paused_spec` has three consumers and they reach it by different stages —
+    plan-checkpoint (`_review_plan_checkpoint`), the spec-approval / epic-boundary /
+    story-gate trio (`_review_gate`), and escalation (`_review_escalation`). The
+    replan rows above only reach the first, so this pins the gate arm: an operator
+    approving a frozen spec must be looking at the spec the run actually froze, not
+    the main checkout's twin at the same relpath.
+
+    Ablation: revert `_paused_spec` to `Path(task.spec_file)` and this reddens — the
+    body is the twin's "# plan for 1".
+    """
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _stories_paused_run(
+        project.project,
+        stage="spec-approval",
+        worktree_path=str(_unit_worktree(project.project)),
+    )
+    monkeypatch.chdir(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        body = render(app.screen.query_one("#spec Static", Static).content)
+        assert "# worktree plan for 1" in body
+        assert "# plan for 1" not in body  # the main-checkout twin's body
+
+
+async def test_paused_spec_undecodable_spec_does_not_crash_the_dashboard(project, monkeypatch):
+    """A non-UTF-8 spec degrades one byte, not the whole document — and never raises.
+
+    `read_text(encoding="utf-8")` raises `UnicodeDecodeError`, which is a ValueError and
+    so escaped the `except OSError` arm entirely; all three review surfaces call
+    `_paused_spec` from the Textual event loop, where an escaping raise kills the
+    dashboard instead of rendering the fault. Closed the way `_commit_subject` closes it
+    — `errors="replace"` — rather than by widening the except arm, because replacing the
+    entire body with a failure sentence cost the reviewer the WHOLE spec at a gate whose
+    only purpose is reading it. The failure body is now reserved for ABSENCE, which is
+    the case the anchoring argument is actually about
+    (`test_paused_spec_missing_at_the_anchor_reads_as_not_found`).
+
+    Ablation: restore `path.read_text(encoding="utf-8")` and this reddens — the modal
+    never opens, because the worker raised.
+    """
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _run_dir, spec = _stories_paused_run(project.project, stage="plan-checkpoint")
+    spec.write_bytes(b"---\nstatus: ready-for-dev\n---\n\n# plan caf\xe9 for 1\n")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        body = render(app.screen.query_one("#spec Static", Static).content)
+        assert "(empty spec)" not in body
+        assert "could not be read" not in body
+        assert "plan caf" in body  # the readable remainder survived the bad byte
+        # a decode fault is not an unreviewable spec, so the actions stay live
+        assert not app.screen.query_one("#act-approve", Button).disabled
+
+
+async def test_replan_on_an_undecodable_spec_does_not_crash_the_dashboard(project, monkeypatch):
+    """The read-side fix made this button REACHABLE; the write side had to catch up.
+
+    `devcontract.reset_spec_status` decodes strictly (`read_bytes().decode("utf-8")`),
+    and `_do_replan` caught only `(OSError, FrontmatterWriteError)` —
+    `UnicodeDecodeError` is a ValueError, so it escaped both. Before this change the
+    dashboard died earlier, at render, so the operator never got here. Once `_paused_spec`
+    began degrading a non-UTF-8 spec in place, the modal opens, the button is live, and
+    pressing it raised inside a Textual worker: the same event-loop crash the read-side
+    fix exists to prevent, moved one click later.
+
+    Ablation: drop `UnicodeDecodeError` from `_do_replan`'s except tuple and this reddens
+    — the worker raises instead of notifying, and the run never fails safe.
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _run_dir, spec = _stories_paused_run(project.project, stage="plan-checkpoint")
+    spec.write_bytes(b"---\nstatus: ready-for-dev\n---\n\n# plan caf\xe9 for 1\n")
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await pilot.pause()
+        assert app.is_running  # the dashboard survived the failed write
+    assert calls == []  # and the run was NOT resumed on an unreplanned spec
+
+
+async def test_unreadable_spec_refuses_the_destructive_actions(project, monkeypatch):
+    """A spec nobody could read is a gate nobody reviewed.
+
+    `_paused_spec` reports the read failure as the body so it cannot be confused with
+    "(empty spec)", but the modal still rendered it in the style reserved for the spec's
+    own words and still offered `Approve & resume` — which resumes the run past a gate
+    whose whole purpose is a human reading the file. The verb is refused at the source
+    rather than left to fail downstream (replan was safe only by accident: the reset
+    returns False and the "could not reset" branch declines).
+
+    Ablation: drop `disabled=self._unreadable` from `SpecReviewModal.compose` and this
+    reddens on the button state.
+    """
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _run_dir, spec = _stories_paused_run(project.project, stage="plan-checkpoint")
+    spec.unlink()  # absent at the anchored path
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        body = render(app.screen.query_one("#spec Static", Static).content)
+        assert "could not be read" in body
+        assert app.screen.query_one("#act-approve", Button).disabled
+        assert app.screen.query_one("#act-replan", Button).disabled
+
+
+async def test_escalation_modal_reads_the_worktree_spec_under_isolation(project, monkeypatch):
+    """Matrix row 3's THIRD consumer — the one the operator re-arms from.
+
+    `_paused_spec` feeds `_blocking_condition`, whose `## Auto Run Result` block is the
+    terminal verdict an operator reads before deciding to re-arm or resolve. The plan-
+    checkpoint and gate surfaces were graded under isolation; this one was not, so the
+    pre-fix bug — showing the MAIN CHECKOUT's verdict for a run whose real halt is in
+    the mount — had no row at all.
+
+    Ablation: revert `_paused_spec` to `Path(task.spec_file)` and this reddens on the
+    blocking condition — the modal reports the decoy twin's.
+    """
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    wt = _unit_worktree(project.project)
+    _run_dir, spec = _stories_paused_run(
+        project.project, stage="escalation", worktree_path=str(wt), blocked_result="decoy halt"
+    )
+    # the fixture copies one body into both trees; the halt text has to differ for
+    # "read the run's tree" to be checkable against "did not read the other one"
+    spec.write_text(
+        spec.read_text(encoding="utf-8").replace("decoy halt", "the mounts real halt"),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project.project)  # what the TUI actually runs from
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        body = render(app.screen.query_one("#blocking Static", Static).content)
+        assert "the mounts real halt" in body
+        assert "decoy halt" not in body
+
+
+async def test_sentinel_indicator_reads_the_worktree_under_isolation(project, monkeypatch):
+    """The other half of the same modal had to move with it.
+
+    `_sentinel_kind` scanned `self.project` while `_paused_spec` anchored on the run's
+    tree, and BOTH feed one `EscalationModal`. Under isolation the engine writes the
+    sentinel into the mount (`stories_engine._stories_folder` IS the worktree during a
+    driven story), so a modal built from two trees could show the mount's spec text
+    beside "no sentinel" — a pre-planning wedge presenting as an ordinary escalation,
+    which is a different operator decision.
+
+    The main checkout's copy is removed so the two anchors give different answers;
+    with a twin present, both spellings find a sentinel and nothing is graded.
+
+    Ablation: revert `_sentinel_kind` to `stories.resolve_spec_folder(self.project, ...)`
+    and this reddens — the indicator disappears.
+    """
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    wt = _unit_worktree(project.project)
+    _run_dir, spec = _stories_paused_run(
+        project.project, stage="escalation", worktree_path=str(wt), sentinel=True
+    )
+    (project.project / spec.relative_to(wt)).unlink()  # only the mount has the sentinel
+    monkeypatch.chdir(project.project)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        shown = " ".join(render(s.content) for s in app.screen.query(Static))
+        assert "pre-planning-halt sentinel" in shown
+
+
+def test_paused_spec_root_without_a_task_answers_the_states_project(tmp_path):
+    """Both arms of `_paused_spec_root` make ONE claim about the project.
+
+    The delegate (`runs.task_spec_root`) answers from `state.project` — the string the
+    run persisted at launch — while `self.project` is the constructor's
+    `resolve_or_lexical` of whatever path the operator opened the dashboard with. The
+    two can differ, so a no-task arm returning `self.project` left a second claim lying
+    around for a future caller to trip on.
+
+    Graded directly because the arm is unreachable from the write path today:
+    `_review_plan_checkpoint`'s `done()` refuses a `None` `spec_path` before calling
+    `_do_replan`, and `_paused_spec` returns `None` exactly when there is no task. An
+    end-to-end row could not reach it, so this calls the method.
+
+    Ablation: return `self.project` from the no-task arm and this reddens — the two
+    directories are deliberately different here.
+    """
+    app = BmadLoopApp(tmp_path / "opened-here")
+    state = RunState(
+        run_id="20260611-100000-aaaa",
+        project=str(tmp_path / "persisted-at-launch"),
+        started_at="2026-06-11T10:00:00",
+    )
+    assert state.paused_story_key is None  # the no-task arm
+    assert app._paused_spec_root(state) == tmp_path / "persisted-at-launch"
+    assert app._paused_spec_root(state) != app.project
+
+
+async def test_paused_spec_missing_at_the_anchor_reads_as_not_found(project, monkeypatch):
+    """An absent spec at the ANCHORED path is the signal that the anchoring failed, so
+    it must not render as `SpecReviewModal`'s `(empty spec)` — which is also what a
+    spec that read fine and is blank renders as. Ablation: return `path, ""` from
+    `_paused_spec`'s degrade arm and this reddens on the `(empty spec)` assertion."""
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _run_dir, spec = _stories_paused_run(project.project, stage="plan-checkpoint")
+    spec.unlink()
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        body = render(app.screen.query_one("#spec Static", Static).content)
+        assert "(empty spec)" not in body
+        assert "could not be read" in body
+
+
+async def test_plan_checkpoint_replan_refuses_a_control_alias_run_before_mutating(
+    project, monkeypatch
+):
+    """Through the ENTRY POINT (the modal's Replan button): a run persisted by
+    an older release under `ctl` must not have its spec reset to draft ahead
+    of the child `bmad-loop resume`'s refusal — the TUI is a second frontend
+    onto the same state, and it kept the mutate-then-refuse shape after the
+    CLI entry gates closed it.
+
+    Ablate `_blocked_by_control_alias` in `_do_replan` and this fails: the
+    spec is reset and the resume child is launched."""
+    from bmad_loop import devcontract
+
+    calls: list[str] = []
+    resets: list[tuple] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        devcontract, "reset_spec_status", lambda p, s, **kw: resets.append((p, s)) or True
+    )
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", lambda p, **kw: True)
+    _stories_paused_run(project.project, stage="plan-checkpoint", run_id="ctl")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: not isinstance(app.screen, SpecReviewModal))
+        await pilot.pause()
+        assert resets == []  # the spec was NOT rewritten ahead of the refusal
+        assert calls == []  # and no resume child was launched to bounce off the CLI gate
+
+
+async def test_tui_rearm_refuses_a_control_alias_run_before_mutating(project, monkeypatch):
+    """The re-arm path (`_do_rearm`, resolve-modal Re-arm & resume) gates
+    ahead of `rearm_escalation` — the pre-launch mutation the launcher's own
+    chokepoint gate cannot protect. Direct method drive inside a running app
+    — the modal wiring is pinned by the existing checkpoint tests, and the
+    launch paths themselves (resume, resolve, and any future button) are
+    gated at their convergence, `launch.start_detached`, graded in
+    test_tui_launch.py.
+
+    Ablate `_blocked_by_control_alias` in `_do_rearm` and the rearm recorder
+    fills."""
+    from bmad_loop import runs
+
+    rearms: list[tuple] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, sk, **kw: rearms.append((rd, sk)))
+    run_dir, _spec = _stories_paused_run(project.project, stage="plan-checkpoint", run_id="ctl")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app._do_rearm("ctl", run_dir, "1")
+        await pilot.pause()
+        assert rearms == []
 
 
 async def test_story_checkpoint_continue_resumes(project, monkeypatch):
@@ -3670,6 +4256,33 @@ async def test_graceful_stop_token_messages(project, monkeypatch, token, needle)
         await until(pilot, lambda: any(needle in m for m in notifications(app)))
 
 
+async def test_graceful_stop_write_failure_notifies_instead_of_crashing(project, monkeypatch):
+    """The worker catches `OSError` the way the CLI's `stop --graceful` does. The
+    confined lodge (#593) raises `UnconfinedWriteError` — an `OSError` — on a
+    planted parent, and Textual workers default to `exit_on_error=True`, so
+    without the catch pressing `S` in that scenario tore the whole dashboard
+    down instead of reporting the refusal.
+
+    Ablation: drop the worker's `except OSError` arm and this reddens — the
+    worker error kills the app under run_test and the toast never arrives."""
+    from bmad_loop import runs
+
+    def boom(rd):
+        raise runs.UnconfinedWriteError("cannot reach .bmad-loop/runs without a redirect")
+
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
+    monkeypatch.setattr(runs, "request_graceful_stop", boom)
+    make_run(project.project, "20260611-100000-aaaa", alive=True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
+        await pilot.press("S")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any("could not be written" in m for m in notifications(app)))
+        assert app.is_running  # the dashboard survived the refusal
+
+
 async def test_graceful_stop_not_live_warns_without_calling(project, monkeypatch):
     # Only a *provably dead* engine is refused at the liveness gate — the helper is
     # never called and no confirm modal opens. Unlike the hard-stop gate, an
@@ -3816,8 +4429,10 @@ async def test_active_agent_shows_in_header_and_task_cell(project, monkeypatch):
         tasks_table = screen.query_one("#tasks", DataTable)
         await until(
             pilot,
-            lambda: tasks_table.row_count == 1
-            and tasks_table.get_cell("1-1-alpha", "agent") == "claude·opus",
+            lambda: (
+                tasks_table.row_count == 1
+                and tasks_table.get_cell("1-1-alpha", "agent") == "claude·opus"
+            ),
         )
 
 
@@ -3872,8 +4487,10 @@ async def test_idle_run_shows_configured_agents_and_cell_falls_back(project, mon
         # cell reads the stamped record's model (haiku), distinct from the config
         await until(
             pilot,
-            lambda: tasks_table.row_count == 1
-            and tasks_table.get_cell("1-1-alpha", "agent") == "claude·haiku",
+            lambda: (
+                tasks_table.row_count == 1
+                and tasks_table.get_cell("1-1-alpha", "agent") == "claude·haiku"
+            ),
         )
 
 
@@ -3909,7 +4526,9 @@ async def test_escalation_rearm_resumes_when_resolution_ready(project, monkeypat
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     monkeypatch.setattr(
-        runs, "rearm_escalation", lambda rd, sk: rearms.append(sk) or "ready-for-dev"
+        runs,
+        "rearm_escalation",
+        lambda rd, sk, **_k: rearms.append(sk) or "ready-for-dev",
     )
     run_dir, _spec = _stories_paused_run(
         project.project,
@@ -3929,6 +4548,119 @@ async def test_escalation_rearm_resumes_when_resolution_ready(project, monkeypat
         assert "Auto Run Result" in app.screen._blocking
         await pilot.click(await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: rearms == ["1"] and calls == ["20260611-100000-aaaa"])
+
+
+async def test_escalation_rearm_hands_the_rearm_the_live_isolation_mode(project, monkeypatch):
+    """The mode `runs.rearm_escalation` needs comes from policy.toml, read HERE.
+
+    It decides three things the operator acts on — which ref a correction has to reach,
+    whether the working-tree flip reaches the re-drive at all, whether a restore latch
+    can be honored — and run state cannot answer any of them: `scm.isolation` is re-read
+    at every resume, and a mid-run change is journalled rather than refused, so the
+    recorded `task.worktree_path` describes only the attempt that already ran. This
+    gesture re-arms BEFORE it resumes, so nothing downstream can supply the value later.
+
+    Ablation: pass a literal `isolated_redrive=False` at the call site and this reddens
+    — the modes stop tracking policy.toml and every isolated run gets the in-place
+    answers.
+    """
+    from bmad_loop import resolve, runs
+
+    bmad = project.project / ".bmad-loop"
+    bmad.mkdir(parents=True, exist_ok=True)
+    (bmad / "policy.toml").write_text('[scm]\nisolation = "worktree"\n', encoding="utf-8")
+    seen: list[bool] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: None)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda rd, sk, *, isolated_redrive: seen.append(isolated_redrive) or "ready-for-dev",
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: seen == [True])
+
+    # ...and the other mode is not a constant: the same gesture on `none` says so
+    (bmad / "policy.toml").write_text('[scm]\nisolation = "none"\n', encoding="utf-8")
+    seen.clear()
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: seen == [False])
+
+
+async def test_escalation_rearm_refuses_when_the_policy_cannot_be_read(project, monkeypatch):
+    """An unreadable policy.toml REFUSES this gesture — a deliberate departure from how
+    this surface treats every other read of that file.
+
+    The launch guard and this block's own conflict check both fall through on an
+    unreadable policy, and correctly: they cannot tell "no conflict" from "could not
+    look", and the detached CLI re-reads the same file and fails loudly on it. That
+    reasoning does not extend to an INPUT of a repair write. Without the mode the re-arm
+    would still flip the spec and then name a tree chosen by a default — and a re-arm
+    CONSUMES the escalation, so the story is no longer ESCALATED for `resolve` to
+    correct. Refusing costs the operator one fix-and-retry; proceeding costs them the
+    escalation.
+
+    Graded on the re-arm not running at all, not merely on the notice: the message is
+    the trace, the un-consumed escalation is the property.
+
+    Ablation: restore the fall-through (default the mode instead of returning) and this
+    reddens on `rearms` — the gesture re-arms against a guessed isolation mode.
+    """
+    from bmad_loop import resolve, runs
+
+    bmad = project.project / ".bmad-loop"
+    bmad.mkdir(parents=True, exist_ok=True)
+    # bytes no UTF-8 decoder accepts
+    (bmad / "policy.toml").write_bytes(b'[scm]\nisolation = "\xff\xfe"\n')
+    rearms: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: None)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs, "rearm_escalation", lambda rd, sk, **_k: rearms.append(sk) or "ready-for-dev"
+    )
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: any("isolation mode" in n for n in notes))
+
+    assert rearms == []  # the escalation is NOT consumed
+    assert not any("re-armed" in n for n in notes)
 
 
 def test_restore_recorded_helper(tmp_path):
@@ -3962,7 +4694,9 @@ async def test_escalation_rearm_warns_when_restore_recorded(project, monkeypatch
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     monkeypatch.setattr(
-        runs, "rearm_escalation", lambda rd, sk: rearms.append(sk) or "ready-for-dev"
+        runs,
+        "rearm_escalation",
+        lambda rd, sk, **_k: rearms.append(sk) or "ready-for-dev",
     )
     orig_notify = BmadLoopApp.notify
     monkeypatch.setattr(
@@ -3987,6 +4721,496 @@ async def test_escalation_rearm_warns_when_restore_recorded(project, monkeypatch
         await pilot.click(await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: rearms == ["1"] and calls == ["20260611-100000-aaaa"])
     assert any("NOT honored" in n for n in notes)  # the drop was surfaced, not silent
+
+
+async def test_escalation_rearm_surfaces_a_failed_baseline_advance(project, monkeypatch):
+    """The TUI re-arm RESUMES in the same gesture, so a degrade it does not surface
+    is a degrade the operator acts on without seeing.
+
+    `cli._echo_rearm_events` prints these to stderr on the other re-arm path; both
+    records are warn-only by contract (a project that is not a git repo must not
+    fail re-arm), so a journal line in a scrolling panel was the only trace here. A
+    failed advance means the re-drive rebuilds against the tree as it stood BEFORE
+    the resolve — the invisibility #640(b) exists to end, not to relocate to the
+    other caller.
+
+    Ablation: delete the journal read-back loop in `_do_rearm` and this reddens,
+    while the plain `re-armed 1` notice still fires.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import Journal
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_rearm(rd, sk, *, isolated_redrive=False):
+        Journal(rd).append(
+            "rearm-baseline-advance-failed",
+            story_key=sk,
+            repo=str(rd),
+            baseline="a" * 40,
+            error="GitError: not a git repository",
+        )
+        return "ready-for-dev"
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+    assert any("could not advance the re-drive baseline" in n for n in notes)
+    assert any("re-armed 1" in n for n in notes)  # the ordinary notice still fires
+
+
+async def test_escalation_rearm_aims_the_code_root_before_it_rearms(project, monkeypatch):
+    """Parity with `cli.cmd_resolve`, on the seam that has the same ordering.
+
+    This gesture re-arms and RESUMES in one click, and `runs.rearm_escalation` reads the
+    code tree out of the run state — so only a process that has just read config.yaml can
+    tell whether a `repo_root:` edit made while the run was paused moved it. Resume
+    re-stamps the mirror, but that is downstream of the re-arm here too: without this the
+    re-arm would advance the attempt baseline in the tree the run has left while the
+    resumed engine reset and measured in the new one.
+
+    Ablation: delete the `runs.restamp_code_root(...)` call from `_do_rearm` and this
+    reddens on the stale root; drop the `self.notify(moved, ...)` and it reddens on the
+    missing warning while the root assertion still passes.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import load_state, save_state
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    seen: list = []
+
+    def fake_rearm(rd, sk, *, isolated_redrive=False):
+        seen.append(load_state(rd).code_root)
+        return "ready-for-dev"
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    install_bmad_config(project)
+    moved = project.project / "moved-code"
+    moved.mkdir()
+    cfg = project.project / "_bmad" / "bmm" / "config.yaml"
+    cfg.write_text(
+        cfg.read_text(encoding="utf-8") + f"repo_root: '{moved.as_posix()}'\n", encoding="utf-8"
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    state = load_state(run_dir)
+    state.repo_root = str(project.project / "old-code")
+    save_state(run_dir, state)
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+
+    assert seen == [moved.resolve()]
+    assert any("the code root in _bmad/bmm/config.yaml has changed" in n for n in notes)
+
+
+async def test_escalation_rearm_refuses_the_isolation_conflict_before_it_mutates(
+    project, monkeypatch
+):
+    """Parity with `cli.cmd_resolve` on the hoisted refusal, and for the same reason this
+    surface needed the re-stamp parity above: it re-arms and resumes in ONE click.
+
+    The detached CLI refuses `isolation = "worktree"` beside a `repo_root` override, but
+    it does so in `_resume_paused_run` — downstream of everything this gesture has
+    already written. So the re-stamp persisted the unsupported root, `rearm_escalation`
+    advanced the attempt baseline against it, the operator was toasted "re-armed 1", and
+    only then did the resumed pane refuse. The story was PENDING by then, and `resolve`
+    needs an ESCALATED story, so the escalation could not be recovered by re-running it.
+
+    Asserted against the sole producer of the text rather than a literal, matching the
+    launch guard's row, so a reworded message cannot drift this away from the CLI's.
+
+    Ablation: delete the `conflict is not None` arm from `_do_rearm` and this reddens on
+    the re-arm that must not happen; move it below the `runs.restamp_code_root(...)` call
+    and it reddens on the persisted root instead.
+    """
+    from bmad_loop import bmadconfig, resolve, runs
+    from bmad_loop.journal import load_state, save_state
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda *a, **k: pytest.fail("re-armed under a configuration the run refuses"),
+    )
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    _split_root_tui_project(project)
+    expected = bmadconfig.worktree_isolation_conflict(
+        bmadconfig.load_paths(project.project), "worktree"
+    )
+    assert expected is not None, "the fixture really does carry the conflicting pair"
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    recorded = str(project.project / "old-code")
+    state = load_state(run_dir)
+    state.repo_root = recorded
+    save_state(run_dir, state)
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: expected in notes)
+
+    assert not calls  # the resume folded into this gesture never fired
+    assert load_state(run_dir).repo_root == recorded  # the mirror was never re-pointed
+
+
+async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monkeypatch):
+    """Every kind the shared table routes reaches this surface — not the three the
+    TUI's own copy of the chain happened to handle.
+
+    That copy carried `rearm-baseline-*` only and silently dropped the whole
+    `stale-restore-*` family, including `stale-restore-commits` — the record
+    `cli._echo_rearm_events`' docstring calls the one a human must act on, and the
+    one whose whole point is that nothing else will tell them. All of it is
+    warn-only by contract, so a toast is the only place this path can ever show it,
+    and this path RESUMES in the same gesture: a dropped record is a degrade the
+    operator acts on without ever seeing. Routing both surfaces through
+    `runs.rearm_event_notice` only buys anything if the TUI is graded against the
+    table's whole vocabulary, so this walks a record of every arm the old copy
+    missed plus the new spec-flip skip.
+
+    Two renderings, not two tables: the severity map is graded here too (`note` is
+    Textual's `information`, `warning` stays `warning`), as is the deliberate drop
+    of `next_step` — its imperative reads "... before resuming" and the resume is
+    already queued behind this toast.
+
+    Ablation: make `runs.rearm_event_notice` return None for any one of these kinds
+    and this reddens on that kind's message alone.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import Journal
+
+    calls: list[str] = []
+    notes: list[tuple[str, str]] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_rearm(rd, sk, *, isolated_redrive=False):
+        journal = Journal(rd)
+        journal.append(
+            "stale-restore-commits",
+            story_key=sk,
+            old_baseline="f" * 40,
+            commits=["c1", "c2"],
+        )
+        journal.append("stale-restore-excluded", story_key=sk, patch="a.patch", files=["new.txt"])
+        journal.append(
+            "rearm-baseline-restamp-skipped",
+            story_key=sk,
+            spec_file="wt/specs/s1.md",
+            baseline="c" * 40,
+        )
+        journal.append(
+            "rearm-spec-flip-skipped",
+            story_key=sk,
+            spec_file="wt/specs/s1.md",
+            status="ready-for-dev",
+        )
+        return "ready-for-dev"
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: (
+            notes.append((str(msg), str(kw.get("severity", "information"))))
+            or orig_notify(self, msg, **kw)
+        ),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+
+    def severity_of(fragment: str) -> str:
+        hits = [n for n in notes if fragment in n[0]]
+        assert len(hits) == 1, f"{fragment!r} not surfaced exactly once: {notes}"
+        return hits[0][1]
+
+    # the one a human must act on — dropped entirely by the pre-table copy
+    assert severity_of("2 commit(s) sit below the re-drive's new baseline (ffffffffffff..)") == (
+        "warning"
+    )
+    assert severity_of("is not a readable file from here") == "warning"
+    assert severity_of("could not be re-opened to `ready-for-dev`") == "warning"
+    # `note` maps onto Textual's own channel name, not through unchanged
+    assert severity_of("excluded the abandoned restore's new files") == "information"
+    # the CLI's trailing imperative is omitted here: the resume is already queued
+    assert not any("before resuming" in n[0] for n in notes), notes
+    assert any("re-armed 1" in n[0] for n in notes)  # the ordinary notice still fires
+
+
+async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatch):
+    """This surface's whole gesture is re-arm + resume, so the hold has to break it.
+
+    `rearm-spec-write-unreachable` fires only once the re-arm has proven the committed
+    spec does not carry the status the re-drive routes on — and this path drops the
+    table's `next_step` precisely because it resumes in the same gesture. That silenced
+    the one record whose remedy MUST land first in BOTH halves: the imperative was
+    dropped as moot, and the resume it was warning against happened anyway, mounting a
+    fresh worktree onto the still-terminal committed spec.
+
+    The re-arm itself is kept — the story is armed and persisted — and the toast names
+    what the operator can finish from this screen: commit, then resume. The
+    `rearm-baseline-restamp-skipped` control keeps this a narrowing rather than
+    "warnings stop resumes": it is a warning on the same walk, and the resume still fires.
+
+    Ablation: drop the `if hold_resume:` arm from `_do_rearm` and the first leg reddens
+    on `calls == []`, with the resume firing behind the warning it was told to wait for.
+    Discard `_echo_rearm_events`' return and it reddens the same way.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import Journal
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_rearm(rd, sk, *, isolated_redrive=False):
+        Journal(rd).append(
+            "rearm-spec-write-unreachable",
+            story_key=sk,
+            spec_file="wt/specs/s1.md",
+            status="ready-for-dev",
+        )
+        Journal(rd).append(  # a warning on the same walk that must NOT hold the resume
+            "rearm-baseline-restamp-skipped",
+            story_key=sk,
+            spec_file="wt/specs/s1.md",
+            baseline="c" * 40,
+        )
+        return "ready-for-dev"
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: any("not resuming" in n for n in notes))
+
+    assert calls == []  # the resume this gesture folds in did NOT fire
+    assert any("re-armed 1" in n for n in notes)  # ...while the re-arm itself stands
+    assert any("commit the corrected spec, then resume this run" in n for n in notes)
+    # the record that proved it still renders, and its warning sibling did not hold
+    assert any("land in a tree it discards" in n for n in notes)
+    assert any("is not a readable file from here" in n for n in notes)
+
+
+async def test_escalation_rearm_echoes_residue_when_the_rearm_aborts(project, monkeypatch):
+    """An aborted re-arm still surfaces what it already journalled — the CLI parity gap.
+
+    `runs._stale_restore_residue` journals BEFORE the re-stamp block that raises
+    `RearmError`, so on that path the records exist and the operator has to decide what
+    to do with the tree. `cli.cmd_resolve` echoes them from a `finally`; this surface
+    used to `return` inside the `except` and drop the whole family — including
+    `stale-restore-commits`, which `cli._echo_rearm_events`' own docstring calls the one
+    record a human must act on. The two surfaces had been unified on ROUTING while
+    still drifting on the abort path, and `docs/FEATURES.md` claimed they could not
+    drift at all.
+
+    Ablation: move the `self._echo_rearm_events(...)` call out of the `finally` and back
+    below the `try`, and this reddens — the commits warning never fires — while
+    `test_escalation_rearm_survives_a_corrupt_journal` still passes.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import Journal
+    from bmad_loop.runs import RearmError
+
+    notes: list[str] = []
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_rearm(rd, sk, *, isolated_redrive=False):
+        # exactly the real ordering: residue journalled, THEN the abort
+        Journal(rd).append(
+            "stale-restore-commits", story_key=sk, old_baseline="f" * 40, commits=["c1"]
+        )
+        raise RearmError("cannot re-stamp baseline_revision on /x/spec.md")
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: any("re-arm failed" in n for n in notes))
+    # the abort is reported AND the residue it already wrote is surfaced
+    assert any("commit(s) sit below" in n for n in notes), notes
+    # ... and an aborted re-arm does not resume the run
+    assert calls == [], calls
+
+
+async def test_escalation_rearm_survives_a_corrupt_journal(project, monkeypatch):
+    """An undecodable byte in journal.jsonl costs the echo, never the gesture.
+
+    `_do_rearm` reads the journal twice to diff what the re-arm appended, and before
+    that echo existed it read it not at all — so `Journal.entries()`' strict UTF-8
+    decode would have turned a corrupt journal into a re-arm the operator can no
+    longer perform. That is strictly worse than the missing echo it was added to
+    fix, and a regression against the gesture's own history. `runs.journal_entries_or_none`
+    (shared with `cli.cmd_resolve`) answers `None`, and `_echo_rearm_events` skips the
+    echo when either end of the diff is unreadable rather than replaying the journal
+    from zero; the dashboard already reads this same file with `errors="replace"`
+    everywhere else.
+
+    Ablation: call `Journal(run_dir).entries()` directly in `_do_rearm` and this
+    reddens — the UnicodeDecodeError escapes into the Textual worker and no
+    `re-armed 1` notice ever fires.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import JOURNAL_FILE, Journal
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_rearm(rd, sk, *, isolated_redrive=False):
+        Journal(rd).append(
+            "stale-restore-commits", story_key=sk, old_baseline="f" * 40, commits=["c1"]
+        )
+        return "ready-for-dev"
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    # a real corruption shape: a valid line, then a byte no UTF-8 decoder accepts
+    (run_dir / JOURNAL_FILE).write_bytes(
+        b'{"ts": 1.0, "kind": "session-start", "task_id": "t1"}\n\xff\xfe not utf-8\n'
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+    # the re-arm ran and the run resumed: the corruption cost only the echo
+    assert any("re-armed 1" in n for n in notes)
+    assert not any("re-arm failed" in n for n in notes), notes
+    assert not any("commit(s) sit below" in n for n in notes), notes
 
 
 async def test_escalation_rearm_disabled_without_resolution(project, monkeypatch):
@@ -4101,10 +5325,13 @@ async def test_epic_boundary_pause_shows_reason_and_run_id_subtitle(project, mon
 
 
 async def test_spec_approval_unreadable_spec_still_uses_spec_viewer(project, monkeypatch):
-    """An unreadable spec file returns (path, "") from _paused_spec — a spec that
+    """An unreadable spec file still returns its PATH from _paused_spec — a spec that
     exists in the task and cannot be read, not a spec-less gate. It keeps the spec
-    viewer (path line + "(empty spec)"), which pins the branch as `spec_path is
-    None` rather than `not spec_text`."""
+    viewer, which pins the branch as `spec_path is None` rather than `not spec_text`.
+    The body is now the read failure rather than "" (an absent spec at the anchored
+    path is the signal that anchoring failed, so it must not render as "(empty spec)"
+    — see `test_paused_spec_missing_at_the_anchor_reads_as_not_found`); this row
+    grades only that the viewer, not the reason-only modal, is chosen."""
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
     task.spec_file = str(project.project / "gone" / "spec-1-1-a.md")
@@ -4687,3 +5914,228 @@ def test_run_tui_survives_junk_forced_backend(monkeypatch, tmp_path):
     finally:
         mux_mod.get_multiplexer.cache_clear()
     assert ran == [True]
+
+
+def _write_two_triage_decisions(run_dir: Path) -> None:
+    """A sweep triage carrying TWO decisions, so a walk has somewhere to continue to."""
+    import json
+
+    (run_dir / "triage.json").write_text(
+        json.dumps(
+            {
+                "workflow": "deferred-sweep-triage",
+                "open_ids": ["DW-1", "DW-2"],
+                "already_resolved": [],
+                "bundles": [],
+                "blocked": [],
+                "skip": [],
+                "decisions": [
+                    {
+                        "id": dw_id,
+                        "question": f"what about {dw_id}?",
+                        "context": "ctx",
+                        "options": [
+                            {"key": "1", "label": "Widen", "effect": "build", "intent": "widen it"},
+                            {"key": "2", "label": "Keep", "effect": "keep-open"},
+                        ],
+                        "recommendation": "1",
+                    }
+                    for dw_id in ("DW-1", "DW-2")
+                ],
+                "escalations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+async def test_decision_modal_survives_lock_and_state_root_failures(project, monkeypatch):
+    """Both ledger-lock failures degrade to a per-decision toast, and the walk
+    carries on to the next decision (#286/#469).
+
+    `apply_pre_answer` now takes a cross-process lock whose sidecar path is
+    derived from the state root, which gives it two new ways to fail: `OSError`
+    from the acquisition itself, and `runs.StateRootError` from deriving the
+    path. The second is NOT an `OSError`, and here that distinction is not
+    cosmetic — an uncaught exception in this callback does not print a traceback
+    and exit, it escapes into the Textual event loop and takes the dashboard
+    down mid-walk, with the human's remaining answers unrecorded and no window
+    left to type them into.
+
+    Both are raised, in that order, across two pending decisions: the first
+    grades the arm that already existed, the second grades the widened tuple.
+    The second modal appearing at all is what says the walk continued rather
+    than stopping at the first failure, and it is keyed on the modal's own
+    decision id so a first modal that simply never dismissed cannot satisfy it.
+
+    Ablation: drop `runs.StateRootError` from `_record_decision`'s catch tuple.
+    The DW-1 toast still lands; the DW-2 assertions red, with the exception
+    coming out of `run_test` instead of arriving as a notification.
+    """
+    from bmad_loop import decisions as decisions_mod
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\nstatus: open\n\n"
+        "### DW-2: second thing\n\norigin: t\nlocation: b.py:1\nreason: t.\nstatus: open\n",
+        encoding="utf-8",
+    )
+    _write_two_triage_decisions(make_run(project.project, "20260101-000000-aaaa", run_type="sweep"))
+
+    failures = iter(
+        [
+            OSError(11, "Resource deadlock avoided"),
+            runs.StateRootError("no usable state root"),
+        ]
+    )
+
+    def boom(*_args, **_kwargs):
+        raise next(failures)
+
+    # `bmad_loop.tui.app` holds the module, not the function, so patching the
+    # attribute here is what the TUI call site resolves.
+    monkeypatch.setattr(decisions_mod, "apply_pre_answer", boom)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("d")
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        await pilot.click(await ready(pilot, "#opt-1"))
+
+        # OSError: toast, no crash.
+        await until(pilot, lambda: any("failed to record DW-1" in m for m in notifications(app)))
+        # ...and the walk moved on, rather than ending on the first failure.
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+
+        # StateRootError: same degradation, and it is not an OSError.
+        await until(pilot, lambda: any("failed to record DW-2" in m for m in notifications(app)))
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+        toasts = [n for n in app._notifications if "failed to record" in n.message]
+        assert len(toasts) == 2
+        assert {n.severity for n in toasts} == {"error"}
+        assert "Resource deadlock avoided" in toasts[0].message
+        assert "no usable state root" in toasts[1].message
+        # Survived both: still running, still on the dashboard, with the whole
+        # walk behind it. The `run_test` context exiting without raising is the
+        # other half — an escape into the event loop surfaces there, not here.
+        assert app.is_running
+
+
+async def test_gate_unreadable_spec_refuses_approve_and_resume(project, monkeypatch):
+    """The GATE arm of the same refusal — its sibling row grades plan-checkpoint only.
+
+    `_review_gate` and `_review_plan_checkpoint` both build a `SpecReviewModal` and both
+    forward `unreadable=not readable`, but the verbs differ: the checkpoint offers
+    `#act-approve`/`#act-replan` and the gate offers `#act-resume`. Only the checkpoint
+    pair was pinned, so `unreadable=` could be dropped from `_review_gate` with
+    `tests/test_tui_app.py` fully green — and `Approve & resume` at a spec-approval gate
+    is the verb that carries the run PAST the gate whose only purpose is a human reading
+    that file.
+
+    Ablation: pass `unreadable=False` in `_review_gate` and this reddens on the button
+    state.
+    """
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
+    task.spec_file = str(project.project / "gone" / "spec-1-1-a.md")
+    make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="spec-approval",
+        paused_reason="awaiting spec approval",
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": task},
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        body = render(app.screen.query_one("#spec Static", Static).content)
+        assert "could not be read" in body
+        assert app.screen.query_one("#act-resume", Button).disabled
+
+
+async def test_escalation_unreadable_spec_refuses_rearm_but_keeps_resolve(project, monkeypatch):
+    """The escalation modal discarded the read verdict entirely.
+
+    `_review_escalation` bound `_readable` and dropped it, so an unreadable spec reached
+    `_blocking_condition` — a `find("## Auto Run Result")` that answers "" for the read-
+    failure sentence exactly as it does for any spec without a halt block. The modal
+    then rendered "(no blocking condition recorded)", BYTE-IDENTICAL to a spec that was
+    read fine and simply halted without one, while `Re-arm & resume` stayed live. Re-arm
+    flips the spec's frontmatter, strips its `## Auto Run Result` and re-stamps the
+    baseline, so that is a destructive write driven from a modal reporting evidence
+    nobody could read.
+
+    The refusal is asymmetric, and deliberately so. `Re-arm` is refused: it flips the
+    spec's frontmatter, strips its result and re-stamps the baseline. `Resolve` is NOT —
+    it opens an interactive agent and writes nothing itself, it is precisely what repairs
+    a bad anchor, and gating it left `close` as the modal's only action while the `R`
+    binding (`action_resolve_run`, which has no readability check) reached the same agent
+    anyway, making the refusal advisory rather than enforced.
+
+    Ablation: drop `unreadable=` from `_review_escalation`'s `EscalationModal(...)` and
+    this reddens on the notice, the re-arm button and the hint.
+    """
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _run_dir, spec = _stories_paused_run(project.project, stage="escalation")
+    spec.unlink()  # absent at the anchored path
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        rendered = " ".join(
+            render(s.content) for s in app.screen.query("#blocking Static").results(Static)
+        )
+        # the distinguishing claim: unknown, NOT absent
+        assert "could not be read" in rendered
+        # and the lie is GONE, not merely outvoted by a warning above it. The unreadable
+        # arm used to prepend its notice and then fall through to the shared body render,
+        # which answers "" for the failure sentence — so the modal showed the warning and
+        # "(no blocking condition recorded)" together, the second denying the first.
+        assert "no blocking condition recorded" not in rendered
+        assert app.screen.query_one("#act-rearm", Button).disabled
+        # Resolve stays OPEN — the non-destructive remedy for the failure on screen
+        assert not app.screen.query_one("#act-resolve", Button).disabled
+        # The hint explains THIS refusal. Unasserted, it could silently revert to the
+        # restore-latch or "re-arm unlocks once..." text — both of which explain a
+        # condition that is not why the button is dark — while the button state stayed
+        # green.
+        hint = render(app.screen.query_one("#hint", Static).content)
+        assert "unreadable" in hint
+        assert "bmad-loop resolve" in hint  # the CLI fallback is named, not just refused
+
+
+async def test_replan_on_a_spec_that_vanished_after_render_names_the_anchored_path(
+    project, monkeypatch
+):
+    """`_do_replan`'s absent-spec branch, which no row reached.
+
+    The branch is narrow by construction — the same absence that produces it also
+    disables `#act-replan`, so only a spec deleted BETWEEN render and click gets here —
+    but it is the arm that distinguishes "absent at the anchor" from "present with no
+    frontmatter status", and `reset_spec_status` answers False to both. Driven directly
+    because the TOCTOU window cannot be opened through the modal.
+
+    Ablation: delete the `is_file()` branch and this reddens — the shared "could not
+    reset the plan to draft" notice takes over and never names the path consulted.
+    """
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    run_dir, spec = _stories_paused_run(project.project, stage="plan-checkpoint")
+    run_id = run_dir.name
+    spec.unlink()  # vanished after the modal rendered
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        app._do_replan(run_id, spec, project.project)
+        await pilot.pause()
+        assert any(f"no spec at {spec}" in m for m in notifications(app))
+        assert not any("could not reset" in m for m in notifications(app))

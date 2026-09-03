@@ -174,6 +174,20 @@ class SessionRecord:
         )
 
 
+def _rebased_on(path: str | None, root: Path) -> str | None:
+    """One persisted spec path, re-anchored on `root`; absolute values pass through.
+
+    Split out so `StoryTask.rebase_spec_paths_on` states the rule once per field
+    without repeating the guard, and so the guard itself is unmissable: the
+    is-absolute test is what keeps an out-of-mount spec (persisted verbatim by
+    `_serialized_worktree_path`) from being joined onto a root that does not
+    contain it.
+    """
+    if not path or Path(path).is_absolute():
+        return path
+    return str(root / path)
+
+
 @dataclass
 class StoryTask:
     story_key: str
@@ -188,6 +202,17 @@ class StoryTask:
     # rather than burning another cycle. Reset to 0 by runs.rearm_escalation so a
     # human-resolved re-drive gets a fresh damping budget. Survives the round-trip.
     followup_reviews_spent: int = 0
+    # Session-id namespace rollovers performed when an escalated task is reopened
+    # while its attempt budget resets to 0. This happens in `runs.rearm_escalation`
+    # and in the sweep engine's ESCALATED restart arms. The next dispatch bumps the
+    # attempt back to 1, so without a discriminator the re-minted session task_id is
+    # byte-equal to a record the ABANDONED attempt already appended to the
+    # append-only `sessions` list. Feeds
+    # `engine._session_task_id`, which emits the suffix only above zero, so every
+    # id already on disk stays byte-identical across the upgrade. `task.sessions`
+    # is deliberately NOT cleared when a task is reopened: the run-dir audit trail
+    # it indexes is read by a later resolve cycle.
+    generation: int = 0
     # set from the bmad-build-auto session's `followup_review_recommended`
     # frontmatter (PR #2505): when True and review.trigger = "recommended", the
     # orchestrator runs a follow-up review pass (bmad-build-auto re-invoked on the
@@ -206,6 +231,13 @@ class StoryTask:
     baseline_ledger_digest: str | None = None
     pre_harvest_ledger: str | None = None
     pre_harvest_ledger_captured: bool = False
+    # Digest of the last ledger state THIS engine left on disk: the snapshot's
+    # own text at capture, refreshed to the post-append bytes once the harvest
+    # writes. It is the compare-and-set anchor `_restore_ledger` uses to tell
+    # its own retractable write from a concurrent writer's (#286), which is why
+    # it is persisted rather than kept in memory: a crash replay must be able to
+    # recognize the dead attempt's append still sitting on disk.
+    post_engine_ledger_digest: str | None = None
     harvest_wrote_ledger: bool = False
     ledger_changed_before_harvest: bool = False
     # JSON-native containers only; callers persist these through state.json.
@@ -262,6 +294,20 @@ class StoryTask:
     # owes, and nothing re-derives it once the session that wrote the spec is
     # gone).
     operator_actions: list[str] = field(default_factory=list)
+    # Whether THIS dev phase was in a position to newly elect a park: captured
+    # once, on the fresh entry into `Engine._dev_phase` (`resume_result is None`),
+    # from the same instant and the same condition as `baseline_commit` — so the
+    # expectation and the diff it guards share one anchor. False when the bound
+    # spec was ALREADY at `awaiting-operator` on entry (an earlier attempt's park
+    # is on disk, so a park observed afterwards may be inherited rather than
+    # elected), when parking is disabled, or when the spec could not be read at
+    # all (fail closed). It gates exactly one thing: `verify_dev`'s proof-of-work
+    # skip on the park leg (#335, #676). Every other park gate still selects on the
+    # observed status alone, so an ineligible park with a real diff still passes.
+    # Deliberately per-PHASE, not per-attempt: a fixable repair keeps the previous
+    # session's tree, so re-observing would make every repair of a malformed park
+    # ineligible and fail it on the gate it just re-armed.
+    park_eligible: bool = False
     defer_reason: str | None = None
     # the recovery ref this attempt's work was parked on by the last auto-rollback
     # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree
@@ -383,12 +429,14 @@ class StoryTask:
             "attempt": self.attempt,
             "review_cycle": self.review_cycle,
             "followup_reviews_spent": self.followup_reviews_spent,
+            "generation": self.generation,
             "followup_review_recommended": self.followup_review_recommended,
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
             "baseline_ledger_digest": self.baseline_ledger_digest,
             "pre_harvest_ledger": self.pre_harvest_ledger,
             "pre_harvest_ledger_captured": self.pre_harvest_ledger_captured,
+            "post_engine_ledger_digest": self.post_engine_ledger_digest,
             "harvest_wrote_ledger": self.harvest_wrote_ledger,
             "ledger_changed_before_harvest": self.ledger_changed_before_harvest,
             "harvested_deferrals": self.harvested_deferrals,
@@ -408,6 +456,7 @@ class StoryTask:
             ),
             "commit_sha": self.commit_sha,
             "operator_actions": self.operator_actions,
+            "park_eligible": self.park_eligible,
             "defer_reason": self.defer_reason,
             "preserve_ref": self.preserve_ref,
             "preserve_partial": self.preserve_partial,
@@ -442,6 +491,92 @@ class StoryTask:
         except ValueError:
             return path  # spec lives outside the worktree; keep absolute
 
+    def release_spec_paths_from_mount(self) -> None:
+        """Give up the spec ownership a mount being DISCARDED carried.
+
+        The counterpart to :meth:`rebase_spec_paths_on`, and deliberately not its
+        exact inverse — the two fields part company here because their roles do:
+
+        * `dispatched_spec_file` / `dispatched_spec_snapshot` are the ATTEMPT's
+          binding, the pair `recovery_flow` restores bytes through. The attempt died
+          with its tree, so the binding has nothing left to name; clearing both
+          together keeps the authority pair whole (a path without its snapshot is the
+          one shape `_bind_dispatched_spec_for_attempt` never persists).
+        * `spec_file` is the ACCEPTED artifact and outlives the attempt. The
+          replacement mount will carry the same story's spec at the same
+          mount-relative place, so the relative spelling is the one that re-resolves
+          onto it — `verify.resolve_spec_path` probes a relative value against the
+          live workspace and passes an absolute one through untouched.
+
+        Leaving `spec_file` absolute into the deleted mount is what made the fresh
+        attempt start UNBOUND: `_dispatched_spec_for_attempt` resolves it
+        `strict=True`, the dead path raises, and the miss is silent because an
+        unbound attempt is a legal state. `_record_dev_spec` cannot repair it either
+        — it no-ops while `spec_file` is set.
+
+        Uses the same relativization as `to_dict`, so the discarded-mount spelling
+        and the persisted one cannot drift, which also means a spec OUTSIDE the mount
+        stays verbatim: it was never the mount's to give up. MUST be called while
+        `worktree_path` still names the mount.
+        """
+        self.dispatched_spec_file = None
+        self.dispatched_spec_snapshot = None
+        self.spec_file = self._serialized_worktree_path(self.spec_file)
+
+    def release_mount_owned_state(self) -> None:
+        """Give up EVERYTHING a mount owned: its spec ownership and the measurements
+        taken inside it.
+
+        One method because the two callers that stop using a mount — the restart
+        discard and the isolation-flip arm — must give up the same set, and the second
+        was written releasing only the spec half. That half-release is not a smaller
+        version of the same thing, it is a different bug: `baseline_commit` and
+        `baseline_untracked` are stamped from `self.workspace.root` (the unit under
+        isolation), so leaving them set hands unit-mount operands to
+        `recovery_flow.rollback_or_pause` running against the MAIN checkout. Neither
+        fails loud there — linked worktrees share the object database, so the baseline
+        still resolves and a reset onto it succeeds, while a fresh worktree is a
+        tracked-only checkout whose empty untracked snapshot makes
+        `verify._rollback_cleanup_plan` compute `untracked_files(repo) -
+        baseline_untracked` as every untracked file in the operator's own checkout.
+        Under an auto-recovering cause those are DELETED.
+
+        Costs the re-run nothing: `_dev_phase` re-stamps both from whatever workspace
+        it re-enters with, so clearing turns the `baseline_commit` leg into a correct
+        no-op instead of a probe of the wrong tree.
+
+        MUST be called while `worktree_path` still names the mount — the spec
+        relativization is measured against it.
+        """
+        self.release_spec_paths_from_mount()
+        self.baseline_commit = None
+        self.baseline_untracked = None
+
+    def rebase_spec_paths_on(self, root: Path) -> None:
+        """Re-absolutize both spec-ownership paths against the tree that owns them.
+
+        The read-side inverse of :meth:`_serialized_worktree_path`, and the single
+        implementation of that rule: `to_dict` persists a worktree-local spec
+        RELATIVE to the mount and `from_dict` reads it back raw, so a consumer that
+        resolves the raw value against anything else names the wrong tree. The main
+        checkout carries the same `_bmad-output/...` layout, so that wrong tree
+        answers `is_file()` and passes containment — the failure is silent, not an
+        error.
+
+        Both fields move together because they are one asymmetry: `spec_file` is the
+        accepted/result artifact and `dispatched_spec_file` the attempt-owned input,
+        and a caller re-anchoring one and not the other leaves a task naming two
+        trees at once.
+
+        Idempotent: an absolute value is already anchored (a spec outside the mount
+        is persisted verbatim) and passes through untouched, so re-running this
+        against the same root cannot double-join. `root` is the tree the values were
+        persisted relative to — `task.worktree_path` — never the caller's cwd or
+        project.
+        """
+        self.spec_file = _rebased_on(self.spec_file, root)
+        self.dispatched_spec_file = _rebased_on(self.dispatched_spec_file, root)
+
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "StoryTask":
         dispatched_spec_snapshot = d.get("dispatched_spec_snapshot")
@@ -462,6 +597,7 @@ class StoryTask:
             attempt=int(d.get("attempt", 0)),
             review_cycle=int(d.get("review_cycle", 0)),
             followup_reviews_spent=int(d.get("followup_reviews_spent", 0)),
+            generation=int(d.get("generation", 0)),
             followup_review_recommended=bool(d.get("followup_review_recommended", False)),
             baseline_commit=d.get("baseline_commit"),
             baseline_untracked=(
@@ -480,6 +616,11 @@ class StoryTask:
                 else None
             ),
             pre_harvest_ledger_captured=bool(d.get("pre_harvest_ledger_captured", False)),
+            post_engine_ledger_digest=(
+                str(d.get("post_engine_ledger_digest"))
+                if d.get("post_engine_ledger_digest") is not None
+                else None
+            ),
             harvest_wrote_ledger=bool(d.get("harvest_wrote_ledger", False)),
             ledger_changed_before_harvest=bool(d.get("ledger_changed_before_harvest", False)),
             harvested_deferrals=[deepcopy(dict(item)) for item in d.get("harvested_deferrals", [])],
@@ -503,6 +644,19 @@ class StoryTask:
             dispatched_spec_snapshot=dispatched_spec_snapshot,
             commit_sha=d.get("commit_sha"),
             operator_actions=[str(a) for a in d.get("operator_actions", [])],
+            # `is True`, not `bool(...)`, and this is the one field on this task
+            # where the difference is load-bearing. Every sibling bool above
+            # merely restores bookkeeping; this one AUTHORIZES a gate to be
+            # waived, so its failure direction is not symmetric — a wrong False
+            # costs one retryable proof-of-work refusal, a wrong True re-opens
+            # the inheritance hole the field exists to close (#335, #676). Under
+            # `bool()` every truthy non-boolean grants the waiver, and the
+            # likeliest one is the string "false" (a hand-edited state.json, a
+            # bridge that stringifies JSON scalars): `bool("false")` is True.
+            # Only a real JSON `true` may authorize; anything else — absent,
+            # null, a string, a number — fails closed onto the ordinary gated
+            # path, where an honest park with a real diff still passes.
+            park_eligible=d.get("park_eligible") is True,
             defer_reason=d.get("defer_reason"),
             preserve_ref=d.get("preserve_ref"),
             preserve_partial=bool(d.get("preserve_partial", False)),
@@ -527,6 +681,15 @@ class RunState:
     run_id: str
     project: str
     started_at: str
+    # The git root this run's code work happens in — `paths.repo_root`, which is
+    # `paths.project` unless `_bmad/bmm/config.yaml` sets a `repo_root:` override.
+    # Persisted because `runs.rearm_escalation` runs OUT OF PROCESS from the engine
+    # and had only `project` to reach for, so it advanced the attempt baseline by
+    # reading HEAD of a repo the proof-of-work gate never measures. Empty means a
+    # state.json written before this field existed; `code_root` then falls back to
+    # `project`, which is exactly the pre-upgrade behavior and the correct answer
+    # for every run without the override.
+    repo_root: str = ""
     policy_snapshot: dict[str, Any] = field(default_factory=dict)
     # SECONDARY copy of the host-exec baseline (#498) — runsetup.config_digest over
     # the agent-writable config that reaches HOST code execution: verify commands,
@@ -612,6 +775,17 @@ class RunState:
     def paused(self) -> bool:
         return self.paused_reason is not None
 
+    @property
+    def code_root(self) -> Path:
+        """The tree git runs against for this run — ``repo_root`` when the run
+        recorded one, else ``project``.
+
+        The single reader of the pair, so an out-of-process consumer
+        (``runs.rearm_escalation``) cannot pick the wrong one, and a pre-upgrade
+        state.json (empty ``repo_root``) degrades to precisely what it did before
+        rather than to a path that does not exist."""
+        return Path(self.repo_root or self.project)
+
     def handled_keys(self) -> set[str]:
         """Story keys this run already drove to a terminal phase."""
         return {k for k, t in self.tasks.items() if t.terminal}
@@ -647,6 +821,7 @@ class RunState:
         return {
             "run_id": self.run_id,
             "project": self.project,
+            "repo_root": self.repo_root,
             "started_at": self.started_at,
             "policy_snapshot": self.policy_snapshot,
             "trusted_config_digest": self.trusted_config_digest,
@@ -677,6 +852,7 @@ class RunState:
         return cls(
             run_id=d["run_id"],
             project=d["project"],
+            repo_root=str(d.get("repo_root", "")),
             started_at=d["started_at"],
             policy_snapshot=d.get("policy_snapshot", {}),
             trusted_config_digest=str(d.get("trusted_config_digest", "")),
@@ -720,10 +896,66 @@ class VerifyOutcome:
     # time): no further session can reconcile it, so it routes to a pause with
     # both sides named rather than to another cycle (#334)
     contradiction: bool = False
+    # Whether this PASSING outcome waived the dev gate's proof-of-work check on
+    # the park leg (`verify_dev`'s two-part park selector fired). The fact of the
+    # waiver, not its result: `Engine._verify_dev_artifacts` journals exactly the
+    # attempts this is True for, so a park that got past the dev ARTIFACT gate
+    # without proving work always leaves a trace there (#676).
+    #
+    # Scoped to that gate at both ends, and the bound is worth stating exactly.
+    # This rides only the `passed()` return, so a leg that waived proof-of-work
+    # and then failed a later check INSIDE `verify_dev` — the sprint pair is the
+    # reachable one — records nothing; anything wider would need the flag on the
+    # failing constructors too. It says nothing at all about the stages AFTER that
+    # gate: the configured `[verify]` commands, decision routing, the review loop,
+    # the pre-commit workflows and the commit all run later and may still reject
+    # the attempt, which is then retried or deferred with its record already
+    # written. So a True here means "the artifact gate was cleared with
+    # proof-of-work waived", never "this park committed".
+    park_proof_skipped: bool = False
+    # An OBSERVATION, never a gate: on that same waived leg, what the skipped
+    # proof-of-work gate WOULD have found, measured from the same baseline and
+    # under the same exclusions it would have used. `True` = nothing it counts —
+    # the residue was confined to what proof-of-work already excludes, the #676
+    # shape the waiver exists for. `False` = it would have found changes. `None` =
+    # the probe could not answer.
+    #
+    # `False` is a statement about the TREE, not about a session, and the wording
+    # matters because the tempting shorthand ("the park wrote real code") is a
+    # claim this seam cannot make: the gate it stands in for cannot attribute
+    # residue to a session either — under `isolation = "none"` a commit that
+    # arrived in the shared checkout from outside the session satisfies it — so
+    # the observation inherits exactly that limit rather than improving on it.
+    #
+    # Three things produce `None`, all of them "the probe could not answer": a
+    # `GitError` (it degrades rather than escalating), a git REFUSAL such as an
+    # unresolvable baseline (any rc that is not one of git's two real answers, rc
+    # 128 being the everyday one — `_changes_since` reports it as unknown instead
+    # of letting the gate's fail-open record a confident `False`), and an
+    # attempt with no `baseline_commit` to measure from. Nothing branches on any
+    # of the three.
+    #
+    # The two fields are deliberately separate, and collapsing them is the bug
+    # this pair exists to prevent: one says a gate was waived, the other says what
+    # that gate would have found. Keyed on the observation alone, an unanswerable
+    # probe is indistinguishable from no waiver at all — so a park whose probe
+    # faulted would go unrecorded, re-creating exactly the silence this pair ends.
+    # A waived gate is recorded whatever the probe managed to say; `None` is a
+    # truthful field value, not a reason to withhold the record.
+    park_zero_diff: bool | None = None
 
     @classmethod
-    def passed(cls) -> "VerifyOutcome":
-        return cls(ok=True)
+    def passed(
+        cls,
+        *,
+        park_proof_skipped: bool = False,
+        park_zero_diff: bool | None = None,
+    ) -> "VerifyOutcome":
+        return cls(
+            ok=True,
+            park_proof_skipped=park_proof_skipped,
+            park_zero_diff=park_zero_diff,
+        )
 
     @classmethod
     def retry(cls, reason: str, fixable: bool = False) -> "VerifyOutcome":

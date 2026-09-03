@@ -1,5 +1,6 @@
 import dataclasses
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -12,17 +13,23 @@ from conftest import (
     _FAIL,
     _OK,
     MISSING_TOOL_CMD,
+    OMIT,
+    PROJECT_MARKER_CMD,
+    REPO_ROOT_MARKER_CMD,
     UNRESOLVABLE,
+    _Omit,
     fault_read_text,
     git,
     make_git_noisy,
+    nested_repo_root_paths,
+    plant_root_markers,
     refuse_to_resolve,
     spec_path,
     write_spec,
     write_sprint,
 )
 
-from bmad_loop import verify
+from bmad_loop import platform_util, verify
 from bmad_loop.model import StoryTask
 from bmad_loop.policy import Policy, ReviewPolicy, VerifyPolicy
 
@@ -782,9 +789,519 @@ def test_verify_dev_park_unknown_when_the_policy_is_off(project):
     assert "'awaiting-operator'" in out.reason and "expected 'done'" in out.reason
 
 
+def _residue_free(project, *, status, sprint, baseline: str | _Omit | None = None):
+    """A dev attempt whose ONLY residue is the spec and the sprint board — the two
+    paths proof-of-work already excludes.
+
+    Deliberately does NOT write `src.txt` the way `_park` does: that one line is
+    what gives every other park row a non-empty proof diff, which is why none of
+    them can see #676.
+
+    What the park row and its control share is the SET OF PATHS touched — exactly
+    the spec and the board, and nothing else — not the bytes in them, which differ
+    by the two status tokens `status`/`sprint` select. The set is what
+    proof-of-work keys on, so it is the property that makes the control a control:
+    both trees are residue-free by the gate's own measure, and only the terminal
+    differs.
+
+    `operator_actions:` is written on the park terminal ONLY, because that is the
+    only status the product ever emits it on: `devcontract.synthesize_result`
+    folds the field from `status == AWAITING_OPERATOR`, and its comment gives the
+    reason — carrying it on another terminal would let a story register
+    obligations the verify gates never held it to. The park call sites pass
+    `verify.AWAITING_OPERATOR` rather than the bare literal so they move with the
+    branch above on a rename: were the two to drift, this helper would quietly stop
+    writing the field and every park row would fail on "declares no usable
+    operator_actions" instead of on the thing it tests.
+
+    `baseline` has three meanings, and the third is not a special case of the
+    second. ``None`` (the default) claims the task's own recorded baseline — the
+    matching pair every ordinary row wants. A STRING overrides what the spec
+    claims, for the row that probes the baseline-match gate. ``OMIT`` writes no
+    `baseline_revision` key at all, which is the only way to reach the
+    proof-of-work probe with a baseline git cannot resolve: with a claim present
+    the baseline-match gate refuses first and the probe is never asked, so the
+    git-refusal rows would pass for the wrong reason. That third meaning rides on
+    ``OMIT`` being truthy in the `baseline or task.baseline_commit` expression
+    below — deliberate, but load-bearing, so do not "simplify" that expression to
+    an ``is None`` test without giving ``OMIT`` its own branch."""
+    write_sprint(project, {"1-1-a": sprint})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(
+        sp,
+        status,
+        baseline or task.baseline_commit,
+        operator_actions=(
+            ["publish the TXT record"] if status == verify.AWAITING_OPERATOR else None
+        ),
+    )
+    return task, sp
+
+
+@pytest.mark.parametrize("review_enabled", [False, True])
+def test_verify_dev_park_with_no_code_residue_passes(project, review_enabled):
+    """A park may legitimately have produced no code — the story's remaining work
+    is a human's, and the session's whole output can be the spec's own park
+    declaration plus the board sync. Both are excluded from proof-of-work, so the
+    gate used to read a correct park as "no changes", retry it, and roll the park
+    commit back (#676). The parked leg now skips proof-of-work outright.
+
+    Parametrized over `review_enabled` because every other park row in this file
+    passes `False`, and the skip is now the only thing standing between a park and
+    this gate. A park short-circuits both terminals — the pair demanded is
+    (awaiting-operator, awaiting-operator) either way — so the flag must not reach
+    the outcome, and the `True` leg is what would catch a future edit that let it.
+
+    `park_eligible=True` is the engine-side half of the selector the skip now
+    needs: the orchestrator's answer, recorded at dispatch, that this phase could
+    newly ELECT a park rather than inherit one (DW-1). Without it this row fails
+    on proof-of-work — which is exactly what
+    `test_verify_dev_ineligible_park_with_no_residue_owes_proof_of_work` asserts.
+    `park_zero_diff` is the accepted skip's record: the tree really was residue-free,
+    and the outcome says so instead of the skip passing silently (DW-6)."""
+    task, sp = _residue_free(
+        project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
+    )
+
+    out = verify.verify_dev(
+        task,
+        project,
+        dev_result(sp),
+        review_enabled=review_enabled,
+        operator_park=True,
+        park_eligible=True,
+    )
+
+    assert out.ok
+    assert task.spec_file == str(sp)
+    assert out.park_proof_skipped is True and out.park_zero_diff is True
+
+
+@pytest.mark.parametrize("park_eligible", [False, True])
+@pytest.mark.parametrize("operator_park", [False, True])
+@pytest.mark.parametrize(
+    "status, sprint, review_enabled",
+    [("in-review", "review", True), ("done", "done", False)],
+)
+def test_verify_dev_residue_free_non_park_still_fails_proof_of_work(
+    project, status, sprint, review_enabled, operator_park, park_eligible
+):
+    """The control for the row above, and the reason that row proves anything: the
+    SAME residue-free tree at an ordinary terminal must still be refused. Without
+    this, the park row would pass for any tree that merely happened not to be
+    empty, and the skip could have widened past `parked` unnoticed.
+
+    Both non-park terminals are covered, not just `in-review`: the skip is spelled
+    `None if parked else engine_written`, and a widening that reached the
+    review-disabled `done` leg instead would redden nothing if this row only ever
+    ran the handoff terminal.
+
+    `operator_park` is parametrized because it is the ONE input that separates the
+    two halves of `parked = operator_park and status_of(fm) == AWAITING_OPERATOR`,
+    and the `True` leg is the only thing in this file pinning the skip's SCOPE. Its
+    absence was a real hole: rewriting the skip as `None if operator_park` — the
+    policy flag alone, ignoring the observed status — left every row in this file
+    green, and reddened only incidental `write_src=False` rows over in
+    `test_engine.py` that are about harvest, not about park. A run with parking
+    enabled but a session that finished ordinarily must still owe a diff.
+
+    `park_eligible` is parametrized for the identical reason, one selector later:
+    the skip is now `parked and park_eligible`, so the engine-side half is the
+    other input that could widen it past the park. Rewriting it as
+    `None if park_eligible` — the dispatch-time expectation alone, ignoring the
+    observed status — is green everywhere without this dimension, and it would let
+    every ordinary session on a story that had never parked skip proof-of-work
+    entirely. Neither half selects the skip on its own.
+
+    Ablation: delete the `if extra_exclude is not None and task.baseline_commit:`
+    proof-of-work block in `_verify_shared_gates` and all four rows fail on
+    `assert not out.ok` — the residue-free tree then verifies clean at every
+    terminal, which is the #676 behavior generalized past the park."""
+    task, sp = _residue_free(project, status=status, sprint=sprint)
+
+    out = verify.verify_dev(
+        task,
+        project,
+        dev_result(sp),
+        review_enabled=review_enabled,
+        operator_park=operator_park,
+        park_eligible=park_eligible,
+    )
+
+    assert not out.ok and out.retryable
+    assert out.reason == "no changes in worktree since baseline commit"
+    # neither half of the record: no gate was waived, so there is nothing observed
+    assert out.park_proof_skipped is False and out.park_zero_diff is None
+
+
+def test_verify_dev_ineligible_park_with_no_residue_owes_proof_of_work(project):
+    """DW-1, and the reason the row above needs its new argument: the skip used to
+    be selected entirely by state a fresh session can INHERIT — the policy flag
+    plus the spec's own status. A spec an earlier attempt left at
+    `awaiting-operator` still reads `awaiting-operator` to a session that did
+    nothing at all, so a re-drive over it selected #676's relaxation and verified
+    green on someone else's park declaration.
+
+    `park_eligible=False` is the orchestrator saying "the bound spec was ALREADY
+    parked when I dispatched this". The park is not refused for being inherited —
+    it is merely held to proof-of-work like every other terminal, and this tree has
+    none to show. Note the reason: the ordinary proof-of-work message, not a
+    park-specific refusal, because the eligibility flag gates the SKIP and nothing
+    else.
+
+    This row and `test_verify_dev_park_with_no_code_residue_passes` differ in
+    exactly one argument over byte-identical state, which is what makes either one
+    evidence. Ablation: rewrite the selector as `skip_proof = parked` (drop the
+    `and park_eligible`) and this fails on `assert not out.ok` while its twin stays
+    green — the pre-DW-1 behavior exactly."""
+    task, sp = _residue_free(
+        project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
+    )
+
+    out = verify.verify_dev(
+        task,
+        project,
+        dev_result(sp),
+        review_enabled=False,
+        operator_park=True,
+        park_eligible=False,
+    )
+
+    assert not out.ok and out.retryable
+    assert out.reason == "no changes in worktree since baseline commit"
+    # no gate was waived here, so neither field carries anything — and the pair is
+    # asserted in both directions, because `park_zero_diff is None` alone is also
+    # what a WAIVED gate whose probe faulted looks like
+    assert out.park_proof_skipped is False and out.park_zero_diff is None
+
+
+def test_verify_dev_ineligible_park_with_a_real_diff_still_passes(project):
+    """The bound on DW-1: ineligibility gates the proof-of-work SKIP, never the
+    park itself. An inherited park that carried real work satisfies proof-of-work
+    on its own and passes — status pair, actions list, workflow tag, baseline match
+    and sprint pair all still select on the OBSERVED status exactly as before.
+
+    This is the row that would catch the over-correction: making `park_eligible`
+    select the park's status pair as well (rather than only the skip) turns a
+    legitimate repair-then-park into a status mismatch, and refuses work that was
+    actually done. `park_zero_diff` stays None because no skip fired — a passing
+    park is not automatically a recorded one."""
+    task, sp = _park(project)
+
+    out = verify.verify_dev(
+        task,
+        project,
+        dev_result(sp),
+        review_enabled=False,
+        operator_park=True,
+        park_eligible=False,
+    )
+
+    assert out.ok
+    assert task.spec_file == str(sp)
+    # a PASSING park that owed and produced its diff: no waiver, nothing observed
+    assert out.park_proof_skipped is False and out.park_zero_diff is None
+
+
+def test_verify_dev_elected_park_with_code_residue_records_a_non_zero_diff(project):
+    """DW-6's discriminator, and the half a zero-diff-only record could never
+    prove: the skip fires for EVERY elected park, including one that wrote real
+    code, and the record has to tell the two apart. `_park` writes `src.txt`, so
+    the waived gate would have passed — and the observation says so.
+
+    Ablation: make the observation arm return a constant `True` and this row fails
+    while `test_verify_dev_park_with_no_code_residue_passes` stays green, because
+    that one cannot distinguish a real probe from a hardcoded answer."""
+    task, sp = _park(project)
+
+    out = verify.verify_dev(
+        task,
+        project,
+        dev_result(sp),
+        review_enabled=False,
+        operator_park=True,
+        park_eligible=True,
+    )
+
+    assert out.ok
+    assert out.park_proof_skipped is True and out.park_zero_diff is False
+
+
+def test_verify_dev_park_zero_diff_observation_degrades_to_unknown(project, monkeypatch):
+    """The observation must never change an outcome. The proof-of-work probe can
+    raise `GitError` (timeout, spawn or decode fault), and on the gated legs that
+    escalates the attempt — here the same fault has to leave the park accepted and
+    the answer honestly unknown.
+
+    Load-bearing because a fault swallowed at the wrong level would be recorded as
+    a confident answer about a question git never answered, which is worse than no
+    record at all.
+
+    This is the row that separates the two reasons `park_zero_diff` can be `None`:
+    the probe could not answer, versus no gate was ever waived. They are different
+    facts and they live on different fields — `park_proof_skipped` stays True here.
+    Collapsing them would make this park look like an ordinary leg and drop its
+    journal record, which is the exact silence DW-6 exists to end.
+
+    The patch target is `_changes_since`, the tri-state body BOTH proof arms share
+    (`has_changes_since` is its fail-open collapse and no longer what the gate
+    calls) — patching the wrapper would leave the probe untouched and this row
+    would pass for no reason at all.
+
+    Ablation: drop the `except GitError` in the observation arm and this fails with
+    the GitError propagating out of `verify_dev`, turning a bookkeeping probe into
+    a failed attempt."""
+    task, sp = _residue_free(
+        project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
+    )
+
+    def boom(*_a, **_kw):
+        raise verify.GitError("git diff exploded")
+
+    monkeypatch.setattr(verify, "_changes_since", boom)
+
+    out = verify.verify_dev(
+        task,
+        project,
+        dev_result(sp),
+        review_enabled=False,
+        operator_park=True,
+        park_eligible=True,
+    )
+
+    assert out.ok
+    assert task.spec_file == str(sp)
+    assert out.park_zero_diff is None
+    # the gate WAS waived — unknown is not the same fact as "no waiver"
+    assert out.park_proof_skipped is True
+
+
+def test_verify_dev_park_zero_diff_is_unknown_when_git_refuses_the_probe(project):
+    """The THIRD cause of `zero_diff: null`, and the one that used to be recorded
+    as a confident answer: git refusing the diff outright.
+
+    `git diff --quiet` reports rc 0 for "no differences" and rc 1 for
+    "differences"; anything else — rc 128 for a baseline it cannot resolve — is the
+    command failing rather than answering. The gate that this observation stands in
+    for reads every non-zero rc as "there are changes", which is right for a gate
+    (uncertainty must keep the stricter path) and wrong for a record: it filed "the
+    waived gate would have found changes" about a question git never answered, and
+    nothing downstream ever re-asks.
+
+    No monkeypatch: the refusal is REAL, produced the way production produces one —
+    a recorded baseline that does not resolve in this repository, with the spec
+    carrying no `baseline_revision` claim so the baseline-match gate has nothing to
+    compare and the attempt reaches the probe. rc 128 is asserted directly first, so
+    a future git that answered differently would fail here rather than silently
+    turning this row into a duplicate of its `GitError` sibling.
+
+    Two ablations, both measured, and they fail this row to DIFFERENT values —
+    which is the point, because only one of them is the defect that shipped. Point
+    `proof_of_work_probe` back at `has_changes_since` (the pre-fix spelling, where
+    the wrapper folds the refusal into its fail-open) and this fails with
+    `park_zero_diff is False`: the record asserting the gate would have found
+    changes. Collapse the observation arm's mapping to `not observed` instead and
+    it fails with `True`, because `not None` is True — a different wrong answer
+    from a different place, and the reason the arm maps the unknown explicitly
+    rather than negating it."""
+    task, sp = _residue_free(
+        project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR, baseline=OMIT
+    )
+    task.baseline_commit = "0" * 40
+    rc, _ = verify._git(project.repo_root, "diff", "--quiet", task.baseline_commit, "--", ".")
+    assert rc == 128, "the premise: git REFUSES this baseline rather than answering"
+
+    out = verify.verify_dev(
+        task,
+        project,
+        dev_result(sp),
+        review_enabled=False,
+        operator_park=True,
+        park_eligible=True,
+    )
+
+    assert out.ok
+    # the waiver is recorded; only the observation is honestly unknown
+    assert out.park_proof_skipped is True
+    assert out.park_zero_diff is None
+
+
+def test_verify_dev_proof_of_work_gate_still_fails_open_on_a_refused_probe(project):
+    """The control for the row above, and the reason it can be trusted to have
+    changed only the record: the GATE's reading of the identical refusal is
+    unchanged. An ordinary terminal on a residue-free tree whose baseline git will
+    not resolve still PASSES proof-of-work, because uncertainty at a gate keeps the
+    stricter path — the same answer the arm gave when it called `has_changes_since`
+    and let that function collapse the refusal.
+
+    Without this row the tri-state could have been introduced by narrowing the gate
+    too (refusing on `None`), which would turn every unresolvable baseline into a
+    burned attempt, and only this residue-free tree — where the refusal is the ONLY
+    thing standing between the attempt and a "no changes" retry — can tell the two
+    spellings apart."""
+    task, sp = _residue_free(project, status="done", sprint="done", baseline=OMIT)
+    task.baseline_commit = "0" * 40
+
+    out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False)
+
+    assert out.ok
+    assert out.park_proof_skipped is False and out.park_zero_diff is None
+
+
+def test_verify_dev_park_zero_diff_is_unknown_without_a_recorded_baseline(project):
+    """The SECOND documented cause of `zero_diff: null`, and the one a reader is
+    likeliest to mistake for the first: not a git fault, but an attempt carrying
+    no `baseline_commit` at all. The shared gate runs neither proof arm without
+    one, so there is nothing to measure from and the observation never happens —
+    yet the waiver did, and the record still has to say so.
+
+    All three causes are named in `verify_dev`'s docstring, in `VerifyOutcome`'s
+    field comment and in `docs/FEATURES.md`; the sibling rows cover the `GitError`
+    and the git refusal, and this one covers the missing baseline, so no claim
+    rests on prose.
+
+    Ablation, measured rather than assumed, and the measurement changed when the
+    refusal fix landed: dropping `and task.baseline_commit` from the observation
+    arm's guard ALONE now leaves this row green, because the probe then runs
+    against an empty baseline, git REFUSES it, and `_changes_since` reports that
+    refusal as the same `None` the guard was suppressing. That convergence is the
+    point of the refusal fix, not a hole — the guard is now a spared git spawn
+    rather than the only thing standing between this attempt and a confident
+    answer. What does redden the row is the pre-fix PAIR: drop the guard and
+    collapse the arm's unknown mapping to `not observed`, and an attempt with
+    nothing to measure is filed `zero_diff: true`."""
+    task, sp = _residue_free(
+        project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
+    )
+    # the spec keeps its real `baseline_revision` claim; what is missing is the
+    # ORCHESTRATOR's recorded baseline, which is what both proof arms measure from
+    task.baseline_commit = ""
+
+    out = verify.verify_dev(
+        task,
+        project,
+        dev_result(sp),
+        review_enabled=False,
+        operator_park=True,
+        park_eligible=True,
+    )
+
+    assert out.ok
+    # the gate was waived and is recorded as such; only the observation is unknown
+    assert out.park_proof_skipped is True
+    assert out.park_zero_diff is None
+
+
+def test_verify_dev_park_zero_diff_excludes_the_orchestrators_own_writes(project):
+    """The observation must exclude exactly what the waived gate would have, and
+    this is the misattribution most likely to be audited: the orchestrator appends
+    a harvested deferral to the ledger DURING the attempt, so a park whose session
+    wrote nothing still leaves that file changed. Counted, the record would read
+    `zero_diff: false` — "the waived gate would have found changes" — about a diff
+    the orchestrator itself produced, and an audit of which parks got in without
+    proving work would quietly exonerate exactly the wrong ones.
+
+    `engine_written` is what `Engine._harvest_gate_exclude` supplies for this, and
+    on the waived leg it is routed to `observe_skipped_proof` rather than
+    `extra_exclude` — same tuple, no gate.
+
+    Ablation: drop `+ mode_exclude` from `proof_of_work_probe`'s exclusion (or
+    stop passing `observe_skipped_proof` at the call site) and this fails with
+    `park_zero_diff is False`, while every other park row stays green — they have
+    no orchestrator residue to misattribute."""
+    task, sp = _residue_free(
+        project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
+    )
+    (project.repo_root / "ledger.md").write_text("- DW-9 harvested by the orchestrator\n")
+
+    out = verify.verify_dev(
+        task,
+        project,
+        dev_result(sp),
+        review_enabled=False,
+        operator_park=True,
+        park_eligible=True,
+        engine_written=("ledger.md",),
+    )
+
+    assert out.ok
+    assert out.park_proof_skipped is True
+    # the ONLY residue is the orchestrator's own write, so the park really is
+    # zero-diff and the record has to say so
+    assert out.park_zero_diff is True
+
+
+def test_verify_dev_park_still_faces_the_workflow_tag_gate(project):
+    """Proof-of-work is the ONLY gate the park leg skips. The tree is residue-free,
+    so nothing else can account for a refusal here — with the skip in place, a
+    foreign `workflow` is the only thing left to refuse on, and it must.
+
+    This is the gate the park-leg docstrings promise "still runs" and that no row
+    asserted: every other park row hands in a well-formed `dev_result(sp)`, so
+    deleting the whole shared-gate block on the parked leg left the suite green.
+
+    Ablation: delete the `if workflow != DEV_WORKFLOW:` refusal at the top of
+    `_verify_shared_gates` and this fails on `assert not out.ok`. With
+    proof-of-work already skipped for the park, that gate is the only thing left
+    to refuse the foreign tag, so the outcome goes straight to ok."""
+    task, sp = _residue_free(
+        project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
+    )
+    rj = {"workflow": "quick-dev", "spec_file": str(sp)}
+
+    # park_eligible=True so the skip really is in place: without it proof-of-work
+    # would also refuse this tree and the row would pass for a compound reason.
+    out = verify.verify_dev(
+        task, project, rj, review_enabled=False, operator_park=True, park_eligible=True
+    )
+
+    assert not out.ok and out.retryable
+    assert "auto-dev" in out.reason
+
+
+def test_verify_dev_park_still_faces_the_baseline_match_gate(project):
+    """The sibling of the row above, and the more load-bearing half: proof-of-work
+    was the park's last diff-based tie to the attempt, so baseline-match is now
+    what remains binding a park to the attempt the orchestrator actually launched.
+    A residue-free park claiming a baseline the orchestrator never recorded must
+    still be refused.
+
+    Ablation: delete the `if task.baseline_commit and claimed_baseline not in
+    ("", "NO_VCS"):` block in `_verify_shared_gates` and this fails on
+    `assert not out.ok`. Ablate that whole block, NOT the inner `canonical_claimed
+    is None` early return on its own: the arms below it consume
+    `canonical_claimed`, so the narrower cut sends `None` on into
+    `commit_reachable_above_baseline` and reddens this row on a subprocess
+    `TypeError` instead — an ablation grading itself rather than the gate."""
+    task, sp = _residue_free(
+        project,
+        status=verify.AWAITING_OPERATOR,
+        sprint=verify.AWAITING_OPERATOR,
+        baseline="deadbeef" * 5,
+    )
+
+    # Same reason as the workflow-tag row above: with park_eligible left False the
+    # tree would also owe proof-of-work, and baseline-match would stop being the
+    # only thing that could refuse here.
+    out = verify.verify_dev(
+        task,
+        project,
+        dev_result(sp),
+        review_enabled=False,
+        operator_park=True,
+        park_eligible=True,
+    )
+
+    assert not out.ok and out.retryable
+    assert "does not match" in out.reason
+
+
 def test_verify_review_accepts_the_park_pair(project):
-    """The gate the park path runs before committing: parked work clears the same
-    deterministic checks `done` work clears."""
+    """The gate the park path runs before committing: at THIS gate parked work
+    clears the same deterministic checks `done` work clears. Scoped on purpose —
+    a `done` story additionally clears proof-of-work at the dev gate, which a park
+    no longer does (#676)."""
     task, sp = _park(project)
     task.spec_file = str(sp)
 
@@ -1564,6 +2081,267 @@ def test_verify_commands_rc1_stays_fixable_retry(tmp_path):
     policy = Policy(verify=VerifyPolicy(commands=(_FAIL,)))
     out = verify.verify_commands_outcome(policy, tmp_path)
     assert not out.ok and out.fixable and out.retryable and not out.env_fault
+
+
+# ---- unusable `cwd`: the spawn fault has no return code (DW-2) ----------------
+
+_unsearchable_dir_skips = (
+    pytest.mark.skipif(os.name == "nt", reason="Windows chmod only toggles the read-only flag"),
+    pytest.mark.skipif(
+        os.geteuid() == 0 if hasattr(os, "geteuid") else False,
+        reason="root searches a 000 directory",
+    ),
+)
+
+
+def _unusable_cwd(request, tmp_path, shape: str) -> Path:
+    """One of the ``cwd`` shapes ``subprocess.run`` refuses before the target
+    program starts — the reachable OSError subclasses of the spawn leg.
+
+    Each is a real filesystem state, never a monkeypatched raise: what is being
+    pinned is that the OS's own refusal is caught, and a synthetic
+    ``FileNotFoundError`` would pass just as well against a handler that only
+    named that one class (the narrowing this change exists to avoid).
+
+    The 000 directory's mode is restored by a finalizer — ``tmp_path``'s own
+    cleanup cannot remove a directory it may not search, and the leftover turns
+    into an rm_rf warning on every later session sharing the tmp root."""
+    if shape == "missing":
+        return tmp_path / "nowhere"  # FileNotFoundError
+    if shape == "file":
+        target = tmp_path / "a-file"
+        target.write_text("x\n", encoding="utf-8")
+        return target  # NotADirectoryError
+    if shape == "under-file":
+        target = tmp_path / "a-file-2"
+        target.write_text("x\n", encoding="utf-8")
+        return target / "beneath"  # NotADirectoryError, one level down
+    unsearchable = tmp_path / "locked"
+    unsearchable.mkdir()
+    request.addfinalizer(lambda: unsearchable.chmod(0o700))
+    unsearchable.chmod(0o000)
+    return unsearchable  # PermissionError
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "missing",
+        "file",
+        "under-file",
+        pytest.param("unsearchable", marks=_unsearchable_dir_skips),
+    ],
+)
+def test_unusable_cwd_becomes_a_result_instead_of_an_exception(request, tmp_path, shape):
+    """A `cwd` no command can run in yields a RESULT, not a raised OSError.
+
+    Before this, `run_verify_commands`' only handler was `except
+    subprocess.TimeoutExpired`, so all three shapes escaped every guard in the
+    engine's verification path and ended the run as a crash (`crash.txt` +
+    `state.crashed`) — over a fact that is a textbook environment problem.
+
+    All three shapes are driven, not just the first: `except FileNotFoundError`
+    would be a perfectly plausible fix and would leave two of them uncaught, so a
+    single-shape row could not tell the narrow handler from the right one.
+
+    Ablation: remove the `except OSError` arm and every parametrization fails with
+    the raw OSError, not with a wrong-message assertion."""
+    cwd = _unusable_cwd(request, tmp_path, shape)
+    policy = Policy(verify=VerifyPolicy(commands=(_OK,)))
+
+    (result,) = verify.run_verify_commands(policy, cwd)
+
+    assert result.command == _OK
+    assert result.spawn_error is not None
+    assert str(cwd) in result.spawn_error  # the failing cwd, which is the finding
+    assert result.returncode == verify.SPAWN_FAULT_RC
+    assert result.returncode != -1  # NOT the timeout sentinel: no child ran at all
+    assert result.output_tail  # names the exception, for the human reading it
+
+
+def test_unusable_cwd_yields_one_result_per_command(tmp_path):
+    """The documented "one CommandResult apiece" holds on the spawn leg too: the
+    loop appends and CONTINUES rather than aborting on the first refusal.
+
+    A caller zipping results against `policy.verify.commands` — or merely counting
+    them — must not silently lose the tail of the list, and the engine journals one
+    record per result, so a short list is a short audit trail.
+
+    Ablation: `break` (or `raise`) instead of `continue` in the new arm and the
+    length assertion fails at 1."""
+    commands = ("first-check", "second-check", "third-check")
+    policy = Policy(verify=VerifyPolicy(commands=commands))
+
+    results = verify.run_verify_commands(policy, tmp_path / "nowhere")
+
+    assert [r.command for r in results] == list(commands)
+    assert all(r.spawn_error is not None for r in results)
+    outcome = verify.verify_command_results_outcome(results, tmp_path / "nowhere")
+    assert "first-check" in outcome.reason
+    assert "second-check" not in outcome.reason and "third-check" not in outcome.reason
+
+
+def test_a_spawn_fault_unrelated_to_the_cwd_translates_too(tmp_path, monkeypatch):
+    """The handler is `except OSError`, not three named cwd classes — and the
+    record must not describe every one of them as a directory problem.
+
+    A missing `/bin/sh`, EMFILE from a descriptor-exhausted host, ENOMEM from a
+    fork that could not allocate: all reach the same arm, none is a fact about
+    the working directory. The message therefore states what was OBSERVED (the
+    child was not started) and names the cwd as context only, leaving the wrapped
+    exception to say why.
+
+    Injected, because a real ENOMEM cannot be provoked from a test without
+    breaking the host running it. What that costs is honest: this row grades the
+    message and the classification, while the sibling rows above drive the OS's
+    own refusals for real.
+
+    Ablation: restore a message hardcoding the cwd as the cause (`could not run
+    in {cwd}: ...`) and the "does not blame the directory" assertion fails."""
+    real_run = subprocess.run
+
+    def out_of_memory(*args, **kwargs):
+        if kwargs.get("shell"):
+            raise OSError(12, "Cannot allocate memory")
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", out_of_memory)
+    policy = Policy(verify=VerifyPolicy(commands=(_OK,)))
+
+    (result,) = verify.run_verify_commands(policy, tmp_path)
+
+    assert result.spawn_error is not None
+    assert "Cannot allocate memory" in result.spawn_error  # the real cause survives
+    # the cwd is context, not a verdict: it appears, but not as the diagnosis
+    assert str(tmp_path) in result.spawn_error
+    assert "could not run in" not in result.spawn_error
+
+    out = verify.verify_command_results_outcome([result], tmp_path)
+    assert not out.ok and out.env_fault and not out.retryable
+
+
+def test_unusable_cwd_escalates_as_an_environment_fault(tmp_path):
+    """Classified, the spawn fault escalates and PAUSES rather than retrying.
+
+    Same channel as rc 126/127 and for the same reason: an unusable `cwd` is
+    deterministic for a given tree, identical for every story, and unfixable by a
+    repair session — which is what `env_fault=True` means. A `retryable` outcome
+    would burn the attempt budget re-running the same refusal.
+
+    The explanatory clause is asserted from BOTH directions. The rc-based leg's
+    fixed "command not found / not executable" is a claim about the command, and
+    on this leg no command was ever looked for — so it must be gone, not merely
+    joined by better text."""
+    cwd = tmp_path / "nowhere"
+    policy = Policy(verify=VerifyPolicy(commands=(_OK,)))
+
+    out = verify.verify_commands_outcome(policy, cwd)
+
+    assert not out.ok and out.env_fault
+    assert not out.retryable and not out.fixable
+    assert "verify environment fault" in out.reason
+    assert str(cwd) in out.reason
+    assert "could not be started" in out.reason
+    assert "command not found / not executable" not in out.reason
+    # The exception already rides `spawn_error`, which is interpolated as the
+    # environment-fault reason. Repeating `output_tail` would print it twice.
+    # The type is the platform's, not a fixed name: POSIX raises
+    # FileNotFoundError for a missing cwd, Windows a different OSError
+    # subclass. Derive it from the same spawn so the once-only check holds
+    # on both rather than pinning one platform's spelling.
+    try:
+        subprocess.run([sys.executable, "-c", ""], cwd=cwd, check=False)
+    except OSError as exc:
+        spawn_exc = type(exc).__name__
+    else:  # pragma: no cover - a missing cwd is not spawnable
+        pytest.fail("spawn into a missing cwd unexpectedly succeeded")
+    assert out.reason.count(spawn_exc) == 1
+
+
+def test_rc_env_fault_keeps_its_own_explanatory_clause(tmp_path):
+    """The complement, so the branch is pinned from both sides: rc 127 still says
+    "command not found / not executable" — that leg IS a claim about the command,
+    and branching must not have quietly rewritten it for everyone."""
+    policy = Policy(verify=VerifyPolicy(commands=("exit 127",)))
+
+    out = verify.verify_commands_outcome(policy, tmp_path)
+
+    assert not out.ok and out.env_fault
+    assert "command not found / not executable" in out.reason
+    assert "could not be started" not in out.reason
+
+
+def test_spawn_fault_rc_cannot_collide_with_a_real_return_code():
+    """The sentinel sits outside every value a child that RAN can report.
+
+    On POSIX `subprocess` reports `-N` for a child killed by signal N, so the
+    small negatives are all real return codes: `-2` is SIGINT, `-9` SIGKILL. A
+    sentinel in that range would make "the verify command was killed" and "the
+    verify command never started" the same observation to anything keying on the
+    rc — and the journal record invites exactly that, since it ships the rc to
+    out-of-process readers.
+
+    Asserted against `signal.Signals` rather than a hardcoded ceiling, so a
+    platform with higher real-time signals grades this honestly instead of
+    against this test's idea of the range.
+
+    Ablation: set `SPAWN_FAULT_RC = -2` — the value this shipped with first — and
+    the collision assertion fails naming SIGINT."""
+    import signal as signal_mod
+
+    assert verify.SPAWN_FAULT_RC < 0  # the win32 early-out and the failure arm
+    assert verify.SPAWN_FAULT_RC != -1  # not the timeout leg's sentinel
+    collisions = [s for s in signal_mod.Signals if -s.value == verify.SPAWN_FAULT_RC]
+    assert not collisions, f"SPAWN_FAULT_RC is a signal death: {collisions}"
+    # nor an ordinary exit status, which is what the positive range holds
+    assert verify.SPAWN_FAULT_RC not in verify.ENV_FAULT_RCS
+
+
+def test_spawn_fault_is_answered_before_any_rc_or_win32_probe(tmp_path):
+    """`env_fault_reason` reads `spawn_error` FIRST, ahead of the rc arms and the
+    win32 token probe.
+
+    Not a style preference. The probe resolves a command's leading token as `cwd /
+    token` to tell "tool missing" from "command failed" — and on this leg `cwd` is
+    exactly what could not be used, so it has nothing true to say about a directory
+    the child never entered. Driven through `env_fault_reason` directly so the row
+    holds on POSIX, where the probe is not reached at all.
+
+    The result carries `SPAWN_FAULT_RC`, which is in neither `ENV_FAULT_RCS` nor
+    `{0}` — so if the ordering ever regressed, the rc arms could not answer for it
+    and the reason would come back None on POSIX."""
+    result = verify.CommandResult(
+        "pytest -q", verify.SPAWN_FAULT_RC, "NotADirectoryError: ...", spawn_error="cwd is a file"
+    )
+
+    assert verify.env_fault_reason(result, tmp_path) == "cwd is a file"
+    # and a result from a child that really ran is untouched by the new arm
+    assert verify.env_fault_reason(verify.CommandResult("pytest -q", 1, "F"), tmp_path) is None
+
+
+def test_timeout_stays_an_ordinary_fixable_retry_with_no_spawn_error(tmp_path, monkeypatch):
+    """The two "no exit status" shapes must not collapse into one.
+
+    A timed-out command RAN — it was found, it was executable, it hung — so it
+    stays a fixable retry a repair session can act on. Only a child that never
+    started is an environment fault. Sharing a sentinel between them (or letting
+    the new arm swallow the timeout) would pause runs over slow test suites.
+
+    Ablation: set `SPAWN_FAULT_RC = -1` and the sentinel assertion below stops
+    discriminating; set `spawn_error` on the timeout leg and the classification
+    flips to `env_fault`."""
+    monkeypatch.setattr(verify, "COMMAND_TIMEOUT_S", 0.5)
+    sleeper = tmp_path / "sleeper.py"
+    sleeper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    policy = Policy(verify=VerifyPolicy(commands=(f'"{sys.executable}" "{sleeper}"',)))
+
+    (result,) = verify.run_verify_commands(policy, tmp_path)
+
+    assert result.spawn_error is None
+    assert result.returncode == -1 and result.output_tail == "timed out"
+
+    out = verify.verify_command_results_outcome([result], tmp_path)
+    assert not out.ok and out.retryable and out.fixable and not out.env_fault
 
 
 def test_verify_commands_bound_a_stream_instead_of_holding_it_whole(tmp_path, monkeypatch):
@@ -2500,6 +3278,312 @@ def test_verify_review_gates_oserror_degrades_to_retry(project, monkeypatch, mod
     assert "expected 'done'" not in out.reason
 
 
+def _review_gate_at_done(project, mode):
+    """A task+spec each review gate accepts, so the only thing left to decide the
+    outcome is the verify commands. Mirrors the mode fan-out beside it."""
+    if mode == "review":
+        write_sprint(project, {"1-1-a": "done"})
+        task = make_task(project)
+        sp = spec_path(project, "1-1-a")
+        write_spec(sp, "done", task.baseline_commit)
+        gate = verify.verify_review
+    elif mode == "review_stories":
+        task = make_stories_task(project, "1")
+        sp = write_story(
+            project.planning_artifacts / "epic-a", "1", "x", "done", task.baseline_commit
+        )
+        gate = verify.verify_review_stories
+    else:
+        task = make_bundle_task(project)
+        sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+        write_spec(sp, "done", task.baseline_commit)
+        bundle_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
+        gate = verify.verify_review_bundle
+    task.spec_file = str(sp)
+    return task, gate
+
+
+@pytest.mark.parametrize("mode", ["review", "review_stories", "review_bundle"])
+def test_verify_review_gates_run_commands_in_repo_root(project, tmp_path, mode):
+    """`[verify] commands` run in the git root, not the BMAD project root (#695).
+
+    The two are the same path everywhere except under an explicit `repo_root:`
+    with `isolation = "none"` — `ProjectPaths.rebased` sets both, so worktree
+    isolation never diverges — and the `project` fixture sets no `repo_root`, so
+    no pre-existing row can tell the two apart. These three gates were the sole
+    callers running the commands in `paths.project`; the dev side and
+    `cli._reverify` both already used `repo_root`.
+
+    Pinned from BOTH directions on purpose: a marker only the repo root holds
+    must pass AND a marker only the project holds must fail. The positive probe
+    identifies `repo_root`; the negative probe rules out `project` explicitly.
+
+    It does NOT pin the other half of the split. The artifact reads resolve
+    through `paths.sprint_status` / `paths.deferred_work` (derived from
+    `implementation_artifacts`) and an absolute `task.spec_file`, none of which
+    `dataclasses.replace(..., repo_root=...)` moves — so no ablation here can
+    redden on them, and this row must not be read as evidence they stayed
+    project-rooted.
+
+    `repo_root` is a bare directory, not a git repo, deliberately: these three
+    gates run no git in that root at all — only `subprocess.run(cwd=...)` — so a
+    plain dir is the honest fixture. Turning it into a real repo would let a
+    regression that started shelling out to git there pass unnoticed.
+
+    The two markers and their RELATIVE probes come from `conftest`
+    (`plant_root_markers`, `REPO_ROOT_MARKER_CMD`, `PROJECT_MARKER_CMD`) rather
+    than being built here: the four other unpinned `[verify] commands` callers
+    (both `Engine._verify_commands_with_results` stages, both `cli._reverify`
+    call sites) are graded by the same two-direction probe, and a re-derived
+    fixture would let one of those rows quietly ask a different question.
+
+    INVERSE ablation: restore the pre-#695 root — `verify_commands_outcome(policy,
+    paths.project)` in `_verify_review_commands` — and all three modes fail on the
+    FIRST assertion, the repo-root marker going missing, before the refusal leg is
+    reached. The gate here is a cwd choice rather than a check, so deleting code
+    cannot reproduce the bug; only putting the old root back does."""
+    repo_root = tmp_path / "code-root"
+    repo_root.mkdir()
+    plant_root_markers(repo_root=repo_root, project=project.project)
+    paths = dataclasses.replace(project, repo_root=repo_root)
+    task, gate = _review_gate_at_done(project, mode)
+
+    assert gate(task, paths, Policy(verify=VerifyPolicy(commands=(REPO_ROOT_MARKER_CMD,)))).ok
+
+    out = gate(task, paths, Policy(verify=VerifyPolicy(commands=(PROJECT_MARKER_CMD,))))
+    assert not out.ok and "verify command failed" in out.reason
+
+
+@pytest.mark.parametrize("mode", ["review", "review_stories", "review_bundle"])
+def test_verify_review_gates_classify_against_the_root_they_run_in(
+    project, tmp_path, monkeypatch, mode
+):
+    """The cwd is forwarded TWICE, and the row above pins only the first hop.
+
+    `verify_commands_outcome` hands its `cwd` to `run_verify_commands` (execution)
+    and again to `verify_command_results_outcome` -> `env_fault_reason` ->
+    `_win32_env_fault_reason`, which resolves a command's leading token as
+    `cwd / token` to tell "tool missing" from "command failed". The two outcomes
+    are not interchangeable: an env fault ESCALATES and pauses the run, while an
+    ordinary failure is `fixable` and routes a repair session.
+
+    The sibling row cannot see the second hop. Both its assertions are rc-based —
+    `.ok`, then `"verify command failed"`, which `verify_command_results_outcome`
+    reaches only AFTER `env_fault_reason` returned None for every result — so
+    re-rooting the classifier alone leaves it green. Confirmed by ablation: rewriting
+    the helper as `verify_command_results_outcome(run_verify_commands(policy,
+    paths.repo_root), paths.project)` passed all of `test_verify.py` +
+    `test_engine.py` at 818 passed / 23 skipped. On Windows that split would probe a
+    relative token such as `check.cmd`, living in the code root, against the project
+    dir instead, miss it, fall through to the PATH branch and escalate — pausing the
+    run over a command that had merely failed.
+
+    Spying both hops rather than asserting on `env_fault` keeps this cross-platform:
+    the classifier's own behavior is already pinned by the rows beside
+    `_win32_env_fault_reason`, and what was unpinned is only WHICH ROOT reaches it
+    from these three gates."""
+    repo_root = tmp_path / "code-root"
+    repo_root.mkdir()
+    paths = dataclasses.replace(project, repo_root=repo_root)
+    task, gate = _review_gate_at_done(project, mode)
+
+    seen: dict[str, Path] = {}
+    real_run = verify.run_verify_commands
+    real_classify = verify.verify_command_results_outcome
+
+    def spy_run(policy, cwd):
+        seen["run"] = cwd
+        return real_run(policy, cwd)
+
+    def spy_classify(results, cwd):
+        seen["classify"] = cwd
+        return real_classify(results, cwd)
+
+    monkeypatch.setattr(verify, "run_verify_commands", spy_run)
+    monkeypatch.setattr(verify, "verify_command_results_outcome", spy_classify)
+
+    assert gate(task, paths, Policy(verify=VerifyPolicy(commands=(_OK,)))).ok
+
+    # both hops, not just execution: the classifier decides escalate-vs-retry
+    assert seen["run"] == repo_root
+    assert seen["classify"] == repo_root
+
+
+def _break_the_check_before_the_commands(project, task, mode) -> None:
+    """Fail the LAST gate check that precedes the verify commands, per mode.
+
+    Deliberately the last one rather than the first: every gate opens on the spec
+    status, so breaking that would prove only that the earliest check
+    short-circuits and would leave the sprint and ledger checks — the ones that
+    sit immediately in front of the commands — unexercised in all three modes.
+    ``review_stories`` has no later check to break, so its spec status is the
+    honest subject there."""
+    if mode == "review":
+        write_sprint(project, {"1-1-a": "in-progress"})
+    elif mode == "review_stories":
+        write_spec(Path(task.spec_file), "in-progress", task.baseline_commit)
+    else:
+        bundle_ledger(project, {"DW-1": "open", "DW-2": "open"})
+
+
+@pytest.mark.parametrize("mode", ["review", "review_stories", "review_bundle"])
+def test_verify_review_gates_hand_their_results_to_the_sink(project, mode):
+    """Every review gate offers its verifier results to `on_results` — the seam
+    the engine journals review-leg `verify-command-result` records through.
+
+    Before this the three gates discarded their `CommandResult`s inside core, so a
+    review pass left no per-command record and no `verify/` stream files, unlike
+    the dev side. The results are handed over BEFORE classification (the order
+    `Engine._verify_commands_with_results` already used), so the record exists
+    whatever the classifier then decides — including an escalation that ends the
+    run.
+
+    Both commands are asserted, not just the count: the sink receives the whole
+    tuple in configured order, which is what makes a record-per-command possible."""
+    task, gate = _review_gate_at_done(project, mode)
+    seen: list[tuple[verify.CommandResult, ...]] = []
+    policy = Policy(verify=VerifyPolicy(commands=(_OK, _FAIL)))
+
+    out = gate(task, project, policy, on_results=seen.append)
+
+    assert not out.ok and out.fixable  # the classification is unchanged by the sink
+    (results,) = seen  # called exactly once per gate invocation
+    assert [r.command for r in results] == [_OK, _FAIL]
+    assert [r.returncode for r in results] == [0, 1]
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        verify.verify_commands_outcome,
+        verify._verify_review_commands,
+        verify.verify_review,
+        verify.verify_review_stories,
+        verify.verify_review_bundle,
+    ],
+)
+def test_review_result_sinks_are_keyword_only_with_a_default(subject):
+    """The additive observation seam cannot silently bind a new positional
+    argument at any layer; every existing call shape remains valid."""
+    parameter = inspect.signature(subject).parameters["on_results"]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is None
+
+
+@pytest.mark.parametrize("mode", ["review", "review_stories", "review_bundle"])
+def test_verify_review_gates_skip_the_sink_when_they_short_circuit(project, mode):
+    """A gate that refuses before reaching its commands offers nothing: nothing
+    ran, so there is nothing to record.
+
+    The distinction is load-bearing for the journal — a record claims a verifier
+    pass happened — and it is why the sink is threaded through the composition
+    rather than fired at the top of each gate.
+
+    Ablation: fire the sink at the top of each gate — necessarily with an empty
+    tuple, since no results exist there yet — and every mode fails here on
+    `seen == []`."""
+    task, gate = _review_gate_at_done(project, mode)
+    _break_the_check_before_the_commands(project, task, mode)
+    seen: list[tuple[verify.CommandResult, ...]] = []
+
+    out = gate(task, project, Policy(verify=VerifyPolicy(commands=(_OK,))), on_results=seen.append)
+
+    assert not out.ok
+    assert seen == []
+
+
+@pytest.mark.parametrize("mode", ["review", "review_stories", "review_bundle"])
+def test_verify_review_gates_call_the_sink_with_no_commands_configured(project, mode):
+    """With `[verify] commands` empty the sink is still called, with `()`.
+
+    "The pass ran and executed nothing" and "no pass ran" are different facts, and
+    only the second is signalled by never calling the sink — which is precisely
+    what the short-circuit row above asserts. The engine's sink then records
+    nothing and allocates no sequence for an empty tuple, so this costs no journal
+    entry; what it buys is that the two cases stay distinguishable at the seam."""
+    task, gate = _review_gate_at_done(project, mode)
+    seen: list[tuple[verify.CommandResult, ...]] = []
+
+    assert gate(task, project, Policy(), on_results=seen.append).ok
+
+    assert seen == [()]
+
+
+@pytest.mark.parametrize("mode", ["review", "review_stories", "review_bundle"])
+def test_verify_review_gates_are_unchanged_with_no_sink(project, mode):
+    """Called from core with no sink — as every pre-existing caller does — the
+    gates behave exactly as before: `on_results` is keyword-with-default, and its
+    absence is not a second code path.
+
+    Both verdicts, so the row cannot be satisfied by a gate that started refusing
+    (or accepting) everything."""
+    task, gate = _review_gate_at_done(project, mode)
+
+    assert gate(task, project, Policy(verify=VerifyPolicy(commands=(_OK,)))).ok
+
+    refused = gate(task, project, Policy(verify=VerifyPolicy(commands=(_FAIL,))))
+    assert not refused.ok and refused.fixable and "verify command failed" in refused.reason
+
+
+@pytest.mark.parametrize("mode", ["review", "review_bundle"])
+def test_verify_review_gates_read_artifacts_from_the_project_root(project, tmp_path, mode):
+    """The other half of the split `_verify_review_commands` states, and the half
+    the row above deliberately cannot reach: only the command `cwd` moved to
+    `repo_root` — the artifacts these gates read stay project-rooted.
+
+    It has to be a decoy rather than an ablation. `dataclasses.replace(...,
+    repo_root=...)` moves nothing else, and both `paths.sprint_status` and
+    `paths.deferred_work` derive from `implementation_artifacts`, so no ablation
+    of the root can redden on them. Instead plant a complete artifact tree at the
+    same RELATIVE path under `repo_root`, carrying statuses that would fail the
+    gate, and require the gate to pass anyway: a regression that re-derived either
+    artifact from `repo_root` reads the decoy and reddens here.
+
+    `review_stories` is absent on purpose — it reads neither artifact, so there is
+    nothing for a decoy to shadow.
+
+    The decoy is followed by a positive control, because on its own it asserts only
+    that a gate PASSED, which is what it would also do if the gate had stopped
+    reading these artifacts altogether. Planting the same statuses in the project's
+    own tree and requiring a refusal is what establishes they are load-bearing —
+    the discrimination is then built here rather than borrowed from the rows that
+    happen to cover each failure separately.
+
+    The control is ablated per mode, since each mode's refusal is carried by its
+    own artifact. ABLATION A1: delete the `if sprint != expected:` refusal in
+    `verify_review` and `[review]` fails on `assert not refused.ok` while
+    `[review_bundle]` still passes. ABLATION A2: delete the `if not_done:` refusal
+    in `verify_review_bundle` and `[review_bundle]` fails there instead, `[review]`
+    passing. Reddening DISJOINT params is the point — it is what shows neither
+    mode's control is being carried by the other mode's gate."""
+    repo_root = tmp_path / "code-root"
+    rel = project.implementation_artifacts.relative_to(project.project)
+    decoy_paths = dataclasses.replace(project, implementation_artifacts=repo_root / rel)
+    decoy_paths.implementation_artifacts.mkdir(parents=True)
+
+    task, gate = _review_gate_at_done(project, mode)
+
+    # both decoys carry the status that WOULD fail this gate, so either artifact
+    # resolving off repo_root is a red test rather than a silent pass
+    write_sprint(decoy_paths, {"1-1-a": "in-progress"})
+    bundle_ledger(decoy_paths, {"DW-1": "open", "DW-2": "open"})
+
+    paths = dataclasses.replace(project, repo_root=repo_root)
+
+    assert gate(task, paths, Policy()).ok
+
+    # positive control: the SAME statuses in the project's own artifacts must
+    # refuse. Without this the row above passes for a gate that reads neither file.
+    write_sprint(project, {"1-1-a": "in-progress"})
+    bundle_ledger(project, {"DW-1": "open", "DW-2": "open"})
+
+    refused = gate(task, paths, Policy())
+
+    assert not refused.ok and refused.retryable
+    assert ("in-progress" if mode == "review" else "DW-1") in refused.reason
+
+
 def test_verify_review_bundle_ledger_oserror_degrades_to_retry(project, monkeypatch):
     """The ledger read is the same TOCTOU class as the spec read beside it — the
     orchestrator's own `mark_done` rewrites it between the dev and review gates."""
@@ -3148,13 +4232,16 @@ def test_safe_rollback_restores_the_policy_through_the_atomic_helper(project, mo
     git(repo, "add", "-f", str(pol))
     git(repo, "commit", "-q", "-m", "add policy after baseline")
     seen: list[tuple[Path, bytes]] = []
-    real = verify.atomic_write_bytes
+    real = verify.atomic_write_bytes_confined
 
-    def record(path, data, *, follow_symlinks=True):
+    def record(path, data, *, confine_root, require_writable_target=False):
         seen.append((Path(path), data))
-        real(path, data, follow_symlinks=follow_symlinks)
+        real(path, data, confine_root=confine_root, require_writable_target=require_writable_target)
 
-    monkeypatch.setattr(verify, "atomic_write_bytes", record)
+    # the CONFINED binding (#593). `verify.atomic_write_bytes` still exists — the
+    # frontmatter writer keeps it — so patching that name would not raise, it would
+    # simply record nothing; `len(seen) == 1` below is what catches that.
+    monkeypatch.setattr(verify, "atomic_write_bytes_confined", record)
 
     verify.safe_rollback(repo, baseline, baseline_untracked=None, keep=(".bmad-loop",))
 
@@ -3165,11 +4252,13 @@ def test_safe_rollback_restores_the_policy_through_the_atomic_helper(project, mo
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_safe_rollback_replaces_a_policy_symlink_by_name(project):
-    """#379. The one row that grades this SITE's `follow_symlinks=False` argument.
-    Unlike the other writers moved to the helper on this branch, the expression
-    replaced here was a direct `write_bytes` — which opens the name and so writes
-    THROUGH a planted link — so no-follow is a genuine change of behaviour, not a
-    preservation of what `os.replace` already did.
+    """#379. The one row that grades this SITE's choice of a writer that replaces
+    the NAME — since #593 the put-back calls `atomic_write_bytes_confined`, which
+    is no-follow by construction; the row below grades the confinement half of
+    that same call. Unlike the other writers moved to the helper on this branch,
+    the expression replaced here was a direct `write_bytes` — which opens the name
+    and so writes THROUGH a planted link — so replacing the name is a genuine
+    change of behaviour, not a preservation of what `os.replace` already did.
 
     It is still the right change. `policy.write_mux_backend` already replaces this
     same file by name, so a link at `.bmad-loop/policy.toml` does not survive the
@@ -3180,8 +4269,11 @@ def test_safe_rollback_replaces_a_policy_symlink_by_name(project):
     the redirect has to aim at a tracked in-repo file — which the reset then
     reverts and this write immediately clobbers with policy bytes.
 
-    Ablation: drop `follow_symlinks=False` and this reddens alone — the link
-    survives and `shared.toml` is the file that gets rewritten."""
+    Ablation: swap the put-back's writer for `atomic_write_bytes(policy_path, ...)`
+    at its follow-the-link default and this reddens on the link surviving and
+    `shared.toml` rewritten (the confined-refusal row below reddens with it, on
+    its `DID NOT RAISE`). It is still the one row here that plants a link at the
+    policy's own name."""
     repo = project.project
     shared = repo / "shared.toml"  # tracked, and NOT the operator's policy
     shared.write_bytes(b"[scm]\nrollback_on_failure = false\n")
@@ -3200,6 +4292,99 @@ def test_safe_rollback_replaces_a_policy_symlink_by_name(project):
     assert not pol.is_symlink()  # the NAME was replaced
     assert pol.read_bytes() == b"[scm]\nrollback_on_failure = true\n"
     assert shared.read_bytes() == b"[scm]\nrollback_on_failure = false\n"  # not through
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_safe_rollback_policy_putback_refuses_a_symlinked_bmad_loop_dir(project, tmp_path):
+    """The escape #593 names, at this site. The `follow_symlinks=False` the row
+    above grades stops at the FINAL component: `.bmad-loop/` itself was still
+    resolved by name, so a link planted there aimed both the temp and the
+    published policy.toml out of the repo entirely. The put-back's own
+    `mkdir(parents=True, exist_ok=True)` ACCEPTS a symlink-to-a-directory, so the
+    planted parent survives the setup step instead of being replaced by it.
+
+    Reaching the writer at all is the hard part, and it is asserted rather than
+    assumed: the put-back only fires when the capture read a real file
+    (`policy_content is not None`) AND the reset CHANGED what the name reads. So
+    the redirect is built the way a session would have to build it — `.bmad-loop/`
+    to a directory it owns, and `policy.toml` inside that directory back at a
+    TRACKED in-repo file the reset reverts. `UnconfinedWriteError` can only come
+    from that one confined call, so the raise itself is the proof the write was
+    reached; the pre-assert pins the capture half independently.
+
+    The last two assertions are the load-bearing ones: refusing loudly is worth
+    nothing if the operator's config already landed outside the project.
+
+    Ablation: revert the call to
+    `atomic_write_bytes(policy_path, policy_content, follow_symlinks=False)` and
+    this fails `DID NOT RAISE`, with the planted link in `outside/` replaced by a
+    real policy.toml holding the operator's config."""
+    repo = project.project
+    outside = tmp_path / "outside"  # sibling of the sandbox, genuinely outside it
+    outside.mkdir()
+    shared = repo / "shared.toml"  # tracked, and NOT the operator's policy
+    shared.write_bytes(b"[scm]\nrollback_on_failure = false\n")
+    git(repo, "add", str(shared))
+    git(repo, "commit", "-q", "-m", "a tracked file a session could aim at")
+    baseline = verify.rev_parse_head(repo)
+
+    (repo / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+    (outside / "policy.toml").symlink_to(shared)
+    shared.write_bytes(b"[scm]\nrollback_on_failure = true\n")
+    pol = repo / ".bmad-loop" / "policy.toml"
+    # precondition: the capture reads a real file through both hops, so
+    # `policy_content` is non-None and the reset below makes `current` differ
+    assert pol.read_bytes() == b"[scm]\nrollback_on_failure = true\n"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        verify.safe_rollback(repo, baseline, baseline_untracked=None, keep=(".bmad-loop",))
+
+    assert shared.read_bytes() == b"[scm]\nrollback_on_failure = false\n"  # reset, not rewritten
+    assert (outside / "policy.toml").is_symlink()  # no file was published out here
+    assert sorted(x.name for x in outside.iterdir()) == ["policy.toml"]  # nor staged
+
+
+def test_safe_rollback_policy_putback_is_confined_to_the_repo(project, monkeypatch):
+    """The positive control for the refusal above, and the row that grades the two
+    keywords this site passes rather than the behaviour they buy.
+
+    `confine_root` is the one component the anchored walk never checks — it is
+    where the walk STARTS — so rooting this call at `policy_path.parent` would be
+    lexically confined and still admit the whole #593 escape, silently. It has to
+    be the repo, which is exactly what `policy_path` was spelled from at the
+    capture. `require_writable_target` is #597: policy.toml is operator config, so
+    a read-only one is refused with the kernel's `PermissionError` instead of
+    being routed around by a replace that only needs the directory writable.
+
+    The wrap keeps the real write, so this is a control and not a stub
+    measurement: the restore below actually lands on disk.
+
+    Ablation: change `confine_root=repo` to `confine_root=policy_path.parent` and
+    this reddens alone (every behavioural row above stays green, which is the
+    point of grading the keyword); drop `require_writable_target=True` and it
+    reddens on the flag row."""
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)  # baseline predates policy.toml
+    pol = repo / ".bmad-loop" / "policy.toml"
+    pol.parent.mkdir(parents=True, exist_ok=True)
+    pol.write_bytes(b"[scm]\nrollback_on_failure = true\n")
+    git(repo, "add", "-f", str(pol))
+    git(repo, "commit", "-q", "-m", "add policy after baseline")
+    seen: list[dict[str, object]] = []
+    real = verify.atomic_write_bytes_confined
+
+    def record(path, data, *, confine_root, require_writable_target=False):
+        seen.append({"root": Path(confine_root), "writable": require_writable_target})
+        real(path, data, confine_root=confine_root, require_writable_target=require_writable_target)
+
+    monkeypatch.setattr(verify, "atomic_write_bytes_confined", record)
+
+    verify.safe_rollback(repo, baseline, baseline_untracked=None, keep=(".bmad-loop",))
+
+    assert len(seen) == 1  # the writer was reached
+    assert seen[0]["root"] == repo  # the REPO, not `.bmad-loop/` — see above
+    assert seen[0]["writable"] is True
+    assert pol.read_bytes() == b"[scm]\nrollback_on_failure = true\n"  # and it landed
 
 
 def test_attempt_dirty_ignores_lone_policy_edit(project):
@@ -3536,13 +4721,17 @@ def test_path_tracked_still_matches_a_directory_prefix(project):
 
 
 def test_path_tracked_file_separates_a_file_from_a_directory_prefix(project):
-    """The whole reason this predicate exists next to its sibling: `path_tracked`
-    answers True for BOTH a tracked file and a tracked directory, and the worktree
-    shield needs opposite behaviour for the two (#392).
+    """Why this predicate is narrower than its sibling: `path_tracked` answers True for
+    BOTH a tracked file and a tracked directory, and its callers have to tell those
+    apart. Since #484 the shield asks `path_tracked_kind` for that — three answers, not
+    two — and this boolean is kept for `_pin_tracked_config_rewrite`, where only a
+    tracked FILE can carry the skip-worktree bit the pin depends on (#392, #484).
 
-    Ablation: return `bool(entries)` instead of comparing the set and the directory
-    assertion flips to True — i.e. the shield would start dropping a tracked skill
-    tree's pattern, which measurably DOES shield new children."""
+    Ablation: return `bool(entries)` instead of comparing the set — the mechanics now
+    live in `path_tracked_kind`, which this delegates to — and the directory assertion
+    flips to True. The shield would then read a tracked skill tree as a tracked FILE and
+    drop its pattern outright, where #484 has it SUBSTITUTE one pattern per file
+    provisioning actually wrote; nothing would shield that tree at all."""
     repo = project.project
     (repo / "_bmad" / "render").mkdir(parents=True, exist_ok=True)
     (repo / "_bmad" / "render" / "render_skill.py").write_text("# renderer\n")
@@ -3582,7 +4771,8 @@ def test_path_tracked_file_reads_a_metachar_name_past_its_glob_neighbour(project
     then keeps an inert pattern and the #392 hygiene failure survives for any project
     whose hook config or skill tree carries `[`, `*` or `?`.
 
-    Ablation: drop the `:(literal)` prefix and the first assertion flips to False."""
+    Ablation: drop the `:(literal)` prefix — the spec now lives in `path_tracked_kind`,
+    which this delegates to — and the first assertion flips to False."""
     repo = project.project
     _metachar_pair(repo, "docs[a]", "docsa")  # both committed, and the glob collides
     assert verify.path_tracked_file(repo, "docs[a]/f.md")
@@ -3604,6 +4794,89 @@ def test_path_tracked_file_raises_on_git_failure(project, monkeypatch):
     monkeypatch.setattr(verify, "git_bytes", boom)
     with pytest.raises(verify.GitError):
         verify.path_tracked_file(repo, "src.txt")
+
+
+def test_path_tracked_kind_separates_untracked_file_and_dir(project):
+    """The tri-state the shield reads (#484). A tracked FILE, a tracked DIRECTORY prefix
+    and a path with no index entry want three different pattern treatments — drop,
+    substitute one pattern per file provisioning wrote, keep — and the boolean sibling
+    collapses the last two into a single False.
+
+    Ablation: in `path_tracked_kind`, discriminate on `bool(entries)` instead of
+    comparing the set against `{os.fsencode(rel)}`, and the directory case answers
+    "file" — the shield would read a tracked skill tree as a tracked file, drop its
+    pattern outright, and put nothing at all in its place."""
+    repo = project.project
+    (repo / "_bmad" / "render").mkdir(parents=True, exist_ok=True)
+    (repo / "_bmad" / "render" / "render_skill.py").write_text("# renderer\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "render")
+    (repo / "stray.txt").write_text("untracked\n")
+
+    assert verify.path_tracked_kind(repo, "src.txt") == "file"
+    assert verify.path_tracked_kind(repo, "_bmad/render/render_skill.py") == "file"
+    # A directory lists the entries BENEATH it, never its own name — at either depth.
+    assert verify.path_tracked_kind(repo, "_bmad/render") == "dir"
+    assert verify.path_tracked_kind(repo, "_bmad") == "dir"
+    # Both untracked directions, which `path_tracked` cannot separate either.
+    assert verify.path_tracked_kind(repo, "stray.txt") == "untracked"
+    assert verify.path_tracked_kind(repo, "never_existed.txt") == "untracked"
+
+
+def test_path_tracked_kind_reads_a_metachar_name_past_its_glob_neighbour(project):
+    """The literal-pathspec hazard, in the direction reading the output's TEXT cannot
+    refuse on its own.
+
+    When the metachar path IS a tracked file and its glob neighbour is tracked too, a
+    bare pathspec returns BOTH names. The set then exceeds the singleton and a genuine
+    tracked FILE reads "dir", so the shield substitutes per-file patterns for a tree it
+    never wrote — for any project whose hook config or skill tree carries `[`, `*` or
+    `?`.
+
+    Ablation: drop the `:(literal)` prefix from `path_tracked_kind`'s spec alone (inline
+    the bare rel in place of `_literal_specs`, so the sibling probes that share that
+    helper stay untouched) and the first assertion flips to "dir". The absent-path
+    assertion below flips too, to "dir" on the neighbour's name alone — where the
+    boolean sibling's own record notes that direction ablates GREEN there, because
+    `{neighbour} != {rel}` reads False whichever way it got there. Widening the answer
+    from two states to three is what gives the second direction teeth."""
+    repo = project.project
+    _metachar_pair(repo, "docs[a]", "docsa")  # both committed, and the glob collides
+    assert verify.path_tracked_kind(repo, "docs[a]/f.md") == "file"
+    assert verify.path_tracked_kind(repo, "docsa/f.md") == "file"
+    git(repo, "rm", "-r", "-q", "--cached", "--", ":(literal)docs[a]")
+    assert verify.path_tracked_kind(repo, "docs[a]/f.md") == "untracked"
+
+
+def test_path_tracked_kind_raises_on_git_failure(project, monkeypatch):
+    """Contracted to raise like every other probe here, so the shield's caller makes its
+    own keep-the-pattern decision rather than inheriting a silent answer. Of the three,
+    a silent "file" drops the pattern and leaks seeded files into a story commit and a
+    silent "dir" substitutes patterns for a tree provisioning never wrote; only
+    "untracked" happens to coincide with the degrade, and a probe must not depend on
+    which fault it draws.
+
+    Pins the rc≠0 branch specifically: `git_bytes` returns the returncode as an ANSWER
+    and never raises on it, so nothing but this check turns a failed spawn into a fault.
+
+    Ablation: delete the `if proc.returncode != 0` raise and the call returns
+    "untracked" — a failed probe reading as a clean answer. That same mutation leaves
+    `test_path_tracked_file_raises_on_git_failure` GREEN, because it monkeypatches
+    `git_bytes` to RAISE rather than to return a bad rc: the sibling pins propagation,
+    not the branch that manufactures the fault, and only this test covers the latter."""
+    repo = project.project
+
+    def failed(_repo, *_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=["git"], returncode=128, stdout=b"", stderr=b"fatal: bad index file"
+        )
+
+    monkeypatch.setattr(verify, "git_bytes", failed)
+    with pytest.raises(verify.GitError) as excinfo:
+        verify.path_tracked_kind(repo, "src.txt")
+    # The BARE rel is the operator's informative half; the magic prefix is our plumbing.
+    assert "src.txt" in str(excinfo.value)
+    assert "fatal: bad index file" in str(excinfo.value)
 
 
 @RESERVED_IN_WINDOWS_FILENAMES
@@ -4519,6 +5792,510 @@ def test_read_frontmatter_ignores_triple_dash_in_value(project):
     assert fm["title"] == "restore --- review"
 
 
+# ------------------------------------------- repo_root override (divergent roots)
+#
+# `isolation = "none"` plus a `repo_root:` key in _bmad/bmm/config.yaml is the ONE
+# supported shape where `paths.project` and `paths.repo_root` name different
+# directories (`bmadconfig.worktree_isolation_conflict` refuses the other). The
+# `project` fixture sets no override, so `repo_root == project` and no pre-existing
+# row here can tell the two apart — which is why the wrong-root bug survived.
+
+
+def _repo_root_override(project, tmp_path):
+    """ProjectPaths for the override: BMAD artifacts under a `project` directory
+    that is not a checkout, code + git under a separate `repo_root`.
+
+    The session's cwd under this config IS `repo_root` (`Workspace.default` sets
+    `root = paths.repo_root`), so the dev writer already stamps its baseline there.
+    Only the readers were anchored on `project`."""
+    art = tmp_path / "artifacts-root"
+    impl = art / "_bmad-output" / "implementation-artifacts"
+    plan = art / "_bmad-output" / "planning-artifacts"
+    impl.mkdir(parents=True)
+    plan.mkdir(parents=True)
+    return dataclasses.replace(
+        project,
+        project=art,
+        implementation_artifacts=impl,
+        planning_artifacts=plan,
+        output_folder=art / "_bmad-output",
+        repo_root=project.project,
+    )
+
+
+def test_verify_dev_measures_proof_of_work_in_the_code_tree(project, tmp_path):
+    """The baseline is written in `repo_root` (by `Engine._dev_phase`, off
+    `workspace.root`) and must be READ there too. Anchored on `paths.project` the
+    gate asked a directory that is not the code checkout about a commit only the
+    code checkout has.
+
+    Ablation: put the canonical-oid probe back on `paths.project` and this reddens
+    with "does not match" — `artifacts-root` is not a repo, so the claimed commit
+    cannot be resolved there.
+
+    The proof-of-work probe deliberately is NOT graded by this row, and cannot be:
+    the gate arm refuses only on a positive "nothing changed" (`is False` over
+    `_changes_since`'s tri-state), so pointing the probe at a non-repo yields the
+    unanswerable `None`, the gate PASSES, and a green row proves nothing. Measured:
+    re-anchor `proof_of_work_probe` on `paths.project` and this row stays green
+    while its sibling below reddens. That sibling is what grades the probe, which
+    is why it asserts the exact reason rather than `not out.ok`.
+    """
+    paths = _repo_root_override(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "review"})
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    # the session's work lands where the session's cwd is: the CODE tree
+    (paths.repo_root / "src.txt").write_text("real work\n")
+
+    out = verify.verify_dev(task, paths, dev_result(sp))
+    assert out.ok
+    assert task.spec_file == str(sp)
+
+
+def test_verify_dev_refuses_proof_of_work_only_the_project_tree_holds(project, tmp_path):
+    """The other half of the same anchor: residue under `project` is not evidence
+    that anything was implemented, because no session writes code there.
+
+    The assertion is on the exact refusal REASON, not merely on `not out.ok` — but
+    NOT for the reason a reader might assume. Re-anchoring the probe on
+    `paths.project` does not make the gate fault: pointing `_changes_since` at a
+    directory that is not a git repository yields its unanswerable `None`, which the
+    gate arm folds toward "there are changes" (`is False` is the only refusal), so
+    the gate PASSES. The exact-reason assertion is still the right call, for the
+    neighbouring row's sake — that one cannot grade this probe at all, precisely
+    because the fail-open answer is also the answer a correct run gives.
+
+    Ablation names the surface actually reached, not `has_changes_since`: that
+    wrapper has no production caller left, so substituting it would prove nothing.
+    Change `proof_of_work_probe`'s first argument from `paths.repo_root` to
+    `paths.project` (verify.py, in `_verify_shared_gates`) and this row reddens,
+    measured, on `assert not out.ok` with `ok=True` — the neighbouring row staying
+    green in the same run.
+    """
+    paths = _repo_root_override(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "review"})
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    # a marker ONLY the project tree holds; the code tree is untouched
+    (paths.project / "marker.txt").write_text("not implementation work\n")
+
+    out = verify.verify_dev(task, paths, dev_result(sp))
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+
+
+def test_verify_dev_exclude_relpaths_follows_the_root_it_is_given(project, tmp_path):
+    """The pathspecs handed to git must be relative to the root git is invoked
+    against. A relpath computed against the other root does not raise — git simply
+    matches nothing — so the exclusion vanishes silently, which is why this is
+    pinned rather than left to the gate's behavior.
+
+    Ablation: make the helper ignore `root` (pin `base = paths.project`) and the
+    second half reddens — the board and spec come back as `project`-relative entries
+    that name nothing inside the code tree, which is the silent-no-op shape.
+    """
+    paths = _repo_root_override(project, tmp_path)
+    sp = spec_path(paths, "1-1-a")
+    sp.write_text("---\nstatus: in-review\n---\n", encoding="utf-8")
+
+    # project-rooted (the default): the board and the spec are both inside it
+    default = verify.verify_dev_exclude_relpaths(paths, sp, root=paths.project)
+    assert any(r.endswith("sprint-status.yaml") for r in default)
+    assert any(r.endswith("spec-1-1-a.md") for r in default)
+    # code-tree-rooted: neither artifact lives there, so there is nothing to exclude
+    assert verify.verify_dev_exclude_relpaths(paths, sp, root=paths.repo_root) == ()
+
+
+def test_verify_dev_accepts_a_newer_reachable_claim_in_the_code_tree(project, tmp_path):
+    """The `newer_ok` leg asks its ancestry question in the CODE tree.
+
+    An intervening commit before step-03 stamps `baseline_revision` makes the claim a
+    descendant of the recorded baseline. That reachability is a fact about the
+    checkout the code lives in; asked of `paths.project` — which under this override
+    is not a repository at all — `commit_reachable_above_baseline` reads the Git
+    failure as False and a correct attempt is refused forever. That is the
+    burn-every-attempt shape #716 exists to close, and no pre-existing row could see
+    it: every other ancestry row runs on the `project` fixture where the two roots
+    are the same object, and both divergent-root rows above claim a baseline EQUAL to
+    the recorded one, so neither enters this branch.
+
+    Adopting a newer claim sets `include_untracked_proof = False`, so the proof here
+    is a TRACKED modification rather than a new untracked file.
+
+    Ablation: re-anchor `commit_reachable_above_baseline` on `paths.project` and this
+    reddens with "does not match".
+    """
+    paths = _repo_root_override(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "review"})
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+
+    # the session commits inside the unit before step-03 stamps its baseline
+    (paths.repo_root / "prior.txt").write_text("prior work\n")
+    git(paths.repo_root, "add", "-A")
+    git(paths.repo_root, "commit", "-q", "-m", "intervening commit in the code tree")
+    descendant = verify.rev_parse_head(paths.repo_root)
+
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, "in-review", descendant)
+    (paths.repo_root / "src.txt").write_text("real work\n")
+
+    out = verify.verify_dev(task, paths, dev_result(sp))
+    assert out.ok
+
+
+def test_verify_dev_bundle_accepts_an_ancestor_claim_in_the_code_tree(project, tmp_path):
+    """The `older_ok` leg — #161's bundle-only relaxation — asks the same question in
+    the same tree.
+
+    `allow_ancestor_baseline` is set at exactly one site (`verify_dev_bundle`), so
+    this is the only route into `is_ancestor`. Anchored on `paths.project` the call
+    lands on a non-repository, `is_ancestor` reads any Git failure as False, and a
+    legitimate bundle adopting a story's older spec baseline is refused.
+
+    Ablation: re-anchor `is_ancestor` on `paths.project` and this reddens with
+    "does not match".
+    """
+    paths = _repo_root_override(project, tmp_path)
+    ancestor = verify.rev_parse_head(paths.repo_root)
+
+    # the unit worktree is cut after the story's own baseline
+    (paths.repo_root / "prior.txt").write_text("unit history\n")
+    git(paths.repo_root, "add", "-A")
+    git(paths.repo_root, "commit", "-q", "-m", "unit worktree cut")
+
+    task = StoryTask(story_key="dw-test-bundle", epic=0)
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    sp = paths.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", ancestor)
+    (paths.repo_root / "src.txt").write_text("real work\n")
+
+    out = verify.verify_dev_bundle(task, paths, dev_result(sp))
+    assert out.ok
+
+
+def test_verify_dev_exclude_relpaths_anchors_the_restore_patch_on_the_root(project, tmp_path):
+    """The latched `restore_patch` follows `root` like every other candidate.
+
+    `base` feeds TWO steps — `resolve_restore_path`'s join and the `relative_to`
+    that follows — and only a RELATIVE latch can tell them apart. Joined under
+    `project` but measured against `repo_root`, it is not relative to that root at
+    all, raises `ValueError`, and drops out of the exclude set silently. A missing
+    exclusion does not raise — it just stops excluding, letting a restore re-drive
+    whose session produced nothing pass proof-of-work on the patch file's mere
+    presence, the hazard this function's own docstring names.
+
+    An ABSOLUTE latch deliberately is not the probe, even though it is what
+    `cli._resolve_restore_patch` stores: `resolve_restore_path` ignores its base for
+    an absolute input, so both halves agree however the join is anchored and the row
+    would pass with the anchor ablated.
+
+    The existing root row passes no `restore_patch`, and both restore-patch rows run
+    on the `project` fixture where the roots are the same object, so this line was
+    unpinned in both directions.
+
+    Ablation: pin the `resolve_restore_path` base to `paths.project` and the first
+    assertion reddens — the latch is no longer relative to the code tree and drops.
+    """
+    paths = _repo_root_override(project, tmp_path)
+    sp = spec_path(paths, "1-1-a")
+    sp.write_text("---\nstatus: in-review\n---\n", encoding="utf-8")
+    (paths.repo_root / "restore.patch").write_text("a saved intent-gap patch\n")
+
+    out = verify.verify_dev_exclude_relpaths(paths, sp, "restore.patch", root=paths.repo_root)
+    assert "restore.patch" in out
+
+
+def test_verify_dev_stories_roots_its_exclude_on_the_code_tree(project, tmp_path, monkeypatch):
+    """`_stories_relpaths` is one of the four exclude sources that had to move with
+    the gate's git root, and it is pinned at the SEAM rather than by outcome — on
+    purpose.
+
+    Under the SIBLING fixture this row uses (`_repo_root_override`: an artifact
+    tree disjoint from the code tree) the story record and manifest sit outside the
+    code tree whichever root is used, so both spellings end in "nothing was
+    excluded" and no outcome assertion over THIS fixture can separate them. What
+    the wrong root actually costs is invisible in a passing gate: a
+    `project`-relative pathspec is resolved by git against the CODE tree, silently
+    excluding whatever happens to live at that relative path there. So the
+    contract here is the root itself.
+
+    The claim is scoped to the fixture, not to the function. Under the NESTED
+    (monorepo) shape the artifacts are inside the code tree and the two spellings
+    differ by value and by outcome — see
+    `test_stories_relpaths_separates_the_two_roots_in_a_monorepo` for the value
+    and, for THIS gate's outcome,
+    `test_verify_dev_stories_refuses_a_bare_spec_flip_under_the_monorepo_shape`
+    (whose sprint-mode twin drops the `_stories` infix).
+
+    Ablation: pass `paths.project` at the call site and the recorded root reddens.
+    """
+    paths = _repo_root_override(project, tmp_path)
+    spec_folder = paths.planning_artifacts / "epic-a"
+    # built by hand rather than via `make_stories_task`, which reads HEAD of
+    # `paths.project` — under this override that directory is not a checkout
+    task = StoryTask(story_key="1", epic=1)
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    (paths.repo_root / "src.txt").write_text("real work\n")
+
+    seen = []
+    real = verify._stories_relpaths
+    monkeypatch.setattr(
+        verify,
+        "_stories_relpaths",
+        lambda root, folder: (seen.append(root), real(root, folder))[1],
+    )
+    out = verify.verify_dev_stories(
+        task, paths, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+
+    assert out.ok
+    assert seen == [paths.repo_root]
+    # the premise the assertion above rests on: under this override the two roots are
+    # genuinely different directories. Should the fixture ever collapse them, the
+    # recorded-root assertion stops separating the two spellings and this reddens.
+    assert paths.project != paths.repo_root
+
+
+def test_stories_relpaths_follows_the_root_it_is_given(project, tmp_path):
+    """Same rule for the stories-mode exclude: rooted where git runs."""
+    paths = _repo_root_override(project, tmp_path)
+    spec_folder = paths.implementation_artifacts / "spec-x"
+    spec_folder.mkdir(parents=True)
+    assert verify._stories_relpaths(paths.project, spec_folder) == (
+        "_bmad-output/implementation-artifacts/spec-x/stories",
+        "_bmad-output/implementation-artifacts/spec-x/stories.yaml",
+    )
+    # outside the code tree: nothing to exclude there, and no exception
+    assert verify._stories_relpaths(paths.repo_root, spec_folder) == ()
+
+
+# ------------------------------------- the MONOREPO shape of the same override
+#
+# `_repo_root_override` above builds the SIBLING shape: `artifacts-root` beside
+# `sandbox`, so every artifact sits outside the code tree. The code-root spelling
+# collapses to `()` while the project-root spelling is a non-empty tail that still
+# matches nothing in the code tree. Values can differ, but both spellings have the
+# same gate outcome, so the seam rows assert on the recorded root instead.
+#
+# `conftest.nested_repo_root_paths` is the shape that CAN separate them: the BMAD
+# project at `<repo>/app`, `repo_root` its ancestor. There the wrong pathspec is
+# not empty, it is *plausible* — `_bmad-output/implementation-artifacts/...`
+# resolved against the code root names the OUTER project's real artifact dir.
+# That is the "not merely wrong, it is SILENTLY wrong" failure the production
+# docstrings describe, and the sibling fixture could never exhibit it. An
+# ADDITIONAL variant, not a replacement: the sibling rows grade the disjoint
+# layout, which is a supported configuration in its own right.
+
+
+def test_verify_dev_exclude_relpaths_separates_the_two_roots_in_a_monorepo(project):
+    """Both spellings are non-empty and unequal, and the code-tree one is prefixed.
+
+    The silently-wrong value assertion the sibling shape cannot make. There the
+    wrong non-empty tail matches nothing in the code tree; here it names a real
+    outer artifact. The two spellings differ by exactly the `app/` prefix, so the
+    equality pins WHICH root the relpaths were measured against rather than merely
+    that something was measured.
+
+    The last assertion is the point of the whole shape: the `project`-rooted
+    spelling, handed to git in the CODE tree, resolves onto a real file that is
+    NOT the one it meant to exclude. A silently-wrong exclusion, not an absent
+    one.
+
+    Ablation: pin `base = paths.project` inside `verify_dev_exclude_relpaths` and
+    the prefix assertions redden — both spellings come back identical.
+    """
+    paths = nested_repo_root_paths(project)
+    # the premise every assertion below rests on: genuinely divergent, and
+    # genuinely NESTED (the sibling shape satisfies the first and not the second)
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+    sp = spec_path(paths, "1-1-a")
+    sp.write_text("---\nstatus: in-review\n---\n", encoding="utf-8")
+    # the OUTER project's board — the file a `project`-rooted pathspec silently
+    # names when git resolves it in the code tree
+    write_sprint(project, {"1-1-a": "review"})
+
+    from_code_root = verify.verify_dev_exclude_relpaths(paths, sp, root=paths.repo_root)
+    from_project = verify.verify_dev_exclude_relpaths(paths, sp, root=paths.project)
+
+    assert from_code_root and from_project and from_code_root != from_project
+    assert from_code_root == tuple(f"app/{rel}" for rel in from_project)
+    assert from_code_root == (
+        "app/_bmad-output/implementation-artifacts/sprint-status.yaml",
+        "app/_bmad-output/implementation-artifacts/spec-1-1-a.md",
+    )
+    # silently wrong, not empty: the wrong spelling names the outer board
+    assert (paths.repo_root / from_project[0]).is_file()
+    assert (paths.repo_root / from_project[0]) != paths.sprint_status
+
+
+def test_stories_relpaths_separates_the_two_roots_in_a_monorepo(project):
+    """Same rule, same shape, for the stories-mode exclude.
+
+    Its sibling row above asserts `() `for the code-tree spelling because under the
+    disjoint layout there is genuinely nothing to exclude. Nested, both spellings
+    produce two pathspecs and only the prefix tells them apart.
+
+    Ablation: drop the `relative_to(root)` rebase in `_stories_relpaths` (return
+    the project-relative tail whatever the root) and the prefix assertion reddens.
+    """
+    paths = nested_repo_root_paths(project)
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+    spec_folder = paths.implementation_artifacts / "spec-x"
+    spec_folder.mkdir(parents=True)
+
+    from_code_root = verify._stories_relpaths(paths.repo_root, spec_folder)
+    from_project = verify._stories_relpaths(paths.project, spec_folder)
+
+    assert from_code_root and from_project and from_code_root != from_project
+    assert from_code_root == tuple(f"app/{rel}" for rel in from_project)
+    assert from_code_root == (
+        "app/_bmad-output/implementation-artifacts/spec-x/stories",
+        "app/_bmad-output/implementation-artifacts/spec-x/stories.yaml",
+    )
+
+
+def test_verify_dev_refuses_a_bare_spec_flip_under_the_monorepo_shape(project):
+    """The OUTCOME assertion the sibling shape cannot make (DW-9).
+
+    An attempt whose only residue is its own spec's status flip and the board has
+    produced nothing, and the proof-of-work gate must say so. That refusal is only
+    reachable when the exclusions actually MATCH: git has to recognise
+    `app/_bmad-output/.../sprint-status.yaml` and the spec as excluded before its
+    tracked-diff probe can come back empty.
+
+    Under the sibling shape this is unaskable — the artifacts sit outside the code
+    tree, so a `project`-rooted exclude names nothing there, but so does a correct
+    one, and `_changes_since` answers False either way. The two seam rows above
+    say exactly that about their own fixture; this row is the counterexample their
+    prose now points at.
+
+    Ablation: force `root=paths.project` at the `verify_dev_exclude_relpaths` call
+    site inside `_verify_shared_gates.proof_of_work_probe` and this reddens with
+    `ok=True` — the exclusions stop matching the two tracked bookkeeping changes,
+    which then count as the work the attempt never did.
+
+    Deliberately asserts the SPECIFIC reason: `not out.ok` alone passes for every
+    other gate this function runs (workflow tag, status, baseline match, sprint
+    pair), none of which is what this row is about.
+    """
+    paths = nested_repo_root_paths(project)
+    # the premise the refusal rests on: genuinely divergent, and genuinely NESTED.
+    # `!=` alone is satisfied by the sibling shape, under which the exclusions
+    # match nothing and this row would grade a different question entirely.
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+    # Seed the bookkeeping as tracked content first. The attempt below then
+    # exercises git's exclude pathspec branch, not only the separate untracked
+    # filtering branch in `_changes_since`.
+    initial_baseline = verify.rev_parse_head(paths.repo_root)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, "ready-for-dev", initial_baseline)
+    git(
+        paths.repo_root,
+        "add",
+        paths.sprint_status.relative_to(paths.repo_root).as_posix(),
+        sp.relative_to(paths.repo_root).as_posix(),
+    )
+    git(paths.repo_root, "commit", "-q", "-m", "seed tracked BMAD bookkeeping")
+
+    task = StoryTask(story_key="1-1-a", epic=1)
+    # the baseline is stamped where the session's cwd is: the CODE tree
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    write_sprint(paths, {"1-1-a": "review"})
+    write_spec(sp, "in-review", task.baseline_commit)
+    # ...and no source edit at all: the spec flip and the board ARE the residue
+
+    out = verify.verify_dev(task, paths, dev_result(sp))
+
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+    # the same attempt with one real source edit passes, so the refusal above is
+    # about the missing work and not about the fixture being unusable
+    (paths.project / "src.txt").write_text("real work\n", encoding="utf-8")
+    assert verify.verify_dev(task, paths, dev_result(sp)).ok
+
+
+def test_verify_dev_stories_refuses_bookkeeping_only_changes_under_the_monorepo_shape(project):
+    """The stories-mode twin of the outcome row above (DW-9).
+
+    `_stories_relpaths` had a VALUE row and a SEAM row but no outcome row, so its
+    production caller — the stories-mode proof-of-work gate — was still graded
+    solely by `test_verify_dev_stories_roots_its_exclude_on_the_code_tree`, whose
+    own amended docstring now says that fixture cannot separate the two roots. A
+    value row proves the helper computes the right string; only this proves the
+    gate ACTS on it.
+
+    Same construction as `test_verify_dev_refuses_a_bare_spec_flip_under_the_monorepo_shape`,
+    driving `verify_dev_stories` instead: the attempt's residue is only bookkeeping
+    git must recognise as excluded before the tracked-diff probe can come back empty.
+    Nested, the exclude is `app/_bmad-output/planning-artifacts/epic-a/...`; rooted
+    on `project` it loses the `app/` prefix, matches nothing in the code tree, and
+    the bookkeeping then counts as the work the attempt never did.
+
+    The residue is deliberately NOT the driven story's own spec. That file is
+    already excluded by `verify_dev_exclude_relpaths` (the gate's own
+    `spec_path` exclusion), so a row whose only residue was the spec refuses
+    identically whichever root `_stories_relpaths` was given — it grades a
+    different exclude and passes the relevant ablation. The residue is therefore
+    the two paths ONLY `_stories_relpaths` covers, one per element of its returned
+    tuple: the `stories.yaml` manifest, and a sibling record under `stories/`.
+
+    Ablation: pass `paths.project` to `_stories_relpaths` at its call site in
+    `verify_dev_stories` and this reddens with `ok=True`.
+
+    Asserts the SPECIFIC reason for the reason the dev twin gives: `not out.ok`
+    alone is reachable from every other gate this function runs (spec resolution,
+    id prefix, workflow tag, status, baseline match).
+    """
+    paths = nested_repo_root_paths(project)
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+    spec_folder = paths.planning_artifacts / "epic-a"
+    initial_baseline = verify.rev_parse_head(paths.repo_root)
+    sp = write_story(spec_folder, "1", "x", "ready-for-dev", initial_baseline)
+    manifest = spec_folder / "stories.yaml"
+    manifest.write_text("stories: [1]\n", encoding="utf-8")
+    sibling = write_story(spec_folder, "2", "y", "draft", initial_baseline)
+    git(
+        paths.repo_root,
+        "add",
+        spec_folder.relative_to(paths.repo_root).as_posix(),
+    )
+    git(paths.repo_root, "commit", "-q", "-m", "seed tracked stories bookkeeping")
+
+    task = StoryTask(story_key="1", epic=1)
+    # stamped where the session's cwd is: the CODE tree
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    # The manifest and sibling record are tracked modifications, so git itself
+    # must honor both pathspecs returned by `_stories_relpaths`.
+    manifest.write_text("stories: [1, 2]\n", encoding="utf-8")
+    write_spec(sibling, "done", task.baseline_commit)
+
+    out = verify.verify_dev_stories(
+        task, paths, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+    # the same attempt with one real source edit passes, so the refusal above is
+    # about the missing work and not about the fixture being unusable
+    (paths.project / "src.txt").write_text("real work\n", encoding="utf-8")
+    assert verify.verify_dev_stories(
+        task, paths, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    ).ok
+
+
 def test_artifact_relpaths_returns_in_repo_folders(project):
     """The orchestrator-owned artifact folders, repo-relative posix."""
     rels = verify.artifact_relpaths(project)
@@ -4561,6 +6338,38 @@ def test_has_changes_since_excludes_artifact_only_edit(project):
     )
 
 
+def test_changes_since_reports_a_git_refusal_and_has_changes_since_collapses_it(project):
+    """The two-function split, at its own layer: `_changes_since` answers the
+    tri-state and `has_changes_since` is its fail-open collapse.
+
+    `git diff --quiet` uses rc 0 / rc 1 for its two real answers, so any other rc
+    is git failing rather than answering. A GATE must read that as "there are
+    changes" — uncertainty keeps the stricter path, which is the long-standing
+    behavior this asserts unchanged — while an OBSERVER (the parked leg's skipped
+    proof-of-work record) must be able to say "unknown" rather than file a
+    confident answer git never gave.
+
+    Both are asserted against ONE refusal so the collapse is pinned as a collapse:
+    the same call that answers `None` here answers `True` there. Ablation: make
+    `has_changes_since` return the tri-state unchanged and its assertion fails on
+    `None is True`; make `_changes_since` fold rc 128 back into `True` and its own
+    assertion fails.
+
+    The refusal is real rather than injected — an all-zero oid no repository
+    resolves — so this row also carries the premise the park observation rows rest
+    on."""
+    baseline = "0" * 40
+
+    assert verify._changes_since(project.project, baseline) is None
+    assert verify.has_changes_since(project.project, baseline) is True
+
+    # and a resolvable baseline is untouched by the split: both answer the same
+    # real question, `False` on a tree that has not moved
+    head = verify.rev_parse_head(project.project)
+    assert verify._changes_since(project.project, head) is False
+    assert verify.has_changes_since(project.project, head) is False
+
+
 def test_has_changes_since_subtracts_baseline_untracked(project):
     """Untracked files already on disk when the baseline snapshot was taken are
     not this session's work. `None` deliberately keeps counting all of them —
@@ -4599,7 +6408,7 @@ def test_verify_dev_exclude_relpaths_is_file_granular(project):
     artifact-folder content (deferred-work.md, other stories' specs) is left
     un-excluded so it can register as real work."""
     sp = spec_path(project, "1-1-a")
-    rels = verify.verify_dev_exclude_relpaths(project, sp)
+    rels = verify.verify_dev_exclude_relpaths(project, sp, root=project.repo_root)
     assert "_bmad-output/implementation-artifacts/sprint-status.yaml" in rels
     assert "_bmad-output/implementation-artifacts/spec-1-1-a.md" in rels
     assert "_bmad-output/implementation-artifacts" not in rels
@@ -4617,9 +6426,11 @@ def test_verify_dev_exclude_relpaths_includes_latched_restore_patch(project):
     sp = spec_path(project, "1-1-a")
     patch = project.implementation_artifacts / "attempt.patch"
     rel = "_bmad-output/implementation-artifacts/attempt.patch"
-    assert rel in verify.verify_dev_exclude_relpaths(project, sp, str(patch))
-    assert rel in verify.verify_dev_exclude_relpaths(project, sp, rel)
-    assert rel not in verify.verify_dev_exclude_relpaths(project, sp)
+    assert rel in verify.verify_dev_exclude_relpaths(
+        project, sp, str(patch), root=project.repo_root
+    )
+    assert rel in verify.verify_dev_exclude_relpaths(project, sp, rel, root=project.repo_root)
+    assert rel not in verify.verify_dev_exclude_relpaths(project, sp, root=project.repo_root)
 
 
 def test_verify_dev_exclude_relpaths_omits_only_an_uncertain_candidate(project, monkeypatch):
@@ -4634,7 +6445,9 @@ def test_verify_dev_exclude_relpaths_omits_only_an_uncertain_candidate(project, 
     patch = project.implementation_artifacts / "attempt.patch"
     refuse_to_resolve(monkeypatch, project.project, refused_spec)
 
-    assert verify.verify_dev_exclude_relpaths(project, refused_spec, str(patch)) == (
+    assert verify.verify_dev_exclude_relpaths(
+        project, refused_spec, str(patch), root=project.repo_root
+    ) == (
         "_bmad-output/implementation-artifacts/sprint-status.yaml",
         "_bmad-output/implementation-artifacts/attempt.patch",
     )
@@ -4760,6 +6573,86 @@ def test_verify_dev_baseline_gate_reads_the_skills_baseline_revision_key(project
     assert verify.verify_dev(task, project, dev_result(sp)).ok
 
 
+def test_verify_dev_baseline_gate_prefers_the_fresh_revision_over_a_stale_legacy_key(project):
+    """#716: a spec carrying BOTH keys is what `runs.rearm_escalation` produces —
+    it inserts `baseline_revision` and never removes a pre-existing
+    `baseline_commit`. The gate must judge the value the skill just wrote, not the
+    leftover.
+
+    Ablation: swap `_BASELINE_KEYS` back to ("baseline_commit", "baseline_revision")
+    and this row reddens with "does not match", which is precisely the attempt this
+    bug burned — everything the session did was correct.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit, legacy_baseline="0" * 40)
+    body = sp.read_text()
+    assert "baseline_revision:" in body and "baseline_commit:" in body  # the dual-key shape
+    (project.project / "src.txt").write_text("real work\n")
+
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+
+
+@pytest.mark.parametrize("legacy", ["", None])
+def test_verify_dev_baseline_gate_skips_an_unusable_legacy_key(project, legacy):
+    """An EMPTY (`baseline_commit: ''`) or YAML-null (bare `baseline_commit:`) legacy
+    key must not shadow the fresh claim. `dict.get`'s default fires only on a MISSING
+    key, so the empty value used to be selected and read back as "no claim" — which
+    skips the baseline-match check entirely, on the very spec shape the re-arm writes.
+
+    Ablation: drop the `if value:` / `if raw is None` guards in `auto_dev_baseline_of`
+    and the gate stops checking (the empty case) or fails on the token "None" (the
+    null case); either way the pairing below no longer holds.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    (project.project / "src.txt").write_text("real work\n")
+
+    # the fresh key still decides: matching passes ...
+    write_spec(sp, "in-review", task.baseline_commit, legacy_baseline=legacy)
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+    # ... and a foreign fresh key is still REFUSED (the gate is live, not skipped)
+    write_spec(sp, "in-review", "0" * 40, legacy_baseline=legacy)
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_baseline_gate_refuses_a_stale_revision_beside_a_matching_legacy_key(project):
+    """The reverse-mismatch row, and a DELIBERATE tightening: `baseline_revision`
+    wins whenever it is non-empty, so a stale fresh key is refused even though the
+    legacy key names the right commit. That is the point of a precedence rule —
+    the stale field cannot override in EITHER direction, and a spec whose two keys
+    disagree is not silently rescued by whichever one happens to match.
+
+    Ablation: make the reader prefer whichever key matches and this row passes,
+    which is the "reads as green for the wrong reason" outcome it exists to refuse.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", "0" * 40, legacy_baseline=task.baseline_commit)
+    (project.project / "src.txt").write_text("real work\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_baseline_gate_reads_a_legacy_only_spec(project):
+    """Back-compat: a spec predating the `baseline_revision` rename claims only
+    `baseline_commit`, and the gate must still read it."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", OMIT, legacy_baseline=task.baseline_commit)
+    body = sp.read_text()
+    assert "baseline_revision:" not in body and "baseline_commit:" in body
+    (project.project / "src.txt").write_text("real work\n")
+
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+
+
 def test_verify_dev_exclude_relpaths_normalizes_dotdot_segments(project):
     """A spec_path with a lexical '..' hop (as an un-normalized session-reported
     spec_file could produce) must resolve to the same exclude entry as the plain
@@ -4770,9 +6663,9 @@ def test_verify_dev_exclude_relpaths_normalizes_dotdot_segments(project):
         project.output_folder / "planning-artifacts" / ".." / "implementation-artifacts" / sp.name
     )
     assert messy != sp  # genuinely a different (messier) Path object
-    assert verify.verify_dev_exclude_relpaths(project, sp) == verify.verify_dev_exclude_relpaths(
-        project, messy
-    )
+    assert verify.verify_dev_exclude_relpaths(
+        project, sp, root=project.repo_root
+    ) == verify.verify_dev_exclude_relpaths(project, messy, root=project.repo_root)
 
 
 def test_verify_dev_own_spec_status_flip_via_dotdot_path_is_not_real_work(project):
@@ -4798,7 +6691,7 @@ def test_has_changes_since_ledger_content_counts_with_narrow_exclude(project):
     changes', while a bare own-spec + sprint-status bookkeeping edit still does."""
     baseline = verify.rev_parse_head(project.project)
     sp = spec_path(project, "1-1-a")
-    exclude = verify.verify_dev_exclude_relpaths(project, sp)
+    exclude = verify.verify_dev_exclude_relpaths(project, sp, root=project.repo_root)
 
     sp.write_text("bookkeeping\n")
     project.sprint_status.write_text("bookkeeping\n")
@@ -5455,6 +7348,13 @@ def test_engine_written_is_keyword_only_on_all_dev_verifiers():
         parameter = inspect.signature(fn).parameters["engine_written"]
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert "operator_park" in inspect.signature(verify.verify_dev).parameters
+    # The park skip's second selector (DW-1). Keyword-only for the same reason
+    # `engine_written` is: `verify_dev`'s positional tail is `review_enabled`, and
+    # a positional eligibility flag would be one transposed argument away from
+    # silently authorizing the skip on every leg.
+    park_eligible = inspect.signature(verify.verify_dev).parameters["park_eligible"]
+    assert park_eligible.kind is inspect.Parameter.KEYWORD_ONLY
+    assert park_eligible.default is False
 
 
 # --------------------------------------------------- the git support floor (GIT_FLOOR)
@@ -5467,6 +7367,10 @@ def test_engine_written_is_keyword_only_on_all_dev_verifiers():
         ("git version 2.33.8\n", False),  # one minor below it
         ("git version 2.9.5\n", False),  # numeric, not lexicographic: "9" > "34" as text
         ("git version 2.44.0.windows.1\n", True),
+        # The four-component fork spelling `_shield_home_git_ignore` gates its
+        # `%APPDATA%/Git/ignore` preference on (#403). The lookahead has to accept the
+        # `.` that continues into `0.windows.1` for that gate to read 2.46 at all.
+        ("git version 2.46.0.windows.1\n", True),
         ("git version 2.39.5 (Apple Git-154)\n", True),
         ("git version 3.0\n", True),
         ("git version 2.34\n", True),  # bare major.minor: the end-of-string arm
@@ -5602,3 +7506,55 @@ def test_git_below_floor_honours_the_floor_argument(project, monkeypatch):
     _fake_git_version(monkeypatch, "git version 2.30.0\n")
     assert verify.git_below_floor(project.project, (2, 20)) is None
     assert verify.git_below_floor(project.project, (2, 40)) == "git version 2.30.0"
+
+
+def test_verify_dev_roots_its_exclude_on_the_code_tree(project, tmp_path, monkeypatch):
+    """The gate's OWN exclude composition, pinned at the seam.
+
+    `_stories_relpaths` has carried a seam pin since this wave landed; the sprint
+    gate's call did not, and no outcome row OVER THE SIBLING FIXTURE can supply one.
+    Under `_repo_root_override` the artifact tree is disjoint from the code tree, so
+    a `project`-rooted exclude yields pathspecs git matches nothing against — and
+    `has_changes_since` fails OPEN (`rc != 0 -> return True`), so the passing row
+    stays green and the refusal row reddens for its own unrelated reason. Reverting
+    `root=paths.repo_root` to `root=paths.project` left the entire suite green before
+    this row existed, which is how the anchor this wave exists to establish could be
+    silently undone.
+
+    The contract here is therefore the ROOT itself, exactly as the stories-mode row
+    states it: a pathspec relative to the wrong root is not merely wrong, it is
+    SILENTLY wrong.
+
+    "No outcome row can supply one" was true of this fixture and is no longer true
+    of the function: `test_verify_dev_refuses_a_bare_spec_flip_under_the_monorepo_shape`
+    is that outcome row, built on the NESTED shape where the artifacts live inside
+    the code tree and the wrong pathspec is plausible rather than empty. Both rows
+    are kept — the seam pin grades the disjoint layout, which is a supported
+    configuration the outcome row does not cover.
+
+    Ablation: pass `root=paths.project` at the call site and the recorded root reddens.
+    """
+    paths = _repo_root_override(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "review"})
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    # the session's work lands where the session's cwd is: the CODE tree
+    (paths.repo_root / "src.txt").write_text("real work\n")
+
+    seen = []
+    real = verify.verify_dev_exclude_relpaths
+    monkeypatch.setattr(
+        verify,
+        "verify_dev_exclude_relpaths",
+        lambda *a, **kw: (seen.append(kw.get("root")), real(*a, **kw))[1],
+    )
+    out = verify.verify_dev(task, paths, dev_result(sp))
+
+    assert out.ok
+    assert seen == [paths.repo_root]
+    # the premise the assertion above rests on: under this override the two roots are
+    # genuinely different directories. Should the fixture ever collapse them, the
+    # recorded-root assertion stops separating the two spellings and this reddens.
+    assert paths.project != paths.repo_root

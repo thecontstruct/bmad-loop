@@ -202,6 +202,61 @@ listing) — the herdr adapter in particular **never** probes or starts its
 background server from `available()`, `version()`, or the constructor; server
 autostart is lazy, confined to the mutating operations that actually need it.
 
+### Registry namespaces (only if your transport has one)
+
+Some multiplexers address sessions through a **registry**: a directory of
+per-session addressing files that every verb resolves a target through. psmux is
+one — `PSMUX_DATA_DIR`, a `.port`/`.key` set per session. tmux is not: a server
+is a socket, and there is no root a caller could be pointed at.
+
+The distinction matters because a registry is a **namespace, not a filter**. A
+session in registry A is not merely hidden from a verb aimed at registry B; it is
+unaddressable from it, and the transport usually reports that as an ordinary "no
+such session" rather than an error. Two processes that disagree about the root
+therefore disagree about which sessions exist — and the verbs that carry that
+disagreement (`has_session`, `list_window_ids`) are exactly the ones whose seam
+contract says to degrade quietly.
+
+If your transport namespaces, four rules:
+
+- **Derive the root from the project**, never from the run, never from the
+  launching shell, and never from anything a driven session can write
+  (`policy.toml` and the project tree are both session-writable). bmad-loop's is
+  `runs.mux_registry_root` — `<state root>/<project key>/_mux`, reusing
+  `runs.project_tag` so two spellings of one project cannot key two registries.
+  The derivation belongs in `runs`, beside the state root, not in the backend.
+- **Bind it once, ahead of every spawn.** `cli._configure_mux` exports it before
+  dispatch — the last point that still knows the project and the first that
+  precedes every verb. A create-call-only injection is worse than doing nothing.
+  An ambient value needs a real question answered, not a flag. A multiplexer
+  hands every pane child the server's environment, so an ambient value there was
+  inherited rather than typed — and a process cannot tell an inherited one from a
+  typed one, nor a value typed in one shell from one a profile exports into every
+  shell. Those want opposite answers, so do not try to decide between them: derive
+  unconditionally, override what you find, and report that you did. A derived root
+  is a pure function of (project, state root), so every process agrees without
+  anything having to travel between them, which is the property worth protecting.
+- **Carry `new_window`'s env inside the command you launch**, not in the
+  environment you hope the pane inherits. A multiplexer is free not to hand a
+  pane child the server's environment (psmux's `PSMUX_BARE_ENV=1` mode clears
+  it to a 14-name allowlist — a mode bmad-loop declares unsupported and warns
+  about, precisely because the _other_ windows ride inheritance); an env dict a
+  caller passed explicitly must survive regardless, and an in-command transport
+  is the one that does. `_window_launch` is the dialect hook that owns each
+  family dialect's answer.
+- **Answer `has_registry_namespace()`, `registry_root()` and
+  `legacy_registries()`.** The first tells cleanup your transport namespaces
+  sessions at all, so a registry with no root in force reads as the shared
+  default it is rather than as proof of ownership. The second lets
+  `bmad-loop mux` disclose the root, so an operator's own client is not silently
+  looking at an empty registry. The third hands cleanup instances bound to roots
+  your sessions may predate; each must be an independent instance, never a global
+  environment swap, because the sweep runs on a TUI worker thread beside other
+  threads issuing ordinary verbs.
+
+All three default to "no namespace" on `TerminalMultiplexer`, so a transport
+without one inherits the right answers and writes no code.
+
 **Deep contract →** [adapter authoring guide: the transport contract for a backend
 author](adapter-authoring-guide.md#the-transport-contract-for-a-backend-author).
 
@@ -328,6 +383,59 @@ Things **without** a seam still need a hand-guarded fallback behind a
 `sys.platform` branch with that ack: `cp --reflink` / CoW copies, symlinks,
 `/proc` scanning, `/tmp`, and `start_new_session`. Keep the Linux fast path
 byte-identical; the new-OS branch can be best-effort until exercised.
+
+---
+
+## Path predicates — the guard family a port must not relax
+
+`src/bmad_loop/platform_util.py` carries four predicates that every "this config
+value must be a path inside the project" guard is built from. They are
+**platform-independent by construction**: each answers the same way on every host,
+because a config file must not mean different things depending on where the run
+happens.
+
+- `is_absolute_path(value)` — rooted or drive-qualified in _either_ flavour:
+  `/etc/passwd`, `C:\x`, `\\server\share`, and the drive-_relative_ `C:foo`.
+- `has_parent_ref(value)` — a `..` segment in either flavour.
+- `names_tree_root(value)` — names the tree itself rather than anything inside it:
+  `""`, `"."`, and the all-periods-and-spaces spellings Win32 trims to nothing
+  (`". "`, `"..."`, `"   "`).
+- `names_win32_alias(value)` — the determinism member. The other three refuse a value
+  that _escapes_ the tree; this one refuses a value that stays inside it and still
+  names a **different** path on Windows: a reserved device basename (`NUL`,
+  `aux.json`, `CON .txt`), a component whose trailing periods and spaces Win32
+  strips (`.claude/skills.`), or a component of _nothing but_ periods and spaces
+  sitting beside a real one (`sub/...` — Win32 empties it and the value addresses
+  `sub`).
+
+What a porter needs to know:
+
+- **Do not make any of them consult `sys.platform`.** A value refused here is refused
+  everywhere, deliberately — `skill_tree = "NUL"` is rejected on Linux for the same
+  reason `C:\secrets` is. The alternative turns a `seed_files` entry into a
+  build-number question, since Windows 11 narrowed the device rule and Windows 10 did
+  not.
+- **They refuse disjoint spelling classes, and that is load-bearing.**
+  `names_tree_root` carves out `..` for `has_parent_ref`; `names_win32_alias` carves
+  out a _value_ made entirely of period/space components for `names_tree_root` (a
+  single such component beside a real one stays its own — it aliases its parent, not
+  the root) and the `.`/`..` components for their owners. Those carve-outs are what
+  let each predicate be ablated on its own — a "simplification" that merges them
+  costs the suite its ability to say which rule fired.
+- **`_is_reserved_basename` is a _segment_ predicate**, blind to `sub/NUL`: it splits
+  on the first dot of the whole string. Apply it per component, after splitting on
+  both separators, or it silently answers False.
+- **`safe_segment` is not one of them.** It maps `/` to `_`, so it sanitizes a single
+  name (a run id, a sweep bundle name) and must never be applied to a multi-segment
+  config path.
+- **Their Win32 half is cited, not measured** — CI's legs are Linux and nothing here
+  calls a Win32 API. A native-Windows port is the first chance to measure it; the
+  docstrings carry their sources (Microsoft, Wine's ntdll path conformance tests,
+  Project Zero) so a disagreement can be settled rather than argued.
+- `src/bmad_loop/data/plugins/unity/unity_seed_assets.py` re-implements all four by
+  hand: it is deployed into a consumer project, is stdlib-only, and is excluded from
+  pyright. Its only drift guard is the parity suite in
+  `tests/test_unity_scene_guard.py`. Mirror any change there too.
 
 ---
 
