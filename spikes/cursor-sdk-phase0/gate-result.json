@@ -1,0 +1,17 @@
+{
+  "gate": "PASS",
+  "childExitCode": 0,
+  "eventCount": 38,
+  "runStatus": "finished",
+  "usage": {
+    "inputTokens": 24265,
+    "outputTokens": 247,
+    "cacheReadTokens": 19901,
+    "cacheWriteTokens": 0,
+    "totalTokens": 44413
+  },
+  "resultWritten": true,
+  "resultValid": true,
+  "model": "composer-2.5",
+  "timestamp": "2026-07-08T03:05:41.016Z"
+}
