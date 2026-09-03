@@ -4628,7 +4628,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         clis=clis,
         skills=args.skills,
         force_skills=args.force_skills,
-        provision=tuple(dict.fromkeys(getattr(args, "provision", None) or ())),
+        provision=tuple(dict.fromkeys(args.provision or ())),
     )
 
 
