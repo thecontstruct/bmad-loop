@@ -3,7 +3,7 @@
 Where the default :class:`~bmad_loop.engine.Engine` walks ``sprint-status.yaml``,
 ``StoriesEngine`` drives a typed ``stories.yaml`` (the Story Breakdown output,
 a fixed-name sibling of ``SPEC.md``). Each entry is dispatched by *spec folder +
-story id* rather than a spec path: the inner ``bmad-dev-auto`` skill reads its
+story id* rather than a spec path: the inner ``bmad-build-auto`` skill reads its
 own entry, creates-or-resumes the story spec at ``<spec-folder>/stories/<id>-<slug>.md``,
 and the orchestrator reads that id-keyed path back deterministically — no
 mtime-scan, no shared mutable board.
@@ -317,6 +317,39 @@ class StoriesEngine(Engine):
 
     # -------------------------------------------------------------- dispatch
 
+    def _dispatched_spec_for_attempt(self, task: StoryTask) -> str | None:
+        """Bind only the unique readable id-keyed spec present at dispatch."""
+        try:
+            state = stories.resolve_story_spec(self._stories_folder(), task.story_key)
+            if state.kind != stories.KIND_PRESENT or state.path is None:
+                return None
+            # Resolution degrades a read fault to PRESENT with an unknown status;
+            # ownership must be stricter because recovery may later repair this
+            # exact file. Re-read now and refuse a vanished/non-regular/unreadable
+            # candidate rather than persisting an ownership claim we did not see.
+            if not state.path.is_file():
+                return None
+            state.path.read_text(encoding="utf-8")
+            return str(state.path)
+        except (OSError, RuntimeError, UnicodeDecodeError):
+            return None
+
+    def _requires_dispatched_spec_snapshot(self, task: StoryTask, prompt: str) -> bool:
+        """Require authority when folder+id dispatch targets an existing spec.
+
+        A pending, ambiguous, or sentinel story does not claim file authority
+        through this seam; normal Stories scheduling handles those states. Once
+        resolution identifies one PRESENT spec, however, a transient binding/read
+        fault must abort rather than let the folder+id child mutate an input
+        recovery cannot restore. An uncertain second observation fails closed for
+        the same reason.
+        """
+        try:
+            state = stories.resolve_story_spec(self._stories_folder(), task.story_key)
+        except (OSError, RuntimeError):
+            return True
+        return state.kind == stories.KIND_PRESENT and state.path is not None
+
     def _extra_session_env(
         self, task: StoryTask, role: str, label: str | None = None
     ) -> dict[str, str]:
@@ -443,7 +476,7 @@ class StoriesEngine(Engine):
         """The ``stories.yaml`` entry's ``closes_deferred`` ids.
 
         This is the channel that makes story-declared closure work unattended:
-        ``bmad-dev-auto`` writes the story spec and knows nothing of the ledger,
+        ``bmad-build-auto`` writes the story spec and knows nothing of the ledger,
         so with the spec frontmatter alone a human would have to hand-edit every
         generated spec. The breakdown, by contrast, is authored while the ledger
         is in view. Both channels compose — the base hook unions them.
@@ -504,8 +537,17 @@ class StoriesEngine(Engine):
 
     def _verify_review(self, task: StoryTask):
         # Drop the sprint-status gate (stories mode has no board); the id-keyed
-        # story spec's own `done` frontmatter is authoritative.
-        return verify.verify_review_stories(task, self.workspace.paths, self.policy)
+        # story spec's own `done` frontmatter is authoritative. The sink is the
+        # base engine's: stories mode runs the same verifier commands and its
+        # results belong in the same journal record kind (see
+        # `Engine._review_command_sink`), so a mode-specific one would only be a
+        # way for the three gates to drift apart on what they record.
+        return verify.verify_review_stories(
+            task,
+            self.workspace.paths,
+            self.policy,
+            on_results=self._review_command_sink(task),
+        )
 
     def _sprint_board_instruction(self) -> str:
         # Stories mode has no sprint-status.yaml: `_post_dev_state_sync` is a no-op
@@ -565,7 +607,8 @@ class StoriesEngine(Engine):
                 self.policy,
                 self.run_dir,
                 f"spec ready for approval: {task.story_key}",
-                f"review {task.spec_file}, then `bmad-loop resume {self.state.run_id}`",
+                f"review {self._operator_spec_path(task)}, then "
+                f"`bmad-loop resume {self.state.run_id}`",
             )
             raise RunPaused(
                 f"awaiting spec approval for {task.story_key}",
@@ -581,13 +624,16 @@ class StoriesEngine(Engine):
         :meth:`_resume_after_dev_verify` for the implement leg. Always raises."""
         task.plan_review_owed = False  # discharged: we are pausing for the review now
         self.journal.append(
-            "checkpoint-pause", story_key=task.story_key, checkpoint="plan", spec=task.spec_file
+            "checkpoint-pause",
+            story_key=task.story_key,
+            checkpoint="plan",
+            spec=self._operator_spec_path(task),
         )
         gates.notify(
             self.policy,
             self.run_dir,
             f"plan ready for review: {task.story_key}",
-            f"review the planned spec {task.spec_file}, then "
+            f"review the planned spec {self._operator_spec_path(task)}, then "
             f"`bmad-loop resume {self.state.run_id}`",
         )
         self._save()
@@ -614,7 +660,7 @@ class StoriesEngine(Engine):
             "checkpoint-pause",
             story_key=task.story_key,
             checkpoint="plan",
-            spec=task.spec_file,
+            spec=self._operator_spec_path(task),
             owed_after_implement=True,
         )
         gates.notify(
@@ -622,7 +668,7 @@ class StoriesEngine(Engine):
             self.run_dir,
             f"plan review owed (already implemented): {task.story_key}",
             f"the story was implemented before its plan checkpoint fired — review "
-            f"{task.spec_file}, then `bmad-loop resume {self.state.run_id}`",
+            f"{self._operator_spec_path(task)}, then `bmad-loop resume {self.state.run_id}`",
         )
         self._save()
         raise RunPaused(

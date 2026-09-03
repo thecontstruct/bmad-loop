@@ -22,8 +22,8 @@ from pathlib import Path
 import pytest
 import regex
 
-from bmad_loop import devcontract
-from bmad_loop.adapters import generic, tmux_base
+from bmad_loop import devcontract, runs
+from bmad_loop.adapters import env_fault, generic, tmux_base
 from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec, SpecSnapshot
 from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError
@@ -40,20 +40,32 @@ HAVE_TMUX = sys.platform != "win32" and shutil.which("tmux") is not None
 # raises UnicodeDecodeError — a ValueError, NOT an OSError.
 _BAD_UTF8 = b"\xff\xfe\x00\x01 not utf-8 \x80\x81"
 
+# The line that decides where the fake relay writes its events. Swapped below to
+# build the version-skew twin, so the two scripts differ in nothing else.
+_EVENTS_LINE = 'ed="$BMAD_LOOP_EVENTS_DIR"'
+_LEGACY_EVENTS_LINE = 'ed="$BMAD_LOOP_RUN_DIR/events"'
+
 FAKE_CLI = """#!/bin/bash
 # fake CLI: last positional arg is the prompt; env comes from tmux -e
 prompt="${@: -1}"
 ts=$(date +%s%N)
-mkdir -p "$BMAD_LOOP_RUN_DIR/events" "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID"
+ed="$BMAD_LOOP_EVENTS_DIR"
+mkdir -p "$ed" "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID"
 printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \\
-    "$ts" "$BMAD_LOOP_TASK_ID" > "$BMAD_LOOP_RUN_DIR/events/$ts-$BMAD_LOOP_TASK_ID-SessionStart.json"
+    "$ts" "$BMAD_LOOP_TASK_ID" > "$ed/$ts-$BMAD_LOOP_TASK_ID-SessionStart.json"
 echo "{\\"workflow\\": \\"auto-dev\\", \\"prompt\\": \\"$prompt\\"}" \\
     > "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID/result.json"
 ts2=$(( ts + 1 ))
 printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \\
-    "$ts2" "$BMAD_LOOP_TASK_ID" > "$BMAD_LOOP_RUN_DIR/events/$ts2-$BMAD_LOOP_TASK_ID-Stop.json"
+    "$ts2" "$BMAD_LOOP_TASK_ID" > "$ed/$ts2-$BMAD_LOOP_TASK_ID-Stop.json"
 sleep 60  # stay alive like an idle interactive session
 """
+
+# What a relay installed before #494 knows: only the in-tree location. Pairing it
+# with a current orchestrator is the version-skew case the dual poll covers, and
+# it is the ordinary state of any project whose `.bmad-loop/bmad_loop_hook.py`
+# copy predates the move.
+LEGACY_EVENTS_FAKE_CLI = FAKE_CLI.replace(_EVENTS_LINE, _LEGACY_EVENTS_LINE)
 
 
 def make_adapter(
@@ -73,6 +85,12 @@ def make_adapter(
         binary=binary,
         extra_args=extra_args,
         mux=mux,
+        # As `runsetup.make_adapters` does: the primary channel is out of the
+        # project tree (#494), keyed by run. Under `tmp_path` rather than the real
+        # state root only because these are unit tests; what matters is that it is
+        # NOT `run_dir / "events"`, so every test here drives the production shape
+        # (out-of-tree primary, in-tree legacy still under poll).
+        events_dir=tmp_path / "state" / run_dir.name / "events",
     )
 
 
@@ -478,7 +496,31 @@ def test_kill_grace_zero_is_the_legacy_single_strike(tmp_path):
 # Stop event, via devcontract. These exercise that override in isolation.
 
 
-def make_dev_adapter(tmp_path, profile_name="claude", policy=None):
+class _UnitMux:
+    """Mux stand-in for the unit tests: the session is alive, nothing else exists.
+
+    These tests stub `_window_alive`, so before #489 they never touched `self.mux`
+    at all and the module docstring's "unit tests need no tmux" held by accident.
+    The crash path now asks `has_session` for its diagnosis, which without this
+    would reach the HOST multiplexer — a real subprocess (~130ms) answering False
+    for a tmp_path session that never existed, scoring every crash test
+    `session_vanished` and writing a breadcrumb. Answering True keeps each test on
+    the side of the distinction it was written for: the CLI exited.
+    """
+
+    def __init__(self):
+        self.sent: list[tuple[str, str]] = []
+
+    def has_session(self, name):
+        return True
+
+    def send_text(self, window_id, text):
+        # The contract/stall nudges reach the mux too; recording them keeps that
+        # off the host binary as well, which is the same promise as has_session.
+        self.sent.append((window_id, text))
+
+
+def make_dev_adapter(tmp_path, profile_name="claude", policy=None, mux=None):
     impl = tmp_path / "impl"
     impl.mkdir()
     # project root == tmp_path so rebased(spec.cwd=tmp_path) is a no-op: these
@@ -493,6 +535,7 @@ def make_dev_adapter(tmp_path, profile_name="claude", policy=None):
         policy=policy or Policy(limits=LimitsPolicy()),
         profile=get_profile(profile_name),
         paths=paths,
+        mux=mux or _UnitMux(),
     )
     return adapter, impl
 
@@ -974,6 +1017,37 @@ def test_resultless_stop_breadcrumb_write_failure_is_swallowed(tmp_path):
     adapter._note_resultless_stop("3-1-dev-1", "pending", "detail")  # must not raise
 
 
+def test_resultless_stop_breadcrumb_surrogate_detail_is_swallowed(tmp_path):
+    """The other half of the same promise: a lone surrogate must not escape
+    `_append_diag_jsonl` either, and it is NOT an OSError like the sibling above.
+
+    `ensure_ascii=False` leaves the surrogate in the dumped str, so it reaches the
+    UTF-8 encode inside `fh.write` as a UnicodeEncodeError — a ValueError, which
+    the pre-#380 `except OSError` did not name. "/tmp/bad\\udcff.md" is exactly the
+    shape a POSIX filename holding a non-UTF-8 byte takes once the filesystem API
+    surrogate-escapes it, and six `_note_resultless_stop` call sites interpolate
+    such a path straight into `detail`.
+
+    NOT codec-conditional, and must never grow a locale skipif: the fault is an
+    ENCODE to UTF-8, pinned by `encoding="utf-8"` in `path.open`, so a lone
+    surrogate is unencodable on every host whatever that host's locale decodes.
+
+    Ablation: narrow the guard back to `except OSError:` and this fails alone, on
+    the UnicodeEncodeError escaping the writer.
+    """
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._note_resultless_stop("3-1-dev-1", "pending", "/tmp/bad\udcff.md")  # must not raise
+
+    # Dropped, not written — and that absence is the anti-vacuity half. "Did not
+    # raise" alone would pass just as well if the encode had never failed; the
+    # missing line is what proves the fault fired and the widened guard ate it.
+    assert _breadcrumbs(adapter) == []
+
+    # ...and the swallow left the writer usable for the next breadcrumb.
+    adapter._note_resultless_stop("3-1-dev-1", "pending", "plain")
+    assert [crumb["detail"] for crumb in _breadcrumbs(adapter)] == ["plain"]
+
+
 def test_generic_dev_disables_nudges(tmp_path):
     adapter, _ = make_dev_adapter(tmp_path)
     assert adapter._stop_nudges == 0
@@ -1032,6 +1106,172 @@ def test_dev_stall_grace_defaults_from_policy(tmp_path):
         profile=get_profile("claude"),
     )
     assert base._stall_grace_s == 0.0
+
+
+# -------------------- launch-stall + dead-window nudge parity (#470/#504)
+#
+# Two-way contract-parity link: tests/test_opencode_http.py carries identically
+# named tests under its matching header (phase 2 adds that reciprocal link).
+# Changes to the shared completion-loop behavior must update both transports or
+# record the deliberate divergence.
+
+
+def _frozen_stall_clock(monkeypatch):
+    clock = {"t": 1000.0}
+
+    class _Clock:
+        monotonic = staticmethod(lambda: clock["t"])
+        time = staticmethod(lambda: 0.0)  # wall co-bound stays frozen
+        sleep = staticmethod(lambda *_: None)
+        time_ns = staticmethod(lambda: 0)
+
+    monkeypatch.setattr(generic, "time", _Clock)
+    return clock
+
+
+def test_dev_stall_arms_at_launch_without_stop(tmp_path, monkeypatch):
+    """A silent dev/review turn is bounded even if no Stop hook ever arrives.
+
+    Ablation target: restore launch initialization of ``stall_deadline`` and
+    ``last_activity`` to ``None`` and this test times out with zero stall nudges.
+    """
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 2
+    adapter._window_alive = lambda handle: True
+    log_path = adapter.logs_dir / "3-1-dev-1.log"
+    log_path.write_bytes(b"launch baseline\n")
+    clock = _frozen_stall_clock(monkeypatch)
+
+    heartbeats: list[dict] = []
+    adapter._write_heartbeat = lambda task_id, payload: heartbeats.append(payload)
+
+    def advance(call_n):
+        clock["t"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=100.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+
+    assert (result.status, [text for _, text in mux.sent]) == (
+        "stalled",
+        [generic.STALL_NUDGE_TEXT] * 2,
+    )
+    assert heartbeats[0]["stall_armed"] is True
+
+
+def test_dev_activity_rearms_launch_stall_grace(tmp_path, monkeypatch):
+    """Two productive launch ticks re-arm grace; the first silent full grace stalls.
+
+    Ablation target: restore a disarmed launch deadline and this no-Stop test
+    reaches the wall timeout instead of tracking activity and stalling on call 3.
+    """
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 0
+    adapter._window_alive = lambda handle: True
+    log_path = adapter.logs_dir / "3-1-dev-1.log"
+    log_path.write_bytes(b"launch baseline\n")
+    clock = _frozen_stall_clock(monkeypatch)
+
+    def advance_and_stream(call_n):
+        clock["t"] += 11.0
+        if call_n <= 2:
+            with log_path.open("ab") as stream:
+                stream.write(b"productive tick\n")
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance_and_stream)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=100.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 3
+    assert mux.sent == []
+
+
+def test_dev_stall_nudge_send_failure_reaches_liveness_verdict(tmp_path, monkeypatch):
+    """A failed launch-stall nudge defers the verdict to the next liveness probe.
+
+    Ablation target: remove the stall-nudge ``MultiplexerError`` guard and this
+    test fails on ``window gone`` before the ordinary crash path can run.
+    """
+    mux = _UnitMux()
+
+    def fail_send(window_id, text):
+        mux.sent.append((window_id, text))
+        raise MultiplexerError("window gone")
+
+    mux.send_text = fail_send
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 2
+    result_reads: list[bool] = []
+    real_result_json = adapter._result_json
+
+    def spy_result_json(handle, spec, *, wait):
+        result_reads.append(wait)
+        return real_result_json(handle, spec, wait=wait)
+
+    monkeypatch.setattr(adapter, "_result_json", spy_result_json)
+    clock = _frozen_stall_clock(monkeypatch)
+    alive = iter((True, False))
+    adapter._window_alive = lambda handle: next(alive)
+
+    def cross_first_grace(call_n):
+        if call_n == 1:
+            clock["t"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher([], on_call=cross_first_grace)
+    result = adapter.wait_for_completion(
+        _dev_handle(), dataclasses.replace(_dev_spec(tmp_path), timeout_s=100.0)
+    )
+
+    assert result.status == "crashed"
+    assert mux.sent == [("@1", generic.STALL_NUDGE_TEXT)]
+    assert adapter.watcher.calls == 2
+    assert result_reads == [False]  # dead-window _final performed ordinary artifact read-back
+
+
+def test_resultless_stop_nudge_send_failure_reaches_liveness_verdict(tmp_path, monkeypatch):
+    """A failed result-less-Stop nudge also leaves liveness in charge of verdicts.
+
+    Ablation target: remove the result-less-Stop ``MultiplexerError`` guard and
+    this test fails on ``window gone`` instead of returning the crash verdict.
+    """
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    mux = _UnitMux()
+
+    def fail_send(window_id, text):
+        mux.sent.append((window_id, text))
+        raise MultiplexerError("window gone")
+
+    mux.send_text = fail_send
+    adapter = make_adapter(tmp_path, mux=mux)
+    adapter._stop_nudges = 1
+    result_reads: list[bool] = []
+
+    def no_result(handle, spec, *, wait):
+        result_reads.append(wait)
+        return None
+
+    monkeypatch.setattr(adapter, "_result_json", no_result)
+    adapter._window_alive = lambda handle: False
+    _frozen_stall_clock(monkeypatch)
+    adapter.watcher = _ScriptedWatcher(
+        [_stop_event("3-1-dev-1", "sess", "/run/events.jsonl"), None]
+    )
+
+    result = adapter.wait_for_completion(
+        _dev_handle(), dataclasses.replace(_dev_spec(tmp_path), timeout_s=100.0)
+    )
+
+    assert result.status == "crashed"
+    assert mux.sent == [("@1", generic.NUDGE_TEXT)]
+    assert adapter.watcher.calls == 2
+    assert result_reads == [True, False]  # Stop await, then dead-window artifact read-back
 
 
 def test_dev_result_less_stop_awaits_reinvocation_then_completes(tmp_path, monkeypatch):
@@ -1519,6 +1759,10 @@ def test_capped_session_still_completes_when_marker_lands_late(tmp_path, monkeyp
 # a session-lifecycle.jsonl line, a wall-clock co-bound fires through a frozen
 # monotonic clock (but may never EXTEND the deadline), and each tick tops up a
 # throttled heartbeat.json whose staleness diagnoses a frozen orchestrator.
+#
+# Contract parity: test_opencode_http.py holds identically named tests over the
+# HTTP transport. A behavior change here must land in both or record the
+# divergence.
 
 
 def _timeout_clock_adapter(tmp_path, monkeypatch):
@@ -1640,7 +1884,7 @@ def test_heartbeat_written_and_throttled(tmp_path, monkeypatch):
     assert writes[0] == {
         "ts": 5000.0,
         "remaining_s": 100.0,
-        "stall_armed": False,
+        "stall_armed": True,
         "stall_nudges_sent": 0,
     }
     assert [w["remaining_s"] for w in writes] == [100.0, 59.0]  # tick 2 was throttled
@@ -1659,6 +1903,213 @@ def test_lifecycle_and_heartbeat_write_failure_is_swallowed(tmp_path):
     adapter._write_heartbeat("3-1-dev-1", {"ts": 0.0})  # must not raise
 
 
+# ------------------------------ in-session hard-stop poll (#319)
+#
+# `bmad-loop stop` lodges a mode-aware stop-request.json before it signals, so a
+# stop reaches a session on platforms where the engine's SIGTERM never arrives.
+# The wait loop reads that file twice per iteration and returns the non-completion
+# `aborted` verdict; the engine raises RunStopped off it. The adapter never
+# unlinks the file — the engine consumes it, and must still see it to attribute
+# the stop.
+#
+# Contract parity: test_opencode_http.py holds the same pair over the HTTP
+# transport. A behavior change here must land in both or record the divergence.
+
+
+def _lodge_stop_request(adapter, mode: str) -> Path:
+    """Lodge a stop request of ``mode`` on this run's control-file channel, as
+    ``bmad-loop stop`` does. Written directly rather than through
+    ``runs._write_stop_request`` so the adapter's read stays pinned to the
+    on-disk shape, not to the writer's guards."""
+    adapter.run_dir.mkdir(parents=True, exist_ok=True)
+    path = adapter.run_dir / runs.STOP_REQUEST_FILE
+    path.write_text(
+        json.dumps({"requested_at": "2026-08-22T00:00:00", "mode": mode}), encoding="utf-8"
+    )
+    return path
+
+
+def test_wait_aborts_on_hard_stop_request(tmp_path, monkeypatch):
+    """A hard stop pending on the channel ends the wait on its very next
+    iteration with the non-completion ``aborted`` verdict — no artifact
+    read-back (that rescue is `_post_kill_reconcile`'s job) and no timeout burn.
+
+    The abort fires before the loop ever reaches its event source, so the
+    steerable clock never advances: the pass is deterministic, not a race.
+
+    Ablation: delete the `_hard_stop_requested()` arm from `wait_for_completion`
+    and the clock runs the session to its scripted `timeout` verdict instead —
+    proven red once, then restored.
+    """
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    request = _lodge_stop_request(adapter, "hard")
+
+    def advance(call_n):
+        clock["mono"] += 11.0  # only reached if the abort arm is gone
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
+
+    assert result.status == "aborted"
+    assert result.result_json is None  # an abort is never a completion path
+    assert adapter.watcher.calls == 0  # aborted before the first event wait
+    fired = [ln for ln in _lifecycle_lines(adapter) if ln["event"] == "stop-abort-fired"]
+    assert len(fired) == 1
+    # The engine consumes the request when it raises; an adapter that unlinked it
+    # would leave the engine unable to attribute the stop.
+    assert request.is_file()
+
+
+def test_wait_polls_the_hard_stop_channel_after_the_event_wait_too(tmp_path, monkeypatch):
+    """The arm at the top of the loop is not enough by itself. Between it and its
+    next run sit the loop's own 5s wait *and* whichever dispatch leg the event
+    selects — a `_window_alive` or `send_text` bounded only by TMUX_TIMEOUT_S (30s),
+    or a `_result_json(wait=True)` that waits RESULT_GRACE_S (15s) for an artifact.
+    That last one outlasts `stop_run`'s 10s grace window on a perfectly healthy box.
+    Polling again straight after the wait leaves at most one leg between two checks.
+
+    The request is lodged *during* the event wait, so it is absent at the
+    top-of-loop check and present immediately after — the exact interval this
+    second poll exists to cover.
+
+    It does not make the interval unconditionally short, and the prose no longer
+    claims it does: an in-flight subprocess cannot be interrupted from this thread,
+    so a leg that outlasts the window still degrades to the force-kill backstop.
+
+    Ablation: delete the second `_hard_stop_requested()` arm (the one just below
+    `watcher.wait_for`) -> `_window_alive` is called, because the loop enters the
+    `event is None` dispatch leg and only notices the request on its next
+    iteration. The verdict stays `aborted` either way, which is exactly why the
+    dispatch spy is the assertion carrying the proof and the status is not."""
+    adapter, _clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    alive_calls: list[int] = []
+    adapter._window_alive = lambda handle: (alive_calls.append(1), True)[1]
+
+    lodged: list[str] = []
+
+    def _lodge_during_the_wait(_call_n):
+        if not lodged:
+            lodged.append("hard")
+            _lodge_stop_request(adapter, "hard")
+
+    adapter.watcher = _ScriptedWatcher([], on_call=_lodge_during_the_wait)
+
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
+
+    assert result.status == "aborted"
+    assert lodged == ["hard"]  # the interleave really happened
+    assert adapter.watcher.calls == 1  # caught on the same iteration, not the next
+    assert alive_calls == []  # never entered the dispatch leg below the wait
+
+
+def _lodge_owner_stop_request(tmp_path, mode: str) -> Path:
+    """Lodge a stop request in a *different* run dir and publish it as the owning
+    run, the way `stop <parent-id>` reaches a nested auto-sweep child: the request
+    lands in the parent's dir while the child's own stays empty."""
+    owner = tmp_path / ".bmad-loop" / "runs" / "parent-run"
+    owner.mkdir(parents=True, exist_ok=True)
+    (owner / runs.STOP_REQUEST_FILE).write_text(
+        json.dumps({"requested_at": "2026-08-22T00:00:00", "mode": mode}), encoding="utf-8"
+    )
+    return owner
+
+
+def test_wait_aborts_on_owning_runs_hard_stop_request(tmp_path, monkeypatch):
+    """A nested auto-sweep child aborts on the *parent's* hard request (#319).
+
+    The child mints its own run dir, so `stop <parent-id>` writes a file this
+    adapter would otherwise never read — and on native Windows, where the shared
+    SIGTERM cannot land, that left the parent stop force-killing blind. The poll now
+    reads the owning run's channel too.
+
+    Ablation: drop the owner leg from `_hard_stop_requested` and the clock runs the
+    session to its scripted `timeout` verdict instead."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    owner = _lodge_owner_stop_request(tmp_path, "hard")
+    assert not (adapter.run_dir / runs.STOP_REQUEST_FILE).exists()  # child's own is empty
+
+    def advance(call_n):
+        clock["mono"] += 11.0  # only reached if the owner leg is gone
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+
+    token = runs.set_owner_run_dir(owner)
+    try:
+        result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
+    finally:
+        runs.reset_owner_run_dir(token)
+
+    assert result.status == "aborted"
+    assert result.result_json is None
+    assert adapter.watcher.calls == 0
+    # The child never consumes the parent's file — the parent's own hard arm must
+    # still find it to record and attribute the stop.
+    assert (owner / runs.STOP_REQUEST_FILE).is_file()
+
+
+def test_wait_ignores_owning_runs_graceful_stop_request(tmp_path, monkeypatch):
+    """The mode-exact twin of the owner leg: graceful already suppresses a child
+    sweep from *starting*, and letting one already in flight finish is what graceful
+    means — so a graceful request on the owning run must not abort this session.
+
+    Ablation: widen the owner leg to `is not None` and this reddens alone."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    owner = _lodge_owner_stop_request(tmp_path, "graceful")
+
+    def advance(call_n):
+        clock["mono"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+
+    token = runs.set_owner_run_dir(owner)
+    try:
+        result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
+    finally:
+        runs.reset_owner_run_dir(token)
+
+    assert result.status == "timeout"  # ran on, exactly as with no request at all
+
+
+def test_hard_stop_requested_falls_back_to_own_dir_outside_any_run(tmp_path, monkeypatch):
+    """With no owning run published — a standalone adapter, as in probes and most
+    tests — the predicate is its own dir alone, and answers without raising."""
+    adapter, _clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    assert runs.owner_run_dir() is None
+    assert adapter._hard_stop_requested() is False
+    _lodge_stop_request(adapter, "hard")
+    assert adapter._hard_stop_requested() is True
+
+
+def test_wait_ignores_graceful_stop_request(tmp_path, monkeypatch):
+    """Graceful means *finish the in-flight item*, so a graceful request pending
+    on the same channel must not touch a running session — only ``hard`` aborts.
+    Since every pre-#319 (modeless) body reads graceful, this is the back-compat
+    pin for the in-session poll as well.
+
+    Ablation: widen the adapter's check to any pending request (drop the
+    ``== "hard"`` comparison in `_hard_stop_requested`) and this test reddens
+    with an `aborted` verdict.
+    """
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: True
+    _lodge_stop_request(adapter, "graceful")
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher([_stop_event("3-1-dev-1", "sess", "/t.jsonl")])
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.result_json["status"] == "done"
+    assert not _lifecycle_lines(adapter) or not [
+        ln for ln in _lifecycle_lines(adapter) if ln["event"] == "stop-abort-fired"
+    ]
+
+
 # ------------------------------ mid-session token-budget guard (#158)
 #
 # The wait loop samples cumulative weighted usage on the heartbeat cadence and
@@ -1668,6 +2119,10 @@ def test_lifecycle_and_heartbeat_write_failure_is_swallowed(tmp_path):
 # artifact under a live window. Driven with a scripted watcher, a steerable
 # clock (ticks advance past HEARTBEAT_INTERVAL_S to cross the throttle), and a
 # real claude-jsonl transcript file.
+#
+# Contract parity: test_opencode_http.py holds identically named tests over the
+# HTTP transport. A behavior change here must land in both or record the
+# divergence.
 
 
 def _write_claude_transcript(path: Path, input_tokens: int) -> None:
@@ -2157,6 +2612,11 @@ def test_post_kill_reconcile_leaves_other_statuses_alone(tmp_path):
         assert (
             adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), original) is original
         )
+    # pins the base.py cross-claim that `session_vanished` rides only verdicts
+    # this hook never rebuilds: if `crashed` ever joins the rescue set, this
+    # rescuable artifact would produce a rebuilt result without the flag.
+    vanished = _unvouched("crashed", session_vanished=True)
+    assert adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), vanished) is vanished
 
 
 def test_post_kill_reconcile_keeps_stall_when_window_alive_after_kill(tmp_path):
@@ -2215,6 +2675,32 @@ def test_post_kill_reconcile_no_artifact_keeps_stall(tmp_path):
     adapter._window_alive = lambda handle: False
     original = _unvouched()
     assert adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), original) is original
+
+
+def test_post_kill_reconcile_rescues_aborted(tmp_path):
+    """An operator's hard stop (#319) kills the window mid-wait, so a Stop event
+    that had already landed is never read — the same lost-vouching problem
+    `stalled` and `timeout` have, settled by the same trust model.
+
+    The upgrade to `completed` does NOT resume the run: the engine re-reads the
+    hard-stop file after saving the rescued session and stops there. So this
+    rescue records the finished work *and* the stop is still honored — the pair
+    is pinned engine-side by
+    `test_engine.py::test_hard_stop_after_completed_session_stops_before_next_leg`.
+
+    Ablation: drop `"aborted"` from the rescue tuple and the verdict stands
+    unrescued.
+    """
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False
+    (impl / "spec-3-1-foo.md").write_text(_DONE_SPEC)
+    result = adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), _unvouched("aborted"))
+    assert result.status == "completed"
+    assert result.result_json["status"] == "done"
+    assert result.result_json["post_kill_reconciled"] is True
+    # the abort verdict's identity is preserved on the rescued result
+    assert result.session_id == "sess"
+    assert result.transcript_path == "/t.jsonl"
 
 
 def test_post_kill_reconcile_ignores_pre_launch_artifact(tmp_path):
@@ -2438,19 +2924,20 @@ def _classify(adapter, status, *, result_json=None, task_id=_ENV_FAULT_TASK) -> 
 
 def test_classify_env_fault_flags_timeout_from_ansi_log(tmp_path):
     """The headline case: a timeout whose pane log holds an ANSI-colored
-    `API Error … (ConnectionRefused)` line is stamped env_fault, the evidence is
-    the ANSI-stripped line, and an `env-fault-classified` breadcrumb is written."""
+    `API Error … Unable to connect to API (ConnectionRefused)` line is stamped
+    env_fault, the evidence is the ANSI-stripped line, and an
+    `env-fault-classified` breadcrumb is written."""
     adapter = make_adapter(tmp_path)  # claude profile ships the seed pattern
     _write_task_log(
         adapter,
         b"building the diff...\n"
-        b"\x1b[31mAPI Error: Unable to connect (ConnectionRefused)\x1b[0m\n"
+        b"\x1b[31mAPI Error: Unable to connect to API (ConnectionRefused)\x1b[0m\n"
         b"idle...\n",
     )
     result = _classify(adapter, "timeout")
     assert result.env_fault is True
     assert result.status == "timeout"  # the status string is unchanged
-    assert result.env_fault_evidence == "API Error: Unable to connect (ConnectionRefused)"
+    assert result.env_fault_evidence == "API Error: Unable to connect to API (ConnectionRefused)"
     assert "\x1b" not in result.env_fault_evidence  # ANSI stripped
     events = _lifecycle_lines(adapter, _ENV_FAULT_TASK)
     assert [e["event"] for e in events] == ["env-fault-classified"]
@@ -2463,10 +2950,10 @@ def test_classify_env_fault_flags_stalled_and_crashed(tmp_path, status):
     """stalled and crashed join timeout in the eligible set — all three can be a
     lost-connection session dressed up as a non-completed verdict."""
     adapter = make_adapter(tmp_path)
-    _write_task_log(adapter, b"API Error: Connection refused\n")
+    _write_task_log(adapter, b"API Error: Connection closed mid-response\n")
     result = _classify(adapter, status)
     assert result.env_fault is True
-    assert result.env_fault_evidence == "API Error: Connection refused"
+    assert result.env_fault_evidence == "API Error: Connection closed mid-response"
 
 
 def test_classify_env_fault_ignores_completed_and_over_budget(tmp_path):
@@ -2474,7 +2961,7 @@ def test_classify_env_fault_ignores_completed_and_over_budget(tmp_path):
     excluded outright — a budget crossing proves real API traffic. Both pass through
     unchanged (same object), with no breadcrumb."""
     adapter = make_adapter(tmp_path)
-    _write_task_log(adapter, b"API Error: Connection refused\n")
+    _write_task_log(adapter, b"API Error: Connection closed mid-response\n")
     completed = _classify(adapter, "completed", result_json={"ok": True})
     assert completed.env_fault is False and completed.env_fault_evidence is None
     over = _classify(adapter, "over_budget")
@@ -2486,18 +2973,29 @@ def test_classify_env_fault_ignores_result_json_present(tmp_path):
     """The guard is `result_json is None`: an eligible status that somehow carries a
     result dict is trusted work, never re-classified."""
     adapter = make_adapter(tmp_path)
-    _write_task_log(adapter, b"API Error: Connection refused\n")
+    _write_task_log(adapter, b"API Error: Connection closed mid-response\n")
     result = _classify(adapter, "timeout", result_json={"salvaged": True})
     assert result.env_fault is False
     assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
 
 
 def test_classify_env_fault_inert_without_patterns(tmp_path):
-    """A profile with no env_fault_patterns (codex) never classifies, even with a
-    matching line in the log."""
-    adapter = make_adapter(tmp_path, profile_name="codex")
+    """A profile with no env_fault_patterns never classifies, even with a matching
+    line in the log — so mixing EnvFaultMixin into an adapter is always safe.
+
+    Builds the empty profile explicitly rather than borrowing whichever shipped CLI
+    happens to have none (it used to borrow codex). Four profiles are in fact
+    unseeded — see test_unseeded_profiles_stay_inert — but which ones is a shipping
+    decision that has changed once already and should not be able to silently
+    invalidate this test.
+
+    The profile is swapped BEFORE the first classification on purpose:
+    _env_fault_patterns is a cached_property, so a swap afterwards would leave the
+    old patterns compiled (documented on the property)."""
+    adapter = make_adapter(tmp_path)
+    adapter.profile = dataclasses.replace(adapter.profile, env_fault_patterns=())
     assert adapter._env_fault_patterns == ()
-    _write_task_log(adapter, b"API Error: Connection refused\n")
+    _write_task_log(adapter, b"API Error: Connection closed mid-response\n")
     result = _classify(adapter, "timeout")
     assert result.env_fault is False
     assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
@@ -2531,9 +3029,9 @@ def test_classify_env_fault_last_match_wins_and_truncates(tmp_path):
     _write_task_log(
         adapter,
         (
-            f"API Error: Connection refused FIRST {filler}\n"
+            f"API Error: Connection closed mid-response FIRST {filler}\n"
             f"unrelated line\n"
-            f"API Error: Connection refused LAST {filler}\n"
+            f"API Error: Connection closed mid-response LAST {filler}\n"
         ).encode(),
     )
     result = _classify(adapter, "crashed")
@@ -2550,7 +3048,7 @@ def test_run_classifies_env_fault_after_reconcile(tmp_path):
     adapter, _impl = make_dev_adapter(tmp_path)
     _write_task_log(
         adapter,
-        b"\x1b[31mAPI Error: Unable to connect (ECONNREFUSED)\x1b[0m\n",
+        b"\x1b[31mAPI Error: Unable to connect to API (ECONNREFUSED)\x1b[0m\n",
         task_id="3-1-dev-1",
     )
     adapter.start_session = lambda spec: _dev_handle()
@@ -2574,9 +3072,9 @@ def test_run_reconcile_upgrade_is_not_reclassified(tmp_path):
         # Padded past PROOF_OF_WORK_MIN_LOG_BYTES: this fixture stands in for a
         # session that implemented the story and then lost its Stop, and such a
         # session renders. A log holding ONLY the error line would be a session that
-        # rendered ~44 bytes total, which the #261 gate correctly declines to rescue
+        # rendered ~50 bytes total, which the #261 gate correctly declines to rescue
         # — it would make this ordering test depend on a scenario it is not about.
-        b"working...\n" * 32 + b"API Error: Unable to connect (ECONNREFUSED)\n",
+        b"working...\n" * 32 + b"API Error: Unable to connect to API (ECONNREFUSED)\n",
         task_id="3-1-dev-1",
     )
     adapter.start_session = lambda spec: _dev_handle()
@@ -2602,6 +3100,11 @@ class _StartSessionMux:
     def pipe_pane(self, window_id, log_file):
         self.piped.append((window_id, Path(log_file)))
 
+    def has_session(self, name):
+        # The crash-path diagnosis probe (#489) asks this; these tests are about a
+        # window that died under a session that is still very much there.
+        return True
+
 
 def test_start_session_resets_reused_task_log(tmp_path):
     """A re-armed run reuses task_ids and both mux backends APPEND to
@@ -2618,7 +3121,9 @@ def test_start_session_resets_reused_task_log(tmp_path):
     adapter = make_adapter(tmp_path, mux=mux)
     adapter._ensure_session = lambda cwd: None  # skip the tmux server plumbing
     task_id = _ENV_FAULT_TASK
-    _write_task_log(adapter, b"API Error: Unable to connect (ECONNREFUSED)\n", task_id=task_id)
+    _write_task_log(
+        adapter, b"API Error: Unable to connect to API (ECONNREFUSED)\n", task_id=task_id
+    )
     log_path = adapter.logs_dir / f"{task_id}.log"
     assert log_path.stat().st_size > 0  # the prior cycle's tee is present...
 
@@ -2632,13 +3137,58 @@ def test_start_session_resets_reused_task_log(tmp_path):
     assert _classify(adapter, "timeout", task_id=task_id).env_fault is False
 
 
+def test_start_session_drops_a_reused_task_dirs_escalation(tmp_path):
+    """The sweep skill writes `escalation.json` into tasks/<task_id>/ and
+    `resolve._gather_escalations` reads it beside result.json. A re-armed run reuses
+    task_ids, so a prior cycle's escalation left there is handed to whatever session
+    lands on the id next — the same reuse hazard result.json's unlink already covers,
+    against a third reader. An ABSENT file must still start cleanly (missing_ok)."""
+    mux = _StartSessionMux()
+    adapter = make_adapter(tmp_path, mux=mux)
+    adapter._ensure_session = lambda cwd: None  # skip the tmux server plumbing
+    task_id = _ENV_FAULT_TASK
+    task_dir = adapter.tasks_dir / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    stale = task_dir / "escalation.json"
+    stale.write_text(
+        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "last cycle"}]}),
+        encoding="utf-8",
+    )
+
+    adapter.start_session(make_spec(tmp_path, task_id=task_id))
+    assert not stale.exists()
+
+    # ...and with the file already gone the unlink is a no-op, not an error. What this
+    # second call asserts is that it RETURNS (the missing_ok path); re-asserting the
+    # file's absence would only restate the line above, since nothing re-created it.
+    assert adapter.start_session(make_spec(tmp_path, task_id=task_id)) is not None
+
+
 def test_classify_env_fault_bounds_pathological_pattern(tmp_path, monkeypatch):
     """A pathological operator regex can't hang run() teardown: each match is bounded
-    by ENV_FAULT_MATCH_TIMEOUT_S, and exceeding it declines to classify (best-effort,
-    like an unreadable log) rather than backtracking forever on a long tail line."""
+    by ENV_FAULT_MATCH_TIMEOUT_S, and exceeding it aborts the WHOLE scan and declines
+    to classify (best-effort, like an unreadable log) rather than backtracking forever
+    on a long tail line.
+
+    Two details keep this test honest, and it was vacuous without both:
+
+    * The patch targets ``env_fault``, the module that DEFINES the constant and reads
+      it at ``pat.search`` time. Patching ``generic`` — which only re-exports the name,
+      copying the object binding — never reaches the classifier, so the scan silently
+      ran at the 2.0s default.
+    * The second, trivially-matching pattern is what makes "declined because a match
+      timed out" distinguishable from "found nothing". With a lone non-matching
+      backtracker, ``evidence is None`` holds for BOTH reasons, so the assertions
+      passed with the timeout gate deleted outright. Here, any scan that is not cut
+      short reaches ``!$``, matches, and reddens every assertion below — which is
+      also what catches the patch being repointed at a non-authoritative module,
+      since the 2.0s default lets the backtracker run to completion."""
     adapter = make_adapter(tmp_path)
-    adapter._env_fault_patterns = (regex.compile(r"(a+)+$"),)  # catastrophic backtracker
-    monkeypatch.setattr(generic, "ENV_FAULT_MATCH_TIMEOUT_S", 0.1)
+    adapter._env_fault_patterns = (
+        regex.compile(r"(a+)+$"),  # catastrophic backtracker, never matches
+        regex.compile(r"!$"),  # trips instantly IF the scan is allowed to get here
+    )
+    monkeypatch.setattr(env_fault, "ENV_FAULT_MATCH_TIMEOUT_S", 0.1)
     _write_task_log(adapter, b"a" * 1000 + b"!\n")  # long non-matching line -> deep backtrack
     start = time.monotonic()
     result = _classify(adapter, "timeout")
@@ -2735,6 +3285,93 @@ def test_wait_for_completion_genuine_window_death_still_crashes(tmp_path, monkey
     assert result.status == "crashed"
 
 
+class _SessionProbeMux:
+    """Mux stand-in exposing only what `_session_vanished` asks: has_session."""
+
+    def __init__(self, answer):
+        self._answer = answer
+        self.calls: list[str] = []
+
+    def has_session(self, name):
+        self.calls.append(name)
+        if isinstance(self._answer, Exception):
+            raise self._answer
+        return self._answer
+
+
+@pytest.mark.parametrize(
+    ("has_session", "expect_vanished"),
+    [
+        (False, True),  # the session itself is gone: something destroyed it
+        (True, False),  # session alive, window gone: the CLI exited
+        (MultiplexerError("server wedged"), False),  # unknown is not vanished
+    ],
+)
+def test_window_death_distinguishes_a_destroyed_session_from_an_exited_cli(
+    tmp_path, monkeypatch, has_session, expect_vanished
+):
+    """#489: `list_window_ids` answers [] for a dead window AND for a session that
+    no longer exists, so the crash verdict alone cannot say which happened. The
+    verdict is `crashed` either way — only the diagnosis differs."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False
+    adapter.mux = _SessionProbeMux(has_session)
+
+    adapter.watcher = _ScriptedWatcher([])
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "crashed"
+    assert result.session_vanished is expect_vanished
+    assert adapter.mux.calls == [adapter.session_name]
+    # The durable half of the diagnosis: CHANGELOG and FEATURES both promise this
+    # crumb, and without an assertion deleting the write keeps the suite green.
+    crumbs = _lifecycle_events(adapter, "session-vanished")
+    assert len(crumbs) == (1 if expect_vanished else 0)
+    if expect_vanished:
+        assert crumbs[0]["session"] == adapter.session_name
+        assert crumbs[0]["status"] == "crashed"
+
+
+def test_session_probe_is_skipped_for_non_crash_verdicts(tmp_path, monkeypatch):
+    """The probe answers "why did the window die" — a stall/timeout reached under a
+    LIVE window never asks it, or an unrelated mux outage would be misattributed to
+    a session the mux never touched."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter.mux = _SessionProbeMux(False)  # would say "vanished" if asked
+
+    res = adapter._final(_dev_handle(), _dev_spec(tmp_path), "timeout", None, None)
+
+    assert res.status == "timeout"
+    assert res.session_vanished is False
+    assert adapter.mux.calls == []
+
+
+def test_read_back_upgrade_is_not_diagnosed_even_if_the_session_is_gone(tmp_path):
+    """The deliberately-dropped case: a session reaped AFTER flushing its result
+    still earns `completed`, and a completed session gets no vanished diagnosis —
+    it produced something. Pinned separately because the skip test above only
+    exercises a `timeout` fallback, so this branch could invert unnoticed."""
+    adapter = make_adapter(tmp_path)
+    adapter.mux = _SessionProbeMux(False)  # the session really is gone
+    task_dir = adapter.tasks_dir / "1-1-a-dev-1"
+    task_dir.mkdir(parents=True)
+    (task_dir / "result.json").write_text('{"status": "done", "workflow": "dev"}')
+
+    res = adapter._final(
+        SessionHandle(task_id="1-1-a-dev-1", native_id="@1"),
+        make_spec(tmp_path),
+        "crashed",
+        None,
+        None,
+    )
+
+    assert res.status == "completed"
+    assert res.session_vanished is False
+    assert adapter.mux.calls == []  # never even asked
+
+
 def _usage_adapter(tmp_path, profile_name, **kw) -> GenericTmuxAdapter:
     return GenericTmuxAdapter(
         run_dir=tmp_path / "run",
@@ -2817,9 +3454,9 @@ def test_read_usage_none_without_transcript(tmp_path):
     assert adapter.read_usage(SessionResult(status="completed")) is None
 
 
-def _write_fake_cli(tmp_path):
+def _write_fake_cli(tmp_path, script: str = FAKE_CLI):
     fake = tmp_path / "fake-cli"
-    fake.write_text(FAKE_CLI)
+    fake.write_text(script)
     fake.chmod(0o755)
     return fake
 
@@ -2836,6 +3473,7 @@ def test_tmux_end_to_end_with_fake_cli(tmp_path, profile_name):
     spec_env = {
         "BMAD_LOOP_MODE": "1",
         "BMAD_LOOP_RUN_DIR": str(adapter.run_dir),
+        "BMAD_LOOP_EVENTS_DIR": str(adapter.watcher.events_dir),
         "BMAD_LOOP_TASK_ID": "t-int-1",
     }
     spec = SessionSpec(
@@ -2883,7 +3521,11 @@ def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
         role="dev",
         prompt="/bmad-dev-auto 1-1-a",
         cwd=tmp_path,
-        env={"BMAD_LOOP_RUN_DIR": str(adapter.run_dir), "BMAD_LOOP_TASK_ID": task_id},
+        env={
+            "BMAD_LOOP_RUN_DIR": str(adapter.run_dir),
+            "BMAD_LOOP_EVENTS_DIR": str(adapter.watcher.events_dir),
+            "BMAD_LOOP_TASK_ID": task_id,
+        },
         timeout_s=30.0,
     )
     try:
@@ -2894,6 +3536,49 @@ def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
     assert result.status == "completed"
     assert result.result_json["workflow"] == "auto-dev"  # fresh, not "STALE"
     assert result.session_id == "fake-1"  # fresh session, not "old"
+
+
+@pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path):
+    """The version-skew guard, end to end through real tmux: a CURRENT
+    orchestrator (it exports BMAD_LOOP_EVENTS_DIR and waits on the out-of-tree
+    channel) driving a session whose relay is an OLD copy that writes only to
+    `<run_dir>/events`. That pairing is not exotic — the relay is copied into the
+    target project at init, so every project not re-inited after an upgrade is in
+    it, and without the watcher's legacy poll EVERY such session stalls to
+    `session_timeout_min` instead of completing.
+
+    Ablation guard: drop `legacy_dir` from `SignalWatcher._dirs()` and this fails
+    (as a 30s timeout, not an assertion — which is precisely the production
+    symptom)."""
+    assert "$BMAD_LOOP_EVENTS_DIR" not in LEGACY_EVENTS_FAKE_CLI, "the twin still reads the new var"
+    assert LEGACY_EVENTS_FAKE_CLI != FAKE_CLI, "the swap did not take"
+
+    fake = _write_fake_cli(tmp_path, LEGACY_EVENTS_FAKE_CLI)
+    adapter = make_adapter(tmp_path, binary=str(fake), extra_args=())
+    spec = SessionSpec(
+        task_id="t-legacy-1",
+        role="dev",
+        prompt="/bmad-dev-auto 1-1-a",
+        cwd=tmp_path,
+        env={
+            "BMAD_LOOP_RUN_DIR": str(adapter.run_dir),
+            "BMAD_LOOP_EVENTS_DIR": str(adapter.watcher.events_dir),
+            "BMAD_LOOP_TASK_ID": "t-legacy-1",
+        },
+        timeout_s=30.0,
+    )
+    try:
+        result = adapter.run(spec)
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", adapter.session_name], capture_output=True)
+
+    assert result.status == "completed"
+    assert result.session_id == "fake-1"
+    # the premise, asserted rather than assumed: the events really did land in the
+    # legacy location and nowhere else, so the completion came through the fallback
+    assert list((adapter.run_dir / "events").glob("*.json"))
+    assert not list(adapter.watcher.events_dir.glob("*.json"))
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
@@ -4273,8 +4958,11 @@ def test_proof_of_work_leaves_task_scoped_result_json_alone(tmp_path):
     large (#298 review). A base adapter's `tasks/<task_id>/result.json` is unique to
     this task and unlinked at launch, so its presence already proves THIS session
     wrote it — no foreign writer can reach it. Gating it could only ever discard an
-    authoritative completion, so `_ResultFileMixin` declines the gate outright."""
-    adapter = make_adapter(tmp_path)
+    authoritative completion, so `_ResultFileMixin` declines the gate outright.
+    `_UnitMux` keeps the crash-verdict `_final` call off the host multiplexer —
+    the read-back upgrade skips the probe today, but that must not be what this
+    test leans on."""
+    adapter = make_adapter(tmp_path, mux=_UnitMux())
     task_dir = adapter.tasks_dir / "1-1-a-dev-1"
     task_dir.mkdir(parents=True)
     (task_dir / "result.json").write_text('{"status": "done", "workflow": "dev"}')
@@ -4287,8 +4975,8 @@ def test_proof_of_work_leaves_task_scoped_result_json_alone(tmp_path):
 
 
 def test_proof_of_work_gates_post_kill_reconcile(tmp_path, monkeypatch):
-    """The i-11 call path: the rescue is for a session that finished and lost its
-    Stop, not for one that never ran."""
+    """The post-kill call path: the rescue is for a session that finished and
+    lost its Stop, not for one that never ran."""
     adapter, impl = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
     adapter._window_alive = lambda handle: False
@@ -4302,6 +4990,29 @@ def test_proof_of_work_gates_post_kill_reconcile(tmp_path, monkeypatch):
 
     _pane_log(adapter, "3-1-dev-1", generic.PROOF_OF_WORK_MIN_LOG_BYTES + 1)
     rescued = adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), stalled)
+    assert rescued.status == "completed"
+    assert rescued.result_json["post_kill_reconciled"] is True
+
+
+def test_proof_of_work_gates_the_aborted_rescue(tmp_path, monkeypatch):
+    """The #261 gate covers the abort leg (#319) exactly as it covers the others:
+    a session a hard stop killed before it did anything produced nothing, so a
+    qualifying artifact on disk is not its output and the `aborted` verdict
+    stands. With proof-of-work the same artifact rescues it.
+
+    Ablation: delete the `_produced_work` gate in `_post_kill_reconcile` and the
+    first arm reddens with a `completed` rescue.
+    """
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    adapter._window_alive = lambda handle: False
+    (impl / "spec-3-1-foo.md").write_text(_DONE_SPEC)
+    _pane_log(adapter, "3-1-dev-1", 0)
+    aborted = SessionResult(status="aborted")
+    assert adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), aborted) is aborted
+
+    _pane_log(adapter, "3-1-dev-1", generic.PROOF_OF_WORK_MIN_LOG_BYTES + 1)
+    rescued = adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), aborted)
     assert rescued.status == "completed"
     assert rescued.result_json["post_kill_reconciled"] is True
 
@@ -4356,3 +5067,135 @@ def test_log_evidence_mro_is_not_shadowed_by_the_mixin():
     assert GenericDevAdapter._READBACK_NEEDS_PROOF_OF_WORK is True
     assert OpencodeDevAdapter._READBACK_NEEDS_PROOF_OF_WORK is True
     assert GenericTmuxAdapter._READBACK_NEEDS_PROOF_OF_WORK is False
+
+
+def test_classify_env_fault_marks_a_dropped_suffix(tmp_path):
+    """A window that dropped a SUFFIX says so. Marking only the head made a
+    truncated excerpt read as a complete line that simply ended there — the one
+    thing a string an operator reads out of a pause reason must not do. Both
+    markers are spent from ENV_FAULT_EVIDENCE_MAX, never added on top of it."""
+    adapter = make_adapter(tmp_path)
+    lead = "y" * 300  # push the match past the head so both ends are cut
+    _write_task_log(
+        adapter, f"{lead} API Error: Connection closed mid-response {'z' * 400}\n".encode()
+    )
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is True
+    ev = result.env_fault_evidence
+    assert ev.startswith("…") and ev.endswith("…")
+    assert len(ev) <= generic.ENV_FAULT_EVIDENCE_MAX
+    assert "API Error: Connection closed mid-response" in ev
+
+
+def test_classify_env_fault_drops_the_partial_line_at_the_tail_seek(tmp_path):
+    """The 64 KiB tail seek lands on an arbitrary byte, so whatever line straddles
+    the window edge arrives as a fragment. Matching it would quote half a line as
+    evidence — and because the cut can land mid-codepoint, its head may be a U+FFFD
+    from the errors="replace" decode. The fragment is discarded."""
+    adapter = make_adapter(tmp_path)
+    # The byte layout is the whole test, so it is computed rather than guessed: the
+    # seek must land INSIDE the matching line, and far enough into its leading junk
+    # that the surviving fragment would STILL match. Otherwise the test passes for
+    # the wrong reason — an earlier version padded so heavily that the matching line
+    # fell entirely outside the 64 KiB window, so it went green with the
+    # fragment-drop deleted and proved nothing.
+    prefix = b"P" * 50
+    straddler = b"J" * 200 + b"API Error: Connection closed mid-response\n"  # 242 bytes
+    cut_into_line = 10
+    filler = b"filler line\n"  # 12 bytes, matches nothing
+    tail_bytes = generic.ENV_FAULT_TAIL_BYTES - len(straddler) + cut_into_line
+    assert tail_bytes % len(filler) == 0  # exact fill; no accidental re-alignment
+    _write_task_log(adapter, prefix + straddler + filler * (tail_bytes // len(filler)))
+
+    log = adapter.logs_dir / f"{_ENV_FAULT_TASK}.log"
+    size = log.stat().st_size
+    seek = size - generic.ENV_FAULT_TAIL_BYTES
+    assert size > generic.ENV_FAULT_TAIL_BYTES  # the tail read actually truncates
+    assert len(prefix) < seek < len(prefix) + len(straddler)  # cut is inside the line
+    # And the surviving fragment still carries the full pattern, so dropping it is
+    # the ONLY reason this must not classify.
+    assert b"API Error: Connection closed mid-response" in log.read_bytes()[seek:]
+
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is False
+    assert result.env_fault_evidence is None
+
+
+def test_classify_env_fault_keeps_a_boundary_aligned_first_line(tmp_path):
+    """Sibling of the test above, and its counterexample: when the 64 KiB seek
+    happens to land on the first byte AFTER a newline, the first element is a
+    COMPLETE line, not a straddling fragment. Discarding it on "the read
+    truncated" alone loses a whole line — and if that line held the only
+    provider-error match in the tail, the outage goes unclassified and the run
+    burns a story attempt. The classifier looks at the byte before the window to
+    tell the two cases apart."""
+    adapter = make_adapter(tmp_path)
+    # As with the straddler test, the byte layout IS the test, so it is computed
+    # and then asserted: the seek must land exactly on len(prefix), i.e. one past
+    # the prefix's terminating newline, and the matching line must be the only
+    # match anywhere in the file.
+    prefix = b"P" * 50 + b"\n"  # 51 bytes, falls outside the window
+    match_line = b"J" * 10 + b"API Error: Connection closed mid-response\n"  # 52 bytes
+    filler = b"filler line\n"  # 12 bytes, matches nothing
+    fill = generic.ENV_FAULT_TAIL_BYTES - len(match_line)
+    assert fill % len(filler) == 0  # exact fill; the seek lands where we computed
+    _write_task_log(adapter, prefix + match_line + filler * (fill // len(filler)))
+
+    log = adapter.logs_dir / f"{_ENV_FAULT_TASK}.log"
+    body = log.read_bytes()
+    seek = len(body) - generic.ENV_FAULT_TAIL_BYTES
+    assert len(body) > generic.ENV_FAULT_TAIL_BYTES  # the tail read actually truncates
+    assert seek == len(prefix)  # window opens exactly on a line boundary...
+    assert body[seek - 1 : seek] == b"\n"  # ...one byte past the terminator
+    assert body[seek : seek + len(match_line)] == match_line  # whole line, not a fragment
+    assert body.count(b"API Error") == 1  # it is the ONLY match in the log
+
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is True
+    # Equality, not containment: the surviving line is the whole line, so this
+    # also fails if the fix ever kept a fragment instead.
+    assert result.env_fault_evidence == "J" * 10 + "API Error: Connection closed mid-response"
+
+
+def test_classify_env_fault_scans_a_truncated_window_with_no_newline(tmp_path):
+    """A >tail-window log containing NO newline is a single fragment. Dropping it
+    as a straddler would leave nothing to scan — trading a cosmetic half-line for
+    a missed outage, which is the wrong way round. The fragment is scanned; the
+    leading ellipsis marks that it is a window, not a whole line."""
+    adapter = make_adapter(tmp_path)
+    hit = b"API Error: Connection closed mid-response"
+    _write_task_log(adapter, b"x" * (generic.ENV_FAULT_TAIL_BYTES + 10) + hit)
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is True
+    assert result.env_fault_evidence.startswith("…")
+    assert "API Error: Connection closed mid-response" in result.env_fault_evidence
+
+
+@pytest.mark.parametrize("terminator", [b"\n", b"\r"], ids=["lf", "cr"])
+def test_classify_env_fault_scans_a_single_oversized_terminated_line(tmp_path, terminator):
+    """The same "leaves nothing to scan" case, one byte different — and the one
+    the length test got wrong. A >tail-window log that IS one line but ends with a
+    terminator splits to [fragment, ""], so a `len(lines) > 1` guard reads it as
+    "there is more to scan", drops the fragment, and scans only "". The window has
+    to be judged by whether anything SURVIVES the drop, not by how many pieces the
+    split produced. \\r counts: pane captures are CR-terminated and \\r is
+    normalized to \\n before the split."""
+    adapter = make_adapter(tmp_path)
+    hit = b"API Error: Connection closed mid-response"
+    _write_task_log(adapter, b"x" * (generic.ENV_FAULT_TAIL_BYTES + 10) + hit + terminator)
+
+    log = adapter.logs_dir / f"{_ENV_FAULT_TASK}.log"
+    body = log.read_bytes()
+    seek = len(body) - generic.ENV_FAULT_TAIL_BYTES
+    assert seek > 0  # the tail read actually truncates
+    window = body[seek:]
+    # The window is ONE line plus its terminator, so the split yields exactly
+    # [fragment, ""] — the layout that makes a length test the wrong question.
+    assert window.count(b"\n") + window.count(b"\r") == 1
+    assert window.endswith(terminator)
+    assert hit in window  # the only match survives the seek, and only as the fragment
+
+    result = _classify(adapter, "timeout")
+    assert result.env_fault is True
+    assert result.env_fault_evidence.startswith("…")
+    assert "API Error: Connection closed mid-response" in result.env_fault_evidence

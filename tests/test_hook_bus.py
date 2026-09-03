@@ -18,10 +18,17 @@ from __future__ import annotations
 import sys
 
 import pytest
-from conftest import committing_crash_state, dev_effect, review_effect, write_sprint
+from conftest import (
+    committing_crash_state,
+    dev_effect,
+    needs_strict_codec,
+    review_effect,
+    write_sprint,
+)
 
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
+from bmad_loop.escalation import critical_escalations
 from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import Phase, RunState, TokenUsage
 from bmad_loop.plugins import (
@@ -90,6 +97,48 @@ def test_observe_sees_readonly_context():
 
     HookBus(registry_of(py_plugin(P))).emit("pre_story", ctx())
     assert seen == {"story": "1-1-a", "stage": "pre_story"}
+
+
+def test_command_results_are_readonly_observation_data():
+    from bmad_loop.verify import CommandResult
+
+    result = CommandResult("pytest -q", 0, "tail", "out", "err")
+    c = ctx("post_dev_verify", command_results=[result])
+
+    assert c.command_results == (result,)
+    with pytest.raises(AttributeError):
+        c.command_results = ()
+
+
+def test_a_plugin_cannot_erase_a_critical_escalation_through_result_json():
+    """The observe-only claim has to hold at the depth escalations actually live.
+
+    ``HookContext`` copies ``result_json`` so a plugin cannot rewrite the session
+    result — but ``dict()`` is shallow, so the nested ``escalations`` LIST stayed
+    the engine's own object. Both verify legs emit ``post_dev_verify`` before
+    reading ``critical_escalations(result.result_json)``, so an in-process plugin
+    that cleared that list erased the CRITICAL before the audit ran, and a
+    verify-green repair proceeded where the run owed a pause.
+
+    Asserted through ``critical_escalations`` on the ENGINE's dict rather than by
+    comparing copies: that call is the read the fix exists to protect, and a test
+    that only checked ``c.result_json is not original`` passed before the fix.
+
+    ABLATION: restore ``dict(result_json)`` in ``HookContext.__init__`` and the
+    audit comes back empty — the assert names the escalation that vanished.
+    Verified."""
+
+    class Eraser(Plugin):
+        def on_post_dev_verify(self, c):
+            c.result_json["escalations"].clear()
+            c.result_json["escalations"].append({"severity": "INFO", "detail": "all fine"})
+
+    original = {"escalations": [{"severity": "CRITICAL", "detail": "prod credential committed"}]}
+    c = HookContext("post_dev_verify", result_json=original)
+    HookBus(registry_of(py_plugin(Eraser))).emit("post_dev_verify", c)
+
+    crits = critical_escalations(original)
+    assert [e["detail"] for e in crits] == ["prod credential committed"]
 
 
 def test_mutations_pipeline_last_writer_wins():
@@ -246,6 +295,48 @@ def test_real_subprocess_runner_reports_exit_code(tmp_path):
     assert rc == 7 and "hi" in out
 
 
+@needs_strict_codec
+def test_real_subprocess_runner_replaces_undecodable_output(tmp_path):
+    """A hook child emitting a byte the locale codec cannot decode is decoded
+    with replacement, not strictly: the strict decode raised UnicodeDecodeError —
+    a ValueError, named by neither `except` arm — which escaped `_HookError`, the
+    bus's designed transport-failure channel, and crashed the run instead of
+    being classified.
+
+    The exit code is asserted because it pins the sharpest consequence: the hook
+    had already run to completion, so a *passing* hook took the run down and its
+    verdict was lost with it. U+FFFD is asserted rather than merely "did not
+    raise" — under `needs_strict_codec` the codec provably cannot decode the
+    byte, so `errors="replace"` is the only thing that could have produced that
+    character. Its *count* stays unasserted (that is what varies by codec), and
+    the ASCII on both sides pins that only the offending byte was replaced.
+
+    Driven through a real child on purpose: a monkeypatched `subprocess.run`
+    never runs the stdlib decode, so such a test passes with the bug restored.
+
+    Ablation: remove `errors="replace"` from `_run_subprocess` and this fails
+    with UnicodeDecodeError."""
+    # Interpreter is `sys.executable`, never a bare `python`: the tests run under
+    # uv, where no `python` need be on PATH. The double quotes are honored by
+    # both sh and cmd, so the one string works on either host shell.
+    script = tmp_path / "emit383.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stdout.buffer.write(b'before \\xff after\\n')\n"
+        "sys.stdout.buffer.flush()\n"
+        "sys.exit(7)\n",
+        encoding="utf-8",
+    )
+
+    rc, out = _run_subprocess(
+        f'"{sys.executable}" "{script}"', cwd=str(tmp_path), env={}, timeout=10
+    )
+
+    assert rc == 7  # the hook verdict a strict decode used to lose entirely
+    assert "�" in out  # the replacement, not a survivor
+    assert "before" in out and "after" in out
+
+
 def test_shared_persists_across_stages():
     class P(Plugin):
         def on_pre_dev_phase(self, c):
@@ -331,6 +422,48 @@ def test_commit_message_mutation_reaches_git(project):
     summary = engine.run()
     assert summary.done == 1
     assert git(project.project, "log", "-1", "--format=%s") == "plugin-authored: 1-1-a"
+
+
+def test_post_dev_verify_reaches_a_real_plugin_through_the_bus(project, monkeypatch):
+    """The verifier results and their discriminators survive the REAL dispatch.
+
+    The engine-side tests for this surface swap `engine._bus` for a capture
+    double: that proves what the engine BUILDS, but skips everything the bus does
+    with it — stage activation, plugin routing, and the read-only view an actual
+    `Plugin` subclass receives. This one goes through `HookBus.emit` into a
+    registered plugin, so the plumbing itself is covered end to end.
+
+    Ablation: drop `command_results`, `verification_stage` or
+    `verification_sequence` from the engine's `post_dev_verify` emit and the
+    plugin observes that field's default (`()` / `None`) instead.
+    """
+    from bmad_loop import verify
+
+    seen = []
+
+    class P(Plugin):
+        def on_post_dev_verify(self, c):
+            seen.append((c.verification_stage, c.verification_sequence, c.command_results))
+
+    result = verify.CommandResult("pytest -q", 0, "tail", "out", "err")
+    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: [result])
+
+    engine, _ = make_engine(project, one_story(project), registry_of(py_plugin(P, "verifyobs")))
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert seen == [("dev", 1, (result,))]
+    # and the keys the plugin was handed are the ones its journal record carries,
+    # which is the correlation the whole surface exists for. Scoped to the dev
+    # stage: the review gate journals its own pass now, and that one deliberately
+    # reaches no plugin — the single `seen` entry above is the other half of that.
+    (entry,) = [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] == "verify-command-result" and e["verification_stage"] == "dev"
+    ]
+    assert entry["verification_sequence"] == 1
+    assert entry["story_key"] == "1-1-a" and entry["command"] == "pytest -q"
 
 
 def _resume_committing(project, engine, registry):

@@ -35,6 +35,13 @@ are `### DW-<n>:` blocks whose `status:` line is `open`. If the ledger is
 missing or unreadable, escalate `CRITICAL` (`type: missing-ledger`) per
 automation-mode.md and end your turn.
 
+An entry carrying an `archived:` line keeps only a stub here — its full body
+lives in the sibling `deferred-work-archive.md`, keyed by the same DW- id; read
+it there before classifying that entry. An `archived-body:` line says the same
+of an entry that was archived and later reopened: it is live work again, but the
+body it carried before that close is still in the archive file, in the block
+stamped with the date the line carries.
+
 If the invocation carries `--feedback <path>`, read that file FIRST — it lists
 the deterministic validation errors your previous attempt's result.json failed
 on. Fix exactly those defects in this attempt's output.
@@ -64,8 +71,9 @@ Classify each open entry into exactly ONE category:
   future story has to land first. Group entries that share a touchpoint (same
   file, same subsystem, same validator pattern) into cohesive single-goal
   bundles sized for one dev session; an entry that stands alone is a
-  one-entry bundle. `name` is kebab-case (e.g. `unicode-string-hardening`),
-  `intent` is 2–6 sentences describing the one cohesive goal.
+  one-entry bundle. `name` matches `^[a-z0-9][a-z0-9-]{1,39}\Z` (kebab-case,
+  at most 40 characters; e.g. `unicode-string-hardening`), and `intent` is
+  2–6 sentences describing the one cohesive goal.
 - **blocked** — the fix is only meaningful (or meaningfully easier) after a
   named future story/epic lands. Name the blocker verbatim.
 - **skip** — superseded, moot, or tied to a scenario the project explicitly

@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from conftest import git
+from conftest import git, refuse_to_resolve
 
 from bmad_loop import verify
 from bmad_loop.bmadconfig import ProjectPaths
@@ -20,6 +20,12 @@ from bmad_loop.gates import ATTENTION_FILE
 from bmad_loop.install import provision_worktree as install_provision_worktree
 from bmad_loop.model import Phase, StoryTask
 from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
+from bmad_loop.workspace import (
+    UnitWorkspace,
+    Workspace,
+    open_unit_workspace,
+    unit_worktrees_dir,
+)
 from bmad_loop.worktree_flow import WorktreeFlow, _setup_mcp_agent_id, provision_worktree
 
 QUIET = NotifyPolicy(desktop=False, file=True)
@@ -180,7 +186,10 @@ def test_merge_message_format(tmp_path):
 # them are silent in the journal by design.
 
 
-def _ledger_flow(tmp_path, *, artifacts: Path | None = None) -> WorktreeFlow:
+def _artifact_flow(tmp_path, *, artifacts: Path | None = None) -> WorktreeFlow:
+    """A flow over BMAD-shaped paths, shared by the ledger- and board-seed rows —
+    both seeds decide over the same artifacts dir, and `artifacts` moves it out of
+    the project tree for the exclusion each has for that case."""
     repo = tmp_path / "repo"
     (repo / "_bmad-output" / "implementation-artifacts").mkdir(parents=True)
     paths = ProjectPaths(
@@ -199,7 +208,7 @@ def test_ledger_seed_names_a_ledger_the_checkout_cannot_deliver(tmp_path):
     """The default shape: a gitignored ledger is absent from a tracked-only
     checkout, so the orchestrator's own close would be written to — and read back
     from — a file that does not exist."""
-    flow = _ledger_flow(tmp_path)
+    flow = _artifact_flow(tmp_path)
     flow.paths.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
     worktree = tmp_path / "wt"
     worktree.mkdir()
@@ -214,7 +223,7 @@ def test_ledger_seed_skips_a_ledger_the_checkout_already_has(tmp_path):
     copies nothing and journals `worktree-seed-skipped` — a diagnostic meaning "a
     seed you asked for did nothing" — on every isolated unit of every ordinary
     project."""
-    flow = _ledger_flow(tmp_path)
+    flow = _artifact_flow(tmp_path)
     flow.paths.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
     worktree = tmp_path / "wt"
     delivered = worktree / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
@@ -229,7 +238,7 @@ def test_ledger_seed_skips_an_absent_ledger(tmp_path):
     it. A seed entry naming a non-existent source is dropped by the seed loop
     without `worktree-seed-skipped` OR `worktree-seed-dropped`, so it would be
     invisible rather than merely inert."""
-    flow = _ledger_flow(tmp_path)
+    flow = _artifact_flow(tmp_path)
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
@@ -242,13 +251,77 @@ def test_ledger_seed_skips_a_ledger_outside_the_project_tree(tmp_path):
     worktree already reads this very file and there is nothing to deliver."""
     shared = tmp_path / "shared-artifacts"
     shared.mkdir()
-    flow = _ledger_flow(tmp_path, artifacts=shared)
+    flow = _artifact_flow(tmp_path, artifacts=shared)
     flow.paths.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
     assert flow.paths.rebased(worktree).deferred_work == flow.paths.deferred_work
     assert flow._ledger_seed(worktree) == ()
+
+
+# -------------------------------------------------------------------- board seed
+#
+# `_board_seed` is `_ledger_seed`'s sibling for the sprint board (#350): same three
+# exclusions, same worktree-presence predicate, different artifact — and a harsher
+# failure when it is missing, since `verify_dev` RAISES on an absent board where
+# the ledger's gate merely re-bundles. Unit-level for the ledger's reason: two of
+# the exclusions are silent in the journal by design.
+
+
+def test_board_seed_names_a_board_the_checkout_cannot_deliver(tmp_path):
+    """A gitignored board is absent from a tracked-only checkout, so the
+    orchestrator's own advance would be written to — and read back from — a file
+    that does not exist, and the read-back raises."""
+    flow = _artifact_flow(tmp_path)
+    flow.paths.sprint_status.write_text("development_status:\n  1-1-a: ready-for-dev\n")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert flow._board_seed(worktree) == (
+        "_bmad-output/implementation-artifacts/sprint-status.yaml",
+    )
+
+
+def test_board_seed_skips_a_board_the_checkout_already_has(tmp_path):
+    """A tracked board — the common shape for this file — is delivered by `git
+    worktree add`. Seeding it anyway copies nothing and journals
+    `worktree-seed-skipped` on every isolated unit of every such project."""
+    flow = _artifact_flow(tmp_path)
+    flow.paths.sprint_status.write_text("development_status:\n  1-1-a: ready-for-dev\n")
+    worktree = tmp_path / "wt"
+    delivered = worktree / "_bmad-output" / "implementation-artifacts" / "sprint-status.yaml"
+    delivered.parent.mkdir(parents=True)
+    delivered.write_text("development_status:\n  1-1-a: ready-for-dev\n")
+
+    assert flow._board_seed(worktree) == ()
+
+
+def test_board_seed_skips_an_absent_board(tmp_path):
+    """No board at all is a real state for the run types that need none (sweep,
+    stories). A seed entry naming a non-existent source is dropped by the seed loop
+    without `worktree-seed-skipped` OR `worktree-seed-dropped`, so it would be
+    invisible rather than merely inert."""
+    flow = _artifact_flow(tmp_path)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert not flow.paths.sprint_status.exists()
+    assert flow._board_seed(worktree) == ()
+
+
+def test_board_seed_skips_a_board_outside_the_project_tree(tmp_path):
+    """`ProjectPaths.rebased` leaves an out-of-tree artifacts dir unmoved, so the
+    worktree already reads this very file and there is nothing to deliver."""
+    shared = tmp_path / "shared-artifacts"
+    shared.mkdir()
+    flow = _artifact_flow(tmp_path, artifacts=shared)
+    flow.paths.sprint_status.write_text("development_status:\n  1-1-a: ready-for-dev\n")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert flow.paths.rebased(worktree).sprint_status == flow.paths.sprint_status
+    assert flow._board_seed(worktree) == ()
 
 
 # --------------------------------------------------------------- profiles / agents
@@ -372,6 +445,56 @@ def test_run_isolated_defers_on_open_failure(tmp_path):
     assert not any(e.startswith("unit-") for e in flow.journal.events())
 
 
+def test_mount_resolution_fault_is_typed_and_defers_only_the_unit(tmp_path, monkeypatch):
+    """An uncertain mount is an ordinary per-unit open failure, not a spawn fault.
+
+    Ablation: delete the mount-resolution translation and the raw provider fault
+    escapes ``run_isolated`` instead of reaching DEFERRED/worktree-open-failed.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    paths = ProjectPaths(
+        project=repo,
+        implementation_artifacts=repo / "_bmad-output/implementation-artifacts",
+        planning_artifacts=repo / "_bmad-output/planning-artifacts",
+    )
+    mount = unit_worktrees_dir(tmp_path) / "1-1"
+    refuse_to_resolve(monkeypatch, mount)
+
+    with pytest.raises(verify.GitError) as excinfo:
+        open_unit_workspace(repo, paths, "run-1", "1-1", "main", "story", tmp_path)
+    assert "worktree mount path" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, OSError)
+
+    state = SimpleNamespace(
+        target_branch="main",
+        run_id="run-1",
+        source="sprint",
+        tasks={},
+        crashed=False,
+    )
+    flow = _make_flow(
+        tmp_path,
+        paths=paths,
+        state=state,
+        open_unit_workspace=open_unit_workspace,
+    )
+    task = StoryTask(story_key="1-1", epic=1)
+    drove = []
+
+    flow.run_isolated(task, lambda candidate: drove.append(candidate))
+
+    assert task.phase == Phase.DEFERRED
+    assert task.defer_reason.startswith("could not open worktree")
+    assert "worktree mount path" in task.defer_reason
+    assert flow.journal.events() == ["worktree-open-failed"]
+    assert flow.calls.saves == 1
+    assert flow.calls.pauses == []  # ordinary GitError, never machine-wide spawn pause
+    assert drove == []
+    assert state.crashed is False
+    assert not mount.exists()
+
+
 def test_run_isolated_spawn_fault_pauses_instead_of_deferring(tmp_path):
     """#343: a spawn fault is machine-wide, not this unit's — deferring would
     march the whole queue into DEFERRED one notification at a time and end the
@@ -395,6 +518,142 @@ def test_run_isolated_spawn_fault_pauses_instead_of_deferring(tmp_path):
     assert flow.calls.pauses == [(excinfo.value.reason, "1-1")]
     assert "cannot spawn git" in excinfo.value.reason
     assert drove == []  # drive body never ran
+
+
+def test_run_isolated_escalates_provisioning_root_failure_before_result_probes(
+    tmp_path, monkeypatch
+):
+    """An opened worktree stays mounted when repair cannot identify its roots.
+
+    Ablation: delete the provisioning ``GitError`` catch in ``run_isolated`` and
+    this escapes without marking ESCALATED, notifying, saving, or pausing.
+    """
+    import bmad_loop.worktree_flow as worktree_flow
+
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    wt.mkdir()
+    paths = ProjectPaths(
+        project=repo,
+        implementation_artifacts=repo / "_bmad-output/implementation-artifacts",
+        planning_artifacts=repo / "_bmad-output/planning-artifacts",
+    )
+    unit = UnitWorkspace(
+        workspace=Workspace(root=wt, paths=paths.rebased(wt)),
+        repo_root=repo,
+        branch="bmad-loop/run-1/1-1",
+        path=wt,
+        baseline="abc123",
+    )
+    cause = OSError(0, "provider unavailable", None, 64)
+
+    def provisioning_root_failure(*_args, **_kwargs):
+        raise verify.GitError("cannot resolve worktree provisioning roots safely") from cause
+
+    monkeypatch.setattr(worktree_flow, "provision_worktree", provisioning_root_failure)
+    for probe in (
+        "worktree_seed_undelivered",
+        "module_skills_seed_undelivered",
+        "base_skills_seed_incomplete",
+    ):
+        monkeypatch.setattr(
+            worktree_flow,
+            probe,
+            lambda *_args, _probe=probe, **_kwargs: pytest.fail(
+                f"result probe {_probe} ran after provisioning failed"
+            ),
+        )
+    state = SimpleNamespace(target_branch="main", run_id="run-1", source="sprint", tasks={})
+    flow = _make_flow(
+        tmp_path,
+        paths=paths,
+        state=state,
+        open_unit_workspace=lambda *_args, **_kwargs: unit,
+    )
+    task = StoryTask(story_key="1-1", epic=1)
+    drove = []
+
+    with pytest.raises(_Pause) as excinfo:
+        flow.run_isolated(task, lambda candidate: drove.append(candidate))
+
+    assert task.phase == Phase.ESCALATED
+    # The wrapper names the unit; the inner GitError names the cause (#592).
+    assert "cannot safely provision the worktree for" in excinfo.value.reason
+    assert "cannot resolve worktree provisioning roots safely" in excinfo.value.reason
+    assert flow.journal.events() == ["worktree-opened", "story-escalated"]
+    assert flow.calls.saves == 1
+    assert flow.calls.pauses == [(excinfo.value.reason, "1-1")]
+    assert drove == []
+    assert task.worktree_path == str(wt)
+    assert wt.is_dir()  # retained for inspection; no integration/teardown ran
+
+
+def test_run_isolated_escalates_an_unparseable_hook_config(tmp_path, monkeypatch):
+    """#592: the refusal `provision_worktree` raises over a seeded config that will
+    not parse routes to the SAME escalation the root-resolve failure takes — CRITICAL
+    notify, run paused, worktree kept — rather than crashing the loop or being
+    swallowed into a hooks-only rewrite.
+
+    The raise site is unit-covered in test_install.py; this pins the routing, and that
+    the generalized wrapper carries the inner message through INTACT. That message is
+    the whole diagnostic — it names the file the operator has to fix — so a wrapper
+    that summarized instead of quoting would leave the pause unactionable.
+
+    Ablation: delete the provisioning ``GitError`` catch in ``run_isolated`` and this
+    escapes without marking ESCALATED, notifying, saving, or pausing.
+    """
+    import bmad_loop.worktree_flow as worktree_flow
+
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    wt.mkdir()
+    paths = ProjectPaths(
+        project=repo,
+        implementation_artifacts=repo / "_bmad-output/implementation-artifacts",
+        planning_artifacts=repo / "_bmad-output/planning-artifacts",
+    )
+    unit = UnitWorkspace(
+        workspace=Workspace(root=wt, paths=paths.rebased(wt)),
+        repo_root=repo,
+        branch="bmad-loop/run-1/1-1",
+        path=wt,
+        baseline="abc123",
+    )
+    config_path = wt / ".claude" / "settings.json"
+    parse_refusal = (
+        f"seeded hook config {config_path} cannot be parsed (Expecting ',' delimiter: "
+        "line 4 column 3 (char 84)); an unparseable config is evidence of an earlier "
+        "fault, not a blank slate — provisioning refuses rather than replace the "
+        "operator's allowlist, env, and MCP settings with a hooks-only file; fix or "
+        "remove it, then resume (#592)"
+    )
+
+    def unparseable_hook_config(*_args, **_kwargs):
+        raise verify.GitError(parse_refusal)
+
+    monkeypatch.setattr(worktree_flow, "provision_worktree", unparseable_hook_config)
+    state = SimpleNamespace(target_branch="main", run_id="run-1", source="sprint", tasks={})
+    flow = _make_flow(
+        tmp_path,
+        paths=paths,
+        state=state,
+        open_unit_workspace=lambda *_args, **_kwargs: unit,
+    )
+    task = StoryTask(story_key="1-1", epic=1)
+    drove = []
+
+    with pytest.raises(_Pause) as excinfo:
+        flow.run_isolated(task, lambda candidate: drove.append(candidate))
+
+    assert task.phase == Phase.ESCALATED
+    assert "cannot safely provision the worktree for 1-1" in excinfo.value.reason
+    assert parse_refusal in excinfo.value.reason  # verbatim, not summarized
+    assert flow.journal.events() == ["worktree-opened", "story-escalated"]
+    assert flow.calls.saves == 1
+    assert flow.calls.pauses == [(excinfo.value.reason, "1-1")]
+    assert drove == []  # drive body never ran
+    assert "CRITICAL escalation: 1-1" in (tmp_path / ATTENTION_FILE).read_text()
+    assert wt.is_dir()  # retained for inspection
 
 
 def test_escalate_unit_marks_escalated_notifies_and_pauses(tmp_path):
@@ -439,5 +698,9 @@ def test_provision_worktree_reexported_from_install():
 
 
 def test_setup_mcp_agent_id_mapping():
+    # only claude carries the "-code" suffix; everything else passes through
     assert _setup_mcp_agent_id("claude") == "claude-code"
     assert _setup_mcp_agent_id("codex") == "codex"
+    assert _setup_mcp_agent_id("gemini") == "gemini"
+    assert _setup_mcp_agent_id("cursor") == "cursor"
+    assert _setup_mcp_agent_id("some-custom-profile") == "some-custom-profile"

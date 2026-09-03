@@ -11,8 +11,10 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 
 import pytest
+from conftest import needs_strict_codec
 
 from bmad_loop.adapters import multiplexer, tmux_base
 from bmad_loop.adapters.base import SessionSpec
@@ -30,6 +32,7 @@ class StubMux(TerminalMultiplexer):
 
     def __init__(self):
         self.calls: list[str] = []
+        self.window_env: dict[str, str] = {}
         self._sessions: set[str] = set()
         self._windows: dict[str, list[str]] = {}
         self._next = 0
@@ -39,7 +42,7 @@ class StubMux(TerminalMultiplexer):
         self.calls.append("has_session")
         return name in self._sessions
 
-    def new_session(self, name, cwd, cols, lines):
+    def new_session(self, name, cwd, cols=None, lines=None):
         self.calls.append("new_session")
         self._sessions.add(name)
         self._windows[name] = []
@@ -49,6 +52,7 @@ class StubMux(TerminalMultiplexer):
 
     def new_window(self, session, name, cwd, env, command):
         self.calls.append("new_window")
+        self.window_env = env
         self._next += 1
         win = f"@stub{self._next}"
         self._windows.setdefault(session, []).append(win)
@@ -154,6 +158,9 @@ def test_generic_adapter_drives_only_the_mux(tmp_path, no_tmux):
         policy=Policy(limits=LimitsPolicy()),
         profile=get_profile("claude"),
         mux=stub,
+        # out of the project tree, as `runsetup.make_adapters` resolves it (#494),
+        # so the seeded Stop below has to be observed on the PRIMARY channel
+        events_dir=tmp_path / "state" / "events",
     )
     spec = _spec(tmp_path)
 
@@ -190,6 +197,56 @@ def test_generic_adapter_drives_only_the_mux(tmp_path, no_tmux):
     assert "kill_window" in stub.calls
 
 
+def test_generic_adapter_window_env_pins_the_state_root_over_profile(
+    tmp_path, no_tmux, monkeypatch
+):
+    """The engine's window merge (`{**profile.env, **spec.env}`) rides through
+    the `runs.pin_state_root` chokepoint: a profile `[env]` table declaring
+    `BMAD_LOOP_STATE_DIR` is forced to this process's resolved root when one
+    derives, and STRIPPED when none does — with an underivable root there is no
+    pin key in `spec.env` for mere merge order to protect, and the profile's
+    absolute value would otherwise aim the coding window at a registry its own
+    orchestrator cannot see. `interactive_env` (the attached resolve path)
+    applies the same rule.
+
+    Ablate the `runs.pin_state_root` wrap at either merge and the matching
+    assertion fails."""
+    import dataclasses
+
+    from bmad_loop import envvars, runs
+
+    def make_adapter():
+        stub = StubMux()
+        adapter = GenericAdapter(
+            run_dir=tmp_path / "run",
+            policy=Policy(limits=LimitsPolicy()),
+            profile=dataclasses.replace(
+                get_profile("claude"), env={envvars.STATE_DIR: str(tmp_path / "S2")}
+            ),
+            mux=stub,
+            events_dir=tmp_path / "state" / "events",
+        )
+        return stub, adapter
+
+    spec = _spec(tmp_path)
+
+    # derivable: the profile's S2 is overwritten with the resolved root
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S1"))
+    stub, adapter = make_adapter()
+    adapter.start_session(spec)
+    assert stub.window_env[envvars.STATE_DIR] == str(runs.state_root())
+    assert adapter.interactive_env(spec)[envvars.STATE_DIR] == str(runs.state_root())
+
+    # underivable: no pin exists, so the profile's entry is stripped outright
+    monkeypatch.setenv(envvars.STATE_DIR, "relative-root")
+    stub, adapter = make_adapter()
+    adapter.start_session(spec)
+    assert envvars.STATE_DIR not in stub.window_env
+    assert envvars.STATE_DIR not in adapter.interactive_env(spec)
+    # ...and the rest of the profile/spec env is untouched
+    assert stub.window_env["BMAD_LOOP_TASK_ID"] == spec.task_id
+
+
 # --------------------------------------------------------------- seam honesty
 #
 # Phase 1: no tmux contract method may leak a raw subprocess.TimeoutExpired /
@@ -208,6 +265,7 @@ def boom_run(request, monkeypatch):
         raise request.param
 
     monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    return request.param
 
 
 def test_seam_methods_never_leak_raw_subprocess_error(boom_run, tmp_path):
@@ -237,8 +295,6 @@ def test_seam_methods_never_leak_raw_subprocess_error(boom_run, tmp_path):
     # (never a raise, never a mis-typed answer).
     assert mux.list_windows("s", ["window_id"]) == []
     assert mux.show_window_option("@1", "opt") == ""
-    assert mux.switch_client("s") is False
-    assert mux.switch_client("s", last_fallback=True) is False
     assert mux.detach_client() is False
     assert mux.kill_window("@1") is None
     assert mux.select_window("@1") is None
@@ -247,12 +303,77 @@ def test_seam_methods_never_leak_raw_subprocess_error(boom_run, tmp_path):
     assert mux.pipe_pane("@1", tmp_path / "log") is None
     assert mux.window_pane_pids("@1") == []
 
+    # switch_client is the one sentinel that splits the two faults the rest
+    # collapse: a missing binary never ran the verb, so nobody moved and whoever
+    # was in front of this window still is — the joint claim False stands for.
+    # A timeout may have completed the switch server-side, and only None can say
+    # so; a False there tells the return path to keep prompting a window the
+    # client has already left (#659, one seam up).
+    unvouched = None if isinstance(boom_run, subprocess.TimeoutExpired) else False
+    assert mux.switch_client("s") is unvouched
+    assert mux.switch_client("s", last_fallback=True) is unvouched
+
     # Already-correct swallowers stay swallowing (lock-in).
     assert mux.kill_session("s") is None
     assert mux.list_sessions() == []
     assert mux.session_options("opt") == {}
     assert mux.version() is None
     assert mux.current_pane_id() is None
+
+
+def test_list_window_ids_decode_fault_raises_the_seam_type(monkeypatch):
+    """A byte the codec cannot decode is a transport failure like a timeout: the
+    liveness probe must answer MultiplexerError ("unknowable"), not leak the raw
+    UnicodeDecodeError — prune_ctl_windows' post-kill verdict and the engine's
+    window_alive catch only the seam type (#435).
+
+    Since #380 `_run` decodes with backslashreplace on every platform, nothing
+    reaches this arm from a stock capture; the fault is injected here instead.
+    The arm still guards a leaf that overrides `_ERRORS` back to a strict handler
+    — which is why the fault below is monkeypatched in rather than produced by a
+    real child, and why this test stays green with or without that fix.
+    """
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: "/usr/bin/tmux")
+
+    def boom(*_a, **_k):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    mux = TmuxMultiplexer()
+    with pytest.raises(MultiplexerError) as excinfo:
+        mux.list_window_ids("s")
+    assert not isinstance(excinfo.value, UnicodeError)
+
+
+@needs_strict_codec
+def test_run_decodes_an_undecodable_byte_instead_of_raising():
+    """A capture carrying a byte the codec cannot decode comes back with that byte
+    rendered as a visible \\xNN escape; `_run` does not raise (#380).
+
+    POSIX left `_ERRORS` at None — the STRICT handler — so a stray byte in any
+    tmux capture raised out of the one spawn primitive, and the fourteen guards
+    that catch only (SubprocessError, OSError) let it through. Fixing it here, at
+    the source, rather than at those catch sites is deliberate: most of them
+    return a sentinel ([], None, {}), so catching a decode fault there would turn
+    a crash into a WRONG ANSWER (see the seam-honesty note on list_window_ids).
+
+    Drives a REAL child, never a monkeypatched `subprocess.run`. Only a real spawn
+    executes the stdlib decode this fix changes, so a faked seam would pass
+    identically with `_ERRORS` back at None — the fake-green #378 was bitten by.
+    `sys.executable`, never a bare `python`: the suite runs under uv, where no
+    `python` need be on PATH (see tests/test_verify.py's note on this).
+
+    Ablation: set BaseTmuxBackend._ERRORS back to None and this fails alone, on
+    the UnicodeDecodeError escaping `_run`.
+    """
+
+    class PyBackend(TmuxMultiplexer):
+        # the "tmux binary" is this interpreter, so _run spawns something whose
+        # bytes we choose; everything else about the primitive is untouched.
+        _BINARY = sys.executable
+
+    proc = PyBackend()._run(["-c", 'import sys; sys.stdout.buffer.write(b"ok-\\xff-tail")'])
+    assert proc.stdout == "ok-\\xff-tail"
 
 
 def test_seam_honesty_holds_for_psmux_style_run_override(monkeypatch):
@@ -300,6 +421,38 @@ def test_tmux_window_pane_pids_parses_pane_pid_lines(monkeypatch):
     assert seen["argv"] == ["tmux", "list-panes", "-t", "@7", "-F", "#{pane_pid}"]
 
 
+def test_tmux_list_windows_keeps_tabs_inside_the_trailing_field(monkeypatch):
+    """The last requested field may legally contain the delimiter.
+
+    PROJECT_OPTION carries a resolved filesystem path, and a tab is a legal
+    POSIX filename byte — so an unbounded split turns one row into four parts
+    and the field slice then drops the tail, handing the caller a *truncated*
+    path. That does not read as "no tag", it reads as another project's tag, so
+    the comparison sites discard the project's own windows. The bounded split
+    keeps the remainder in the field it belongs to."""
+    mux = TmuxMultiplexer()
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(
+            argv, 0, stdout="@7\tresume-RID\t/home/u/my\tproj\n", stderr=""
+        ),
+    )
+    rows = mux.list_windows("ctl", ["window_id", "window_name", "@bmad_project"])
+    assert rows == [("@7", "resume-RID", "/home/u/my\tproj")]
+
+    # Unchanged where it always held: short rows still pad trailing fields, and
+    # a single-field request still takes the whole line.
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(argv, 0, stdout="@7\trun-RID\n", stderr=""),
+    )
+    assert mux.list_windows("ctl", ["window_id", "window_name", "@bmad_project"]) == [
+        ("@7", "run-RID", "")
+    ]
+
+
 @pytest.mark.parametrize(
     "outcome",
     [
@@ -313,6 +466,114 @@ def test_tmux_window_pane_pids_degrades_to_empty(monkeypatch, outcome):
     mux = TmuxMultiplexer()
     monkeypatch.setattr(tmux_base.subprocess, "run", lambda argv, **k: outcome(argv))
     assert mux.window_pane_pids("@7") == []
+
+
+def _kill_fake(monkeypatch, *, kill_rc: int, kill_err: str = "", live: str = "", probe_rc: int = 0):
+    """Script kill-window's exit and the survivor probe's, recording the argv.
+
+    ``live`` feeds the session-listing probe (qualified targets); ``probe_rc``
+    feeds both it and the list-panes probe (unqualified targets).
+    """
+    calls: list[list[str]] = []
+
+    def fake(argv, **k):
+        calls.append(argv)
+        if argv[1] == "list-windows":
+            return subprocess.CompletedProcess(argv, probe_rc, stdout=live, stderr="")
+        if argv[1] == "list-panes":
+            return subprocess.CompletedProcess(argv, probe_rc, stdout="", stderr="")
+        return subprocess.CompletedProcess(argv, kill_rc, stdout="", stderr=kill_err)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    return calls
+
+
+def test_kill_window_warns_only_when_the_window_outlived_the_kill(monkeypatch, capsys):
+    # The detectable leak class: the kill failed while the window it names is
+    # still in its session's listing. The listing resolves independently of the
+    # failed target (kill and list-windows are separate verbs against separate
+    # targets), so this state is reachable — a same-target replay was not: a
+    # target the kill could not resolve fails the replay too. The verdict is
+    # unchanged — still None, still never raises — only now the target and the
+    # binary's own stderr reach the operator.
+    calls = _kill_fake(
+        monkeypatch, kill_rc=1, kill_err="server temporarily unavailable\n", live="@1\n@3\n"
+    )
+    mux = TmuxMultiplexer()
+    assert mux.kill_window("ctl:@3") is None
+    err = capsys.readouterr().err
+    assert "kill-window ctl:@3" in err
+    assert "still alive" in err
+    assert "server temporarily unavailable" in err  # verbatim: the reader judges it
+    # The probe reads the session's own window list, not the failed target.
+    assert calls[1][1:] == ["list-windows", "-t", "=ctl", "-F", "#{window_id}"]
+
+
+def test_kill_window_is_silent_when_the_window_is_already_gone(monkeypatch, capsys):
+    # The dominant case, not an edge one: CodingCLIAdapter.run kills in a
+    # `finally` on every session, and a session that completed by window death
+    # has nothing left to kill. A warning here would fire on ordinary teardown.
+    # Covers the never-existed target too: not listed means nothing leaked.
+    # Ablation: drop the `not self._window_survived_kill(target)` half of
+    # kill_window's gate and this fails — every non-zero kill would warn.
+    _kill_fake(monkeypatch, kill_rc=1, kill_err="can't find window: @7\n", live="@1\n")
+    assert TmuxMultiplexer().kill_window("ctl:@7") is None
+    assert capsys.readouterr().err == ""
+
+
+def test_kill_window_is_silent_when_the_session_died_with_the_window(monkeypatch, capsys):
+    # A session that ended when its last window died fails the listing probe —
+    # ambiguous, so no warning: nothing provably survived.
+    # Ablation: same mutation as the already-gone test above; this fails too.
+    _kill_fake(monkeypatch, kill_rc=1, kill_err="can't find session: ctl\n", probe_rc=1)
+    assert TmuxMultiplexer().kill_window("ctl:@7") is None
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("target", ["ctl:@7", "@7"])
+def test_kill_window_is_silent_when_the_survivor_probe_cannot_answer(monkeypatch, capsys, target):
+    # Unreadable is not "alive": the warning is a diagnostic, so a probe that
+    # could not answer must not manufacture one — that would put the noise back
+    # on exactly the path the probe exists to clear. Both probe shapes: the
+    # session listing (qualified target) and list-panes (bare target).
+    # Ablation: drop the `not self._window_survived_kill(target)` half of
+    # kill_window's gate and both params fail on an unexpected warning.
+    def fake(argv, **k):
+        if argv[1] in ("list-windows", "list-panes"):
+            raise subprocess.TimeoutExpired(argv, 1)
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom\n")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    assert TmuxMultiplexer().kill_window(target) is None  # must not raise
+    assert capsys.readouterr().err == ""
+
+
+def test_kill_window_unqualified_target_keeps_the_same_resolution_probe(monkeypatch, capsys):
+    # A bare `@N` (tmux native_id shape) carries no session to list, so the
+    # probe replays the target through list-panes: blind to a wrong-target
+    # leak, but a kill that failed while the target resolves still warns.
+    calls = _kill_fake(monkeypatch, kill_rc=1, kill_err="boom\n", probe_rc=0)
+    assert TmuxMultiplexer().kill_window("@7") is None
+    err = capsys.readouterr().err
+    assert "kill-window @7" in err and "still alive" in err
+    assert calls[1][1:] == ["list-panes", "-t", "@7"]
+
+
+def test_kill_window_warning_omits_a_bare_colon_on_empty_stderr(monkeypatch, capsys):
+    # A non-zero exit with nothing on stderr is plausible; "exited 1: " reads as
+    # a truncated message rather than a complete one.
+    _kill_fake(monkeypatch, kill_rc=1, kill_err="")
+    TmuxMultiplexer().kill_window("@7")
+    err = capsys.readouterr().err.strip()
+    assert err.endswith("still alive")
+    assert ": " not in err.removeprefix("warning: ")
+
+
+def test_kill_window_is_silent_when_the_kill_lands(monkeypatch, capsys):
+    calls = _kill_fake(monkeypatch, kill_rc=0)
+    assert TmuxMultiplexer().kill_window("@7") is None
+    assert capsys.readouterr().err == ""
+    assert len(calls) == 1  # a landed kill never pays for the survivor probe
 
 
 # -------------------------------- version() is one bounded line, always (#321)
@@ -383,6 +644,86 @@ def test_version_is_bounded_not_just_flattened(monkeypatch):
     assert got.startswith("tmux 3.4 ") and got.endswith("…")
 
 
+def test_version_error_records_the_probe_crash_version_swallows(monkeypatch):
+    """A binary on PATH that dies answering `-V` is the case version()'s None
+    cannot express (#428). None stays the seam's answer; the diagnostic keeps
+    the identity of the failure — including the probe's stderr, which _run
+    already folds into the error text."""
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(argv, 1, stdout="", stderr="Access denied"),
+    )
+    mux = TmuxMultiplexer()
+
+    assert mux.version() is None
+    error = mux.version_error()
+    assert error is not None and "Access denied" in error
+
+
+def test_version_error_records_undecodable_probe_output(monkeypatch):
+    """Pins the `UnicodeError` arm of version()'s catch. A strictly-decoding _run
+    raises UnicodeDecodeError out of subprocess itself on a binary emitting an
+    undecodable byte — a corrupt install, the very case #428 is about — and it is
+    a ValueError, outside the SubprocessError/OSError family, so without the arm
+    it escapes as a raw crash that every guard above turns back into an
+    unexplained None. Since #380 `_run` is no longer strict on any platform
+    (_ERRORS is backslashreplace), the arm now covers a leaf that overrides it
+    back to a strict handler. The raise is injected rather than decoded for real:
+    this owns the except clause, not the decoding (tmux_base documents that
+    half) — which is also why it is unaffected by that default."""
+
+    def boom(argv, **k):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    mux = TmuxMultiplexer()
+
+    assert mux.version() is None
+    error = mux.version_error()
+    assert error is not None and "invalid start byte" in error
+
+
+def test_version_error_is_none_when_the_binary_is_simply_absent(monkeypatch):
+    """Nothing was asked, so there is no failure to report — a missing binary is
+    already legible from AVAILABLE and must not also raise a warning."""
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: None)
+    mux = TmuxMultiplexer()
+
+    assert mux.version() is None
+    assert mux.version_error() is None
+
+
+def test_version_error_never_outlives_the_probe_it_describes(monkeypatch):
+    """It describes the LAST call. A recovered probe that left the old failure
+    standing would have `mux` warning about a backend that just answered fine."""
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    mux = TmuxMultiplexer()
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(argv, 1, stdout="", stderr="transient"),
+    )
+    assert mux.version() is None and mux.version_error() is not None
+
+    _version_stdout(monkeypatch, "tmux 3.4\n")
+
+    assert mux.version() == "tmux 3.4"
+    assert mux.version_error() is None
+
+
+def test_version_error_of_a_backend_that_keeps_no_record_is_none():
+    """The seam default: an out-of-tree backend inherits silence rather than an
+    AttributeError, so the accessor is safe to call on anything registered — and
+    non-abstract, so adding it does not break a backend that never heard of it.
+    Called unbound because the body reads no state (an ABC subclass cannot be
+    instantiated to hold any)."""
+    assert "version_error" not in multiplexer.TerminalMultiplexer.__abstractmethods__
+    assert multiplexer.TerminalMultiplexer.version_error(object()) is None  # type: ignore[arg-type]
+
+
 def test_version_of_a_real_probe_is_never_truncated(monkeypatch):
     # The bound must clear the probes that actually exist by a wide margin —
     # otherwise it trades one unreadable cell for a useless one.
@@ -420,11 +761,15 @@ def test_run_posix_default_passes_no_encoding_and_no_env(monkeypatch):
 
     TmuxMultiplexer()._run(["list-windows"])
 
-    # byte-identical to today: locale-default decode (encoding=None ≡ bare text=True),
-    # inherit the parent env (env=None).
+    # The locale-default codec (encoding=None ≡ bare text=True) and the inherited
+    # parent env (env=None) are both unchanged; only strictness went away. errors is
+    # backslashreplace on every platform since #380, so an undecodable byte degrades
+    # to a visible \xNN escape instead of raising out of the one spawn primitive.
+    # This pins the KWARG; the decode it actually produces is pinned against a real
+    # child by test_run_decodes_an_undecodable_byte_instead_of_raising.
     assert rec.kwargs["text"] is True
     assert rec.kwargs["encoding"] is None
-    assert rec.kwargs["errors"] is None
+    assert rec.kwargs["errors"] == "backslashreplace"
     assert rec.kwargs["env"] is None
 
 
@@ -498,6 +843,15 @@ def test_new_parked_window_posix_argv_byte_identical(monkeypatch, tmp_path):
         "-c",
         _PARKED_SH_SOURCE,
     ]
+
+
+def test_new_session_argv_byte_identical(monkeypatch, tmp_path):
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+
+    TmuxMultiplexer().new_session("s", tmp_path)
+
+    assert rec.argv == ["tmux", "new-session", "-d", "-s", "s", "-c", str(tmp_path)]
 
 
 def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):

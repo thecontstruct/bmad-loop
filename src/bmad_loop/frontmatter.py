@@ -1,16 +1,23 @@
 """Pure spec-frontmatter parsing: read the YAML ``---``…``---`` block, normalize
 the status token, and rewrite ``status:`` in place.
 
-Zero git/subprocess dependencies (only stdlib + PyYAML) so pure domain modules
-(``stories``, ``devcontract``) can read spec status without importing ``verify``
-and dragging in its whole git surface (assessment finding F-1). ``verify``
-re-exports these names, so every existing ``verify.<name>`` / ``from .verify
-import <name>`` call site stays valid. (The same docstring rule bars importing
-``platform_util`` here — it pulls in ``subprocess`` — so this module's writes are
-a plain ``write_bytes``, not ``atomic_replace``: byte-preserving, but not atomic.
-``read_bytes().decode`` on the way in for the same reason — ``read_text``'s
-universal-newline translation would hand the writer an all-LF copy of a CRLF
-spec, and every line ending in the file would be relaid on the way back out.)
+No git dependency, so a pure domain module can read spec status without importing
+``verify`` and dragging in its whole git surface (assessment finding F-1).
+``stories`` still collects on that: ``import bmad_loop.stories`` genuinely leaves
+``bmad_loop.verify`` out of ``sys.modules``. ``devcontract`` no longer does — it
+imports ``verify`` directly for `read_frontmatter` and `operator_actions_of` — so
+the rule now has one beneficiary, not the two it was written for. ``verify``
+re-exports these names either way, so every existing ``verify.<name>`` /
+``from .verify import <name>`` call site stays valid.
+
+That rule is about ``verify``, NOT about ``subprocess``: this module imports
+``platform_util`` (#379), which pulls ``subprocess`` in, and both named modules
+already paid that cost anyway — ``devcontract`` imports it directly and
+``stories`` reaches it through ``deferredwork``. So the writes here are atomic as
+well as byte-verbatim: ``read_bytes().decode`` in, ``atomic_write_bytes`` out.
+The byte path is load-bearing on its own — ``read_text``'s universal-newline
+translation would hand the writer an all-LF copy of a CRLF spec, and every line
+ending in the file would be relaid on the way back out.
 
 READER AND WRITER DEGRADE IN OPPOSITE DIRECTIONS, deliberately. `read_frontmatter`
 turns an unparseable or undecodable block into ``{}``: it runs on the observation
@@ -30,6 +37,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from .platform_util import atomic_write_bytes, atomic_write_bytes_confined
 
 
 def _split_frontmatter(text: str) -> tuple[str, str, str] | None:
@@ -54,18 +63,16 @@ def _split_frontmatter(text: str) -> tuple[str, str, str] | None:
     return None
 
 
-def read_frontmatter(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    try:
-        text = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        # A non-UTF-8 file carries no readable frontmatter — degrade exactly like
-        # unparseable YAML below. Every status gate then reads status "" and
-        # returns a clean retry/repair outcome instead of crashing mid-verify
-        # (UnicodeDecodeError is a ValueError, so it slipped past callers'
-        # except-OSError guards).
-        return {}
+def parse_frontmatter(text: str) -> dict[str, Any]:
+    """The frontmatter mapping ``text`` carries, or ``{}`` when it carries none.
+
+    Split out of `read_frontmatter` so a spec that never touches the filesystem — a
+    blob read back out of git with `verify.file_bytes_at_revision`, say — parses
+    through the SAME reader as a live file rather than through a second copy free to
+    drift from it. Degrades rather than raising on every shape: no frontmatter block,
+    unparseable YAML, or a document that is not a mapping. Callers tell "absent" from
+    "present but empty" by asking the `*_of` readers, never by inspecting this.
+    """
     split = _split_frontmatter(text)
     if split is None:
         return {}
@@ -74,6 +81,21 @@ def read_frontmatter(path: Path) -> dict[str, Any]:
     except yaml.YAMLError:
         return {}
     return doc if isinstance(doc, dict) else {}
+
+
+def read_frontmatter(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # A non-UTF-8 file carries no readable frontmatter — degrade exactly like the
+        # unparseable-YAML arm in `parse_frontmatter` above. Every status gate then
+        # reads status "" and returns a clean retry/repair outcome instead of crashing
+        # mid-verify (UnicodeDecodeError is a ValueError, so it slipped past callers'
+        # except-OSError guards).
+        return {}
+    return parse_frontmatter(text)
 
 
 def status_of(fm: dict[str, Any]) -> str:
@@ -129,6 +151,62 @@ def operator_actions_of(fm: dict[str, Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(a for a in items if a))
 
 
+# The two frontmatter keys a bmad-build-auto spec can carry a dev baseline under,
+# in precedence order. `baseline_revision` is what the skill's step-03 actually
+# stamps; `baseline_commit` is the legacy spelling (the name the orchestrator's
+# synthesized result.json uses) kept readable for specs written before the rename.
+_BASELINE_KEYS = ("baseline_revision", "baseline_commit")
+
+
+def auto_dev_baseline_of(fm: dict[str, Any]) -> str:
+    """The dev baseline a bmad-build-auto spec CLAIMS: the first non-empty value
+    among ``baseline_revision`` then ``baseline_commit``, stripped; ``""`` when the
+    spec claims neither.
+
+    Deliberately not the bare ``baseline_of`` the siblings' naming would suggest.
+    ``status_of`` and ``operator_actions_of`` are field-generic — they read one key
+    and normalize it — whereas this precedence belongs to the bmad-build-auto
+    contract specifically: the skill stamps ``baseline_revision``, the orchestrator's
+    own result.json says ``baseline_commit``, and a spec re-armed by
+    ``runs.rearm_escalation`` can carry both. A bare ``baseline_of`` would read as
+    universal when it is not (#716).
+
+    ``baseline_revision`` WINS whenever it is non-empty, even against a
+    ``baseline_commit`` that would have matched. Both consumers — the dev
+    devcontract's synthesized result and verify's baseline-match gate — read
+    through here so the two cannot drift, and the two byte-identical
+    ``fm.get("baseline_commit", fm.get("baseline_revision", ""))`` expressions
+    this replaces had the precedence the other way round. That flip is deliberate
+    and tightening: the legacy key is a leftover the re-arm never removes, so
+    ranking it first let a stale sha silently outrank the fresh value the skill
+    had just written, killing the gate on an attempt that did everything right.
+
+    An EMPTY legacy key is skipped rather than returned. ``dict.get``'s default
+    only fires on a MISSING key, so ``baseline_commit: ''`` used to be selected and
+    yield ``""`` — which every consumer reads as "no claim" and which therefore
+    disabled the baseline-match gate outright.
+
+    A YAML-null value (a bare ``baseline_commit:`` line, or ``: null``) is treated
+    as absent for the same reason ``status_of`` guards it: ``str(None)`` is the
+    token ``"None"``, which is not a sha but IS non-empty, so it would flow into
+    the gate as a claim and fail an attempt that never made one (#358). A YAML
+    BOOLEAN is the same trap class and is skipped with it: PyYAML resolves ``no``,
+    ``off`` and ``false`` to ``False`` (``yes``/``on``/``true`` to ``True``), and
+    ``str(False)`` is the token ``"False"`` — again not a sha, again non-empty.
+    Worse than null: because the truthiness test is on the STRINGIFIED value, a
+    bool on ``baseline_revision`` outranks and SHADOWS a correct ``baseline_commit``
+    sitting right beside it, refusing an attempt whose legacy claim was good.
+    """
+    for key in _BASELINE_KEYS:
+        raw = fm.get(key)
+        if raw is None or isinstance(raw, bool):
+            continue
+        value = str(raw).strip()
+        if value:
+            return value
+    return ""
+
+
 class FrontmatterWriteError(Exception):
     """A frontmatter block carries a key the reader can see but no minimal line
     edit can safely rewrite.
@@ -182,12 +260,15 @@ LineRenderer = Callable[[str, "re.Match[str]", str], str]
 # token and the ordinary scalar frontmatter values have; anything richer than
 # that falls back to the full-drop render, which is merely lossy, never wrong.
 #
-# `sprintstatus._set_mapping_value` solves the same problem with the WIDE `val`
-# this one refuses (`\S(?:.*?\S)?`), and the asymmetry is deliberate rather than
-# an oversight: it writes the orchestrator-owned board, whose values are status
-# tokens and timestamps, while this writes a hand-authored spec. It has the
-# fabricated-comment defect described above and is tracked separately (#366) —
-# do not "unify" the two by widening this one.
+# `sprintstatus._set_mapping_value` solves the same problem with a wider value
+# class than this one accepts, and the asymmetry is deliberate rather than an
+# oversight: it writes the orchestrator-owned board, whose `last_updated` is a
+# bare scalar WITH SPACES that this token class would refuse outright, while this
+# writes a hand-authored spec where a value richer than a token is exactly the
+# shape whose boundary cannot be trusted. Since #366 the two agree on the part
+# that matters — neither guesses where a QUOTED scalar ends — and they part only
+# on how much of an unquoted one they will read. Do not "unify" them by widening
+# this one back; the token class is this side's whole gate.
 _VALUE_COMMENT_RE = re.compile(
     r"^[ \t]*(?P<q>['\"]?)(?P<val>[A-Za-z0-9._-]*)(?P=q)(?P<sep>[ \t]+)(?P<comment>#.*)$"
 )
@@ -348,7 +429,7 @@ def _verified(candidate: str, key: str, value: str, rest: dict[str, Any]) -> str
     return candidate
 
 
-def set_frontmatter_status(path: Path, status: str) -> bool:
+def set_frontmatter_status(path: Path, status: str, *, confine_root: Path) -> bool:
     """Rewrite the `status:` field in a spec's `---`…`---` frontmatter block.
 
     A minimal in-place line replacement (not a YAML round-trip) so the spec's
@@ -362,8 +443,53 @@ def set_frontmatter_status(path: Path, status: str) -> bool:
     through ``read_text``/``write_text`` instead relaid the whole file — CRLF in,
     LF out on POSIX, and every LF out as CRLF on Windows — which is the largest
     violation a writer contracted to "only the status value changes" can commit.
-    Not atomic (see the module docstring); a torn write is a separate concern
-    from a byte-preserving one.
+
+    The rewrite is also atomic (#379): the bytes go out through
+    `platform_util.atomic_write_bytes`, which is byte-verbatim on the same terms
+    as `write_bytes` and additionally leaves either the old file or the whole new
+    one. That matters most here, where the layout is ``before + edited + after``
+    — a truncating write that faults after the frontmatter has landed leaves
+    intact frontmatter saying ``status: done`` over a decapitated body, a spec
+    that lies and that the loop then commits. `devcontract._atomic_write_spec`
+    reached the same conclusion on the same files, with fault injection: it cut a
+    46-byte spec to 12.
+
+    The write is CONFINED, and this is the canonical statement of the rule the
+    three spec writers share (`verify.set_frontmatter_field` and
+    `devcontract._atomic_write_spec` restate it by reference):
+
+    * A spec path under ``confine_root`` goes through
+      `platform_util.atomic_write_bytes_confined`, which walks the components
+      below that root ``O_NOFOLLOW`` and writes through the descriptor the walk
+      produced. Refusing a link at the FINAL component was never enough (#593):
+      `mkstemp(dir=...)` and `os.replace`'s destination still looked every
+      DIRECTORY above the spec up by name, so a link planted at the artifacts
+      folder landed both the temp and the published spec wherever it pointed —
+      and the callers' own ``mkdir(parents=True, exist_ok=True)`` accepts a
+      symlinked directory, so a planted parent survives the setup step.
+    * A spec path OUTSIDE ``confine_root`` keeps the plain no-follow write. An
+      artifacts folder configured outside the checkout is real, supported
+      configuration (`bmadconfig` resolves one; `verify.spec_within_roots` trusts
+      it), and a confined writer cannot vouch for a tree it was not given — so
+      refusing there would break working setups rather than close a hole.
+
+    ``follow_symlinks=False`` on that second arm matches the name-replacing
+    `atomic_replace` this writer's `devcontract` sibling always had. A spec path
+    is handed to this writer from a session-driven scan, so honouring a link
+    planted there would aim a host-side write wherever that session chose. The
+    confined arm needs no such flag — it never follows anything.
+
+    ``confine_root`` is a REQUIRED keyword: a caller that has not decided which
+    checkout the spec belongs to is a pyright error rather than an unconfined
+    write, which is how every call site of this and its two siblings was found.
+
+    ``require_writable_target=True`` on both arms (#597): a spec is
+    operator-editable, and a temp-and-replace write needs write permission on the
+    PARENT DIRECTORY, never on the entry it replaces — so before this a spec an
+    operator had marked ``0444`` was rewritten anyway and, where the mode was
+    inherited, came back reading ``0444`` with nothing in the permission bits to
+    record it. The kernel's `PermissionError` is what a bare ``write_bytes``
+    raised, and it is what this raises again.
 
     Returns True when the file was rewritten. Returns False for **nothing to
     change** only: no file, no frontmatter block, no top-level `status` for
@@ -390,5 +516,11 @@ def set_frontmatter_status(path: Path, status: str) -> bool:
     edited = _edit_frontmatter_block(block, "status", status, pattern=_STATUS_KEY_RE)
     if edited is None:
         return False
-    path.write_bytes((before + edited + after).encode("utf-8"))
+    payload = (before + edited + after).encode("utf-8")
+    if path.is_relative_to(confine_root):
+        atomic_write_bytes_confined(
+            path, payload, confine_root=confine_root, require_writable_target=True
+        )
+    else:
+        atomic_write_bytes(path, payload, follow_symlinks=False, require_writable_target=True)
     return True

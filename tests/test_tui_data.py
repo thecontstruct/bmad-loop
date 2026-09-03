@@ -9,14 +9,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-from conftest import install_bmad_config, write_sprint
+from conftest import install_bmad_config, refuse_to_resolve, write_sprint
 
-from bmad_loop import deferredwork, policy
-from bmad_loop.adapters import tmux_base
+from bmad_loop import bmadconfig, deferredwork, policy
 from bmad_loop.journal import Journal, save_state
 from bmad_loop.model import RunState
-from bmad_loop.runs import RUNS_DIR, write_pid
+from bmad_loop.runs import RUNS_DIR
 from bmad_loop.tui import data
 
 
@@ -84,6 +82,32 @@ def test_pending_missed_decisions_reads_and_caches(project, monkeypatch):
     assert data.pending_missed_decisions(project.project) is pending
 
 
+def test_pending_missed_decisions_uses_loaded_project_root(project, monkeypatch):
+    """The canonical root from ProjectPaths is both the reader and cache key.
+
+    INVERSE ablation: restore the second ``project.resolve()`` in
+    ``pending_missed_decisions`` and this test raises the stubbed WinError 64
+    instead of returning the cached decision from the already-loaded root.
+    """
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    run_dir = make_run(project.project, "20260101-000000-aaaa")
+    _write_triage_decision(run_dir)
+    paths = bmadconfig.load_paths(project.project)
+    original_spelling = project.project / "unresolved-alias" / ".."
+    monkeypatch.setattr(data, "_project_paths", lambda _project: paths)
+    refuse_to_resolve(monkeypatch, original_spelling)
+
+    pending = data.pending_missed_decisions(original_spelling)
+
+    assert [decision.id for decision in pending] == ["DW-1"]
+    assert data.pending_missed_decisions(original_spelling) is pending
+    assert paths.project in data._missed_cache
+    assert original_spelling not in data._missed_cache
+
+
 def test_pending_missed_decisions_empty_for_uninitialized(tmp_path):
     assert data.pending_missed_decisions(tmp_path) == []
 
@@ -105,128 +129,13 @@ def test_data_imports_without_textual(monkeypatch):
 # ----------------------------------------------------------------- discovery
 
 
-def test_discover_runs_missing_dir(tmp_path):
-    assert data.discover_runs(tmp_path) == []
-
-
-def test_discover_runs_classification(tmp_path):
-    make_run(tmp_path, "20260611-100000-aaaa", finished=True)
-    make_run(tmp_path, "20260611-110000-bbbb", paused_reason="escalation")
-    alive_dir = make_run(tmp_path, "20260611-120000-cccc")
-    write_pid(alive_dir)  # test process pid: alive
-    gone_dir = make_run(tmp_path, "20260611-130000-dddd", run_type="sweep")
-    (gone_dir / "engine.pid").write_text(str(dead_pid()))
-
-    infos = data.discover_runs(tmp_path)
-    assert [i.status for i in infos] == [
-        data.FINISHED,
-        data.PAUSED,
-        data.RUNNING,
-        data.INTERRUPTED,
-    ]
-    assert infos[0].started_at == "2026-06-11T10:00:00"
-    assert [i.run_type for i in infos] == ["story", "story", "story", "sweep"]
-    # statuses re-classify on a second (cached-header) pass
-    assert [i.status for i in data.discover_runs(tmp_path)] == [i.status for i in infos]
-
-
-def test_live_pid_with_unreadable_identity_is_unknown_not_interrupted(tmp_path, monkeypatch):
-    from bmad_loop import runs
-
-    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
-    (run_dir / "engine.pid").write_text("4242 123.0")
-
-    class Host:
-        def liveness_of(self, pid, identity):
-            return "unknown"
-
-    # data.liveness delegates its pid branch to runs.engine_liveness, so the host seam
-    # is now read there; patch it there to exercise the full delegation path.
-    monkeypatch.setattr(runs, "get_process_host", lambda: Host())
-    assert data.liveness(run_dir) == "unknown"
-    assert data.discover_runs(tmp_path)[0].status == data.UNKNOWN
-
-
-def test_process_host_misconfig_degrades_to_unknown(tmp_path, monkeypatch):
-    # A ProcessHostError from get_process_host (bad BMAD_LOOP_PROCESS_HOST) must not
-    # escape the display layer: the dashboard poll worker has no except and would
-    # take the whole app down. The status column degrades to 'unknown' instead.
-    from bmad_loop import runs
-    from bmad_loop.process_host import ProcessHostError
-
-    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
-    (run_dir / "engine.pid").write_text("4242 123.0")
-
-    def boom():
-        raise ProcessHostError("BMAD_LOOP_PROCESS_HOST matches no registered host")
-
-    monkeypatch.setattr(runs, "get_process_host", boom)
-    assert data.liveness(run_dir) == "unknown"
-    assert data.discover_runs(tmp_path)[0].status == data.UNKNOWN
-
-
-def test_stopped_run_classifies_as_stopped_not_interrupted(tmp_path):
-    # a deliberate stop leaves a dead pid; it must read STOPPED, not INTERRUPTED
+def test_stopped_run_watcher_status_is_stopped(tmp_path):
+    # Companion to test_runs.py's discover_runs half of this case (#650): the
+    # watcher runs the same _classify, so a deliberate stop's dead pid must read
+    # STOPPED here too, not INTERRUPTED.
     run_dir = make_run(tmp_path, "20260611-100000-aaaa", stopped=True)
     (run_dir / "engine.pid").write_text(str(dead_pid()))
-    assert data.discover_runs(tmp_path)[0].status == data.STOPPED
     assert data.RunWatcher(run_dir).status() == data.STOPPED
-
-
-def test_finished_beats_stopped(tmp_path):
-    make_run(tmp_path, "20260611-100000-aaaa", finished=True, stopped=True)
-    assert data.discover_runs(tmp_path)[0].status == data.FINISHED
-
-
-def test_discover_runs_marks_graceful_stop_pending_while_running(tmp_path):
-    from bmad_loop.runs import STOP_REQUEST_FILE
-
-    run_dir = make_run(tmp_path, "20260611-120000-cccc")
-    write_pid(run_dir)  # test process pid: alive -> RUNNING
-    assert data.discover_runs(tmp_path)[0].stopping is False  # no request yet
-    (run_dir / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
-    info = data.discover_runs(tmp_path)[0]
-    assert info.status == data.RUNNING
-    assert info.stopping is True
-
-
-def test_discover_runs_marks_graceful_stop_pending_while_unknown(tmp_path, monkeypatch):
-    # An unverifiable ('unknown') pid still has an engine that can consume the control
-    # file, so the "stopping" badge shows for an UNKNOWN-status run too — matching the
-    # CLI's graceful_stop_pending, which projects the request on liveness != "dead".
-    from bmad_loop import runs
-    from bmad_loop.runs import STOP_REQUEST_FILE
-
-    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
-    (run_dir / "engine.pid").write_text("4242 123.0")
-
-    class Host:
-        def liveness_of(self, pid, identity):
-            return "unknown"
-
-    monkeypatch.setattr(runs, "get_process_host", lambda: Host())
-    assert data.discover_runs(tmp_path)[0].stopping is False  # no request yet
-    (run_dir / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
-    info = data.discover_runs(tmp_path)[0]
-    assert info.status == data.UNKNOWN
-    assert info.stopping is True
-
-
-def test_stopping_ignored_on_a_non_running_run(tmp_path):
-    # The engine consumes the control file at the stop boundary; a file lingering
-    # on an already-stopped or finished run must not read as still-stopping.
-    from bmad_loop.runs import STOP_REQUEST_FILE
-
-    stopped = make_run(tmp_path, "20260611-100000-aaaa", stopped=True)
-    (stopped / "engine.pid").write_text(str(dead_pid()))
-    (stopped / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
-    finished = make_run(tmp_path, "20260611-110000-bbbb", finished=True)
-    (finished / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
-    infos = {i.run_id: i for i in data.discover_runs(tmp_path)}
-    assert infos["20260611-100000-aaaa"].status == data.STOPPED
-    assert infos["20260611-100000-aaaa"].stopping is False
-    assert infos["20260611-110000-bbbb"].status == data.FINISHED
-    assert infos["20260611-110000-bbbb"].stopping is False
 
 
 def test_watcher_stopping_reads_the_control_file(tmp_path):
@@ -237,55 +146,6 @@ def test_watcher_stopping_reads_the_control_file(tmp_path):
     assert watcher.stopping() is False
     (run_dir / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
     assert watcher.stopping() is True
-
-
-def test_discover_runs_legacy_no_pid_is_unknown(tmp_path, monkeypatch):
-    make_run(tmp_path, "20260611-100000-aaaa")
-    # legacy liveness now flows through the multiplexer backend; patch its seam.
-    monkeypatch.setattr(tmux_base.shutil, "which", lambda _: None)
-    assert data.discover_runs(tmp_path)[0].status == data.UNKNOWN
-
-
-@pytest.mark.usefixtures("force_tmux_backend")  # asserts tmux liveness through the seam
-def test_legacy_run_with_live_tmux_session_is_running(tmp_path, monkeypatch):
-    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
-    monkeypatch.setattr(tmux_base.shutil, "which", lambda _: "/usr/bin/tmux")
-    calls = []
-
-    def fake_run(argv, **kwargs):
-        calls.append(argv)
-
-        class Proc:
-            returncode = 0
-
-        return Proc()
-
-    monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
-    assert data.discover_runs(tmp_path)[0].status == data.RUNNING
-    assert calls[0][:3] == ["tmux", "has-session", "-t"]
-    assert calls[0][3] == f"=bmad-loop-{run_dir.name}"
-
-
-def test_legacy_run_liveness_unknown_when_backend_query_fails(tmp_path, monkeypatch):
-    """A timed-out / failing has-session surfaces as a MultiplexerError at the seam,
-    not a raw subprocess error: a dead query proves nothing about a legacy run, so it
-    degrades to 'unknown' instead of escaping discover_runs() and crashing the TUI."""
-    make_run(tmp_path, "20260611-100000-aaaa")
-    monkeypatch.setattr(tmux_base.shutil, "which", lambda _: "/usr/bin/tmux")
-
-    def boom(argv, **kwargs):
-        raise tmux_base.subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
-
-    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
-    assert data.discover_runs(tmp_path)[0].status == data.UNKNOWN
-
-
-def test_discover_runs_corrupt_state_is_unknown_not_crash(tmp_path):
-    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
-    (run_dir / "state.json").write_text("{ not json")
-    infos = data.discover_runs(tmp_path)
-    assert [i.status for i in infos] == [data.UNKNOWN]
-    assert infos[0].run_id == "20260611-100000-aaaa"
 
 
 # --------------------------------------------------------------- RunWatcher
@@ -334,29 +194,17 @@ def test_watcher_status_reused_pid_reads_interrupted(tmp_path):
     assert watcher.status() == data.INTERRUPTED
 
 
-def test_classify_crashed(tmp_path):
-    # a recorded crash classifies as CRASHED (distinct from a generic INTERRUPTED),
-    # checked before liveness so the dead pid does not override it.
-    assert (
-        data._classify(
-            finished=False,
-            paused=False,
-            stopped=False,
-            crashed=True,
-            run_dir=tmp_path,
-        )
-        == data.CRASHED
-    )
-    # a state.json carrying crashed=True surfaces through the watcher
+def test_watcher_status_crashed(tmp_path):
+    # Companion to test_runs.py::test_classify_crashed (#650): a state.json
+    # carrying crashed=True surfaces through the watcher, ahead of liveness.
     run_dir = make_run(tmp_path, "20260611-100000-aaaa", crashed=True)
     (run_dir / "engine.pid").write_text(str(dead_pid()))
     assert data.RunWatcher(run_dir).status() == data.CRASHED
-    assert data.discover_runs(tmp_path)[0].status == data.CRASHED
 
 
-def test_classify_legacy_crash_stays_interrupted(tmp_path):
-    # a pre-feature run has no crashed flag; a dead pid reads as INTERRUPTED, not
-    # CRASHED — backward compatible.
+def test_watcher_status_legacy_crash_stays_interrupted(tmp_path):
+    # Companion to test_runs.py's discover_runs half (#650): a pre-feature run has
+    # no crashed flag, so the watcher reads a dead pid as INTERRUPTED, not CRASHED.
     run_dir = make_run(tmp_path, "20260611-100000-aaaa")
     import json
 
@@ -365,7 +213,6 @@ def test_classify_legacy_crash_stays_interrupted(tmp_path):
     (run_dir / "state.json").write_text(json.dumps(doc), encoding="utf-8")
     (run_dir / "engine.pid").write_text(str(dead_pid()))
     assert data.RunWatcher(run_dir).status() == data.INTERRUPTED
-    assert data.discover_runs(tmp_path)[0].status == data.INTERRUPTED
 
 
 def test_watcher_attention(tmp_path):
@@ -858,6 +705,39 @@ def test_active_task_id_matches_open_session_start(tmp_path):
     assert data.active_task_id(tmp_path, closed) == "t-new"
 
 
+def test_active_task_id_ignores_verifier_streams(tmp_path):
+    """The newest-log fallback sees pane logs only: verifier streams are not tasks.
+
+    Regression. Verifier stdout/stderr used to be retained in ``logs/``, whose
+    every other inhabitant is an adapter pane capture named after a session task
+    id. That collides in the COMMON case, not a corner: session-end is journalled
+    when the session ends, before its result reaches verification, so nothing is
+    open exactly when the verifier files are the newest in the directory. The
+    fallback then returned a stream's stem as the live task and the dashboard
+    reopened it as ``logs/{stem}.log`` — a path that resolves, so the log pane
+    rendered verifier stderr in place of the agent session log.
+
+    The streams are written through the real writer, not hand-placed: pointing
+    ``Journal.write_verify_stream`` back at ``logs/`` must redden this test.
+    """
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "1-1-a-dev-1.log").write_text("pane capture")
+    os.utime(logs / "1-1-a-dev-1.log", ns=(1, 1))  # older than anything written below
+
+    journal = Journal(tmp_path)
+    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stdout.log", "out")
+    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stderr.log", "err")
+
+    # a dev session that has ended -> no open session -> the fallback fires
+    ended = [
+        {"kind": "session-start", "task_id": "1-1-a-dev-1"},
+        {"kind": "session-end", "task_id": "1-1-a-dev-1"},
+    ]
+    assert data.active_task_id(tmp_path, ended) == "1-1-a-dev-1"
+    assert data.active_task_id(tmp_path, []) == "1-1-a-dev-1"
+
+
 # ------------------------------------------------------------- active agent
 
 
@@ -953,6 +833,52 @@ def test_pending_decision_missing_fields():
 # ------------------------------------------------------------ sprint overview
 
 
+def test_project_paths_degrades_and_recovers_from_root_resolve_refusal(project, monkeypatch):
+    """A dead provider yields unavailable readers without poisoning recovery.
+
+    INVERSE ablation: restore bare ``project.resolve()`` in ``_project_paths``
+    and this test raises the stubbed WinError 64 on its first observation rather
+    than returning empty panes and recovering after the provider is healthy.
+    """
+    install_bmad_config(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    root = project.project
+
+    with monkeypatch.context() as refusal:
+        refuse_to_resolve(refusal, root)
+        assert data._project_paths(root) is None
+        assert data.sprint_overview(root) is None
+        assert data.deferred_entries(root) is None
+        assert data.pending_missed_decisions(root) == []
+        assert root not in data._paths_cache
+
+    paths = data._project_paths(root)
+    assert paths is not None
+    assert paths.project == root
+    assert data._paths_cache[root][1] is paths
+    assert data.sprint_overview(root) is not None
+
+
+def test_project_paths_uses_one_canonical_cache_key(project):
+    """Healthy aliases share one ProjectPaths snapshot under the canonical root.
+
+    INVERSE ablation: key ``_paths_cache`` with the pre-canonical spelling while
+    loading from the stable root and this test finds the ``..`` spelling as a
+    second cache key instead of reusing the canonical entry.
+    """
+    install_bmad_config(project)
+    root = project.project.resolve()
+    alternate_spelling = root / ".." / root.name
+
+    paths = data._project_paths(alternate_spelling)
+
+    assert paths is not None
+    assert paths.project == root
+    assert data._project_paths(root) is paths
+    assert root in data._paths_cache
+    assert alternate_spelling not in data._paths_cache
+
+
 def test_sprint_overview(project):
     install_bmad_config(project)
     write_sprint(
@@ -994,28 +920,6 @@ def test_sprint_overview_unavailable(tmp_path, project):
 
 
 # ------------------------------------------------- stories mode: pause + board
-
-
-def test_discover_runs_reports_pause_stage(tmp_path):
-    from bmad_loop.model import PAUSE_PLAN_CHECKPOINT
-
-    make_run(
-        tmp_path,
-        "20260101-000000-aaaa",
-        paused_reason="plan checkpoint for 1",
-        paused_stage=PAUSE_PLAN_CHECKPOINT,
-    )
-    info = data.discover_runs(tmp_path)[0]
-    assert info.status == data.PAUSED
-    assert info.paused_stage == PAUSE_PLAN_CHECKPOINT
-
-
-def test_discover_runs_pause_stage_blank_when_not_paused(tmp_path):
-    # a finished run keeps its last paused_stage in state; it must not badge.
-    make_run(tmp_path, "20260101-000000-aaaa", finished=True, paused_stage="plan-checkpoint")
-    info = data.discover_runs(tmp_path)[0]
-    assert info.status == data.FINISHED
-    assert info.paused_stage == ""
 
 
 def _write_stories(folder: Path, entries: list[dict]) -> None:
@@ -1151,28 +1055,6 @@ def test_deferred_entries_mixed_ledger_in_file_order(project):
     assert items[1].severity == "high"
 
 
-def test_stat_sig_includes_inode_for_same_size_rewrite(tmp_path):
-    # The engine rewrites state.json atomically (temp + os.replace), landing a
-    # fresh inode. A same-size rewrite with an identical (forced) mtime must still
-    # change the signature — otherwise a coarse-mtime filesystem (WSL2 drvfs) would
-    # serve a stale parse from cache. st_ino is what catches it.
-    target = tmp_path / "state.json"
-    target.write_text("AAAA", encoding="utf-8")
-    before = data._stat_sig(target)
-    original = target.stat()
-
-    replacement = tmp_path / "state.json.tmp"
-    replacement.write_text("BBBB", encoding="utf-8")  # same size, different content
-    os.replace(replacement, target)
-    os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))  # pin mtime
-
-    after = data._stat_sig(target)
-    same_size = before[1] == after[1]
-    same_mtime = before[0] == after[0]
-    assert same_size and same_mtime  # (mtime_ns, size) alone could not tell these apart
-    assert before != after  # ...but the inode did
-
-
 def test_run_watcher_state_refreshes_on_same_size_rewrite(tmp_path):
     # A same-content atomic rewrite keeps size and (forced) mtime identical but
     # lands a fresh inode. The watcher must re-parse — detected here by object
@@ -1244,3 +1126,36 @@ def test_char_style_degrades_unparseable_color_instead_of_raising():
     assert style.color is None and style.bgcolor is None
     assert style.bold and style.underline and not style.italic
     assert data._char_style(key) is style  # fallback is cached like any other
+
+
+def test_story_key_from_task_id_grammar_including_the_generation_suffix():
+    """The id grammar this fallback parses, pinned in both directions.
+
+    `_session_task_id` composes `safe_segment(f"{story_key}-{part}-{seq}{gen}")`, and
+    #705 added `gen` — a `-g<N>` suffix emitted only above generation zero. That
+    changed the grammar this parser documents, and nothing recorded either half of it.
+
+    The `-g1` row pins a DOCUMENTED LIMITATION, not a desired outcome: the suffix
+    fails `seq.isdigit()` and the whole id comes back as the story key. It is
+    unreachable today because every `session-start` has carried `story_key` since #153
+    phase 1, so the entries this fallback actually sees predate generations entirely.
+    It is pinned precisely because that reasoning is an assumption about the CALLER:
+    widen the fallback to entries that can carry `-gN` and this row is where the
+    breakage surfaces, instead of a bogus `1-1-a-dev-1-g1` row appearing in the
+    active-agent view.
+
+    Ablation: drop the `seq.isdigit()` term and the `-g1` row changes answer (it then
+    peels `g1` as if it were a sequence); change the emitted suffix shape in
+    `engine._session_task_id` and the last row reddens.
+    """
+    # the ordinary unsuffixed shape: the recorded role is peeled with its seq
+    assert data._story_key_from_task_id("1-1-a-dev-1", "dev") == "1-1-a"
+    assert data._story_key_from_task_id("1-1-a-review-12", "review") == "1-1-a"
+    # a labeled plugin session: role does not match, so one more `-` group goes
+    assert data._story_key_from_task_id("1-1-a-somelabel-1", "dev") == "1-1-a"
+    # not the expected shape at all — returned verbatim
+    assert data._story_key_from_task_id("nonsense", "dev") == "nonsense"
+
+    # generation-suffixed (#705): NOT parsed, returned whole. Unreachable today.
+    assert data._story_key_from_task_id("1-1-a-dev-1-g1", "dev") == "1-1-a-dev-1-g1"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g12", "dev") == "1-1-a-dev-1-g12"

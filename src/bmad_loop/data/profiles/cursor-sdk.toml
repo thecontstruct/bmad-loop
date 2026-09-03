@@ -1,0 +1,45 @@
+# Cursor's headless agent, driven through the bundled Node sidecar over the
+# `@cursor/sdk` package — hookless: the adapter reads the sidecar's NDJSON
+# stdout and its terminal sentinel, so no hook scripts or config merges are
+# ever written and no tmux window is opened.
+# Transport facts live in the adapters/cursor_sdk.py docstring.
+name = "cursor-sdk"
+# `node`, not a Cursor binary: the SDK is a Node library and the sidecar is the
+# program that is launched. Override here (or in .bmad-loop/profiles/) to pin a
+# specific interpreter, e.g. an nvm path.
+binary = "node"
+# Driven by the bundled Node-sidecar adapter class (adapters/registry.py), not
+# the tmux generic adapter. Distinct from `hooks.dialect = "none"` below, which
+# says only that no hook config is ever registered: the two axes are decoupled.
+adapter = "cursor-sdk"
+# A headless SDK run has no slash-command dispatcher, so the canonical
+# "/skill args" prompt is spelled out as an instruction instead of passed
+# through. `{skill}` and `{args}` are the two halves the profile layer splits it
+# into; the trailing line names the env contract the engine has already set, so
+# the session does not go looking for it.
+prompt_template = """You are running fully headless in the bmad-loop automation harness.
+Run the `{skill}` skill and follow it to completion.
+Invocation arguments: {args}
+BMAD_LOOP_MODE, BMAD_LOOP_RUN_DIR and BMAD_LOOP_TASK_ID are already set in your environment."""
+# Usage arrives in-band, in the sidecar's completion sentinel — there is no
+# transcript file to parse.
+usage_parser = "none"
+# `.claude/skills`, not `.cursor/skills`: Cursor loads the Claude tree too (for
+# compatibility), and that is the tree the BMAD installer puts the dev primitive
+# in. Pointing at `.cursor/skills` would give this provider a tree containing
+# only the bundled bmad-loop-* skills, leaving every dev/review leg without the
+# `bmad-build-auto` skill it dispatches. Same choice, same reason, as
+# opencode-http.
+skill_tree = ".claude/skills"
+first_run_note = "export CURSOR_API_KEY, then run `bmad-loop init --provision cursor-sdk` once on this machine to install the @cursor/sdk runtime"
+
+# No env_fault_patterns are seeded, deliberately. The file this adapter scans
+# (logs/<task_id>.sidecar.err — the sidecar's own stderr, which the model cannot
+# write to) is structurally safe for content-anchored patterns, but no captured
+# Cursor SDK provider-outage line exists yet. An unverified pattern is not a
+# neutral bet: one that fires on a healthy session pauses the whole run. Seed
+# one only from a captured line, citing the run it came from — the bar
+# tests/test_env_fault_patterns.py::test_unseeded_profiles_stay_inert states.
+
+[hooks]
+dialect = "none"

@@ -117,7 +117,12 @@ class SessionHandle:
 
 @dataclass(frozen=True)
 class SessionResult:
-    status: str  # "completed" | "stalled" | "timeout" | "crashed" | "over_budget"
+    # "aborted" is the in-session hard-stop verdict (#319): the wait loop saw a
+    # `mode: "hard"` stop-request.json and tore the session down. It is an abort,
+    # NEVER a completion — sessions complete only on hook Stop events or window
+    # death (AGENTS.md) — and it never escapes `Engine._run_session`, which
+    # unwinds it as a RunStopped before any SessionRecord is written.
+    status: str  # "completed" | "stalled" | "timeout" | "crashed" | "over_budget" | "aborted"
     result_json: dict[str, Any] | None = None
     session_id: str | None = None
     transcript_path: str | None = None
@@ -145,6 +150,14 @@ class SessionResult:
     # and both fire on a CLI that launched and wedged without doing anything. Stop
     # is the only canonical event that means a turn actually ended.
     stop_seen: bool = False
+    # Set on a `crashed` verdict when the mux no longer reports the SESSION, not
+    # just its window (#489) — see `GenericAdapter._session_vanished` for why the
+    # two are otherwise indistinguishable. Diagnostic label only: it changes the
+    # reason text, never the routing. Deliberately NOT carried by
+    # `_post_kill_reconcile`'s hand-built result — that path gates on
+    # stalled/timeout/over_budget, which this flag can never accompany; add it
+    # there if `crashed` ever joins that rescue set.
+    session_vanished: bool = False
 
 
 class CodingCLIAdapter(ABC):
@@ -217,14 +230,25 @@ class CodingCLIAdapter(ABC):
         self, handle: SessionHandle, spec: SessionSpec, result: SessionResult
     ) -> SessionResult:
         """Last-chance post-mortem: label a non-completed session an environment
-        fault (#194) when the CLI lost its API connection and idled out the
-        session clock rather than doing real work.
+        fault (#194) when the CLI never got usable work out of the provider —
+        connection lost, or quota/rate limit refused — and idled out the session
+        clock rather than doing real work.
 
         Runs LAST in ``run()`` — after ``_post_kill_reconcile`` — so a reconcile
         upgrade to ``completed`` is never re-classified, and only a genuinely
         non-completed verdict (``result_json is None``) is ever inspected. Base
-        behavior: identity, like ``_post_kill_reconcile``, so adapters with no
-        post-mortem signal (HTTP/mock) stay inert. Adapters that tee the pane
-        (see GenericAdapter) may match profile patterns against the log tail here
-        and stamp ``env_fault`` / ``env_fault_evidence`` onto the result."""
+        behavior: identity, like ``_post_kill_reconcile``, so an adapter with no
+        session log at all (mock) stays inert.
+
+        Any adapter that writes a per-task diagnostic log should mix in
+        ``EnvFaultMixin``, which matches profile patterns against the tail of the
+        file its ``ENV_FAULT_LOG_SUFFIX`` names and stamps ``env_fault`` /
+        ``env_fault_evidence`` onto the result. That covers the tmux adapters
+        (pane capture, ``<task_id>.log``) and the opencode HTTP adapter (the
+        serve process's stdout/stderr, ``<task_id>.server.out``, NOT its
+        conversation transcript) alike — the signal is the log, not the
+        transport. This docstring used to say HTTP adapters had no
+        post-mortem signal; that stopped being true once opencode_http began
+        teeing its server log, and the stale premise is why a provider quota
+        outage went unclassified and burned three stories' retry budgets."""
         return result

@@ -14,7 +14,10 @@ bmad-loop a new CLI:
 - **The advanced case — a new adapter class.** If the CLI does _not_ fit that
   transport (e.g. an HTTP/SSE service), see
   [Writing a new adapter class](#writing-a-new-adapter-class) for the
-  `CodingCLIAdapter` ABC.
+  `CodingCLIAdapter` ABC — and
+  [Shipping a new adapter class out-of-tree](#shipping-a-new-adapter-class-out-of-tree)
+  to register it (and the profile that selects it) from a co-installed package
+  with **zero core edits**, the same way a transport backend ships out-of-tree.
 
 ## Two axes: CLI vs transport
 
@@ -22,7 +25,10 @@ These are independent and abstracted separately:
 
 - **CLI axis** — `CodingCLIAdapter` (`adapters/base.py`): _which_ binary to launch,
   how the prompt is rendered, the hook dialect, where the transcript lives. The
-  generic adapter + a TOML profile cover this; the rest of this guide is about it.
+  generic adapter + a TOML profile cover the common case; a CLI needing its own
+  adapter class registers one via `register_adapter(...)` (`adapters/registry.py`),
+  selected by the profile's `adapter` field and shippable out-of-tree just like a
+  transport backend. Most of this guide is about this axis.
 - **Transport axis** — `TerminalMultiplexer` (`adapters/multiplexer.py`): how
   sessions, windows, and panes are created, observed, and torn down. The generic
   adapter never shells out itself — it goes through `self.mux`, obtained from
@@ -74,15 +80,30 @@ fragments) — or implement
 seams of a full OS port are in
 [Porting bmad-loop to a new OS](porting-to-a-new-os.md). The contract groups into:
 
-- **Sessions** — `has_session`, `new_session` (geometry is optional: agent
-  sessions pin a fixed pane size because they are observed while detached; the
-  control session omits it), `kill_session`, `list_sessions`, `session_options`
-  (read a user option across all sessions), `set_session_option`.
+- **Sessions** — `has_session`, `new_session` (geometry is
+  optional: agent sessions pin a fixed pane size because they are observed
+  while detached; the control session omits it),
+  `kill_session`, `list_sessions`, `session_options` (read a user option
+  across all sessions), `set_session_option`.
+
+  One session method carries a default the seam cannot verify for your
+  transport: `session_name_key(name)`, the canonical comparison key — two
+  names denote the same live session exactly when their keys are equal. The
+  default is identity (exact comparison — correct for tmux, whose session
+  names are case-sensitive). **If your transport resolves session names
+  case-insensitively — or folds them any other way — you MUST override**
+  (psmux does: its NTFS port-file store opens names case-insensitively).
+  With the inherited identity key, a case-variant of the control session's
+  name is not discounted by the removal guard, so the documented recovery
+  `bmad-loop delete ctl` wedges behind a false live-session refusal on a
+  persisted `CTL` run.
+
 - **Windows** — `new_window` (run a command in a fresh window), `new_parked_window`
-  (run a command, then _park_ on a keypress so the exit status stays inspectable,
-  then return any attached client to its origin — the POSIX `sh -c` recipe is
-  composed from the base's overridable shell-dialect hooks, so a non-POSIX
-  backend swaps the dialect fragments, not the method body), `list_window_ids`
+  (run a command, then _park_ on a keypress so the exit
+  status stays inspectable, then return any attached client to its origin — the
+  POSIX `sh -c` recipe is composed from the base's overridable shell-dialect
+  hooks, so a non-POSIX backend swaps the dialect fragments, not the method
+  body), `list_window_ids`
   (which MUST emit the same id form your `new_window` returns — `window_alive` is
   a membership test over it, so qualifying one side and not the other reads every
   live window as dead), `list_windows` (selected fields per window),
@@ -100,23 +121,60 @@ seams of a full OS port are in
   `available` (is this backend usable on the current host), `version` (the
   binary's version string or `None` — **one bounded line**, folded with
   `fold_version()`; see [the porting guide](porting-to-a-new-os.md)).
+- **Registry namespace** (optional; all three default to "no namespace", so a
+  transport without one writes nothing) — `has_registry_namespace` (a property
+  of the transport: does it namespace sessions by registry at all? Answer
+  `True` on every instance if it does, even when no root is currently in
+  force: cleanup uses it to tell "no namespace exists" from "running on the
+  transport's shared default registry", and only the first lets an untagged
+  session be claimed on run-directory evidence — a namespaced backend that
+  leaves this at the inherited `False` keeps the pre-namespace historical
+  reach, which on a shared registry can kill another project's session),
+  `registry_root` (the root your verbs
+  currently resolve targets through, for `bmad-loop mux` to disclose; `None`
+  from a namespaced backend means "no root in force" — the shared default —
+  not "no namespace") and
+  `legacy_registries` (instances bound to roots your sessions may predate, for
+  the cleanup sweep). Only for a transport that addresses sessions through a
+  directory of per-session files, as psmux does through `PSMUX_DATA_DIR`; the
+  rules are in [the porting
+  guide](porting-to-a-new-os.md#registry-namespaces-only-if-your-transport-has-one).
 
-  **Both client verbs report effect, not dispatch.** They answer a bool the
-  parked-window return path trusts, so a backend with no real detach (herdr —
+  **Both client verbs report effect, not dispatch.** They answer what the
+  parked-window return path trusts — a bool from `detach_client`, a tri-state
+  from `switch_client` (see below) — so a backend with no real detach (herdr —
   only a manual chord releases its client) answers `False`. If your CLI's exit
   code already means "a client moved" you are done (tmux: `detach-client` fails
   with _no current client_); if it does not, **measure** what the verb is meant
-  to change — psmux counts the session's attached clients across the call and
-  answers on the drop — and record what the measure cannot see in your
-  degradation ledger (psmux's `Residue:` note: a switch _within_ one session
-  moves no client count, so it reads as no effect). Where no measure is
-  available, answer `False` and record that gap in the ledger too.
-  `tui.launch.return_attached_client` reads a failed `switch_client` as
+  to change — psmux counts the session's attached clients across `detach_client`
+  and the last-client fallback, and answers on the drop — and record what the
+  measure cannot see in your degradation ledger. Where no measure is available,
+  answer `False` from `detach_client` and `None` from `switch_client`, and
+  record that gap in the ledger too — per _call_, though, never as the wiring: a
+  `switch_client` hard-coded to `None` pins the return path to `UNREACHABLE`, and
+  an attended sweep then stops prompting for good. Use the exit code wherever it
+  carries the effect. Check the ledger against every verb before you
+  trust one measure for all of them: psmux's drop is blind
+  to a `switch_client` whose target sits in the same session, which is the common
+  case for the return path, so that verb gates on the client count read _before_
+  the call and takes the exit code as the verdict instead (#659). A fallback verb
+  belongs to the same audit — hang it on the primary verb's failure, never on
+  "the primary could not be vouched for", or a hand-back that worked gets undone
+  by its own fallback and the undo is read as the success.
+  `tui.launch.return_attached_client` reads a `False` from `switch_client` as
   `ATTENDED` — the client never left this window, so an attended sweep keeps
-  prompting — and a failed `detach_client` as `UNREACHABLE`, which is evidence of
-  nothing, so the sweep goes unattended and defers this cycle's decisions to
-  `bmad-loop decisions`. `False` is the safe answer either way; a vacuous `True`
-  is the one answer no backend may give — it announces a hand-back that never
+  prompting — and a `False` from `detach_client` as `UNREACHABLE`, which is evidence
+  of nothing, so the sweep goes unattended and defers this cycle's decisions to
+  `bmad-loop decisions`. That makes `switch_client`'s `False` a **joint claim**:
+  no switch happened _and_ the client is still here. A move you cannot _vouch_
+  for is only its first half — a timed-out verb, an unreadable count, nothing
+  attached to move — so answer `None`, which routes to `UNREACHABLE`: the return
+  option survives and the sweep still stops prompting a window the client may
+  already have left. Do not reach for that surviving option as the recovery. The
+  parked trailer sits behind a blocking read, so it never runs while a `--repeat`
+  cycle is stuck on `input()` in the same window — which is exactly what an
+  `ATTENDED` the client has walked away from produces. A vacuous `True` remains
+  the one answer no backend may give: it announces a hand-back that never
   happened and sends the sweep unattended with the human still sitting there
   (#227).
 
@@ -130,16 +188,17 @@ module-level `parse_target()` — or the backend's own **native id** (whatever y
 `target()`, precisely so the seam grammar never has to carry a pane or window
 id: the parked-window return target — `current_return_target`, above — and the
 native window id, which psmux qualifies to `session:@N` because its ids are
-per-server (falling back to the bare id where that grammar would not survive —
-the backend owns those conditions, and applies them uniformly, so the
-`new_window`/`list_window_ids` symmetry rule holds under the fallback too).
+per-server (falling back to the bare id where that grammar would not survive).
 Both are replayed opaquely; neither is parsed by core. psmux applies the same
 qualification to `new_parked_window`, the `window_id` columns of `list_windows`
-and `current_window_id`; the latter two must agree, since the ctl-window prune
-compares them to skip its own window.) tmux consumes the token natively (it coincides with tmux exact-match
-syntax), so `BaseTmuxBackend` passes it straight through. A native-id backend
-calls `parse_target()` first — `None` means "already a native id, use as-is",
-otherwise resolve `(session, window)` yourself; the herdr adapter's
+and `current_window_id`. To preserve unambiguous lookup, `new_parked_window` must
+agree with the `list_windows` column; a backend that qualifies one side only
+remains usable but falls back to resolving parked windows by name, which is
+ambiguous whenever several kinds share a run id (#482). tmux consumes the token
+natively (it coincides with tmux exact-match syntax), so `BaseTmuxBackend` passes
+it straight through. A native-id backend calls `parse_target()` first — `None`
+means "already a native id, use as-is", otherwise resolve `(session, window)`
+yourself; the herdr adapter's
 `_parse_target`
 ([backend.py](https://github.com/pbean/bmad-loop-adapter-herdr/blob/main/src/bmad_loop_adapter_herdr/backend.py))
 is the worked example (workspace-by-label → tab-by-name → root pane, resolved
@@ -147,6 +206,35 @@ lazily at use time). You MAY override `target()` to emit native ids, but the tok
 stay a stable _by-name_ reference: core formats targets ahead of use (a parked
 window's return target, for one), so eager resolution to a live id goes stale —
 inheriting the default and resolving lazily is almost always right.
+
+**The qualified-id obligation.** The psmux qualifications above are instances of
+one rule, and it is the rule — not the instances — a native-id backend needs:
+**if an id-minting seam returns anything other than a bare native id, every seam
+whose output core compares that id against must emit the identical form, and
+every verb the id is replayed through must accept it.** Where a verb cannot take
+that form — or cannot take a window scope at all — the backend translates inside
+that verb rather than exempting the id from qualification: psmux has no
+per-window _user_ options to write to (#310), so its option trio runs the
+qualified target through `_option_scope` and writes a session-scoped key carrying
+the window's id, refusing a bare id rather than guessing a server (the built-ins
+pass straight through to the base). It carried a second such translation on
+`select_window` until its 3.3.8 floor made the server resolve a scoped id itself
+(psmux/psmux#497). Where the composed grammar cannot carry the value at all, the
+backend degrades uniformly across every seam that mints or lists the id, so the
+pairings still line up under the fallback — but the fallback is lossy, not a free
+escape hatch: a bare psmux id routes by the _caller's_ server, so the degrade
+condition must stay the narrow one the grammar forces (#221), never a
+convenience. Those pairings are not a closed set: a new one appears whenever a
+caller compares two id-producing seams to each other, so treat the rule as the
+contract and each documented pairing as an instance of it. Every way of getting
+the _form_ wrong is quiet — these are id-shape faults, never transport faults,
+which `list_window_ids` must still raise: a mint/list split reads every live
+window as instantly dead; a `list_windows`/`current_window_id` split makes the
+ctl-window prune kill the window it is running in (#291); a
+`list_windows`/`list_window_ids` split reports every kill candidate as verifiably
+gone, survivors included (#435). And a verb handed a form it rejects fails or
+silently no-ops — the seam is best-effort or its caller swallows the raise, so no
+error reaches core either way.
 
 Operations that can race a window dying (`pipe_pane`) or a session already being
 gone (`kill_session`) must tolerate it rather than raise; everything else raises a
@@ -178,9 +266,11 @@ whenever the content changes, which is exactly enough to drive the two log consu
 a tmux tee would (`generic._log_activity_key`'s stall re-arm and `probe`'s marker
 discovery). Its module docstring is a **degradation ledger** of every such
 divergence (sidecar options, poller `pipe_pane`, the no-op `detach_client` —
-which the widened seam now requires to answer `False`, not `None`, so the
+which #317's widening requires to answer `False`, not `None`, so the
 parked-return path reads it as `UNREACHABLE` and an attended sweep stops
-prompting into a window whose client only a manual chord can release — the attach
+prompting into a window whose client only a manual chord can release; that is a
+different widening from `switch_client`'s tri-state above, and `detach_client`
+is the verb that stays a bool — the attach
 argv, the advisory geometry, the protocol-version policy) — the reference for what
 "implement fresh" costs when the host has no tmux-shaped CLI. The operator-facing
 view — what a herdr _user_ notices and does — is
@@ -391,24 +481,25 @@ resolves to `claude`.
 
 ### `CLIProfile`
 
-| Field                              | Required | Default            | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ---------------------------------- | -------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`                             | ✅       | —                  | Profile id, also the `--cli` value and override key.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `binary`                           | ✅       | —                  | Executable to launch (resolved on `PATH`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `[hooks]`                          | ✅       | —                  | The `HookSpec` table (see below).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `skill_tree`                       |          | `.claude/skills`   | Project-relative tree this CLI reads skills from (`.agents/skills` for codex/gemini); `bmad-loop init` installs the `bmad-loop-*` skills here. Must be relative.                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `prompt_template`                  |          | `{prompt}`         | How the canonical `/skill args` prompt is rendered. Placeholders: `{prompt}` (whole string), `{skill}` (leading slash-command name, no `/`), `{args}` (the remainder).                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `launch_args`                      |          | `()`               | Extra argv passed at launch, e.g. `["-i"]` to stay interactive (gemini/copilot).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `bypass_args`                      |          | `()`               | Flags that bypass permission/approval prompts for unattended runs (e.g. `--allow-all-tools`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `model_flag`                       |          | `--model`          | Flag used to pass the model name when one is configured.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `env`                              |          | `{}`               | Extra environment variables for the session.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `usage_parser`                     |          | `none`             | Which transcript token parser to use — one of `claude-jsonl`, `codex-rollout`, `gemini-chat`, `copilot-events`, `none`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `usage_grace_s`                    |          | `0.0`              | Seconds to keep polling the transcript for token totals after the session ends. `0` = read once. Raise it for CLIs that flush totals only on shutdown (copilot writes `modelMetrics` ~1s after the turn-end hook). Must be ≥ 0.                                                                                                                                                                                                                                                                                                                                                          |
-| `stop_without_result_nudges`       |          | unset (use global) | Per-adapter floor for Stop-without-result nudges. Leave unset to inherit `limits.stop_without_result_nudges`. Raise it for CLIs that fire a turn-end hook _per response turn_ (copilot's `agentStop`), where the global default of 1 declares them stalled too early. Must be ≥ 0 if set.                                                                                                                                                                                                                                                                                                |
-| `subagent_stop_without_transcript` |          | `false`            | Set `true` for CLIs that fire the turn-end hook for _subagent_ turns too, with an empty `transcriptPath` and a tool-use session id (copilot's `agentStop`). A `Stop` carrying no transcript is then treated as a subagent stop and ignored, so the main session's real turn-end drives completion. Leave `false` and every `Stop` is the main turn-end.                                                                                                                                                                                                                                  |
-| `first_run_note`                   |          | `""`               | Human note printed by `init` about a manual first-run/auth step this CLI needs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `seed_files`                       |          | `()`               | Project-relative gitignored configs (MCP/CLI settings) a `git worktree add` checkout omits; `provision_worktree` copies them into isolated dev/review worktrees. Must be relative.                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `env_fault_patterns`               |          | `()`               | Regex patterns matched line-by-line against the ANSI-stripped tail of a **non-completed** (`timeout`/`stalled`/`crashed`) session's pane log to classify a transport/API **environment fault** (#194); a match stamps `env_fault` / `env_fault_evidence` on the `SessionResult`. Must be a **list of strings**; compiled and validated at parse time (an invalid regex is a profile error). Matched with the `regex` module under a per-pattern timeout (`ENV_FAULT_MATCH_TIMEOUT_S`), so a pathological pattern can't hang a session teardown. Seeded only for `claude`; empty = inert. |
+| Field                              | Required | Default            | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ---------------------------------- | -------- | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                             | ✅       | —                  | Profile id, also the `--cli` value and override key.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `binary`                           | ✅       | —                  | Executable to launch (resolved on `PATH`). `bmad-loop validate` also probes it — a name that resolves but fails `--version` (typically a dead WSL/npm shim) is reported as `adapter.binary-unrunnable` at warning severity, #294. Only a **packaged** profile's binary is probed. A project overlay (or an entry-point package's) profile is resolved and reported found but never launched, whatever its `binary` is called — profile fields arrive with a clone, so a project's own config cannot choose which binary this diagnostic launches. The boundary is provenance rather than the spelling of `binary`, because a bare name still resolves into the checkout whenever a checkout-local directory is on `PATH`. Note what it bounds: **which name** is probed, not what that name resolves to. Resolution runs through your `PATH`, so validate launches whatever `PATH` says the CLI is — the same file the session launch itself would run.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `[hooks]`                          | ✅       | —                  | The `HookSpec` table (see below).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `adapter`                          |          | `generic`          | Which adapter **class** drives this CLI — a key resolved against the [adapter registry](#shipping-a-new-adapter-class-out-of-tree), not a fixed enum. `generic` = the bundled tmux + hook-signal adapter; `opencode-http` = the bundled HTTP/SSE adapter; `cursor-sdk` = the bundled Node-sidecar adapter; an out-of-tree package registers its own. Membership is checked against the **live** registry (at run start, and by `bmad-loop validate`'s `adapter.kind`), never at parse time — so an unknown kind is a clear config error rather than a schema change. Orthogonal to `hooks.dialect = "none"` — hooklessness is about the transport, this is about the driving class — with two qualifications. A back-compat carve-out for files written before this field existed: when the key is **absent** and the dialect is `none`, the kind is `opencode-http` (what hooklessness used to select), not `generic`. And one refused pairing: an explicit `generic` beside `dialect = "none"` is rejected at load — that adapter completes on a `Stop` hook a hookless profile never registers, so the session could only wait out `session_timeout_min`. Hookless on any **other** kind stays legal, which is the decoupling this field exists for; a provider shipping a hookless profile must therefore set `adapter` rather than leave it at the default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `skill_tree`                       |          | `.claude/skills`   | Project-relative tree this CLI reads skills from (`.agents/skills` for codex/gemini); `bmad-loop init` installs the `bmad-loop-*` skills here. Must be relative.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `prompt_template`                  |          | `{prompt}`         | How the canonical `/skill args` prompt is rendered. Placeholders: `{prompt}` (whole string), `{skill}` (leading slash-command name, no `/`), `{args}` (the remainder).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `launch_args`                      |          | `()`               | Extra argv passed at launch, e.g. `["-i"]` to stay interactive (gemini/copilot).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `bypass_args`                      |          | `()`               | Flags that bypass permission/approval prompts for unattended runs (e.g. `--allow-all-tools`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `model_flag`                       |          | `--model`          | Flag used to pass the model name when one is configured.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `env`                              |          | `{}`               | Extra environment variables for the session.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `usage_parser`                     |          | `none`             | Which transcript token parser to use — one of `claude-jsonl`, `codex-rollout`, `gemini-chat`, `copilot-events`, `none`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `usage_grace_s`                    |          | `0.0`              | Seconds to keep polling the transcript for token totals after the session ends. `0` = read once. Raise it for CLIs that flush totals only on shutdown (copilot writes `modelMetrics` ~1s after the turn-end hook). Must be ≥ 0.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `stop_without_result_nudges`       |          | unset (use global) | Per-adapter floor for Stop-without-result nudges. Leave unset to inherit `limits.stop_without_result_nudges`. Raise it for CLIs that fire a turn-end hook _per response turn_ (copilot's `agentStop`), where the global default of 1 declares them stalled too early. Must be ≥ 0 if set.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `subagent_stop_without_transcript` |          | `false`            | Set `true` for CLIs that fire the turn-end hook for _subagent_ turns too, with an empty `transcriptPath` and a tool-use session id (copilot's `agentStop`). A `Stop` carrying no transcript is then treated as a subagent stop and ignored, so the main session's real turn-end drives completion. Leave `false` and every `Stop` is the main turn-end.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `first_run_note`                   |          | `""`               | Human note printed by `init` about a manual first-run/auth step this CLI needs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `seed_files`                       |          | `()`               | Project-relative gitignored configs (MCP/CLI settings) a `git worktree add` checkout omits; `provision_worktree` copies them into isolated dev/review worktrees. Must be relative.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `env_fault_patterns`               |          | `()`               | Regex patterns matched line-by-line against the ANSI-stripped tail of a **non-completed** (`timeout`/`stalled`/`crashed`) session's log to classify a transport/API **environment fault** (#194); a match stamps `env_fault` / `env_fault_evidence` on the `SessionResult`. **Which log is per-adapter**, named by `EnvFaultMixin.ENV_FAULT_LOG_SUFFIX`: the tmux adapters scan the pane capture `logs/<task-id>.log`, `opencode-http` scans `logs/<task-id>.server.out` (the `opencode serve` process's own stdout) and never its `.log` conversation transcript, and `cursor-sdk` scans `logs/<task-id>.sidecar.err` (the Node sidecar's own stderr) and never its `.log` event stream. A pattern is only **sound** if the model cannot write to the log it is matched against — a pane capture carries the model's own output, so a story that merely _implements_ rate limiting prints `429`/`quota` in ordinary healthy work. So for a pane-capture profile a pattern must reproduce one of the CLI's **complete error sentences**, taken from captured output. An error-shaped token **plus** a cause on the same line is _not_ sufficient — that is exactly the shape a story writing about the error produces, and it is why the previous doctrine had to be withdrawn (#507). A shipped pattern must also not match **its own line in the profile file**, or a session that prints or diffs its profile reads its own configuration as an outage; the seeded patterns carry single-character classes (`t[o]`, `respons[e]`) for that, changing nothing about what they match and everything about what their source line matches. `test_shipped_patterns_do_not_match_their_own_profile_line` pins the self-match rule and `test_pane_capture_patterns_do_not_match_this_repo` extends the same scan to every tracked file, so a doc bullet or profile comment written in the forbidden shape fails the suite. No quota patterns are seeded for the pane-capture profiles: no captured line exists, and that vocabulary is what a rate-limiting story prints all day. Must be a **list of strings**; compiled and validated at parse time (an invalid regex is a profile error). Matched with the `regex` module under a per-pattern timeout (`ENV_FAULT_MATCH_TIMEOUT_S`), so a pathological pattern can't hang a session teardown. Seeded for `claude` (three patterns over its captured error sentences — connection loss and the two captured provider 5xx refusals, whose statuses are enumerated rather than ranged so an uncaptured `503` stays prose, #507) and `opencode` (provider quota/rate-limit + connection, #323); empty = inert. |
 
 ### `HookSpec` (the `[hooks]` table)
 
@@ -480,7 +571,7 @@ Three frozen dataclasses cross the seam:
   window id, HTTP session id, …), `launched_ns` (wall-clock ns just before launch;
   the floor for hook events).
 - **`SessionResult`** (returned by `wait_for_completion`) — `status` (one of
-  `completed`, `stalled`, `timeout`, `crashed`, `over_budget`), `result_json`,
+  `completed`, `stalled`, `timeout`, `crashed`, `over_budget`, `aborted`), `result_json`,
   `session_id`, `transcript_path`, and the optional post-mortem forensics
   `env_fault` / `env_fault_evidence` (set by `_classify_env_fault` when a
   non-completed session is matched as a transport/API **environment fault** —
@@ -492,7 +583,19 @@ Required (abstract):
 
 - `start_session(spec) -> SessionHandle` — launch the session.
 - `wait_for_completion(handle, spec) -> SessionResult` — block until the session
-  ends (or stalls/times out), then report status.
+  ends (or stalls/times out), then report status. Poll
+  `runs.read_stop_request_mode(run_dir) == "hard"` on both sides of the loop's
+  own blocking wait and return `SessionResult(status="aborted")` when it is true
+  (#319): that is what makes `bmad-loop stop` land mid-session where a signal to
+  the engine cannot be delivered. Return the verdict — never raise, never unlink
+  the file (the engine consumes it and attributes the stop). Keep that wait
+  short — both bundled adapters cap theirs at 5s and inherit the poll from
+  `_ResultFileMixin` — but do not read it as a bound on the stop: a dispatch leg
+  that waits out an artifact grace or blocks on a transport call outlasts
+  `stop_run`'s 10s grace window on its own, and the force-kill backstop is what
+  catches that. Skipping it is
+  not fatal: the engine still honors the request at the next item boundary, which
+  is where an adapter without the poll leaves the operator waiting.
 
 The base class provides `run(spec)`, the template that chains
 `start_session` → `wait_for_completion` → `kill` (the kill runs in a `finally`).
@@ -510,7 +613,11 @@ neither leaves them alone):
   non-`completed` result with `result_json is None`. An adapter may re-inspect
   its post-mortem log tail and stamp `env_fault` / `env_fault_evidence` on the
   result (see the `env_fault_patterns` profile key). Because it runs after the
-  reconcile, a rescue-to-`completed` is never re-classified.
+  reconcile, a rescue-to-`completed` is never re-classified. Mixing in
+  `EnvFaultMixin` supplies the profile-driven implementation for free; set its
+  `ENV_FAULT_LOG_SUFFIX` if your adapter's diagnostics do not land in
+  `logs/<task-id>.log`, since the file scanned is part of the patterns' safety
+  contract.
 
 Optional capabilities (default to "unsupported" / no-op):
 
@@ -531,15 +638,8 @@ shipped non-tmux adapter: it drives [OpenCode](https://opencode.ai) entirely ove
 `opencode serve`'s HTTP API + SSE event stream (`injection = "http"`,
 `observation = "sse"`, `state = "remote"`). Every API fact it relies on was
 pinned live against a real 1.18.2 binary and is recorded in the module's
-API-contract docstring — start there when the upstream API drifts. Its design
-
-`cursor-sdk` is the other shipped non-profile provider. It registers through
-[`adapters/adapter_kinds.py`](../src/bmad_loop/adapters/adapter_kinds.py), which is the narrow
-seam for transports that cannot use tmux hooks. Its Node sidecar emits an in-band terminal
-sentinel; `runsetup.make_adapters`, installation, validation, and worktree provisioning consume
-the kind's hookless `CLIProfile` metadata just as they do any other provider.
-
-OpenCode's implementation decisions worth stealing:
+API-contract docstring — start there when the upstream API drifts. The design
+decisions worth stealing:
 
 - **One server per session.** The API has no per-session env, but the engine's
   `BMAD_LOOP_*` contract must reach tool subprocesses — so each session gets its
@@ -566,7 +666,10 @@ OpenCode's implementation decisions worth stealing:
   `perm ask:` / `perm reply:` / `error:` lines), `<task-id>.server.out` takes the
   server's own stdout so it cannot drown that transcript, and
   `<task-id>.sse.jsonl` keeps the raw frames for post-hoc debugging (behind the
-  `sse_trace` module knob, per-token deltas excluded). The catch of curating:
+  `sse_trace` module knob, per-token deltas excluded). That split is also a
+  safety boundary: env-fault classification points `ENV_FAULT_LOG_SUFFIX` at
+  `<task-id>.server.out` and never at the curated transcript, whose lines are the
+  model's own words. The catch of curating:
   what you render is only as good as the event names you pinned — check every
   branch against the running binary, not against the names that read plausibly.
 - **Hookless profile.** The profile sets `[hooks] dialect = "none"`: no hook
@@ -575,7 +678,7 @@ OpenCode's implementation decisions worth stealing:
   and copy normally — opencode discovers `.claude/skills/<name>/SKILL.md`
   natively.
 - **Reuse the synthesis mixins, never fork them.** `_ResultFileMixin`
-  (`result.json` read-back) and `_DevSynthesisMixin` (the whole bmad-dev-auto
+  (`result.json` read-back) and `_DevSynthesisMixin` (the whole bmad-build-auto
   dev/review synthesis machinery) live in
   [`adapters/generic.py`](../src/bmad_loop/adapters/generic.py).
   `OpencodeDevAdapter(_DevSynthesisMixin, OpencodeHttpAdapter)` plugs into two
@@ -596,10 +699,180 @@ adapter against a scripted stdlib FakeOpencode (no binary, no network beyond
 smoke-checks the pinned HTTP contract against a real local binary — skipped
 when absent, zero tokens spent.
 
+### Worked example: the cursor-sdk adapter
+
+[`adapters/cursor_sdk.py`](../src/bmad_loop/adapters/cursor_sdk.py) is the second
+shipped non-tmux adapter, and the useful contrast: Cursor's headless agent is a
+**Node library** (`@cursor/sdk`), not a program with a terminal, so there is
+nothing to inject a prompt into and no hook dialect to register. The adapter
+spawns one short-lived Node process per session
+([`data/cursor-sidecar.mjs`](../src/bmad_loop/data/cursor-sidecar.mjs)) and reads
+its stdout (`injection = "launch-flag"`, `observation = "stream"`,
+`state = "local-json-tree"`). It is selected exactly like every other family — the
+packaged `cursor-sdk` profile's `adapter` field naming the kind registered in
+`registry.py` with `needs_mux = false`.
+
+What is worth copying from it:
+
+- **Own the wire when you can.** The sidecar is bmad-loop's own code, so its
+  protocol is a contract rather than something probed off a third-party binary:
+  NDJSON on stdout, one line per SDK stream event, then exactly one sentinel
+  object. The sentinel is the turn-end signal — this transport's `Stop` — so
+  completion is unambiguous, and every sidecar exit path emits one, including
+  its own error paths.
+- **Split the streams by who can write to them.** stdout carries the SDK event
+  stream and therefore the model's own words; stderr goes to a separate
+  `logs/<task-id>.sidecar.err`, and that is what `ENV_FAULT_LOG_SUFFIX` names.
+  Same split, same reason, as opencode's `.server.out` — see the
+  `env_fault_patterns` row in the field table.
+- **Empty the budgets you cannot spend.** A `@cursor/sdk` run is one
+  `agent.send` with no mid-run injection channel, so the dev variant zeroes the
+  stall grace, the wake-nudge budget and the contract nudge rather than leaving
+  them armed against a channel that does not exist.
+- **Point `skill_tree` at a tree that already has the dev primitive.** Cursor
+  loads `.claude/skills/` for compatibility, and that is where the BMAD installer
+  puts `bmad-build-auto`. Choosing `.cursor/skills/` instead would have given the
+  provider a tree holding only the bundled `bmad-loop-*` skills, and every
+  dev/review leg would dispatch a skill that is not there.
+- **A runtime that cannot be a Python dependency gets a `provision` thunk.**
+  `@cursor/sdk` is an npm package, so it rides
+  [`AdapterKind.provision`](../src/bmad_loop/adapters/registry.py) —
+  `bmad-loop init --provision cursor-sdk` installs it under `~/.bmad-loop/cursor-sdk`
+  (override with `BMAD_LOOP_CURSOR_SDK_DIR`). Nothing in a run path ever calls a
+  provisioner; it touches the network, so it stays human-triggered.
+  `bmad-loop validate` reports the three preconditions — Node ≥ 22.13, the
+  provisioned runtime, and `CURSOR_API_KEY` — as `adapter.cursor-sdk` findings.
+
+[`tests/test_cursor_sdk.py`](../tests/test_cursor_sdk.py) drives the whole
+transport against a scripted fake sidecar injected through the `_sidecar_argv`
+seam: real spawn, real stdout pump, real verdicts, no Node and zero tokens.
+
+### Shipping a new adapter class out-of-tree
+
+How does a new adapter class ever get _selected_ when it lives in its own package?
+Which class drives a CLI is data — the profile's `adapter` field, resolved against
+the adapter registry
+([`adapters/registry.py`](../src/bmad_loop/adapters/registry.py)) — so a
+co-installed package registers its own kind with no edit to any core `.py`, exactly
+as a transport backend ships via `bmad_loop.mux_backends`
+([the transport contract](#the-transport-contract-for-a-backend-author)).
+
+Advertise **two entry points** in the package's `pyproject.toml`:
+
+- **`bmad_loop.adapters`** → a module whose import registers the kind. Core scans
+  the group and imports each advertised module (after the builtins, so a bundled
+  name always keeps first registration) before it resolves any adapter:
+
+  ```python
+  # acme_adapter/__init__.py
+  from bmad_loop.adapters.registry import AdapterBuilder, register_adapter
+
+  def _load():                       # lazy: imported only when a run builds this kind,
+      from .acme import AcmeAdapter, AcmeDevAdapter   # so an optional dep stays unpaid
+      return AdapterBuilder(
+          plain=AcmeAdapter,          # the plain class
+          dev=AcmeDevAdapter,         # the _DevSynthesisMixin-composed dev/review class
+          construct_error=(),         # exception type(s) __init__ may raise; () = none
+      )
+
+  register_adapter("acme", needs_mux=True, load=_load)   # needs_mux: does it drive a multiplexer?
+  ```
+
+  A family whose runtime cannot be a Python dependency adds a fourth argument,
+  `provision=` — a thunk `bmad-loop init --provision acme` calls, returning
+  progress notes and raising `registry.ProvisionError` on failure. It is never
+  called from a run path. `cursor-sdk` is the bundled example.
+
+  ```toml
+  # pyproject.toml
+  [project.entry-points."bmad_loop.adapters"]
+  acme = "acme_adapter"
+  ```
+
+- **`bmad_loop.profiles`** → a callable returning `CLIProfile`s (or an iterable of
+  them), so the profile that _selects_ your kind ships with it — no project TOML
+  required. Precedence is packaged < entry-point < project, so a project TOML can
+  still override it:
+
+  ```python
+  # acme_adapter/__init__.py  (same package)
+  from bmad_loop.adapters.profile import CLIProfile, HookSpec
+
+  def profiles():
+      return [CLIProfile(name="acme", binary="acme", adapter="acme",
+                         hooks=HookSpec("none", "", {}))]
+  ```
+
+  ```toml
+  [project.entry-points."bmad_loop.profiles"]
+  acme = "acme_adapter:profiles"
+  ```
+
+The two entry-point **values** differ on purpose: the adapter group's is a bare
+module path (core only imports it — registration is the import's side effect, and
+the entry-point name is just a diagnostic label), while the profile group's names a
+provider object core actually calls. Installing the package into bmad-loop's
+environment is the entire setup — e.g.
+`uv tool install bmad-loop --with <your-adapter>` — with no core edit and no config
+step.
+
+Once co-installed, `bmad-loop adapters` lists the kind and the profiles that select
+it, `bmad-loop validate` checks the reference (an `adapter.kind` finding, resolved
+against the live registry — never a hardcoded set), and a run whose policy
+`[adapter] name` points at a profile carrying `adapter = "acme"` selects it. Note
+those are two different keys: policy's `[adapter] name` picks the **profile**; the
+profile's own `adapter` field picks the **kind**.
+
+A broken package can never break selection: the failure is recorded and reported by
+`bmad-loop adapters` (a `warning: external adapter '<name>' failed to load: <reason>`
+line, and the same for a failed profile provider) and by the `validate` preflight,
+and selection proceeds without it. There is no out-of-tree adapter-**class** package
+to copy yet; the packaging pattern is identical to the transport axis's
+[bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr), which
+registers a `TerminalMultiplexer` rather than an adapter class.
+
+Two seam facts worth internalizing:
+
+- **`needs_mux`** gates whether the run bootstrap resolves and usability-checks the
+  shared terminal multiplexer for your family. A tmux/hook family sets it `True`; a
+  self-hosted HTTP/SSE family (like opencode) sets it `False` and is never handed a
+  `mux`.
+- **The `dev` / `plain` split is a pipeline concept, not a per-family branch.** When
+  a dev/review session runs the dev primitive (which writes no `result.json`), the
+  bootstrap builds the `dev` variant — the `_DevSynthesisMixin`-composed class — and
+  threads the project `paths` into it so it can synthesize the result from the spec
+  on disk; every other role builds `plain`. Both variants of a family share the
+  `(*args, paths, **kwargs)` dev `__init__` contract, so honoring it is all an
+  out-of-tree class must do to slot into that machinery.
+- **The bootstrap's keyword set grows.** Accept `**kwargs` in both variants.
+  `runsetup.make_adapters` builds every class with `cls(**build_kwargs)`, and that
+  dict is a _description of the run_ — `run_dir`, `policy`, `profile`, the usage and
+  nudge settings, `events_dir` (the run's hook-event channel), plus `mux` for a
+  `needs_mux=True` kind and `paths` for the `dev` variant. Core adds to it as the run
+  gains things worth describing; `events_dir` arrived that way (#494). A class with a
+  closed signature raises `TypeError` on the first keyword it has not heard of,
+  before the session starts.
+
+  The bundled families carry closed signatures instead, which is not a second
+  pattern to copy: they are edited in the same commit that adds the keyword, and an
+  out-of-tree class cannot be. What they do model is the other half of the
+  obligation — accept what you have no use for rather than refusing it.
+  `opencode_http` takes `events_dir` and immediately `del`s it, because that family
+  observes over SSE and fires no hooks, so there is no channel for it to point at.
+
+An entry-point profile is held to the same invariants a TOML profile is (hook
+dialect, path containment, `env_fault_patterns` compilation, …): it is validated on
+arrival, so a provider that ships an invalid profile is reported rather than
+half-installed.
+
 ### References
 
-- [`adapters/opencode_http.py`](../src/bmad_loop/adapters/opencode_http.py) — the
+- [`adapters/registry.py`](../src/bmad_loop/adapters/registry.py) — the adapter-kind
+  registry and the two entry-point scans described above.
+- [`adapters/opencode_http.py`](../src/bmad_loop/adapters/opencode_http.py) — a
   worked example above: a real non-tmux (HTTP/SSE) transport.
+- [`adapters/cursor_sdk.py`](../src/bmad_loop/adapters/cursor_sdk.py) — the other
+  worked example: a Node-sidecar transport with a provisioned runtime.
 - [`adapters/mock.py`](../src/bmad_loop/adapters/mock.py) — the test-only reference
   implementation.
 - [`adapters/generic.py`](../src/bmad_loop/adapters/generic.py) — the tmux +

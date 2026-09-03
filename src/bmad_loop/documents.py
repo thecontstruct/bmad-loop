@@ -46,8 +46,8 @@ if TYPE_CHECKING:
     from .checks import ValidationReport
     from .model import RunState
     from .operatoractions import ParkedStory
+    from .runs import RunInfo
     from .sweep import Decision
-    from .tui.data import RunInfo
 
 
 VALIDATE_SCHEMA_VERSION = 1
@@ -66,7 +66,7 @@ def validate_document(
     failure to produce one (see machine.py on parsing non-empty stdout whatever
     the exit code).
 
-    Three things a consumer has to know:
+    Four things a consumer has to know:
 
     - **``message`` is not contracted.** Several problems are a bare ``str(e)``
       from the config, policy, profile and sprint-status exceptions, so their
@@ -77,7 +77,18 @@ def validate_document(
       no finding at all. A check id missing from ``findings`` means "did not run",
       never "passed" — check ``ok`` for the verdict, not the absence of an id.
     - **``mux.backends-detected`` is gated on more than one registered backend**,
-      so a lone-tmux host carries no backend inventory. Same rule as above.
+      so a lone-tmux host carries no backend inventory. Same rule as above. The one
+      exception to its ``ok`` severity is a detection failure, which reports under
+      the same id at ``warning`` and carries no ``detail`` at all — read the
+      severity, never index ``detail["backends"]`` without a null check.
+    - **``mux.selection`` is not gated on the reason.** It used to appear only for a
+      forced ``env``/``policy`` choice and now names the reason wherever selection
+      resolves. It is absent whenever no backend row is *selected*, which has three
+      causes: a forced name matching no registered backend (``mux.preflight``
+      carries that failure), a detection failure (the ``warning`` above carries
+      it), and ``_select`` bottoming out at its historical tmux fallback with tmux
+      unregistered (nothing else reports that — the inventory simply holds no
+      selected row). Same rule as above.
 
     ``findings`` stays flat and in emission order rather than grouped by severity:
     grouping would destroy the cross-severity ordering (the order the gates ran)
@@ -232,9 +243,11 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
     derived from state.json alone — never from live policy or other project
     files — so a consumer can reproduce the document, and the weight matches
     what the run actually enforced (see run_token_totals). The one exception is
-    ``graceful_stop_pending``: liveness plus the presence of the control file is
-    not in state.json, so the caller supplies it (default False keeps the
-    builder a pure projection); ``status`` itself is unaffected.
+    ``graceful_stop_pending``: liveness plus a *graceful*-mode stop-request
+    control file is not in state.json, so the caller supplies it (default False
+    keeps the builder a pure projection); ``status`` itself is unaffected. The
+    mode read is exact — a lodged hard request (#319) is a stop in flight, not a
+    graceful stop pending, and reports False here.
 
     Two adapter-identity keys (#153 phase 3), both derived from the snapshot and
     the recorded sessions — never live policy — and deliberately named apart:
@@ -318,6 +331,12 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
             "weighted": weighted_total,
         },
         "adapters": adapters,
+        # auto-sweep triggers the run did not deliver, trigger -> reason slug
+        # (model.SWEEP_REFUSED_*). Always present, `{}` when nothing was refused:
+        # a key that appears only on the failing run makes "absent" ambiguous
+        # between "swept fine" and "old state.json". Additive per machine.py, so
+        # STATUS_SCHEMA_VERSION does not move.
+        "sweeps_refused": dict(state.sweeps_refused),
         "tasks": tasks,
     }
 
@@ -354,7 +373,7 @@ def list_document(infos: list[RunInfo]) -> dict[str, object]:
     }
 
 
-CLEANUP_SCHEMA_VERSION = 1
+CLEANUP_SCHEMA_VERSION = 2
 
 
 def cleanup_document(
@@ -364,6 +383,10 @@ def cleanup_document(
     live: list[str],
     unknown: set[str],
     windows: list[str],
+    windows_survived: list[str],
+    windows_unverifiable: list[str],
+    scan_error: str | None = None,
+    legacy_leftovers: list[str] | None = None,
 ) -> dict[str, object]:
     """The `cleanup --json` document: the multiplexer artifacts this invocation
     removed, or — under ``--dry-run`` — would remove.
@@ -379,6 +402,42 @@ def cleanup_document(
     empty. It never blocks cleanup: pruning kills the tmux session, never the
     engine pid. Nothing to clean up is a valid document of empty lists at
     exit 0, never an error.
+
+    `ctl_windows` is a three-way partition, disjoint by window id (the values
+    are names): `removed` was verified gone after the kill, `survived` was still
+    listed, and `unverifiable` is a kill whose outcome could not be probed at
+    all. Schema 2 narrowed `removed` from "a kill was attempted" to "the window
+    is verifiably gone" (#435) — a meaning change, hence the version bump rather
+    than a bare field addition. Under `--dry-run` nothing is killed, so `removed`
+    is the would-close plan and the other two are empty — the shared
+    plan/outcome shape holds, with `dry_run` still the field that says which one
+    you are holding.
+
+    `ctl_windows.scan_error` is the candidate scan failing before any window was
+    chosen or killed: the three arms are empty and mean "no answer", not
+    "verified empty". Without it, a failed preflight is indistinguishable from a
+    clean scan that found nothing — automation reading the document would accept
+    the empty partition and skip cleanup it still owes. The `unverifiable_pid`
+    precedent: the degradation travels in the document, not only on stderr.
+    `null` when the scan reported no failure — which is as much as this document
+    can promise: the seam's listing call degrades a transport fault to an empty
+    listing by contract (the sentinel-returner half of the multiplexer seam), so
+    that one fault mode still reads as an empty scan. The same documented
+    ceiling as prune_ctl_windows' post-kill probe; narrowing it is seam work,
+    not a document field.
+
+    `sessions.legacy_leftovers` is the migration's remainder: session NAMES (not
+    run ids — the control session has no run id) that a legacy multiplexer
+    registry still holds and that cleanup deliberately did not remove. Additive,
+    so no schema bump: a consumer that does not know the key reads exactly what it
+    read before. Empty on every platform and every already-migrated machine. See
+    `runs.legacy_registry_leftovers` for what qualifies and why; the text mode
+    prints the same list on stderr, the `unverifiable_pid` precedent.
+
+    `sessions.removed` did NOT get the same treatment and is still the pre-kill
+    prunable partition — an *attempted* kill, since `kill_session` is best-effort
+    and silent in exactly the way `kill_window` is. #435 narrowed the windows
+    half only; read the sessions half with that in mind.
     """
     return {
         "schema_version": CLEANUP_SCHEMA_VERSION,
@@ -387,8 +446,14 @@ def cleanup_document(
             "removed": list(killed),
             "live": list(live),
             "unverifiable_pid": sorted(unknown),
+            "legacy_leftovers": list(legacy_leftovers or []),
         },
-        "ctl_windows": {"removed": list(windows)},
+        "ctl_windows": {
+            "removed": list(windows),
+            "survived": list(windows_survived),
+            "unverifiable": list(windows_unverifiable),
+            "scan_error": scan_error,
+        },
     }
 
 
@@ -407,6 +472,7 @@ def clean_document(
     deleted: list[str],
     protected: list[str],
     unverifiable_pid: list[str],
+    state_dirs_swept: int,
 ) -> dict[str, object]:
     """The `clean --json` document: the disk this invocation reclaimed, or —
     under ``--dry-run`` — would reclaim.
@@ -420,20 +486,31 @@ def clean_document(
     this number, and formatting is the renderer's job. It is the same estimate
     the text prints: measured before mutating (so it holds under --dry-run) and
     approximate by construction, since it sums whole run dirs for archive/delete
-    but only the `worktrees/` tree for a trim.
+    but only the trimmed scaffolding (`runs.heavy_run_entries`) for a trim.
 
     Every list names items the text enumerates or counts: `worktrees` holds
     absolute worktree paths, the rest hold run ids. `protected` is the runs left
-    untouched — `--keep`-listed or non-terminal — which the text reports only as
-    a count. `unverifiable_pid` is the subset of touched runs whose engine
-    liveness could not be proven; it is the text mode's stderr warning, carried
-    in the document so JSON mode leaves stderr empty, and it never blocks
-    reclamation.
+    untouched — `--keep`-listed, non-terminal, or carrying a live agent session,
+    which protects a run wherever it sits relative to the retention window
+    (reclaiming it would strand the session, #419) — which the text reports only
+    as a count. `unverifiable_pid` is the subset
+    of touched runs whose engine liveness could not be proven; it is the text
+    mode's stderr warning, carried in the document so JSON mode leaves stderr
+    empty, and it never blocks reclamation.
 
     `policy.retain` is the *effective* window — `--retain` when given, else
     `[cleanup] run_retention`. The other three are the configured policy as
     loaded. Note `--hard` overrides `archive_old` for this invocation only, so
     it does not change the reported value; the outcome shows in `deleted`.
+
+    `state_dirs_swept` counts the orphaned out-of-tree control-plane dirs the
+    invocation reclaimed (#494) — run state dirs under the user-scoped state root
+    with no run dir left to own them. A count rather than a list, because that is
+    exactly what the text mode reports and the paths name a location outside the
+    project that no caller acts on per-item. It is an additive field on the
+    existing schema version: a v1 consumer reads every field it already knew.
+    Those dirs hold only consumed event files, so their bytes are not in
+    `freed_bytes` — an accepted under-count of a few kilobytes at most.
     """
     return {
         "schema_version": CLEAN_SCHEMA_VERSION,
@@ -451,4 +528,5 @@ def clean_document(
         "deleted": list(deleted),
         "protected": list(protected),
         "unverifiable_pid": list(unverifiable_pid),
+        "state_dirs_swept": state_dirs_swept,
     }

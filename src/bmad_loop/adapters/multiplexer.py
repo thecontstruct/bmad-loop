@@ -12,10 +12,13 @@ and slots in without the rest of the codebase shelling out to ``tmux`` directly.
 ``TerminalMultiplexer`` is the contract a backend author implements. Operation
 names mirror today's call sites verbatim so the migration is mechanical. Backends
 register themselves through :func:`register_multiplexer` (bundled ones from
-:func:`_load_builtin_backends`; out-of-tree ones at import time, triggered by the
-``bmad_loop.mux_backends`` entry-point scan in :func:`_load_external_backends` —
-so a pip/uv co-installed adapter package is selectable with no config step); the
-process-wide backend is selected by registry and returned by :func:`get_multiplexer`.
+:func:`_load_builtin_backends`, which :func:`register_multiplexer` seeds first so
+a bundled name keeps first-wins no matter who registers earliest; out-of-tree
+ones at import time — usually the ``bmad_loop.mux_backends`` entry-point scan in
+:func:`_load_external_backends`, so a pip/uv co-installed adapter package is
+selectable with no config step, but *any* import reaches it, a plugin's
+``[python]`` module included); the process-wide backend is selected by registry
+and returned by :func:`get_multiplexer`.
 
 Selection precedence (issue #87): the ``BMAD_LOOP_MUX_BACKEND`` env var, then the
 policy ``[mux] backend`` choice (installed once per CLI invocation via
@@ -37,6 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import envvars
+from .entrypoints import record_load_error
 
 
 class MultiplexerError(Exception):
@@ -90,9 +94,37 @@ class TerminalMultiplexer(ABC):
 
     # ----------------------------------------------------------- sessions
 
+    def session_name_key(self, name: str) -> str:
+        """Canonical comparison key for a session name on this transport: two
+        names denote the same live session exactly when their keys are equal.
+
+        Identity by default — tmux resolves session names case-sensitively
+        (measured on 3.4: ``bmad-loop-ctl`` and ``bmad-loop-CTL`` coexist), so
+        exact comparison is the truth there. A transport that resolves names
+        through a case-folding store overrides (psmux: the registry is a
+        directory of per-session files opened by name, and NTFS opens names
+        case-insensitively). Non-abstract so released out-of-tree backends
+        keep their exact-comparison behavior unchanged.
+
+        This is where "are these the same session name?" gets its answer:
+        core must never decide it with a constant, because the same fold that
+        is required on one transport destroys data on the other — a
+        case-variant agent session discounted as "the control session" on
+        tmux is a genuinely live session whose run dir then gets deleted."""
+        return name
+
     @abstractmethod
     def has_session(self, name: str) -> bool:
-        """True iff a session named exactly ``name`` exists."""
+        """True iff a session named exactly ``name`` exists.
+
+        Weak False (#489): a False means the backend did not *confirm* the
+        session, not that it provably no longer exists — implementations map
+        any failed lookup ("no such session", "no server running", a target
+        the grammar could not parse) to False alike. A transport failure
+        (the backend could not be asked at all) raises ``MultiplexerError``
+        rather than returning False. Callers that surface a False as
+        evidence must word it as what the negative withdraws, not what it
+        proves — see ``escalation.session_failure_reason``."""
 
     @abstractmethod
     def new_session(
@@ -158,7 +190,13 @@ class TerminalMultiplexer(ABC):
         """Create a window that runs ``argv`` then *parks* — waiting on a key so
         the exit status stays inspectable instead of the window closing the moment
         the process exits — and finally returns an attached client to its origin
-        (keyed by the per-window ``return_opt``). Returns the native window id."""
+        (keyed by the per-window ``return_opt``). Returns the native window id.
+
+        That id is **opaque to core** exactly as :meth:`new_window`'s is, so a
+        backend MAY return an already-qualified target rather than a bare id
+        (psmux returns ``session:@N``) — and an obligation follows from that
+        choice here too, a different pairing than :meth:`new_window`'s: for the
+        form it binds the id to, see :meth:`list_window_ids`'s note on #482."""
 
     @abstractmethod
     def list_window_ids(self, session: str) -> list[str]:
@@ -172,10 +210,11 @@ class TerminalMultiplexer(ABC):
         server per session), so a bare ``@N`` replayed as a ``-t`` target
         routes by the *caller's* server instead of the owning one.
 
-        :meth:`new_parked_window` is *outside* the rule — nothing
-        membership-tests a parked id, it is only replayed as a ``-t`` target by
-        the TUI — so a backend MAY mint it in a form this list never carries
-        (psmux happens to qualify it too, #291).
+        :meth:`new_parked_window` is outside *this* list's rule. To preserve
+        #482's unambiguous lookup, however, its id must match the ``window_id``
+        column of :meth:`list_windows` (psmux qualifies both, #291). A backend
+        that diverges remains usable, but falls back to the ambiguous by-name
+        lookup whenever several kinds share a run id.
 
         Raises :class:`MultiplexerError` if the transport itself fails (timeout /
         missing binary): an empty list means "no windows" and must not be
@@ -190,7 +229,13 @@ class TerminalMultiplexer(ABC):
         probe, so a sentinel is safe).
 
         A ``window_id`` column carries the same id form :meth:`current_window_id`
-        returns; core compares the two directly."""
+        AND :meth:`list_window_ids` return; core compares all three directly. The
+        second pairing is load-bearing for the ctl-window prune's kill verdict,
+        which is a membership test of this column against that listing
+        (:func:`bmad_loop.tui.launch.prune_ctl_windows`): a backend that
+        qualifies one side and not the other reports every killed window as
+        verifiably gone — silently, and in the optimistic direction the verdict
+        exists to remove (#435)."""
 
     @abstractmethod
     def window_alive(self, session: str, window_id: str) -> bool:
@@ -294,18 +339,42 @@ class TerminalMultiplexer(ABC):
         instead (psmux counts the session's attached clients across the call).
         Callers that only want the terminal handed back may ignore the answer;
         the parked-window return path cannot — it clears its return option on a
-        True, and a vacuous one strands the human, while a False is positive
-        evidence that nobody is watching this window any more (see
+        True, and a vacuous one strands the human. It reads a False as
+        UNREACHABLE: on tmux that is positive evidence nobody is watching this
+        window any more, but off tmux the same False also covers an effect the
+        backend could not observe and a backend with no detach verb at all, so
+        the response is a policy for the uncertainty rather than proof (see
         tui.launch.return_attached_client)."""
 
     @abstractmethod
-    def switch_client(self, target: str, last_fallback: bool = False) -> bool:
+    def switch_client(self, target: str, last_fallback: bool = False) -> bool | None:
         """Switch the current client to ``target`` (optionally falling back to
-        the last client on failure). Returns True iff a switch happened — the
-        same effect-not-dispatch rule as :meth:`detach_client`, so a transport
-        failure returns False and a backend whose CLI cannot report the move
-        measures it or answers False. ``target`` is a :meth:`target` token or a
-        backend-native id."""
+        the last client on failure). ``target`` is a :meth:`target` token or a
+        backend-native id.
+
+        Three answers, because the parked-window return path asks two questions
+        of the one verb — did the switch happen, and is anyone still at this
+        terminal:
+
+        - ``True`` — a switch happened. Effect, not dispatch, the same rule as
+          :meth:`detach_client`.
+        - ``False`` — the **joint** claim: no switch happened *and* the client
+          is still here. The verb ran, refused, and moved nobody.
+          :func:`tui.launch.return_attached_client` reads it as ATTENDED and
+          keeps prompting this terminal, so do not answer it for the first half
+          alone.
+        - ``None`` — cannot vouch for the second half: the verb's answer never
+          arrived (a timed-out call), its effect was unobservable, or there was
+          no client here to move. That reads as UNREACHABLE — the sweep keeps
+          its return option but stops prompting, which is the safe way to be
+          wrong, since prompting into a window nobody is viewing blocks a
+          ``--repeat`` sweep on ``input()`` forever and the parked trailer's
+          retry cannot recover it (it sits behind that same blocking read).
+
+        A backend that never widened to the third state keeps working — a bool
+        is a valid answer and the seam only loses a distinction that backend
+        never drew. What no backend may do is answer ``False`` for a move it
+        merely could not confirm, or a vacuous ``True`` (#659)."""
 
     @abstractmethod
     def available(self) -> bool:
@@ -330,6 +399,93 @@ class TerminalMultiplexer(ABC):
         folding backend keeps the identifying version in the first segment."""
         return None
 
+    def version_error(self) -> str | None:
+        """Why the most recent :meth:`version` call answered None despite the
+        binary being there — a crashing probe, a hung server, an AV-blocked exe.
+        None when that call succeeded, when there was no binary to ask, when no
+        probe has run yet, or when the backend keeps no such record (the default
+        here, so an out-of-tree backend inherits silence rather than breaking).
+
+        This is a *diagnostic*, not a second contract: `version()` keeps its None
+        sentinel (observation may degrade) and this only recovers the identity of
+        the failure it dropped, which is otherwise indistinguishable from "the
+        binary reports no version" (#428). Must not raise.
+
+        It describes the LAST probe, so read it directly after :meth:`version`,
+        **on an instance you own** — nothing recomputes it, a later successful
+        probe clears it, and the record is unsynchronized per-instance state. The
+        process-wide :func:`get_multiplexer` backend is shared across the TUI's
+        worker threads, so a caller reading the accessor off THAT instance can be
+        handed another thread's probe. :func:`detect_multiplexers` is the one
+        in-tree reader and builds its own instance per row."""
+        return None
+
+    def registry_root(self) -> str | None:
+        """The registry this backend's verbs currently resolve targets through,
+        or ``None`` when the backend has no registry namespace at all.
+
+        ``None`` is the default and the tmux answer: tmux addresses a server by
+        socket, and there is no root an operator could be pointed at. Backends
+        that DO namespace (see :meth:`legacy_registries` for the concept) answer
+        the root in force, so a frontend can disclose it — an operator whose own
+        client reads a different root sees none of these sessions, and is told
+        "no sessions" rather than an error.
+
+        A diagnostic, like :meth:`version_error`: must not raise, and a value it
+        cannot use (one the transport would reject) still comes back verbatim
+        rather than as ``None`` — "the root is unusable" and "there is no root"
+        are different facts and the caller acts on the difference.
+
+        ``None`` from a backend that DOES namespace means "no root in force":
+        its verbs then address the transport's own *default* registry, which is
+        shared with every project and with the operator. That is a different
+        fact from tmux's ``None`` (no namespace exists), and
+        :meth:`has_registry_namespace` is how a caller tells them apart."""
+        return None
+
+    def has_registry_namespace(self) -> bool:
+        """Whether this transport namespaces sessions by registry at all — a
+        property of the backend, independent of whether a root is currently in
+        force (see :meth:`registry_root` / :meth:`legacy_registries` for the
+        concept).
+
+        ``False`` is the default and the tmux answer: one server for the
+        machine, and ``registry_root() is None`` means exactly that. A backend
+        answering ``True`` here with ``registry_root()`` ``None`` is running on
+        its own default registry — shared, not this project's — which is what
+        ``runs._registry_proves_ownership`` needs to know before it lets an
+        untagged session be claimed on run-directory evidence."""
+        return False
+
+    def legacy_registries(self) -> list[TerminalMultiplexer]:
+        """Backends addressing *other* registries this one's own sessions may
+        still be living in, for the cleanup sweep. ``[]`` by default — a backend
+        with a single registry, tmux included, has nothing to sweep.
+
+        **The registry-namespace seam concept.** A *registry* is wherever a
+        multiplexer keeps the per-session addressing state its verbs resolve a
+        target through: for psmux, the ``PSMUX_DATA_DIR`` directory of
+        ``.port``/``.key`` files, one per session. It is a namespace, not a
+        filter — a session in registry A is not merely hidden from a verb aimed
+        at registry B, it is unaddressable from it. bmad-loop aims psmux at a
+        per-project root (``runs.mux_registry_root``), which is what makes this
+        method necessary: sessions created before that root existed are in
+        psmux's default registry, addressable only by a backend pointed there.
+
+        Each element must be an independent instance bound to its registry, and
+        must NOT work by mutating this process's environment: the callers include
+        a TUI worker thread running beside other threads issuing ordinary verbs,
+        and a global swap would silently aim one of *those* at the wrong
+        registry — the same live-session-reads-as-gone failure the per-project
+        root exists to prevent.
+
+        A porting note for a new OS or multiplexer: if the transport has no such
+        namespace, inherit this default and nothing else changes. If it does,
+        the seam wants the derivation in ``runs`` (keyed on the project, never on
+        the run or the shell) and the sweep here — see
+        ``docs/porting-to-a-new-os.md``."""
+        return []
+
     def window_pane_pids(self, target: str) -> list[int]:
         """Best-effort OS pids of ``target``'s pane root processes, for the kill
         escalation. Not abstract: backends that can't (or don't) report pids
@@ -344,7 +500,7 @@ class TerminalMultiplexer(ABC):
 # row past 350, unreadable for the same reason an embedded newline was (#321).
 # Length is half the seam's promise, not a separate concern. 80 keeps the widest
 # cell inside a standard terminal with room to spare over the real probes, which
-# fold to ~44 (`tmux 3.3.7; psmux 3.3.7 (05cc5d4 2026-07-20)`).
+# fold to ~42 (`tmux 3.4; psmux 3.3.8 (66cf613 2026-08-18)`).
 VERSION_MAX_CHARS = 80
 
 
@@ -392,8 +548,24 @@ def register_multiplexer(
 ) -> None:
     """Register a transport backend. ``matches(sys.platform)`` decides automatic
     selection; ``name`` is the key for the ``BMAD_LOOP_MUX_BACKEND`` override.
-    Bundled backends register from :func:`_load_builtin_backends`; an out-of-tree
-    backend calls this at import time — no core edit required."""
+    Bundled backends register from :func:`_load_builtin_backends`, seeded here
+    rather than only by the resolution entry points, so an out-of-tree package can
+    never shadow a bundled name. An out-of-tree backend calls this at import time
+    — no core edit required.
+
+    Seeding on *this* side is what makes first-wins an invariant instead of an
+    ordering coincidence. ``_BACKENDS`` is an ordered list and every consumer
+    takes the first entry under a name (:func:`_factory_by_name` and all three
+    :func:`_select` loops), so whichever registration lands first owns the name.
+    An external module runs its ``register_multiplexer`` calls as an import side
+    effect, and that import is not always triggered by a mux resolution: a
+    plugin's ``[python]`` module is exec'd in-process by ``plugins/registry.py``,
+    which has no ordering relationship to the first :func:`get_multiplexer` call.
+    Arriving first, it would land ahead of the bundled tmux entry and be selected
+    in its place. Seeding keeps the bundled entry first; the external stays behind
+    it, since this list appends rather than dedups — which is exactly what a
+    shadowed name should look like."""
+    _load_builtin_backends()
     _BACKENDS.append((name, matches, factory))
     get_multiplexer.cache_clear()  # a later registration must not be shadowed by a cached pick
 
@@ -402,17 +574,29 @@ def _load_builtin_backends() -> None:
     """Register the bundled backends — tmux (POSIX) and psmux (native Windows);
     every other backend is out-of-tree and arrives via
     :func:`_load_external_backends` or a manual import. Idempotent and lazy
-    (called from :func:`get_multiplexer`, not at
-    module import) to stay cycle-safe. Registers inline rather than via
+    (called from :func:`get_multiplexer` and from :func:`register_multiplexer`,
+    not at module import) to stay cycle-safe. Registers inline rather than via
     tmux_backend's import side effect so the registry can be cleared and
     re-loaded deterministically (a re-import is a no-op once cached) —
-    mirroring ``process_host._load_builtin_hosts``."""
+    mirroring ``process_host._load_builtin_hosts``.
+
+    The flag sits between the imports and the registrations, and both halves of
+    that position are load-bearing: below the imports so a transient import
+    failure leaves the seeding retryable, above the registrations because they
+    re-enter this function through :func:`register_multiplexer`. The adapter twin
+    sets it at the very top only because its builtins are lazy thunks with
+    nothing to import first."""
     global _BUILTINS_LOADED
     if _BUILTINS_LOADED:
         return
     from .psmux_backend import PsmuxMultiplexer
     from .tmux_backend import TmuxMultiplexer
 
+    # Set after the imports but BEFORE the registrations. Below the imports so a
+    # transient import failure still retries; above the registrations because they
+    # re-enter this function through register_multiplexer, and a flag set
+    # afterwards would recurse without end.
+    _BUILTINS_LOADED = True
     # tmux is the default everywhere except native Windows (no tmux binary there);
     # get_multiplexer still falls back to tmux when no backend matches. Builtins
     # register before externals, so tmux keeps first-wins on any name collision.
@@ -420,7 +604,6 @@ def _load_builtin_backends() -> None:
     # psmux speaks the tmux CLI through its own distinctly-named binary, so
     # native Windows gets the tmux-family backend with a PowerShell dialect.
     register_multiplexer("psmux", lambda platform: platform == "win32", PsmuxMultiplexer)
-    _BUILTINS_LOADED = True  # set only after a successful import so a transient failure retries
 
 
 # The entry-point group an out-of-tree backend package advertises its module
@@ -442,13 +625,32 @@ def _load_external_backends() -> None:
     and the ``validate`` preflight via :func:`external_backend_errors`), not
     raised. Unlike ``_BUILTINS_LOADED``, the loaded-flag is set up front: a
     third-party import failure is not transient, and retrying on every
-    selection would re-import (and re-fail) each time."""
+    selection would re-import (and re-fail) each time.
+
+    Entry points are visited in (name, distribution) order. ``importlib.metadata``
+    yields them in distribution-discovery order, which varies with ``sys.path``, so
+    without an explicit sort two hosts carrying the same packages could register a
+    collision in a different order — and the order failures are recorded in would
+    be a fact about the install rather than about the packages.
+
+    The distribution belongs in the key because the name alone is NOT a total
+    order. ``entry_points(group=...)`` does not dedup across distributions, so two
+    packages advertising the same entry-point name come back as two entries, and
+    ``sorted`` is stable — a name-only key resolves that tie straight back into
+    ``sys.path`` order.
+
+    Such a same-named failure now ACCUMULATES rather than overwriting: recording
+    goes through :func:`~.entrypoints.record_load_error`, which appends under the
+    entry-point name and labels each reason with its distribution."""
     global _EXTERNALS_LOADED
     if _EXTERNALS_LOADED:
         return
     _EXTERNALS_LOADED = True
     try:
-        eps = importlib.metadata.entry_points(group=MUX_BACKENDS_GROUP)
+        eps = sorted(
+            importlib.metadata.entry_points(group=MUX_BACKENDS_GROUP),
+            key=lambda e: (e.name, getattr(e.dist, "name", "") or ""),
+        )
     except Exception as exc:  # diagnostics path, never crash selection
         _EXTERNAL_ERRORS["<entry-point scan>"] = f"{type(exc).__name__}: {exc}"
         return
@@ -456,12 +658,17 @@ def _load_external_backends() -> None:
         try:
             ep.load()  # module import runs register_multiplexer(...)
         except Exception as exc:  # one bad package must not hide the rest
-            _EXTERNAL_ERRORS[ep.name] = f"{type(exc).__name__}: {exc}"
+            record_load_error(_EXTERNAL_ERRORS, ep, exc)
 
 
 def external_backend_errors() -> dict[str, str]:
-    """Entry-point name -> failure reason for every external backend that failed
-    to load this process (empty when all loaded). For diagnostics surfaces."""
+    """Entry-point name -> failure reason(s) for every external backend that failed
+    to load this process (empty when all loaded). For diagnostics surfaces.
+
+    One value may carry MORE than one reason, ``"; "``-joined: two distributions
+    may advertise the same entry-point name, and each of their failures is kept
+    (see :func:`~.entrypoints.record_load_error`). Each reason is labelled with
+    its distribution whenever one is resolvable."""
     return dict(_EXTERNAL_ERRORS)
 
 
@@ -638,6 +845,10 @@ class MuxBackendInfo:
     version: str | None
     selected: bool
     reason: str  # "" unless selected: env | policy | platform-default | first-match | fallback
+    # The diagnostic version() dropped, when it answered None with the binary
+    # present (TerminalMultiplexer.version_error). Defaulted so it is additive
+    # for anyone constructing this row positionally.
+    version_error: str | None = None
 
 
 def detect_multiplexers() -> list[MuxBackendInfo]:
@@ -666,6 +877,7 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
         except Exception:
             matches_platform = False
         version: str | None = None
+        version_error: str | None = None
         try:
             backend = factory()
             available = _usable(backend)
@@ -679,6 +891,14 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
                 version = fold_version(backend.version())
             except Exception:
                 version = None
+            if version is None:
+                # Read only after version(), which is what it describes, and
+                # only when there is a None to explain. Guarded like every other
+                # probe here — this function never raises.
+                try:
+                    version_error = backend.version_error()
+                except Exception:
+                    version_error = None
         selected = name == selected_name
         rows.append(
             MuxBackendInfo(
@@ -688,6 +908,7 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
                 version=version,
                 selected=selected,
                 reason=reason if selected else "",
+                version_error=version_error,
             )
         )
     return rows

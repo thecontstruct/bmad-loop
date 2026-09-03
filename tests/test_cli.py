@@ -3,29 +3,45 @@
 import argparse
 import io
 import json
+import ntpath
 import os
+import shutil
+import subprocess
 import sys
+import types
+from pathlib import Path
 
 import pytest
 import yaml
 from conftest import (
+    PROJECT_MARKER_CMD,
+    REPO_ROOT_MARKER_CMD,
+    UNRESOLVABLE,
     escalated_run,
     fault_read_text,
     git,
+    ignore_before_commit,
     install_bmad_config,
     install_build_auto_skill,
     install_dev_base_skills,
     install_dev_shim,
     machine_json,
     mark_ledger_done,
+    plant_root_markers,
+    refuse_to_resolve,
     spec_path,
+    write_gated_ledger,
     write_ledger,
+    write_repo_root_override,
+    write_script_launcher,
     write_spec,
     write_sprint,
 )
 
-from bmad_loop import cli
+from bmad_loop import cli, envvars, platform_util
 from bmad_loop import policy as policy_mod
+from bmad_loop import probe as probe_mod
+from bmad_loop import runs, runsetup, verify
 from bmad_loop.adapters import multiplexer as mux_mod
 
 STORIES_SPEC_FOLDER = "_bmad-output/epic-1"
@@ -60,6 +76,18 @@ def _write_policy(project, text=DUAL_CLIENT_POLICY) -> None:
     bmad_loop_dir = project / ".bmad-loop"
     bmad_loop_dir.mkdir(parents=True, exist_ok=True)
     (bmad_loop_dir / "policy.toml").write_text(text)
+
+
+def _config_pin(project) -> str:
+    """The host-exec config digest for a sandbox project as it stands — the launch
+    baseline `cmd_run` / `_resume_paused_run` pin (#461 point 4)."""
+    # Resolve the path the way the production baseline does. Hardcoding it would
+    # silently hand `policy_mod.load` a missing file (which returns all defaults)
+    # if that layout ever moved, turning every gate test below into a confusing
+    # digest mismatch instead of a pointer at the path.
+    return runsetup.config_digest(
+        policy_mod.load(cli._policy_path(project.project)), project.project
+    )
 
 
 def test_init_registers_hooks_for_all_policy_profiles(tmp_path):
@@ -1296,6 +1324,74 @@ def test_status_reports_a_parked_story_on_both_surfaces(project, capsys):
     assert parked_line.index("dev×") == done_line.index("dev×")
 
 
+def _run_with_refusals(project, refusals):
+    """A finished run carrying `sweeps_refused`. Written through load/mutate/save
+    rather than by widening `_make_run_with_tokens`, which a dozen weight tests
+    share and none of them need this field."""
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase, StoryTask
+
+    done = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)
+    run_dir = _make_run_with_tokens(project, {"1-1-login": done}, weight=0.1)
+    state = load_state(run_dir)
+    state.sweeps_refused.update(refusals)
+    save_state(run_dir, state)
+    return run_dir
+
+
+def test_status_reports_a_refused_auto_sweep_on_both_surfaces(project, capsys):
+    """#501's closing note: the refusal lived only in the journal, so neither
+    surface distinguished a run whose deferred-work sweep was refused from one
+    that swept cleanly. Under `[sweep] auto = "run-end"` the trigger is not
+    re-asked once the run finishes, so surfacing it IS the fix.
+
+    Additive per machine.py — a new key is not a breaking change — so
+    STATUS_SCHEMA_VERSION does not move, and this asserts it stayed at 1.
+
+    The text side names the clean worktree because `cmd_sweep` hard-refuses an
+    unclean tree; without it the operator's next command is a second refusal.
+
+    Ablation: delete the `"sweeps_refused"` entry from `documents.status_document`
+    and the json asserts fail; delete the `if state.sweeps_refused:` block in
+    `cmd_status` and only the text asserts fail. Disjoint — the read model and
+    the human surface are separate code paths."""
+    _run_with_refusals(project, {"run-end": "dirty"})
+
+    doc = _status_json(project, capsys)
+    assert doc["sweeps_refused"] == {"run-end": "dirty"}
+    assert doc["schema_version"] == 1  # additive: no consumer breaks
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0  # exit code unchanged
+    out = capsys.readouterr().out
+    assert "auto-sweep not run: run-end (dirty)" in out
+    assert "bmad-loop sweep" in out and "clean worktree" in out
+
+
+def test_status_json_carries_sweeps_refused_even_when_nothing_was_refused(project, capsys):
+    """Always present, `{}` on a clean run. A key that appears only on the failing
+    run leaves "absent" ambiguous between "swept fine" and "state.json predates
+    #501", and a consumer cannot tell those apart — which is the whole point of a
+    document it can rely on.
+
+    The text line is the opposite call and follows the `awaiting operator` idiom:
+    printed only when it fires, because a standing "auto-sweep not run: none"
+    trains the reader to skip the line that matters.
+
+    Ablation for the text half: drop the `if state.sweeps_refused:` guard (print
+    unconditionally) and the last assert fails while the json assert stays green."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase, StoryTask
+
+    done = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)
+    run_dir = _make_run_with_tokens(project, {"1-1-login": done}, weight=0.1)
+    assert load_state(run_dir).sweeps_refused == {}  # the run really refused nothing
+
+    assert _status_json(project, capsys)["sweeps_refused"] == {}
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    assert "auto-sweep not run" not in capsys.readouterr().out
+
+
 def test_status_json_stories_mode_is_pure_json(project, capsys):
     """--json must skip every text trailer (stories board, backlog, decisions
     nudge) — the stories-mode board would otherwise corrupt the document."""
@@ -1460,10 +1556,11 @@ def test_status_document_library_call_matches_the_cli(project, capsys):
 
 
 def test_list_document_library_call_matches_the_cli(project, capsys):
-    # cmd_list sources its RunInfos the same lazy way — data.py has no textual
-    # imports, so this does not drag the TUI into a library consumer's process.
+    # cmd_list sources its RunInfos from the same core reader (#650): the run
+    # inventory lives in bmad_loop.runs, so a library consumer gets identical
+    # documents without the [tui] extra installed.
     from bmad_loop.documents import list_document
-    from bmad_loop.tui.data import discover_runs
+    from bmad_loop.runs import discover_runs
 
     # Deterministic statuses only: running/interrupted probe pid liveness and
     # would flake (see _make_list_run).
@@ -1486,12 +1583,16 @@ def test_attach_records_return_pane_inside_tmux(project, monkeypatch):
     from bmad_loop.tui import launch
 
     _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    planned: list = []
     monkeypatch.setattr(
         launch,
         "attach_plan",
         lambda proj, rid: (
-            ["tmux", "switch-client", "-t", "=bmad-loop-ctl"],
-            "=bmad-loop-ctl:sweep-RID",
+            planned.append((proj, rid))
+            or (
+                ["tmux", "switch-client", "-t", "=bmad-loop-ctl"],
+                "=bmad-loop-ctl:sweep-RID",
+            )
         ),
     )
     monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1,0")
@@ -1504,6 +1605,9 @@ def test_attach_records_return_pane_inside_tmux(project, monkeypatch):
     assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 0
     assert recorded == [("=bmad-loop-ctl:sweep-RID", "=main:%3")]
     assert called == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
+    # The *value* of the project argument, not just the arity: attach_plan finds
+    # the run's recorded ctl window only under the --project root (#482).
+    assert planned == [(project.project, "20260101-000000-aaaa")]
 
 
 def test_attach_records_detach_outside_tmux(project, monkeypatch):
@@ -1644,15 +1748,21 @@ def test_make_adapters_review_synthesizes_from_spec(project, monkeypatch):
 
 
 def test_make_adapters_hookless_synthesizing_roles_get_dev_adapter(project, monkeypatch):
-    """Hookless dev/review (bmad-dev-auto roles) dispatch to OpencodeDevAdapter —
-    the _DevSynthesisMixin composed over the HTTP transport — sharing one
-    instance via the (cfg, synthesizes) key, while triage on the same config
-    gets a separate plain OpencodeHttpAdapter (it reads a real result.json)."""
+    """Dev/review on the `opencode-http` adapter KIND dispatch to
+    OpencodeDevAdapter — the _DevSynthesisMixin composed over the HTTP transport —
+    sharing one instance via the (cfg, synthesizes) key, while triage on the same
+    config gets a separate plain OpencodeHttpAdapter (it reads a real result.json).
+
+    Named `hookless` for the era when `profile.hookless` was what selected the
+    adapter class. It no longer is: the kind comes from `profile.adapter` and
+    hooklessness only describes the hook transport. The opencode profile carries
+    both, so this still exercises the same dispatch — see
+    tests/test_adapter_registry.py for the axes tested apart."""
     from bmad_loop.adapters import opencode_http
     from bmad_loop.adapters.opencode_http import OpencodeDevAdapter, OpencodeHttpAdapter
 
     def no_mux():
-        raise AssertionError("hookless adapters must not resolve a multiplexer")
+        raise AssertionError("a needs_mux=False kind must not resolve a multiplexer")
 
     monkeypatch.setattr(opencode_http, "_require_httpx", lambda: object())
     monkeypatch.setattr(mux_mod, "get_multiplexer", no_mux)
@@ -1671,9 +1781,9 @@ def test_make_adapters_hookless_synthesizing_roles_get_dev_adapter(project, monk
 
 
 def test_make_adapters_hookless_triage_dispatches_http_adapter(project, monkeypatch):
-    """A hookless profile on a non-synthesizing role (triage) dispatches to the
-    HTTP adapter — resolved via the `opencode` alias — while dev/review keep the
-    shared spec-synthesizing tmux adapter. The HTTP adapter exposes `profile`
+    """An `opencode-http`-kind profile on a non-synthesizing role (triage)
+    dispatches to the HTTP adapter — resolved via the `opencode` alias — while
+    dev/review keep the shared spec-synthesizing tmux adapter. The HTTP adapter exposes `profile`
     (worktree provisioning keys off it) and never constructs a multiplexer."""
     from bmad_loop.adapters import opencode_http
     from bmad_loop.adapters.generic import GenericDevAdapter
@@ -1800,6 +1910,9 @@ _BAD_RUN_IDS = [
     "a b",  # whitespace
     "",  # empty
     "CON",  # reserved windows device basename
+    "ctl",  # session_name("ctl") IS the control session
+    "ctl-0123456789abcdef",  # can equal a per-registry control-session name exactly
+    "CTL-0123456789ABCDEF",  # Windows resolves session names case-insensitively
 ]
 
 
@@ -1988,9 +2101,56 @@ def test_stop_graceful_is_idempotent(tmp_path, monkeypatch, capsys):
     run_dir = _pending_graceful_run(tmp_path)  # request already on disk
     before = (run_dir / runs.STOP_REQUEST_FILE).read_text()
     assert cli.main(["stop", "--project", str(tmp_path), "r1", "--graceful"]) == 0
-    assert "already has a graceful stop pending" in capsys.readouterr().out
+    assert "already has a stop request pending" in capsys.readouterr().out
     # left untouched — the original request's timestamp stands
     assert (run_dir / runs.STOP_REQUEST_FILE).read_text() == before
+
+
+def test_stop_graceful_reports_a_pending_hard_request_without_calling_it_graceful(
+    tmp_path, monkeypatch, capsys
+):
+    """A lodged *hard* request answers "already-pending" too, and the message must
+    not describe it as graceful — that reports a strictly stronger stop as a weaker
+    one. Reachable with no race at all: `stop_run` leaves a hard request lodged when
+    it could not prove the engine dead, and it sits there at rest.
+
+    Written directly rather than through `_pending_graceful_run`, which hardcodes
+    the graceful mode.
+    """
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    run_dir = _make_run_with_state(tmp_path, "r1")
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "now", "mode": "hard"}', encoding="utf-8"
+    )
+    before = (run_dir / runs.STOP_REQUEST_FILE).read_text()
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--graceful"]) == 0
+    out = capsys.readouterr().out
+    assert "already has a stop request pending" in out
+    assert "graceful stop pending" not in out  # the hard request is not a graceful one
+    # and the stronger request still stands, unchanged and un-downgraded
+    assert (run_dir / runs.STOP_REQUEST_FILE).read_text() == before
+    assert runs.read_stop_request_mode(run_dir) == "hard"
+
+
+def test_stop_graceful_reports_a_failed_write_as_possibly_pending(tmp_path, monkeypatch, capsys):
+    """The lodge deliberately does not roll back a failed write — an unlink there
+    resolves the name and could delete a hard request a concurrent `stop` escalated
+    onto it. So a request can be standing even though the write raised, and saying
+    "failed" flatly would invite the operator to ask again for something already
+    pending. Same exit code; accurate message."""
+    from bmad_loop import runs
+
+    def _boom(_run_dir):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs, "request_graceful_stop", _boom)
+    _make_run_with_state(tmp_path, "r1")
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--graceful"]) == 1
+    err = capsys.readouterr().err
+    assert "may still be pending" in err
+    assert "--cancel-graceful" in err  # names the way to withdraw it
 
 
 def test_stop_cancel_graceful_clears_pending(tmp_path, capsys):
@@ -2005,7 +2165,43 @@ def test_stop_cancel_graceful_clears_pending(tmp_path, capsys):
 def test_stop_cancel_graceful_without_pending_errors(tmp_path, capsys):
     _make_run_with_state(tmp_path, "r1")  # nothing on disk to cancel
     assert cli.main(["stop", "--project", str(tmp_path), "r1", "--cancel-graceful"]) == 1
-    assert "no graceful stop pending" in capsys.readouterr().err
+    assert "no stop request pending" in capsys.readouterr().err
+
+
+def test_stop_cancel_clears_a_pending_hard_request(tmp_path, capsys):
+    """`--cancel-graceful` is mode-neutral by contract (#319): the one hard request a
+    human can still reach is the one `stop_run` deliberately leaves lodged after
+    refusing to force-kill an unverifiable pid, and withdrawing that is a legitimate
+    thing to want. The graceful twin above proves the wiring for one mode only — the
+    function is named `clear_graceful_stop` while its contract is mode-neutral, so
+    mode-gating the clear is a live regression, and this is what reddens on it."""
+    from bmad_loop import runs
+
+    run_dir = _pending_hard_run(tmp_path)
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--cancel-graceful"]) == 0
+    assert "cancelled" in capsys.readouterr().out
+    assert not (run_dir / runs.STOP_REQUEST_FILE).exists()
+
+
+def test_stop_cancel_reports_a_request_it_could_not_remove(tmp_path, monkeypatch, capsys):
+    """`clear_graceful_stop` never raises — five callers depend on that — so it
+    answers False for "nothing was pending" and "could not remove it" alike. Cancel
+    must not read the second as the first and tell the operator their request is gone
+    while it is still on disk and still honorable. Exit stays 1 either way; only the
+    message moves."""
+    from bmad_loop import runs
+
+    run_dir = _pending_graceful_run(tmp_path)
+
+    def _refuse(_path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(runs, "retrying_unlink", _refuse)
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--cancel-graceful"]) == 1
+    err = capsys.readouterr().err
+    assert "still pending" in err
+    assert "no stop request pending" not in err  # the misleading line, specifically
+    assert (run_dir / runs.STOP_REQUEST_FILE).exists()  # and it really did survive
 
 
 def test_stop_graceful_and_cancel_are_mutually_exclusive(tmp_path):
@@ -2036,6 +2232,53 @@ def test_status_json_graceful_stop_pending_true(tmp_path, monkeypatch, capsys):
     doc = machine_json(["status", "--project", str(tmp_path), "r1", "--json"], capsys)
     assert doc["graceful_stop_pending"] is True
     assert doc["schema_version"] == 1  # additive field — no schema bump
+
+
+def _pending_hard_run(tmp_path, run_id="r1", **state_kwargs):
+    """A run with a HARD-mode stop request on disk — what `bmad-loop stop` lodges
+    before signalling, still unconsumed because the engine has not reached a
+    boundary (or, on native Windows, was never reachable by the signal at all)."""
+    from bmad_loop import runs
+
+    run_dir = _make_run_with_state(tmp_path, run_id, **state_kwargs)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "now", "mode": "hard"}', encoding="utf-8"
+    )
+    return run_dir
+
+
+def test_status_json_graceful_stop_pending_false_for_hard_request(tmp_path, monkeypatch, capsys):
+    """A hard stop in flight is not a *graceful* stop pending. The field is
+    mode-exact, not an existence check: reporting True here would promise an
+    operator that the in-flight item still finishes, when a hard request stops the
+    run as soon as the engine sees it.
+
+    Ablation: reverting cli.py's derivation to `runs.graceful_stop_requested`
+    (bare existence) turns this True and fails the assertion — confirmed, restored.
+    """
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    _pending_hard_run(tmp_path)
+    doc = machine_json(["status", "--project", str(tmp_path), "r1", "--json"], capsys)
+    assert doc["graceful_stop_pending"] is False
+    assert doc["schema_version"] == 1  # same field, same type — narrowed, not bumped
+
+
+def test_status_text_does_not_claim_graceful_for_hard_request(tmp_path, monkeypatch, capsys):
+    """The text branch reads the same derivation, so it inherits the fix: no
+    "will stop after the current item" promise for a hard request.
+
+    Ablation: with the bare-existence derivation restored this prints the graceful
+    line and fails — confirmed, restored."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    _pending_hard_run(tmp_path)
+    assert cli.main(["status", "--project", str(tmp_path), "r1"]) == 0
+    out = capsys.readouterr().out
+    assert "graceful stop pending" not in out
+    assert "in progress" in out  # still reported live — only the promise is gone
 
 
 def test_status_json_graceful_stop_pending_false_without_request(tmp_path, capsys):
@@ -2099,6 +2342,87 @@ def test_archive_force_stop_error_blocks(tmp_path, monkeypatch, capsys):
     assert cli.main(["archive", "--project", str(tmp_path), "r1", "--force"]) == 1
     assert "host probe failed" in capsys.readouterr().err
     assert run_dir.exists()
+
+
+def test_delete_refuses_an_orphaned_session_without_force(tmp_path, monkeypatch, capsys):
+    """Engine dead, agent session still live — the one state the pid-keyed guard
+    passes, and the one where the run dir is the only ownership proof an untagged
+    session has left (#419)."""
+    from test_runs import _LivenessMux
+
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux(["bmad-loop-r1"]))
+    run_dir = _make_run_with_state(tmp_path, "r1")  # no pid -> engine reads dead
+    assert cli.main(["delete", "--project", str(tmp_path), "r1"]) == 1
+    err = capsys.readouterr().err
+    # the refusal surfaces as an exit code + message, never as a traceback, and the
+    # CLI adds the escape its own flag provides to what runs.py could say alone
+    assert "agent session is still live" in err and "bmad-loop cleanup" in err
+    assert "(or pass --force)" in err
+    assert run_dir.exists()
+
+
+def test_delete_force_overrides_the_session_guard_without_killing_it(tmp_path, monkeypatch, capsys):
+    """--force removes anyway, and kills nothing.
+
+    Killing `bmad-loop-<id>` from here would be unscoped: a session name carries no
+    project, so on a `--run-id` collision it would tear down another project's live
+    run — and this project cannot prove the session is its own, which is the very
+    defect the guard exists for. `bmad-loop cleanup` is the remedy the refusal
+    names, but it is not sound unaided either: prune_sessions proves ownership from
+    the tag only when there is one, and falls back to the local run dir when there
+    is not — so it too can prune another project's session on a shared id, which is
+    why the message asks the operator to confirm first. So --force stays an override
+    of a warning about the operator's own leak, not a destructive act."""
+    from bmad_loop import runs
+
+    killed = []
+    from test_runs import _LivenessMux
+
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux(["bmad-loop-r1"]))
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+    run_dir = _make_run_with_state(tmp_path, "r1")
+    assert cli.main(["delete", "--project", str(tmp_path), "r1", "--force"]) == 0
+    assert killed == []  # the session — which may be another project's — is left alone
+    assert not run_dir.exists()
+
+
+def test_archive_force_overrides_the_session_guard_without_killing_it(
+    tmp_path, monkeypatch, capsys
+):
+    """Archive's half of the same property — see the delete test for why nothing is
+    killed. Asserted separately because the two commands reach the guard by
+    different calls, and only one of them writes a tarball."""
+    from bmad_loop import runs
+
+    killed = []
+    from test_runs import _LivenessMux
+
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux(["bmad-loop-r1"]))
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+    run_dir = _make_run_with_state(tmp_path, "r1")
+    assert cli.main(["archive", "--project", str(tmp_path), "r1", "--force"]) == 0
+    assert killed == []
+    assert not run_dir.exists()
+    assert (tmp_path / ".bmad-loop" / "archive" / "r1.tar.gz").is_file()
+
+
+def test_archive_refuses_an_orphaned_session_without_force(tmp_path, monkeypatch, capsys):
+    from test_runs import _LivenessMux
+
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux(["bmad-loop-r1"]))
+    run_dir = _make_run_with_state(tmp_path, "r1")
+    assert cli.main(["archive", "--project", str(tmp_path), "r1"]) == 1
+    err = capsys.readouterr().err
+    # `(or pass --force)` is the handler's own; main's catch-all backstop would give
+    # the same exit code and a bare `error: ...`, so asserting only the run message
+    # would pass with the handler's except removed
+    assert "agent session is still live" in err and "(or pass --force)" in err
+    assert run_dir.exists()
+    assert not (tmp_path / ".bmad-loop" / "archive").exists()
 
 
 def test_delete_dead_run(tmp_path, capsys):
@@ -2251,6 +2575,169 @@ def test_resolve_no_interactive_rearms_and_resumes(tmp_path, monkeypatch, capsys
     assert "ready-for-dev" in spec.read_text()
 
 
+# ------------------------------------ resolve aims the code root before it re-arms
+
+# `_resume_paused_run` re-stamps the persisted code root because the engine it arms
+# works in `paths.repo_root` — but `resolve` re-arms FIRST, so on this path that
+# re-stamp lands too late to aim `runs.rearm_escalation`, which reads the mirror out of
+# process. Three rows: the move is adopted and announced before the re-arm sees it, a
+# cancelled confirm writes nothing, and a config this process cannot read degrades
+# instead of guessing a tree.
+
+
+def _resolve_run_with_a_moved_code_root(project, monkeypatch):
+    """An escalated run whose recorded code root is NOT the one config.yaml now names.
+    Returns (run_dir, the tree config names, the tree the run recorded)."""
+    from bmad_loop.journal import load_state, save_state
+
+    install_bmad_config(project)
+    moved = project.project / "moved-code"
+    moved.mkdir()
+    _configure_repo_root(project, moved)
+    run_dir = _escalated_run(project.project, "r1")
+    recorded = project.project / "old-code"
+    state = load_state(run_dir)
+    state.repo_root = str(recorded)
+    save_state(run_dir, state)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    return run_dir, moved, recorded
+
+
+def test_resolve_restamps_the_code_root_before_it_rearms(project, monkeypatch, capsys):
+    """The ordering IS the fix. `rearm_escalation` advances the attempt baseline and
+    re-stamps `baseline_revision` against `RunState.code_root`; the engine resumed at the
+    bottom of the same command works in `paths.repo_root`. With the re-stamp left to
+    `_resume_paused_run`, a `repo_root:` edit made while the run was paused split those
+    two readers with no error anywhere — the re-arm armed one repository and the run
+    continued in another.
+
+    Asserted at the moment of the re-arm, not afterwards: a re-stamp that lands after
+    `rearm_escalation` returns is exactly the bug, and reading state.json at the end
+    cannot tell the two apart.
+
+    Ablation: move the `runs.restamp_code_root(...)` call below the `try:` that re-arms
+    and this reddens on the stale root while the warning assertion still passes.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    run_dir, moved, _ = _resolve_run_with_a_moved_code_root(project, monkeypatch)
+    seen: list = []
+
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+        seen.append(load_state(rd).code_root)
+        return key
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-interactive", "--resume"]
+    assert cli.main(argv) == 0
+
+    assert seen == [moved.resolve()]
+    err = capsys.readouterr().err
+    assert "the code root in _bmad/bmm/config.yaml has changed" in err
+    assert str(moved) not in err  # the warning names neither tree, matching resume's
+
+
+def test_resolve_declined_at_the_confirm_leaves_the_code_root_for_resume(
+    project, monkeypatch, capsys
+):
+    """The re-stamp sits AFTER the confirm on purpose. A cancelled resolve must write
+    nothing: adopting the new root there would silence the loud `code_root_changed`
+    warning `_resume_paused_run` raises on its own terms, and the operator would never
+    hear about the move they did not go through with.
+
+    Ablation: hoist the re-stamp above the `args.resume is None` confirm and this
+    reddens on both the persisted root and the silence.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    run_dir, _moved, recorded = _resolve_run_with_a_moved_code_root(project, monkeypatch)
+    monkeypatch.setattr(cli, "_confirm", lambda _prompt: False)
+    monkeypatch.setattr(
+        runs, "rearm_escalation", lambda *a, **k: pytest.fail("re-armed after a decline")
+    )
+
+    assert cli.main(["resolve", "--project", str(project.project), "r1", "--no-interactive"]) == 0
+
+    assert load_state(run_dir).repo_root == str(recorded)
+    assert "code root" not in capsys.readouterr().err
+
+
+def test_resolve_refuses_worktree_isolation_before_it_mutates_anything(
+    project, monkeypatch, capsys
+):
+    """`resolve` re-arms and THEN resumes, so the isolation refusal `_resume_paused_run`
+    makes used to land after the whole re-arm had already been persisted.
+
+    On `isolation = "worktree"` beside a `repo_root` override, the re-stamp wrote the
+    unsupported root onto the mirror and `rearm_escalation` then advanced the attempt
+    baseline — and re-stamped the spec's `baseline_revision` — against it, all before
+    the refusal at the bottom of the command returned 1. The escalation was spent
+    either way: the story came back PENDING, and `resolve` needs an ESCALATED story, so
+    the operator could not re-run it to undo the damage after fixing the config.
+
+    It also made a configuration reachable that `runs.rearm_escalation` documents as
+    unreachable — it reads the code tree's HEAD on the stated premise that
+    `repo_root == project` "in every reachable configuration", which is true only
+    BECAUSE this refusal exists.
+
+    Both post-conditions are asserted, because a refusal that merely returns 1 is not
+    the fix — writing nothing is. `_resolve_run_with_a_moved_code_root` stubs
+    `_resume_paused_run` to 0, so the rc can only come from the hoisted check.
+
+    Ablation: move the `_reject_isolation_conflict(...)` call below the
+    `runs.restamp_code_root(...)` line and the persisted-root assertion reddens; delete
+    it outright and the rc assertion reddens too.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    run_dir, _moved, recorded = _resolve_run_with_a_moved_code_root(project, monkeypatch)
+    _write_policy(project.project, ISOLATION_WORKTREE_POLICY)
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda *a, **k: pytest.fail("re-armed under a configuration the run refuses"),
+    )
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-interactive", "--resume"]
+    assert cli.main(argv) == 1
+
+    assert REFUSAL in capsys.readouterr().err
+    state = load_state(run_dir)
+    assert state.repo_root == str(recorded)  # the mirror was never re-pointed
+    assert state.tasks["s1"].phase == Phase.ESCALATED  # still armed for a corrected config
+
+
+def test_resolve_degrades_when_the_config_cannot_name_the_code_root(tmp_path, monkeypatch, capsys):
+    """Reading config.yaml to learn the tree is an OBSERVATION, so it degrades: without
+    it this process cannot name the code root, and re-pointing the mirror at a guess is
+    the one outcome worse than leaving it alone. The re-arm proceeds against the root the
+    run recorded — what it did before this seam existed — and says so.
+
+    Ablation: turn the `except (bmadconfig.BmadConfigError, OSError)` arm into a
+    `return 1` and this reddens on the exit code; delete the warning it prints and it
+    reddens on the silence while the re-arm assertion still passes.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    run_dir = _escalated_run(tmp_path, "r1")  # no _bmad/bmm/config.yaml anywhere
+    rearmed: list = []
+    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, key, **k: rearmed.append(key) or key)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+
+    argv = ["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]
+    assert cli.main(argv) == 0
+
+    assert rearmed == ["s1"]
+    assert load_state(run_dir).repo_root == ""  # nothing guessed onto the mirror
+    assert "cannot read the project config to confirm the code root" in capsys.readouterr().err
+
+
 def test_resolve_echoes_this_rearms_stale_restore_events(tmp_path, monkeypatch, capsys):
     """#90's journal entries reach the operator. The commits variant is warn-only —
     stderr is the only place it ever surfaces. Entries from *earlier* re-arms are
@@ -2261,7 +2748,7 @@ def test_resolve_echoes_this_rearms_stale_restore_events(tmp_path, monkeypatch, 
     run_dir = _escalated_run(tmp_path, "r1")
     Journal(run_dir).append("stale-restore-excluded", story_key="s1", files=["FROM-LAST-TIME.txt"])
 
-    def fake_rearm(rd, key, *, restore_patch=None):
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
         journal = Journal(rd)
         journal.append("stale-restore-excluded", story_key=key, patch="a.patch", files=["new.txt"])
         journal.append("stale-restore-unparseable", story_key=key, patch="b.patch", error="OSErr")
@@ -2279,6 +2766,365 @@ def test_resolve_echoes_this_rearms_stale_restore_events(tmp_path, monkeypatch, 
     assert "could not read the abandoned restore patch (b.patch)" in err
     assert "1 commit(s) sit below the re-drive's new baseline (ffffffffffff..)" in err
     assert "FROM-LAST-TIME.txt" not in err
+
+
+def test_resolve_echoes_the_rearm_baseline_records(tmp_path, monkeypatch, capsys):
+    """The two `rearm-baseline-*` records reach the operator on the same seam.
+
+    Both are warn-only by contract — a project that is not a git repo must not fail
+    re-arm — so stderr is the only place either ever surfaces. A failed advance is the
+    most actionable outcome of the whole re-arm: the re-drive rebuilds against the
+    tree as it stood BEFORE the resolve, and the re-stamp then refuses to write a sha
+    it did not earn, so spec and task stay honestly out of step rather than silently
+    agreeing on a stale value. Journal-only, that is invisible to the human running
+    `bmad-loop resolve` — the invisibility #640(b) exists to end.
+
+    Ablation: drop either `rearm-baseline-*` arm from `runs.rearm_event_notice`
+    (the shared table both surfaces route through) and the matching assertion
+    reddens.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    _escalated_run(tmp_path, "r1")
+
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+        journal = Journal(rd)
+        journal.append(
+            "rearm-baseline-advance-failed",
+            story_key=key,
+            repo=str(tmp_path),
+            baseline="a" * 40,
+            error="GitError: not a git repository",
+        )
+        journal.append(
+            "rearm-baseline-restamped",
+            story_key=key,
+            spec_file="spec.md",
+            overwritten="b" * 40,
+            baseline="c" * 40,
+            restore=False,
+        )
+        return key
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+
+    err = capsys.readouterr().err
+    assert "could not advance the re-drive baseline (GitError: not a git repository)" in err
+    assert "aaaaaaaaaaaa" in err
+    assert "deliberately NOT re-stamped" in err
+    assert "re-stamped the spec baseline bbbbbbbbbbbb.. -> cccccccccccc.." in err
+
+
+def test_resolve_restamp_echo_warns_on_both_legs(tmp_path, monkeypatch, capsys):
+    """The record fires only on a REAL divergence, so both legs warn.
+
+    The `restore` split predated the record's condition moving to
+    `overwritten != old_baseline` — compared against what the RUN recorded, not against
+    the value the advance just wrote. Under that condition the record is written only
+    when the spec claimed a baseline the run never recorded, which is equally
+    exceptional whichever leg produced it; keeping the old "routine on a restore
+    re-drive" note meant the patch-restore leg's genuine divergence was the one
+    downgraded. The flag stays ON the record to say which leg it was.
+
+    Ablation: restore the `if entry.get("restore")` branch in `runs.rearm_event_notice`
+    and the `restore=True` leg reddens — it goes back to printing "routine" for a
+    divergence.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    def rearm_with(restore: bool):
+        def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+            Journal(rd).append(
+                "rearm-baseline-restamped",
+                story_key=key,
+                spec_file="spec.md",
+                overwritten="b" * 40,
+                baseline="c" * 40,
+                restore=restore,
+            )
+            return key
+
+        return fake_rearm
+
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+
+    _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "rearm_escalation", rearm_with(True))
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+    err = capsys.readouterr().err
+    assert "DIFFERENT baseline" in err  # the restore leg is NOT exempt
+    assert "routine on a restore re-drive" not in err
+
+    _escalated_run(tmp_path, "r2")
+    monkeypatch.setattr(runs, "rearm_escalation", rearm_with(False))
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r2", "--no-interactive", "--resume"]) == 0
+    )
+    err = capsys.readouterr().err
+    assert "DIFFERENT baseline" in err
+    assert "routine on a restore re-drive" not in err
+    # both legs reached the same sentence; only the flag on the record differs
+
+
+@pytest.mark.parametrize("outcome", ["ok", "rearm-error"])
+def test_resolve_survives_a_corrupt_journal(tmp_path, monkeypatch, capsys, outcome):
+    """An undecodable byte in journal.jsonl costs the echo, never the gesture — and
+    never the exit code.
+
+    The counterpart to `test_escalation_rearm_survives_a_corrupt_journal` in the TUI,
+    which had no CLI twin: the TUI's reads were guarded while `cmd_resolve`'s two were
+    left calling `Journal(run_dir).entries()` straight, and the echo then MOVED into a
+    `finally`. On the `RearmError` path that `finally` runs before `return 1`, so a
+    raise from the echo would replace an actionable error with a traceback and swallow
+    the original — the one path where the residue matters most.
+
+    Ablation: call `Journal(run_dir).entries()` directly in `_echo_rearm_events` and
+    both legs redden — `ok` with a UnicodeDecodeError escaping `cmd_resolve`, and
+    `rearm-error` with the same, losing the `RearmError` message entirely.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import JOURNAL_FILE
+
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+        if outcome == "rearm-error":
+            raise runs.RearmError("cannot re-open story spec /x/spec.md")
+        return key
+
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    run_dir = _escalated_run(tmp_path, "r1")
+    (run_dir / JOURNAL_FILE).write_bytes(
+        b'{"ts": 1.0, "kind": "session-start", "task_id": "t1"}\n\xff\xfe not utf-8\n'
+    )
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"])
+    err = capsys.readouterr().err
+
+    if outcome == "rearm-error":
+        # the operator gets the real error, not a decode traceback from the `finally`
+        assert rc == 1
+        assert "cannot re-open story spec" in err
+    else:
+        assert rc == 0
+
+
+def test_resolve_echoes_a_skipped_restamp(tmp_path, monkeypatch, capsys):
+    """The unreadable-spec skip is warn-only like its two siblings, so stderr is the
+    only place it ever surfaces. Without the echo the operator resumes a re-drive
+    whose spec still names the escalated attempt's baseline.
+
+    Ablation: drop the `rearm-baseline-restamp-skipped` arm from
+    `runs.rearm_event_notice` and this reddens.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    _escalated_run(tmp_path, "r1")
+
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+        Journal(rd).append(
+            "rearm-baseline-restamp-skipped",
+            story_key=key,
+            spec_file="wt/specs/s1.md",
+            baseline="c" * 40,
+        )
+        return key
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+
+    err = capsys.readouterr().err
+    assert "wt/specs/s1.md" in err
+    assert "not a readable file from here" in err
+
+
+def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeypatch, capsys):
+    """An abort is when the residue matters MOST, so the echo lives in a `finally`.
+
+    `runs._stale_restore_residue` journals BEFORE the re-stamp block that raises
+    `RearmError`, so on that path the records are already on disk when the abort
+    happens — and an echo placed after an early `return 1` threw away records the
+    re-arm had genuinely written. The one it threw away is the one that cannot be
+    recovered from anywhere else: `stale-restore-commits` names commits now sitting
+    below a baseline the operator is looking at in a half-run re-arm, and nothing
+    but this line will tell them. The failure and the residue are both true, and the
+    operator needs both to decide what to do with the tree.
+
+    Ablation (residue echo): move `_echo_rearm_events` out of the `finally` back under
+    the `try` and the commits assertion reddens while the `error:` line still prints.
+
+    Ablation (success output): deleting the gate outright does NOT grade the last
+    assertion. Drop `return 1` from `cmd_resolve`'s `except runs.RearmError` arm and the
+    success line does leak to stdout, but `main` then answers 0 and the exit-code
+    assertion above reddens first, so this line is never reached — a bare rc is a
+    worthless oracle for an absent-output claim. The mutation that grades it keeps
+    `return 1` and adds `print(f"re-armed {story_key}")` to that arm:
+    `AssertionError: assert 're-armed' not in 're-armed s1\n'`.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    _escalated_run(tmp_path, "r1")
+
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+        # journalled first, exactly as the real residue pass is ordered
+        Journal(rd).append(
+            "stale-restore-commits", story_key=key, old_baseline="f" * 40, commits=["c1", "c2"]
+        )
+        raise runs.RearmError("could not re-stamp the spec baseline")
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 1
+    )
+
+    out, err = capsys.readouterr()
+    assert "error: could not re-stamp the spec baseline" in err  # the abort still reports
+    assert "2 commit(s) sit below the re-drive's new baseline (ffffffffffff..)" in err
+    assert "re-armed" not in out  # ...and the failure is not dressed up as a success
+
+
+def test_resolve_holds_the_resume_when_the_correction_cannot_reach_the_redrive(
+    tmp_path, monkeypatch, capsys
+):
+    """A record that PROVES a wedge breaks the re-arm+resume gesture.
+
+    Two kinds qualify (`rearm-spec-write-unreachable` here, and the sentinel path's
+    `rearm-upstream-write-unreachable`); this grades the gesture, which is shared, so it
+    drives the spec one and leaves the sentinel producer to tests/test_resolve.py.
+
+    `rearm-spec-write-unreachable` fires only once the re-arm has established that the
+    committed spec does not carry the status the re-drive routes on, and its own
+    next_step reads "Commit the corrected spec before resuming". This command printed
+    that and then resumed two lines later, so the imperative was already unactionable
+    when it rendered — and the interactive resolve agent cannot close the gap either,
+    since its skill forbids it from committing. The fresh worktree then checked out the
+    still-terminal committed spec, step-01 halted blocked on an unrecognized status, and
+    the escalation was spent.
+
+    `--resume` does not override it: that flag skips the confirmation prompt, while the
+    hold is a proof rather than a question. The re-arm itself SUCCEEDED, so this stays a
+    0, with the run armed and the resume command named.
+
+    The advance-failed leg is the control, and it is what makes this a narrowing rather
+    than "warnings stop resumes": it is the most actionable degrade the re-arm has, it
+    prints its own "before resuming" imperative, and it still resumes — because nothing
+    about it proves the re-drive cannot route.
+
+    Ablation: drop the `if hold_resume:` arm from `cmd_resolve` and the first leg
+    reddens on `assert [] == ['r1']`; make `runs.rearm_holds_the_resume` answer True for
+    every entry and the control leg reddens instead. Discard `_echo_rearm_events`' return
+    (keep `hold_resume = False`) and the first leg reddens alone.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    def rearm_journalling(kind, **fields):
+        def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+            Journal(rd).append(kind, story_key=key, **fields)
+            return key
+
+        return fake_rearm
+
+    resumed: list[str] = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd.name) or 0)
+
+    _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        rearm_journalling(
+            "rearm-spec-write-unreachable", spec_file="wt/specs/s1.md", status="ready-for-dev"
+        ),
+    )
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+    out, err = capsys.readouterr()
+    assert "Commit the corrected spec before resuming" in err
+    assert "NOT resuming in this gesture" in out
+    assert "bmad-loop resume r1" in out  # the escape hatch, reachable once it is committed
+    assert resumed == []  # the gesture stopped; the story stays armed and resumable
+
+    _escalated_run(tmp_path, "r2")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        rearm_journalling(
+            "rearm-baseline-advance-failed",
+            repo=str(tmp_path),
+            baseline="a" * 40,
+            error="GitError: not a git repository",
+        ),
+    )
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r2", "--no-interactive", "--resume"]) == 0
+    )
+    out, err = capsys.readouterr()
+    assert "Check the baseline before resuming" in err  # equally imperative...
+    assert "NOT resuming in this gesture" not in out
+    assert resumed == ["r2"]  # ...and it still resumes: an advisory is not a proof
+
+
+def test_resolve_appends_the_next_step_imperative(tmp_path, monkeypatch, capsys):
+    """This surface renders `severity: message; next_step`; the TUI renders `message`.
+
+    That split is the entire reason `runs.rearm_event_notice` returns three fields
+    instead of one formatted line — the TUI re-arms and RESUMES in a single gesture,
+    so "before resuming" is already moot there, while `resolve` leaves the run parked
+    and the imperative is the actionable half. Dropping it here would leave the field
+    with no observable purpose on either surface and nothing red to say so.
+
+    Graded both ways in one run, because the empty string is a real table value: a
+    row that carries a next_step prints it after `; `, and a row that carries "" must
+    print no dangling separator.
+
+    Ablation: drop `tail` from `_echo_rearm_events`' f-string and the first assertion
+    reddens; hard-code it to `f"; {next_step}"` and the second does.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    _escalated_run(tmp_path, "r1")
+
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+        journal = Journal(rd)
+        journal.append(  # table row with a next_step
+            "rearm-baseline-advance-failed",
+            story_key=key,
+            repo=str(tmp_path),
+            baseline="a" * 40,
+            error="GitError: not a git repository",
+        )
+        journal.append(  # table row whose next_step is ""
+            "stale-restore-commits", story_key=key, old_baseline="f" * 40, commits=["c1"]
+        )
+        return key
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+
+    lines = capsys.readouterr().err.splitlines()
+    advance = next(ln for ln in lines if "could not advance the re-drive baseline" in ln)
+    assert advance.startswith("warning: ")
+    assert advance.endswith("; Check the baseline before resuming")
+    commits = next(ln for ln in lines if "commit(s) sit below" in ln)
+    assert commits.endswith("revert them now")
 
 
 def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
@@ -2299,6 +3145,44 @@ def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
     assert rc == 0
     assert calls == {"ctx": True, "session": True}
     assert load_state(run_dir).tasks["s1"].phase == Phase.PENDING
+
+
+def test_resolve_passes_the_tasks_own_generation_to_the_session(tmp_path, monkeypatch):
+    """`cmd_resolve` hands the resolve session the generation it read off the task — a
+    real value, not a constant. The row seeds a NON-zero generation deliberately:
+    `escalated_run` builds tasks at the default 0, so an `assert seen == [0]` cannot
+    tell "read from the task" from "hardcoded 0" — that earlier form passed with
+    `generation=task.generation` ablated to a literal `generation=0`.
+
+    The call precedes `rearm_escalation`, so the value passed is the pre-bump one still
+    on disk. That follows from call ORDER, not from where the read sits: the re-arm
+    reloads state and bumps its own copy, leaving this `task` object untouched either
+    way. Nothing consumes the resulting id, so no collision claim rides on it."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state, save_state
+
+    _escalated_run(tmp_path, "r1")
+    run_dir = tmp_path / ".bmad-loop" / "runs" / "r1"
+    state = load_state(run_dir)
+    state.tasks["s1"].generation = 2  # a story already re-armed twice
+    save_state(run_dir, state)
+    seen: list[int] = []
+
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+        seen.append(generation)
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("{}", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    # --no-resume: re-arm only, so the bump this row contrasts against still runs
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-resume"]) == 0
+
+    assert seen == [2]  # the task's own generation, not a constant
+    assert load_state(run_dir).tasks["s1"].generation == 3  # the re-arm bumped past it
 
 
 def test_resolve_interactive_unsupported_adapter(tmp_path, monkeypatch, capsys):
@@ -2433,6 +3317,135 @@ def test_resolve_restore_patch_outside_project_rejected(tmp_path, monkeypatch, c
     )
     assert rc == 1
     assert "not a file under the project" in capsys.readouterr().err
+    assert called == []  # never resumed
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+
+
+def test_resolve_restore_patch_unresolvable_rejected(tmp_path, monkeypatch, capsys):
+    """A restore patch path whose `.resolve()` faults (WinError 64 on a dead UNC
+    provider, or a symlink loop on the 3.11/3.12 floor, #560) escaped this
+    function's own try/except (scoped to `bmadconfig.BmadConfigError`) and fell
+    through to `main()`'s generic backstop, which reports a bare `[Errno ...]`
+    string instead of naming the restore-patch path or what failed. Pin the
+    specific message this function now returns, in the shape its five sibling
+    rejection reasons use.
+
+    Measured ablation (delete the `except (OSError, RuntimeError)` arm from
+    `_resolve_restore_patch`, leaving the bare `.resolve()`): this row fails, at
+    `assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err`.
+    Only the two message assertions carry it. The unguarded `OSError` reaches
+    `main()`'s generic `except Exception` backstop, which prints `error: {e}` to
+    stderr and returns `ExitCode.FAILURE` — so ablated, `rc == 1`,
+    `UNRESOLVABLE in err`, `called == []` and both halves of the
+    phase/restore_patch assertion still pass; measured `err` is exactly
+    `error: [Errno 0] stubbed: the provider is registered but not serving`, and
+    with only those two message lines commented out the ablated row goes GREEN.
+    `UNRESOLVABLE in err` can never discriminate this regression — the guard
+    interpolates `{e}` and the backstop prints `{e}` bare, so it is the same
+    substring on both sides. Loosening the message assertion to it would make
+    this row a false green."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    patch = tmp_path / "whatever.patch"
+    refuse_to_resolve(monkeypatch, patch)
+
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(patch),
+            "--resume",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err
+    assert UNRESOLVABLE in err
+    assert "Run `bmad-loop validate` for what this host is doing." in err
+    assert called == []  # never resumed
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+
+
+def test_resolve_restore_patch_unresolvable_from_resolution_json_rejected(
+    tmp_path, monkeypatch, capsys
+):
+    """The same `.resolve()` guard, reached from the OTHER caller. `cmd_resolve`
+    validates an explicit `--restore-patch` flag BEFORE the interactive session,
+    but a `restore_patch` the agent recorded in resolution.json only exists once
+    that session has written it — so this arm cannot be hoisted, and its abort
+    lands after a whole agent conversation. The sibling flag-arm row above cannot
+    stand in for it: that row passes `--no-interactive`, which short-circuits the
+    resolution.json read (`if raw is None and args.interactive`), leaving `raw`
+    None so `if not raw: return None, None` fires and the guarded `.resolve()` is
+    never reached from this side. `ran == ["s1"]` is what pins that difference —
+    an identity assertion for the row, not a guard assertion (see below). The
+    patch here is a real file under the configured implementation_artifacts root,
+    i.e. an otherwise-honorable restore whose only defect is that this host cannot
+    canonicalize its path.
+
+    Measured ablation (delete the `except (OSError, RuntimeError)` arm from
+    `_resolve_restore_patch`, leaving the bare `.resolve()`): this row fails, at
+    `assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err`.
+    Only the two message assertions carry it — with just those two lines removed
+    the ablated row goes GREEN. The unguarded `OSError` unwinds `cmd_resolve` into
+    `main()`'s generic `except Exception` backstop, which prints `error: {e}` to
+    stderr and returns `ExitCode.FAILURE`, so ablated `rc == 1`, `ran == ["s1"]`
+    (the session had already run), `UNRESOLVABLE in err`, `called == []` and both
+    halves of the phase/restore_patch assertion all still pass; measured `err` is
+    exactly `error: [Errno 0] stubbed: the provider is registered but not
+    serving`. As in the flag-arm row, `UNRESOLVABLE in err` can never discriminate
+    this regression — the guard interpolates `{e}` and the backstop prints `{e}`
+    bare, so it is the same substring on both sides."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    patch = tmp_path / "artifacts" / "attempt.patch"  # a legitimate restore target
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    ran: list = []
+
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+        # the resolve agent records a restore_patch in its output marker
+        ran.append(story_key)
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"restore_patch": str(patch)}), encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    refuse_to_resolve(monkeypatch, patch)
+
+    # interactive is the default, and is required: this arm reads the marker the
+    # session writes, so --no-interactive would short-circuit it before the guard
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"])
+    assert rc == 1
+    assert ran == ["s1"]  # the session really ran: this abort is post-session
+    err = capsys.readouterr().err
+    assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err
+    assert UNRESOLVABLE in err
+    assert "Run `bmad-loop validate` for what this host is doing." in err
     assert called == []  # never resumed
     task = load_state(run_dir).tasks["s1"]
     assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
@@ -2594,7 +3607,7 @@ def test_resolve_interactive_restore_patch_from_resolution_json(tmp_path, monkey
     patch.write_text("diff", encoding="utf-8")
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
         # the resolve agent records a restore_patch in its output marker
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -2612,6 +3625,74 @@ def test_resolve_interactive_restore_patch_from_resolution_json(tmp_path, monkey
     assert "in-review" in spec.read_text()
 
 
+@pytest.mark.parametrize("flipped_mid_session", [False, True])
+def test_resolve_rereads_isolation_after_the_agent_session(
+    tmp_path, monkeypatch, capsys, flipped_mid_session
+):
+    """`pol` is read BEFORE a session that blocks on a human conversation of arbitrary
+    length, and the re-arm below it is keyed on that stale answer.
+
+    Everything after `resolve.run_session` returns — the restore-patch latch, the
+    isolation-conflict refusal, and `rearm_escalation`'s `isolated_redrive` — used the
+    mode as it stood when the operator TYPED the command, while `_resume_paused_run` at
+    the bottom of the same function re-reads policy for the engine it arms. So a
+    `none -> worktree` edit made while the agent was open split the two readers in the
+    one window nobody can bound: the re-arm treated the main-checkout correction as
+    reachable and emitted no hold, then the engine mounted a fresh worktree cut from git
+    that could not see it. The escalation was spent and the story re-wedged, with no
+    error anywhere.
+
+    The window is real precisely because this session is INTERACTIVE by contract — a
+    human is present, the skill is allowed to ask, and `run_session` blocks on
+    `subprocess.run` until they exit. Editing policy while a resolve agent is open is
+    not exotic; deciding the story needs isolation is one of the things a resolve
+    conversation concludes.
+
+    The control row is what makes this a re-read rather than a hardcode: an untouched
+    policy must still re-arm on its own answer and print nothing.
+
+    Ablation: delete the second `pol = policy_mod.load(...)` in `cmd_resolve` and the
+    flipped row reddens on `assert False is True` — the re-arm goes back to the mode
+    read before the conversation. Drop the warning `print` and the row reddens on
+    stderr alone, with the isolation assertion still passing.
+    """
+    from bmad_loop import resolve, runs
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_policy(tmp_path, '[scm]\nisolation = "none"\n')
+    _escalated_run(tmp_path, "r1", spec_file=str(spec))
+
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
+        # the human and the agent conclude the story needs isolation, and the operator
+        # edits policy.toml from another terminal while the session is still open
+        if flipped_mid_session:
+            _write_policy(tmp_path, '[scm]\nisolation = "worktree"\n')
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("{}", encoding="utf-8")
+        return True
+
+    seen: list[bool] = []
+
+    def recording_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+        seen.append(isolated_redrive)
+        return key
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    monkeypatch.setattr(runs, "rearm_escalation", recording_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"]) == 0
+
+    # the re-arm keyed on the mode in force when it ran, not the one read before the
+    # conversation started
+    assert seen == [flipped_mid_session]
+    err = capsys.readouterr().err
+    assert ("[scm] isolation changed none -> worktree" in err) is flipped_mid_session
+
+
 def test_resolve_corrupt_resolution_json_aborts_loudly(tmp_path, monkeypatch, capsys):
     """A present-but-unparseable resolution.json may carry the agent's recorded
     restore decision, and a re-arm consumes the escalation — so corruption must
@@ -2625,7 +3706,7 @@ def test_resolve_corrupt_resolution_json_aborts_loudly(tmp_path, monkeypatch, ca
     spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text('{"restore_patch": "artifacts/attempt.patch",}', encoding="utf-8")
@@ -2656,7 +3737,7 @@ def test_resolve_empty_restore_patch_field_aborts_loudly(tmp_path, monkeypatch, 
     spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
-    def fake_session(adapter, project, rd, story_key, *, model=""):
+    def fake_session(adapter, project, rd, story_key, *, generation, model=""):
         marker = resolve.resolution_path(rd, story_key)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(json.dumps({"restore_patch": ""}), encoding="utf-8")
@@ -2771,7 +3852,7 @@ def test_cleanup_prunes_sessions_and_windows(tmp_path, monkeypatch, capsys):
     from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ["sweep-fin-1"])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: (["sweep-fin-1"], [], []))
 
     assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
     assert "removed 1 session(s), 1 ctl window(s)" in capsys.readouterr().out
@@ -2784,7 +3865,7 @@ def test_cleanup_warns_per_unknown_session(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1", "odd-1"], [], {"odd-1"})
     )
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: [])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], []))
 
     assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
     captured = capsys.readouterr()
@@ -2811,8 +3892,18 @@ def test_cleanup_json_dry_run_plans_without_pruning(tmp_path, monkeypatch, capsy
 
     assert doc["schema_version"] == cli.CLEANUP_SCHEMA_VERSION
     assert doc["dry_run"] is True
-    assert doc["sessions"] == {"removed": ["fin-1"], "live": ["live-1"], "unverifiable_pid": []}
-    assert doc["ctl_windows"] == {"removed": ["sweep-fin-1"]}
+    assert doc["sessions"] == {
+        "removed": ["fin-1"],
+        "live": ["live-1"],
+        "unverifiable_pid": [],
+        "legacy_leftovers": [],
+    }
+    assert doc["ctl_windows"] == {
+        "removed": ["sweep-fin-1"],
+        "survived": [],
+        "unverifiable": [],
+        "scan_error": None,
+    }
     assert dry_runs == [True]  # the kill stayed suppressed
 
 
@@ -2821,7 +3912,7 @@ def test_cleanup_json_real_run_reports_what_it_did(tmp_path, monkeypatch, capsys
     from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ["sweep-fin-1"])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: (["sweep-fin-1"], [], []))
 
     doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
 
@@ -2839,7 +3930,7 @@ def test_cleanup_json_carries_unverifiable_pid_with_empty_stderr(tmp_path, monke
     monkeypatch.setattr(
         runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1", "odd-1"], [], {"odd-1"})
     )
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: [])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], []))
 
     doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
 
@@ -2852,13 +3943,387 @@ def test_cleanup_json_nothing_to_clean_up_is_a_valid_empty_document(tmp_path, mo
     from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: [])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], []))
 
     doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
 
     assert doc["schema_version"] == cli.CLEANUP_SCHEMA_VERSION
-    assert doc["sessions"] == {"removed": [], "live": [], "unverifiable_pid": []}
-    assert doc["ctl_windows"] == {"removed": []}
+    assert doc["sessions"] == {
+        "removed": [],
+        "live": [],
+        "unverifiable_pid": [],
+        "legacy_leftovers": [],
+    }
+    assert doc["ctl_windows"] == {
+        "removed": [],
+        "survived": [],
+        "unverifiable": [],
+        "scan_error": None,
+    }
+
+
+def test_cleanup_json_still_emits_its_document_when_the_ctl_prune_raises(
+    tmp_path, monkeypatch, capsys
+):
+    """prune_sessions has already killed the sessions by the time the ctl half
+    runs, and the ctl half is raiser-side. An unguarded raise reaches main()'s
+    backstop, which leaves stdout EMPTY — so the record of those kills is gone
+    and a consumer cannot tell "killed nothing" from "killed one and lost the
+    receipt". The repair succeeded; only the observation failed — and the
+    document says so: empty arms with a null scan_error would read as a clean
+    scan that found nothing, so the failure travels as ctl_windows.scan_error
+    (the unverifiable_pid precedent)."""
+    from bmad_loop import runs
+    from bmad_loop.adapters.multiplexer import MultiplexerError
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
+
+    def boom(_proj):
+        raise MultiplexerError("tmux has-session failed: server gone")
+
+    monkeypatch.setattr(launch, "prune_ctl_windows", boom)
+
+    # err_contains, not the strict empty-stderr default: the failure is chatter
+    # this command now documents, and stdout must still be the document alone.
+    doc = machine_json(
+        ["cleanup", "--project", str(tmp_path), "--json"],
+        capsys,
+        err_contains="ctl window prune failed",
+    )
+
+    assert doc["sessions"]["removed"] == ["fin-1"]  # the receipt survives
+    assert doc["ctl_windows"] == {
+        "removed": [],
+        "survived": [],
+        "unverifiable": [],
+        "scan_error": "tmux has-session failed: server gone",
+    }
+
+
+def test_cleanup_dry_run_json_marks_a_failed_candidate_scan(tmp_path, monkeypatch, capsys):
+    """--dry-run --json is a preflight automation diffs against the real run, so
+    a candidate scan dying in transport must not emit the same document as a
+    scan that found nothing to prune — that reads as "nothing to do" and the
+    owed cleanup is skipped. Arms empty (no plan was formed), scan_error set,
+    exit still 0: dry-run kills nothing, so there is no receipt an exit 1 could
+    destroy, but the shared plan/outcome shape keeps one failure contract."""
+    from bmad_loop import runs
+    from bmad_loop.adapters.multiplexer import MultiplexerError
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
+
+    def boom(_proj):
+        raise MultiplexerError("tmux list-windows failed: timeout")
+
+    monkeypatch.setattr(launch, "prunable_ctl_windows", boom)
+
+    doc = machine_json(
+        ["cleanup", "--project", str(tmp_path), "--dry-run", "--json"],
+        capsys,
+        err_contains="ctl window prune failed",
+    )
+
+    assert doc["dry_run"] is True
+    assert doc["ctl_windows"] == {
+        "removed": [],
+        "survived": [],
+        "unverifiable": [],
+        "scan_error": "tmux list-windows failed: timeout",
+    }
+
+
+def test_cleanup_json_survives_a_decode_faulting_scan(tmp_path, monkeypatch, capsys):
+    """The scan's raiser-side probes decode with the strict POSIX handler and do
+    not all normalize a decode fault to the seam type (#380). It is the same
+    scan failure: the sessions receipt must survive and the document must say
+    the scan failed — reaching main()'s backstop instead empties stdout of both."""
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
+
+    def boom(_proj):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(launch, "prune_ctl_windows", boom)
+
+    doc = machine_json(
+        ["cleanup", "--project", str(tmp_path), "--json"],
+        capsys,
+        err_contains="ctl window prune failed",
+    )
+
+    assert doc["sessions"]["removed"] == ["fin-1"]  # the receipt survives
+    assert doc["ctl_windows"]["removed"] == []
+    assert "invalid start byte" in doc["ctl_windows"]["scan_error"]
+
+
+def test_cleanup_text_reports_a_raising_ctl_prune_without_losing_the_sessions(
+    tmp_path, monkeypatch, capsys
+):
+    from bmad_loop import runs
+    from bmad_loop.adapters.multiplexer import MultiplexerError
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
+
+    def boom(_proj):
+        raise MultiplexerError("tmux has-session failed: server gone")
+
+    monkeypatch.setattr(launch, "prune_ctl_windows", boom)
+
+    assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "removed 1 session(s), 0 ctl window(s)" in captured.out
+    assert "ctl window prune failed: tmux has-session failed" in captured.err
+
+
+def test_cleanup_schema_version_is_2_after_removed_narrowed(tmp_path, monkeypatch, capsys):
+    """`ctl_windows.removed` changed meaning (attempted -> verifiably gone), which
+    the contract says bumps the version rather than riding an additive field."""
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ([], [], []))
+
+    doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
+
+    assert doc["schema_version"] == 2
+
+
+def test_cleanup_json_separates_survivors_from_removals(tmp_path, monkeypatch, capsys):
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        launch, "prune_ctl_windows", lambda _proj: (["gone-1"], ["stuck-1"], ["dunno-1"])
+    )
+
+    doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
+
+    assert doc["ctl_windows"] == {
+        "removed": ["gone-1"],
+        "survived": ["stuck-1"],
+        "unverifiable": ["dunno-1"],
+        "scan_error": None,
+    }
+
+
+def test_cleanup_text_counts_only_verified_removals_and_names_the_rest(
+    tmp_path, monkeypatch, capsys
+):
+    """The count is what an operator reads as "it worked", so a window that
+    survived its kill must not be in it — and must not vanish silently either."""
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        launch, "prune_ctl_windows", lambda _proj: (["gone-1"], ["stuck-1"], ["dunno-1"])
+    )
+
+    assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "removed 0 session(s), 1 ctl window(s) (2 not verified — see stderr)" in captured.out
+    # Bound name-to-label, not just name-present: the two arms make different
+    # claims (still open vs no idea), and a bare membership check passes just as
+    # happily when the code reports one under the other's wording.
+    assert "still open after the kill: stuck-1" in captured.err
+    assert "kill attempted, outcome unverifiable: dunno-1" in captured.err
+
+
+def test_resolve_refuses_a_persisted_ctl_run_before_any_side_effect(project, monkeypatch, capsys):
+    """Through the ENTRY POINT, deliberately — the round-15 test called the
+    shared helper directly and could not see that resolve's flow launches the
+    interactive session and re-arms the escalation before reaching it. The
+    gate is at cmd_resolve entry: no adapters are built (the interactive
+    session is downstream of that), nothing is re-armed.
+
+    Ablate the entry gate and this fails two ways: the stderr message becomes
+    the not-at-an-escalation one, and the adapter build runs."""
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    run_dir = _make_run_with_state(
+        project.project,
+        "ctl",
+        paused_reason="spec approval",
+        paused_stage="spec-approval",
+    )
+    built = []
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: built.append(1) or {})
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+
+    assert cli.main(["resolve", "ctl", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "cannot resolve" in err and "bmad-loop-ctl" in err and "delete ctl" in err
+    assert built == [] and killed == []
+    # the run is untouched: still paused exactly as persisted, nothing re-armed
+    from bmad_loop.journal import load_state
+
+    assert load_state(run_dir).paused_reason == "spec approval"
+
+
+def test_resume_entrypoint_refuses_a_persisted_ctl_run(project, monkeypatch, capsys):
+    """The same gate through `bmad-loop resume ctl` itself — the helper-level
+    test cannot see the command wiring."""
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    _make_run_with_state(
+        project.project,
+        "ctl",
+        paused_reason="spec approval",
+        paused_stage="spec-approval",
+    )
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+
+    assert cli.main(["resume", "ctl", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "cannot resume" in err and "delete ctl" in err
+    assert killed == []
+
+
+def test_delete_removes_a_persisted_ctl_run_despite_the_live_control_session(
+    project, monkeypatch, capsys
+):
+    """The recovery the refusal advertises has to WORK: with the normal live
+    `bmad-loop-ctl` control session up, `bmad-loop delete ctl` used to reach
+    the live-session backstop (that session name IS `session_name("ctl")`),
+    raise, and leave the run directory intact — a refusal naming a recovery
+    that fails. The control session is never claimed through a run dir, so
+    its liveness is not evidence about the run and the delete proceeds.
+
+    Ablate the alias early-return in `live_session_may_be_ours` and this
+    fails with the LiveSessionError message."""
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    run_dir = _make_run_with_state(
+        project.project,
+        "ctl",
+        paused_reason="spec approval",
+        paused_stage="spec-approval",
+    )
+    # the machine's normal, live control session — untagged, as ctl sessions are
+    from test_runs import _LivenessMux
+
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux(["bmad-loop-ctl"]))
+
+    assert cli.main(["delete", "ctl", "--project", str(project.project)]) == 0
+    assert "deleted" in capsys.readouterr().out
+    assert not run_dir.exists()
+
+
+def test_delete_refuses_a_historical_digest_run_with_a_live_agent(project, monkeypatch, capsys):
+    """The data-loss inverse of the recovery test below, through the ENTRY
+    POINT: on tmux a `main`-created run `ctl-<16 hex>` owns a genuine agent
+    session (there are no digest-named control sessions there), and the
+    round-16 shape discount let `delete` destroy its run dir while that
+    agent was live — removing the untagged session's only ownership proof.
+    The instance test queries the mux and the live-session backstop refuses.
+
+    Ablate the discount back to the shape predicate and this fails: rc 0
+    and the run dir gone."""
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    run_dir = _make_run_with_state(
+        project.project,
+        "ctl-0123456789abcdef",
+        paused_reason="spec approval",
+        paused_stage="spec-approval",
+    )
+    # tmux shape: the fixed name is the only control session; the digest name
+    # is this run's own live agent session
+    from test_runs import _LivenessMux
+
+    monkeypatch.setattr(runs, "ctl_session_for", lambda p, mux=None: runs.CTL_SESSION)
+    monkeypatch.setattr(
+        runs,
+        "get_multiplexer",
+        lambda: _LivenessMux(["bmad-loop-ctl", "bmad-loop-ctl-0123456789abcdef"]),
+    )
+
+    assert cli.main(["delete", "ctl-0123456789abcdef", "--project", str(project.project)]) == 1
+    assert "still live" in capsys.readouterr().err
+    assert run_dir.exists()  # the run dir survived its live agent
+
+
+def test_delete_refuses_a_case_variant_run_where_the_transport_is_case_sensitive(
+    project, monkeypatch, capsys
+):
+    """Finding-1's reproduction, through the ENTRY POINT: on tmux
+    `bmad-loop-CTL` coexists with `bmad-loop-ctl` (measured on 3.4), so a
+    persisted `CTL` run's uppercase agent is a genuinely live session — the
+    round-17 constant fold discounted it as "the control session" and delete
+    removed the run dir under it. The comparison now belongs to the
+    transport (`session_name_key`, identity on tmux) and the refusal stands.
+
+    Ablate the seam key back to a constant `.lower()` and this fails: rc 0
+    and the run dir gone."""
+    from test_runs import _LivenessMux
+
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    run_dir = _make_run_with_state(
+        project.project,
+        "CTL",
+        paused_reason="spec approval",
+        paused_stage="spec-approval",
+    )
+    monkeypatch.setattr(runs, "ctl_session_for", lambda p, mux=None: runs.CTL_SESSION)
+    monkeypatch.setattr(
+        runs,
+        "get_multiplexer",
+        lambda: _LivenessMux(["bmad-loop-ctl", "bmad-loop-CTL"], fold=False),
+    )
+
+    assert cli.main(["delete", "CTL", "--project", str(project.project)]) == 1
+    assert "still live" in capsys.readouterr().err
+    assert run_dir.exists()
+
+
+def test_resume_refuses_a_persisted_ctl_shaped_run(project, monkeypatch, capsys):
+    """Mint-time validation never sees what an older release already wrote to
+    disk: a run dir named `ctl`, resolved through resume, would relaunch under
+    the control session's own name (and its stale-session sweep would kill
+    that session first). Refused in the shared helper — so resolve's re-arm
+    gets the same gate — before any side effect, and the message names the
+    way out (`bmad-loop delete`, which no longer touches any session under
+    the name).
+
+    Ablate the gate and this proceeds to the stub engine: rc 0, and the
+    stale-session sweep fires with the reserved name."""
+    from conftest import install_base_skills
+
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = _make_run_with_state(
+        project.project,
+        "ctl",
+        paused_reason="spec approval",
+        paused_stage="spec-approval",
+    )
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    err = capsys.readouterr().err
+    assert "cannot resume" in err and "bmad-loop-ctl" in err and "delete ctl" in err
+    assert killed == []  # the stale-session sweep never ran with the reserved name
 
 
 def test_resume_kills_stale_session_before_running(project, monkeypatch):
@@ -3043,6 +4508,106 @@ def test_resume_restamps_policy_snapshot_for_sweep_runs(project, monkeypatch):
     assert load_state(run_dir).cache_read_weight() == 0.5
 
 
+# ------------------------------------------- resume re-stamps the code root
+
+# `repo_root:` is the one ProjectPaths member that decides which git TREE the run
+# works in, and resume re-reads config.yaml, so it is also the one the persisted
+# mirror (`RunState.repo_root`, which `runs.rearm_escalation` reads back out of
+# process) can fall behind. The three rows below are the whole contract: a move is
+# adopted and announced, a run that did not move reports nothing, and a state.json
+# from before the field existed migrates without being called a move.
+
+
+def _configure_repo_root(project, root: Path) -> None:
+    """Add a `repo_root:` override to the config.yaml `install_bmad_config` wrote.
+    Appended rather than rewritten so the artifact keys keep their real values —
+    `load_paths` requires them, and a stub would move what the test is not about."""
+    cfg = project.project / "_bmad" / "bmm" / "config.yaml"
+    cfg.write_text(
+        cfg.read_text(encoding="utf-8") + f"repo_root: '{root.as_posix()}'\n", encoding="utf-8"
+    )
+
+
+def test_resume_restamps_the_code_root_when_the_config_moved(project, monkeypatch, capsys):
+    """Resume adopts the code root now on disk, so the mirror must follow it.
+
+    `compose_resume` builds the Workspace off the freshly loaded `paths`, never off
+    state.json, so after a `repo_root:` edit the engine works in the new tree while
+    `runs.rearm_escalation` — a separate process, reading `RunState.code_root` — would
+    still advance the attempt baseline and re-stamp `baseline_revision` in the old one.
+    Two readers, two trees, no error: `resolve` would report a re-arm that armed the
+    wrong repository.
+
+    Durable BEFORE the engine starts, like the snapshot and the digest beside it:
+    `rearm_escalation` reads the file, and `Engine._save()` may not fire for minutes.
+
+    Ablation: delete `state.repo_root = str(paths.repo_root)` from `_resume_paused_run`
+    and this reddens on the stale root (the legacy-migration row below reddens with
+    it); neutralize `code_root_changed` to a literal `False` and it reddens on the
+    journal field and the warning instead.
+    """
+    seen: list = []
+    run_dir = _paused_run_for_resume(
+        project, monkeypatch, repo_root=str(project.project / "old-code")
+    )
+    moved = project.project / "moved-code"
+    moved.mkdir()
+    _configure_repo_root(project, moved)
+    monkeypatch.setattr(cli, "Engine", _state_reading_engine(seen))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    (at_start,) = seen
+    assert at_start.code_root == moved.resolve()
+    assert _resume_entry(run_dir)["code_root_changed"] is True
+    err = capsys.readouterr().err
+    assert "the code root in _bmad/bmm/config.yaml has changed" in err
+    # the warning names neither tree: a journalled scalar, an operator-facing sentence
+    assert str(moved) not in err
+
+
+def test_resume_reports_no_code_root_change_when_the_config_did_not_move(
+    project, monkeypatch, capsys
+):
+    """The ordinary resume, and the reason the compare is exact rather than a
+    canonicalizing one: both sides are `str(paths.repo_root)` off `load_paths`, which
+    resolves every member or raises, so an unmoved config must compare equal on the
+    nose. A row that reported a change here would fire the warning on every resume —
+    the per-configuration constant the `rearm-spec-write-unreachable` narrowing exists
+    to avoid, one file over.
+    """
+    run_dir = _paused_run_for_resume(
+        project, monkeypatch, repo_root=str(Path(project.project).resolve())
+    )
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert _resume_entry(run_dir)["code_root_changed"] is False
+    assert "code root" not in capsys.readouterr().err
+
+
+def test_resume_migrates_a_legacy_state_without_calling_it_a_move(project, monkeypatch, capsys):
+    """A state.json written before `repo_root` existed reads back "" — a MISSING value,
+    not a divergent one. The `bool(state.repo_root)` guard is what keeps it out of the
+    compare, and the unconditional re-stamp is what migrates it onto the root the run
+    was already using.
+
+    Ablation: drop that guard and this reddens on both the journal field and the
+    warning, on every legacy run's first resume — the exact false alarm the guard buys.
+    """
+    from bmad_loop.journal import load_state
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)  # no repo_root: pre-field
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert load_state(run_dir).repo_root == str(Path(project.project).resolve())
+    assert _resume_entry(run_dir)["code_root_changed"] is False
+    assert "code root" not in capsys.readouterr().err
+
+
 def test_resume_tolerates_a_corrupt_sweep_json(project, monkeypatch):
     """A torn/corrupt sweep.json (a crash mid-write on an older run) must not abort
     resume — the recovery path. compose_resume guards the read and falls back to the
@@ -3143,9 +4708,180 @@ def test_resume_under_an_unchanged_policy_reports_no_change(project, monkeypatch
     assert "cache_read_weight_was" not in entry  # unchanged -> omitted
 
 
+def test_resume_warns_when_the_pinned_host_exec_config_changed(project, monkeypatch, capsys):
+    """#461 point 4, human-present half. A session may have rewritten the verify
+    commands while the operator was away; `resume` is the moment they can still
+    look, so the change stops being silent. It stays a WARNING — a human typed
+    `resume`, and refusing here would break resume-to-fix-a-setting.
+
+    The baseline round-trips through the out-of-tree state dir since #498; the
+    behaviour asserted here is the one that must NOT have changed with it."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    # First resume stamps the pin (the run predates the field, so it has none).
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert _resume_entry(run_dir)["security_config_changed"] is False
+    pinned = runs.read_trusted_config_digest(project.project, run_dir.name)
+    assert pinned  # the launch/resume baseline is persisted, not just in memory
+    capsys.readouterr()
+
+    _write_policy(project.project, RESUME_POLICY.replace('["true"]', '["touch pwned"]'))
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert _resume_entries(run_dir)[-1]["security_config_changed"] is True
+    err = capsys.readouterr().err
+    assert "host-exec config pinned at launch has changed" in err
+    # STATIC category names only — never the command that was substituted in.
+    assert "verify commands" in err and "plugin allowlist" in err
+    assert "touch pwned" not in err
+    # ...and the resume re-blesses it, so the next one is quiet again.
+    assert runs.read_trusted_config_digest(project.project, run_dir.name) != pinned
+
+
+def test_resume_still_warns_when_a_session_rewrote_the_digest_in_state_json(
+    project, monkeypatch, capsys
+):
+    """#498, the whole point of the relocation. The baseline used to round-trip
+    through `<project>/.bmad-loop/runs/<id>/state.json` — inside the very tree the
+    digest exists to police — so the session that rewrote `policy.toml` could blank
+    the field in the same breath and the warning never fired. Blanking sufficed:
+    the guard reads "" as "no prior pin".
+
+    This is the attack, run end to end: change the host-exec config AND blank the
+    in-tree field, exactly as one session could. The warning must still fire,
+    because the baseline that decides it is now out of the tree.
+
+    ABLATION: point `_resume_paused_run`'s read back at
+    `state.trusted_config_digest` (or make the reader prefer the legacy field over
+    the state-root file) and this goes quiet — no warning, `security_config_changed`
+    False."""
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)
+    capsys.readouterr()
+
+    # The session rewrites the verify commands...
+    _write_policy(project.project, RESUME_POLICY.replace('["true"]', '["touch pwned"]'))
+    # ...and covers its tracks in the one file it can reach.
+    state = load_state(run_dir)
+    state.trusted_config_digest = ""
+    save_state(run_dir, state)
+    assert load_state(run_dir).trusted_config_digest == ""  # the cover-up landed
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert _resume_entries(run_dir)[-1]["security_config_changed"] is True
+    assert "host-exec config pinned at launch has changed" in capsys.readouterr().err
+
+
+def test_resume_migrates_a_pre_498_baseline_out_of_state_json(project, monkeypatch, capsys):
+    """The one-release legacy fallback. A run PAUSED under the old code has its
+    baseline in `state.json` and nowhere else, so reading only the state root would
+    silently drop the pin for exactly the runs that sat idle longest — turning
+    "this run has a pin" into "this run has none" on the first resume after the
+    upgrade, which is the empty-means-legacy contract read backwards.
+
+    So: no state-root file + a non-empty in-tree field = compare against the field,
+    warn, and migrate. After this resume the run has a file out of tree, and the
+    in-tree copy stops deciding anything for it while that file stays reachable.
+
+    ABLATION: drop the `if pinned is None` fallback in `_resume_paused_run` and the
+    warning assert fails (the migrated run reads no baseline and stays quiet)."""
+    from bmad_loop import runs
+
+    # A run persisted by the old code: a pin in state.json, nothing out of tree.
+    run_dir = _paused_run_for_resume(project, monkeypatch, trusted_config_digest="stale-pin")
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    assert runs.read_trusted_config_digest(project.project, run_dir.name) is None
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    # It compared against the legacy field, so the change is caught on this resume.
+    assert _resume_entries(run_dir)[-1]["security_config_changed"] is True
+    assert "host-exec config pinned at launch has changed" in capsys.readouterr().err
+    # ...and migrated: the baseline now lives out of tree, and is the fresh one.
+    migrated = runs.read_trusted_config_digest(project.project, run_dir.name)
+    assert migrated and migrated != "stale-pin"
+
+
+def test_resume_still_warns_after_the_project_is_renamed(project, monkeypatch, capsys):
+    """The out-of-tree baseline is keyed by the project's RESOLVED PATH
+    (`runs.project_tag`), so moving or renaming the project keys the run somewhere
+    new and orphans the subtree holding its `config-digest` — FEATURES.md documents
+    the GC half of the same fact. state.json travels with the run dir instead.
+
+    Stamping ONLY out of tree therefore made a rename silently retire the pin: the
+    reader answers `None`, the in-tree copy was never written under that code, and
+    an empty fallback means "no prior pin, no warning" — so a host-exec config
+    change across a move was accepted in silence, and every later resume stayed
+    quiet too. No tampering involved; a documented operator action. Pre-#498 the
+    pin lived in state.json and survived this, which makes it a regression, not a
+    pre-existing hole. Writing both copies keeps the warning alive here WITHOUT
+    making the in-tree one authoritative — the test above is the other half of that
+    pair, and still passes: with the file present, this copy loses.
+
+    ABLATION: drop `state.trusted_config_digest = new_digest` from
+    `_resume_paused_run` (or the `trusted_config_digest=` argument from
+    `runsetup.build_run_state`) and the warning assert fails."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)
+    capsys.readouterr()
+
+    # The operator renames the project directory; the run dir goes with it.
+    src = project.project
+    dst = src.parent / (src.name + "-renamed")
+    shutil.move(str(src), str(dst))
+    moved = dst / run_dir.relative_to(src)
+    assert moved.is_dir()
+    # Precondition, or this test would pass for the wrong reason: the rename really
+    # did put the out-of-tree baseline out of reach.
+    assert runs.project_tag(dst) != runs.project_tag(src)
+    assert runs.read_trusted_config_digest(dst, run_dir.name) is None
+
+    # ...and the host-exec config changes, exactly as in the no-move case.
+    _write_policy(dst, RESUME_POLICY.replace('["true"]', '["touch pwned"]'))
+    assert cli._resume_paused_run(dst, moved) == 0
+
+    assert _resume_entries(moved)[-1]["security_config_changed"] is True
+    assert "host-exec config pinned at launch has changed" in capsys.readouterr().err
+    # The resume re-keys the run: from here the baseline is out of tree again.
+    assert runs.read_trusted_config_digest(dst, run_dir.name)
+
+
+def test_resume_under_an_unchanged_host_exec_config_reports_no_security_change(
+    project, monkeypatch, capsys
+):
+    """The false-positive guard, and the reason the pin is a field-scoped digest:
+    a `[limits]` edit is a policy change (#189 supports it mid-run) but not a
+    host-exec one, so `policy_changed` fires and `security_config_changed` must
+    not — otherwise the warning cries wolf on every supported live-edit."""
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    capsys.readouterr()
+
+    _write_policy(project.project, RESUME_POLICY.replace("0.5", "0.25"))
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    entry = _resume_entries(run_dir)[-1]
+    assert entry["policy_changed"] is True  # the edit IS a policy change...
+    assert entry["security_config_changed"] is False  # ...but not a host-exec one
+    assert "host-exec config" not in capsys.readouterr().err
+
+
 def test_resume_discards_stale_graceful_stop_request(project, monkeypatch, capsys):
-    """A resume is fresh user intent: a graceful-stop request left over from the
-    prior stopped-gracefully run must be cleared before write_pid re-arms the
+    """A resume is fresh user intent: a stop request left over from the prior
+    stopped run — either mode — must be cleared before write_pid re-arms the
     engine, or the re-driven loop would consume it at the first item boundary and
     immediately re-stop. The clear is noted on stderr."""
     from bmad_loop import runs
@@ -3159,7 +4895,101 @@ def test_resume_discards_stale_graceful_stop_request(project, monkeypatch, capsy
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
     assert not (run_dir / runs.STOP_REQUEST_FILE).exists()  # consumed before the engine ran
-    assert "discarded a stale graceful-stop request" in capsys.readouterr().err
+    assert "discarded a stale stop request" in capsys.readouterr().err
+
+
+def test_resume_discards_a_stale_hard_stop_request(project, monkeypatch, capsys):
+    """The mode-neutral half of the docstring above, which the graceful test alone
+    could not prove. A hard request survives `stop_run`'s refusal to force-kill an
+    unverifiable pid, and `_resume_paused_run` gates on `finished`, not `stopped`, so
+    such a run is genuinely resumable with a hard file still on disk.
+
+    Ablation: mode-gate the clear at its call site to
+    `read_stop_request_mode(...) == "graceful"` — this reddens and its graceful twin
+    stays green."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "old", "mode": "hard"}', encoding="utf-8"
+    )
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert not (run_dir / runs.STOP_REQUEST_FILE).exists()
+    assert "discarded a stale stop request" in capsys.readouterr().err
+
+
+def test_resume_refuses_when_a_stale_request_cannot_be_discarded(project, monkeypatch, capsys):
+    """Fail closed. The clear conflates "nothing pending" with "could not remove it",
+    so on a removal failure the discard notice never prints and resume used to arm
+    the pid anyway — the engine then consumed the surviving request at the very first
+    item boundary and re-stopped, with nothing on stderr to say why. Resuming again
+    repeats it: a livelock, not a one-shot annoyance.
+
+    The refusal has to land *before* write_pid, or the run is already re-armed."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "old", "mode": "hard"}', encoding="utf-8"
+    )
+
+    def _refuse(_path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(runs, "retrying_unlink", _refuse)
+    started: list[str] = []
+    monkeypatch.setattr(runs, "write_pid", lambda _d: started.append("armed"))
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert started == []  # refused before the engine was re-armed
+    assert "could not be discarded" in capsys.readouterr().err
+
+
+def test_refused_resume_leaves_the_pin_and_the_journal_untouched(project, monkeypatch, capsys):
+    """A refusal past this function's commit point must leave no trace of a resume
+    that did not happen. `_require_base_skills` used to be the last early exit here,
+    so the stale-request refusal above is the first branch that returns from *below*
+    the journal append and the integrity re-stamp — and both of those are persistent
+    writes, not in-memory state.
+
+    The pin is the one that lasts. `write_trusted_config_digest` writes the exact
+    file the next resume reads back as `pinned`, so re-baselining it on a refusal
+    inverts the advisory it feeds: the warning fires on the attempt that stopped and
+    goes silent on the attempt that actually arms an engine — for a config change the
+    operator never accepted by resuming. The re-stamp's stated justification is that
+    the engine this process is about to arm re-reads the config; a path that arms
+    nothing does not earn it.
+
+    Ablation: move the clear/refuse block back below
+    `runs.write_trusted_config_digest`. Both assertions redden, on two independent
+    axes — the pin becomes the freshly computed sha256, and one `run-resume` entry
+    appears — while `test_resume_refuses_when_a_stale_request_cannot_be_discarded`
+    above stays green, which is what separates this guard from that one."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "old", "mode": "hard"}', encoding="utf-8"
+    )
+    # A sentinel the re-stamp cannot reproduce: the real digest is a sha256, so
+    # equality against this is a positive assertion, not "some value is present" —
+    # which `is not None` would have been, and which would survive the ablation.
+    runs.write_trusted_config_digest(project.project, run_dir.name, "OLDPIN")
+
+    def _refuse(_path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(runs, "retrying_unlink", _refuse)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert "could not be discarded" in capsys.readouterr().err
+    assert runs.read_trusted_config_digest(project.project, run_dir.name) == "OLDPIN"
+    assert _resume_entries(run_dir) == []
 
 
 def test_resume_refuses_live_run(tmp_path, monkeypatch, capsys):
@@ -3226,7 +5056,7 @@ def test_diagnose_json_emits_pure_document(project, capsys):
 
     _seed_run(project.project)
     doc = machine_json(["diagnose", "--project", str(project.project), "--json"], capsys)
-    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 1
+    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 2
     assert doc["runs"], "the document carries the run it resolved"
     for canary in CANARIES:
         assert canary not in json.dumps(doc), f"LEAK via CLI: {canary!r}"
@@ -3246,7 +5076,7 @@ def test_diagnose_json_out_writes_document_and_keeps_stdout_empty(project, tmp_p
     assert "written to" in err  # the confirmation moved to stderr
     written = out_file.read_text()
     doc = json.loads(written)
-    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 1
+    assert doc["schema_version"] == diagnostics.SCHEMA_VERSION == 2
     assert "```" not in written  # no fences in a file written in JSON mode
     for canary in CANARIES:
         assert canary not in written, f"LEAK via CLI: {canary!r}"
@@ -3428,10 +5258,13 @@ def _patch_preflight(monkeypatch, backend):
     monkeypatch.setattr(ph_mod, "get_process_host", lambda: _FakeHost())
 
 
-def _preflight_notes_problems():
+def _preflight_notes_problems(project=Path("C:/p")):
     """The preflight's pre-#205 (notes, problems) shape, rebuilt from its findings —
-    these tests assert the *seam probing*, which the Finding refactor did not change."""
-    found = cli._platform_preflight()
+    these tests assert the *seam probing*, which the Finding refactor did not change.
+
+    The default project is a plain drive path so the #332 WSL check stays quiet;
+    the tests that care pass their own."""
+    found = cli._platform_preflight(project)
     return (
         [f.message for f in found if f.severity != "problem"],
         [f.message for f in found if f.severity == "problem"],
@@ -3534,7 +5367,7 @@ def test_validate_hookless_profile_notes_no_hook_registration(project, capsys):
 
     cli.cmd_validate(args)
     text = _validate_output(capsys)
-    assert "opencode-http: hookless (http/sse transport)" in text
+    assert "opencode-http: hookless (the adapter observes completion itself)" in text
     assert "hooks not registered for opencode-http" not in text
     # httpx ships in the dev group, so the extra-dependency gate passes here
     assert "httpx available for opencode-http" in text
@@ -3553,7 +5386,7 @@ def test_validate_hookless_dev_review_is_runnable(project, capsys):
 
     cli.cmd_validate(args)
     text = _validate_output(capsys)
-    assert "opencode-http: hookless (http/sse transport)" in text
+    assert "opencode-http: hookless (the adapter observes completion itself)" in text
     assert "cannot drive the dev/review roles" not in text
     assert "phase 4" not in text
 
@@ -3758,13 +5591,20 @@ def test_validate_warns_on_unknown_closes_deferred_in_sprint_mode(project, capsy
     assert findings[0]["detail"] == {"source": "spec spec-1-1-a.md", "unknown_ids": ["DW-99"]}
 
 
-def test_validate_warns_when_the_ledger_itself_is_unreadable(project, capsys, monkeypatch):
+def test_validate_fails_when_the_ledger_itself_is_unreadable(project, capsys, monkeypatch):
     """The ledger read shared a `try` with the manifest read, and that arm returns
     silently — correctly for the manifest, which `queue.stories-manifest` already
     reports, but nothing else in `validate` reads the ledger. So an unreadable one
     produced no finding at all: preflight reported success for a check that
     examined nothing, against the very file the run's closure will fail on
-    (#284 round-5 review, finding 6)."""
+    (#284 round-5 review, finding 6).
+
+    A problem, not a warning. A warning exits 0 with the hard gate never evaluated,
+    which is a fail-open on the one deferred check that refuses — and it cannot be
+    narrowed by asking whether the project gates anything, because the file that
+    would answer is the unreadable one. `Engine._refuse_gated_story` pauses on the
+    same fault, and the two surfaces have to give the same verdict about the same
+    file."""
     install_bmad_config(project)
     _write_policy(project.project)
     write_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -3778,10 +5618,15 @@ def test_validate_warns_when_the_ledger_itself_is_unreadable(project, capsys, mo
     doc = json.loads(capsys.readouterr().out)
     findings = [f for f in doc["findings"] if f["check"] == "deferred.ledger-unreadable"]
     assert len(findings) == 1
-    assert findings[0]["severity"] == "warning"  # advisory: still never a gate
+    assert findings[0]["severity"] == "problem"  # the gate rode on these bytes
     assert findings[0]["detail"]["ledger"] == str(project.deferred_work)
+    # the same bytes now back the hard gate, so the message has to say the gate went
+    # unchecked too — a warning that names only closes_deferred reads as though the
+    # refusal had run and found nothing
+    assert "gate:" in findings[0]["message"] and "hard gates" in findings[0]["message"]
     # and the declaration checks it could not run stay quiet rather than guessing
     assert not [f for f in doc["findings"] if f["check"] == "deferred.closes-unknown"]
+    assert not [f for f in doc["findings"] if f["check"].startswith("deferred.hard-gate")]
 
 
 def test_validate_warns_on_a_malformed_closes_deferred_declaration(project, capsys):
@@ -3818,6 +5663,514 @@ def test_validate_sprint_mode_silent_without_declarations(project, capsys):
 
     doc = json.loads(capsys.readouterr().out)
     assert [f for f in doc["findings"] if f["check"].startswith("deferred.closes")] == []
+
+
+def _hard_gate_findings(capsys, check="deferred.hard-gate"):
+    doc = json.loads(capsys.readouterr().out)
+    return [f for f in doc["findings"] if f["check"] == check]
+
+
+def _validate_gated_sprint(project, capsys, board, ledger):
+    """Run validate over a sprint project with `board` on the queue and `ledger`
+    (write_gated_ledger's shape) on disk; returns the parsed findings."""
+    install_bmad_config(project)
+    _write_policy(project.project)
+    write_sprint(project, board)
+    write_gated_ledger(project, ledger, commit=False)
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)  # rc varies by host (binary/skills) — parse the document
+    return json.loads(capsys.readouterr().out)["findings"]
+
+
+def test_validate_fails_when_an_open_entry_gates_an_actionable_story(project, capsys):
+    """The gate the ledger could only ever *say* before: an entry whose prose read
+    "HARD GATE: must run before 3-2" stopped nothing, and `run` drove the story on
+    a leg nobody had wired. With `gate:` the claim is matchable, and unlike every
+    other deferred check this one is a problem — it describes work that must not
+    start, which is what a non-zero exit is for."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link-student-surface": "ready-for-dev"},
+        {"DW-1": ("open", ["gate: 3-2"])},
+    )
+
+    gates = [f for f in findings if f["check"] == "deferred.hard-gate"]
+    assert len(gates) == 1
+    assert gates[0]["severity"] == "problem"  # the one deferred check that gates
+    assert gates[0]["detail"] == {
+        "dw_id": "DW-1",
+        "title": "item DW-1",
+        "story_key": "3-2-invite-link-student-surface",
+        "tokens": ["3-2"],
+    }
+    # names the entry, the story, the token, and both ways out
+    assert "DW-1 (item DW-1)" in gates[0]["message"]
+    assert "3-2-invite-link-student-surface" in gates[0]["message"]
+    assert "gate: 3-2" in gates[0]["message"]
+    assert "status: done <date>" in gates[0]["message"]
+
+
+def test_validate_passes_when_the_gated_story_is_already_done(project, capsys):
+    """A gate is about work that must not *start*. A story the board has already
+    finished is past the point the entry was protecting, so it reports the passing
+    case rather than a refusal nobody can act on."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link-student-surface": "done"},
+        {"DW-1": ("open", ["gate: 3-2"])},
+    )
+
+    gates = [f for f in findings if f["check"] == "deferred.hard-gate"]
+    assert len(gates) == 1 and gates[0]["severity"] == "ok"
+    assert gates[0]["detail"] == {"gating_ids": ["DW-1"], "actionable": []}
+
+
+def test_validate_passes_when_the_gate_entry_is_closed(project, capsys):
+    """Closing the entry is the primary remedy the failure names, so it has to be
+    the one that clears it: the same board passes once DW-1 lands."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link-student-surface": "ready-for-dev"},
+        {"DW-1": ("done 2026-08-01", ["gate: 3-2"])},
+    )
+
+    gates = [f for f in findings if f["check"] == "deferred.hard-gate"]
+    assert len(gates) == 1 and gates[0]["severity"] == "ok"
+    assert gates[0]["detail"]["gating_ids"] == []
+
+
+def test_validate_ignores_an_unstructured_gate_on_a_closed_entry(project, capsys):
+    """The `entry.open` skip guards the warning as well as the refusal, and only the
+    refusal half was pinned — an ablation of the skip left every closed entry
+    warning about gates that already landed, with nothing red."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {
+            "DW-1": ("done 2026-08-01", ["gate: 3-2 3-3"]),
+            "DW-2": ("done 2026-08-01", ["HARD GATE: must land before 3-2"]),
+            "DW-3": ("done 2026-08-01", ["gate:"]),
+        },
+    )
+
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+
+
+@pytest.mark.parametrize("status", ["opne", "opened", "in progress", ""])
+def test_validate_hard_gate_holds_on_a_status_the_format_cannot_read(project, capsys, status):
+    """`entry.open` is False for a typo'd status, so the entry was skipped — the
+    gate silently did not apply, AND the check went on to emit an `ok` naming the
+    board as clear. One character disabled the refusal and replaced it with an
+    all-clear, which is the exact silent miss `gate:` exists to end.
+
+    Only an explicit `done` retires a gate; a status the format cannot read is not
+    evidence the work landed."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": (status, ["gate: 3-2"])},
+    )
+
+    gates = [f for f in findings if f["check"] == "deferred.hard-gate"]
+    assert len(gates) == 1 and gates[0]["severity"] == "problem"
+    assert gates[0]["detail"]["story_key"] == "3-2-invite-link"
+    # and the message sends the operator to the `status:` line rather than telling
+    # them to close work that may already have landed
+    assert "cannot be read as landed" in gates[0]["message"]
+    if status:
+        assert f"`{status}`" in gates[0]["message"]
+
+
+def test_validate_warns_on_a_gate_line_the_field_anchor_cannot_read(project, capsys):
+    """`Gate: 3-2` and an indented `  gate: 3-2` produced no finding of any kind —
+    the field failing open, where a missed `status:` fails closed. Surfaced rather
+    than accepted: reading an indented line as a declaration would turn a fenced
+    example inside an entry into a refusal of a story nobody meant to block."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", ["Gate: 3-2", "  gate: 3-3"])},
+    )
+
+    unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+    assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
+    assert unstructured[0]["detail"]["near_miss"] == 2
+    assert "the very start of a line" in unstructured[0]["message"]
+    # nothing enforceable was declared, so there is no passing gate to report either
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
+
+
+def test_validate_does_not_report_an_all_clear_for_an_unmatchable_token(project, capsys):
+    """`gate: 3.2` is one keystroke from the shape that works and can never match
+    any key. It used to land in `tokens`, which made the ledger "gated", and the
+    check then reported a green `ok` — an all-clear earned by a gate that held
+    nothing. It is a malformed token now, so the operator is told."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", ["gate: 3.2"])},
+    )
+
+    unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+    assert len(unstructured) == 1 and unstructured[0]["detail"]["malformed"] == ["3.2"]
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
+
+
+def test_validate_does_not_refuse_a_story_over_a_quoted_gate_example(project, capsys):
+    """End to end: an entry documenting the field must not refuse the story its
+    example names. A false refusal wedges a run, which is the one way this check
+    can be worse than the prose gate it replaced — and the entry most likely to
+    carry a quoted `gate:` is the one written to explain `gate:`."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", ["```markdown", "gate: 3-2", "```"])},
+    )
+
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+
+
+def test_validate_hard_gate_token_stops_at_the_key_boundary(project, capsys):
+    """`3-2` gates the story it names and both halves of that story once breakdown
+    splits it, and not its numeric neighbours. A bare `startswith` would sweep
+    `3-20-...` in and block unrelated work; a `-`-only boundary would drop the gate
+    the moment 3-2 became 3-2a/3-2b, which is the same gate failing silently."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {
+            "3-2-invite-link-student-surface": "ready-for-dev",
+            "3-2a-split-half": "ready-for-dev",
+            "3-20-later-story": "ready-for-dev",
+        },
+        {"DW-1": ("open", ["gate: 3-2"])},
+    )
+
+    gated = [f["detail"]["story_key"] for f in findings if f["check"] == "deferred.hard-gate"]
+    assert gated == ["3-2-invite-link-student-surface", "3-2a-split-half"]
+
+
+def test_validate_unions_multiple_gate_lines(project, capsys):
+    """One entry may block several stories, spelled across lines or on one line.
+    A line-oriented file gives an author no reason to prefer either, so both read
+    the same — and each gated story is its own refusal."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev", "4-1-receipts": "backlog"},
+        {"DW-1": ("open", ["gate: 3-2", "gate: 4-1, 9-9"])},
+    )
+
+    gated = [f["detail"]["story_key"] for f in findings if f["check"] == "deferred.hard-gate"]
+    assert gated == ["3-2-invite-link", "4-1-receipts"]  # 9-9 is on no board
+
+
+def test_validate_warns_on_a_prose_only_hard_gate(project, capsys):
+    """The convention `gate:` replaces. A ledger that says HARD GATE in prose is
+    making a claim nothing enforces, so preflight names it — otherwise the entry
+    reads, to anyone scanning it, as a gate already in force."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", ["HARD GATE: must land before story 3-2"])},
+    )
+
+    unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+    assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
+    assert unstructured[0]["detail"] == {
+        "dw_id": "DW-1",
+        "malformed": [],
+        "empty": 0,
+        "near_miss": 0,
+    }
+    assert "`gate:` line" in unstructured[0]["message"]
+    # nothing enforceable exists, so there is no passing gate to report either
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
+
+
+def test_validate_warns_on_a_mid_line_hard_gate(project, capsys):
+    """Real ledgers hard-wrap their `reason:` prose, so a declaration routinely
+    lands mid-line. A line-anchored detector missed exactly the entries that had
+    one — which is the whole population this warning exists for."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", ["reason: wired late. HARD GATE: must land before 3-2."])},
+    )
+
+    unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+    assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
+
+
+def test_validate_ignores_a_hard_gate_quoted_in_a_fenced_example(project, capsys):
+    """The citation an author writes as a block rather than inline. `gates()`
+    already masks a fenced `gate:` out of the refusal; leaving the prose scan on
+    the raw body made the entry documenting the migration — the one place both
+    spellings appear together — warn about its own example."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {
+            "DW-1": (
+                "open",
+                ["reason: documents the old convention:", "```", "HARD GATE: before 3-2", "```"],
+            )
+        },
+    )
+
+    assert not [f for f in findings if f["check"].startswith("deferred.hard-gate")]
+
+
+def test_validate_ignores_an_entry_that_only_cites_a_hard_gate(project, capsys):
+    """An entry *about* the convention is not declaring one — the ledger's own
+    "no mechanical check enforces a HARD GATE" entry must not warn about itself.
+    The quote is what separates the two, and a colon-less mention never reaches
+    the pattern at all."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {
+            "DW-1": ("open", ['reason: an entry naming a "HARD GATE: before X" binds nothing.']),
+            "DW-2": ("open", ["reason: this HARD GATE is textual only, nothing enforces it."]),
+        },
+    )
+
+    assert not [f for f in findings if f["check"].startswith("deferred.hard-gate")]
+
+
+def test_validate_warns_on_an_empty_gate_line(project, capsys):
+    """`gate:` with nothing after it is a claim made inertly. It reads, to anyone
+    scanning the entry, as a gate already in force, and silence would make it
+    indistinguishable from an entry that never gated anything."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", ["gate:"])},
+    )
+
+    unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+    assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
+    assert "empty `gate:` line" in unstructured[0]["message"]
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
+
+
+def test_validate_warns_on_a_malformed_gate_token(project, capsys):
+    """`gate: 3-2 3-3` looks like two tokens and is one that matches nothing.
+    Reading it leniently would guess at a separator the format never promised, so
+    it is surfaced instead — a token that gates nothing is the prose gate again,
+    wearing the field's syntax."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", ["gate: 3-2 3-3"])},
+    )
+
+    unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+    assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
+    assert unstructured[0]["detail"] == {
+        "dw_id": "DW-1",
+        "malformed": ["3-2 3-3"],
+        "empty": 0,
+        "near_miss": 0,
+    }
+    # and it is NOT reported as an enforced gate: nothing matched
+    assert not [f for f in findings if f["check"] == "deferred.hard-gate"]
+
+
+def test_validate_warns_on_an_empty_gate_line_beside_an_enforced_one(project, capsys):
+    """The entry gates 3-2 and names nothing on its second line. Reporting only the
+    token would leave the operator believing both lines hold — the belief the field
+    exists to end — so the empty line is reported even though the entry is gating."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev", "4-1-billing": "ready-for-dev"},
+        {"DW-1": ("open", ["gate: 3-2", "gate:"])},
+    )
+
+    unstructured = [f for f in findings if f["check"] == "deferred.hard-gate-unstructured"]
+    assert len(unstructured) == 1 and unstructured[0]["severity"] == "warning"
+    assert "empty `gate:` line" in unstructured[0]["message"]
+    assert unstructured[0]["detail"]["empty"] == 1
+    # the valid half still gates, so this is additive to the refusal, not instead of it
+    gated = [f for f in findings if f["check"] == "deferred.hard-gate"]
+    assert [f["severity"] for f in gated] == ["problem"]
+    assert gated[0]["detail"]["story_key"] == "3-2-invite-link"
+
+
+def test_validate_does_not_gate_a_word_id_that_merely_shares_a_prefix(project, capsys):
+    """`stories.ID_RE` admits word ids, and the split-story arm used to read the `z`
+    of `authz-login` as a split letter — FAILING validate for a story nobody gated.
+    A false refusal wedges a run, which is worse than the prose gate it replaced.
+
+    Stories mode deliberately: a sprint board cannot express this. `authz-login`
+    does not match `sprintstatus.STORY_RE`, so it never reaches `ss.stories`, and a
+    sprint fixture stays green with the digit guard ablated — which is exactly how
+    the first version of this test was written, and it measured nothing."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    _setup_stories_fixture(project, [_stories_entry("authz-login")])
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: auth"])}, commit=False)
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    findings = _hard_gate_findings(capsys)
+    assert [f["severity"] for f in findings] == ["ok"]
+
+
+def test_validate_silent_when_the_ledger_declares_no_gate(project, capsys):
+    """Zero-config output stays byte-identical: a project that has never written a
+    `gate:` line gets no new lines at all, in either direction."""
+    findings = _validate_gated_sprint(
+        project,
+        capsys,
+        {"3-2-invite-link": "ready-for-dev"},
+        {"DW-1": ("open", []), "DW-2": ("done 2026-08-01", [])},
+    )
+
+    assert not [f for f in findings if f["check"].startswith("deferred.hard-gate")]
+
+
+def test_validate_hard_gate_runs_in_stories_mode(project, capsys):
+    """Stories mode dispatches manifest ids rather than board keys, and the same
+    token has to reach both — an epic driven from stories.yaml is exactly where a
+    gated leg would otherwise be run first and discovered later."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])}, commit=False)
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    findings = _hard_gate_findings(capsys)
+    assert len(findings) == 1 and findings[0]["severity"] == "problem"
+    assert findings[0]["detail"]["story_key"] == "1"
+
+
+def test_validate_survives_an_unreadable_story_spec_in_stories_mode(project, capsys, monkeypatch):
+    """`resolve_story_spec` globs the filesystem per story, so it has to sit inside
+    the same guard as the manifest read. Outside it, a gated stories-mode project on
+    a mount that raises turned a degraded advisory into a traceback out of
+    `validate` — no findings, no JSON, which is worse than the check being skipped."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])}, commit=False)
+    monkeypatch.setattr(
+        cli.stories_mod,
+        "resolve_story_spec",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("EIO")),
+    )
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)  # must not raise
+
+    # the queue was never read, so the check says nothing rather than an all-clear
+    assert _hard_gate_findings(capsys) == []
+
+
+def test_validate_reports_no_gate_all_clear_when_the_queue_is_unreadable(project, capsys):
+    """`_actionable_story_keys` degrades on an unreadable queue, and an empty list
+    read as "nothing is gated" produced an `ok` naming the very entry it claimed was
+    clear. `queue.*` owns the outage; this check must not answer for a queue it
+    never saw."""
+    install_bmad_config(project)
+    _write_policy(project.project)
+    project.sprint_status.write_text("development_status: [oh no\n", encoding="utf-8")
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 3-2"])}, commit=False)
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    assert _hard_gate_findings(capsys) == []
+
+
+def test_validate_stories_mode_skips_a_done_story(project, capsys):
+    """The manifest carries no status — the story's own spec does. Without reading
+    it, a finished epic would fail validate forever over gates on work that already
+    landed. `done` is only the clearest case of the general rule the sibling test
+    pins: actionability is `stories._classify`, not "anything but done"."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    folder = _setup_stories_fixture(project, [_stories_entry("1")])
+    (folder / "stories" / "1-slug.md").write_text(
+        "---\ntitle: 'test'\nstatus: 'done'\n---\n\n## Intent\n\ntest\n", encoding="utf-8"
+    )
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])}, commit=False)
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    findings = _hard_gate_findings(capsys)
+    assert len(findings) == 1 and findings[0]["severity"] == "ok"
+
+
+@pytest.mark.parametrize("status", ["blocked", "opne"])
+def test_validate_stories_mode_skips_a_story_the_scheduler_would_wedge(project, capsys, status):
+    """A gate only means something for a story the queue can dispatch. `blocked`
+    and an unrecognized status both STOP the stories scan (`SCHEDULE_WEDGED`), so
+    refusing over them made `validate` exit nonzero about a story that could not
+    move, and made the two queue modes disagree — the sprint arm's
+    `ACTIONABLE_STATUSES` is a two-element allowlist that already excludes both.
+
+    Parametrized over the two arms `_classify` reaches "wedged" by: a status it
+    knows and refuses, and one it cannot read at all. A single case would let the
+    other regress, since only the second depends on the unknown-status branch."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    folder = _setup_stories_fixture(project, [_stories_entry("1")])
+    (folder / "stories" / "1-slug.md").write_text(
+        f"---\ntitle: 'test'\nstatus: '{status}'\n---\n\n## Intent\n\ntest\n", encoding="utf-8"
+    )
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])}, commit=False)
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    findings = _hard_gate_findings(capsys)
+    assert len(findings) == 1 and findings[0]["severity"] == "ok"
+
+
+def test_validate_stories_mode_still_gates_a_story_behind_a_wedged_one(project, capsys):
+    """The deliberate half of the parity, pinned so it is not "fixed" into a
+    `break`. `schedule()` gives up at the first wedged entry, but preflight shares
+    its per-entry predicate and NOT its stop rule: story 2 is reachable right now
+    via `run --story 2`, which scans that entry alone, and `validate` takes no
+    story selector so it cannot know which run is coming. Stopping here would also
+    let one blocked entry at the top of a manifest silence the gate check for
+    every story below it — the silent miss this field exists to end."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    folder = _setup_stories_fixture(project, [_stories_entry("1"), _stories_entry("2")])
+    (folder / "stories" / "1-slug.md").write_text(
+        "---\ntitle: 'test'\nstatus: 'blocked'\n---\n\n## Intent\n\ntest\n", encoding="utf-8"
+    )
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 2"])}, commit=False)
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    findings = _hard_gate_findings(capsys)
+    assert len(findings) == 1 and findings[0]["severity"] == "problem"
+    assert findings[0]["detail"]["story_key"] == "2"
 
 
 OPENCODE_QUALIFIED_POLICY = '[adapter]\nname = "opencode"\nmodel = "anthropic/claude-haiku-4-5"\n'
@@ -3974,6 +6327,120 @@ def test_validate_flags_registered_hooks_with_an_unreadable_relay_script(project
     relay.chmod(0o644)  # so the sandbox tears down cleanly
 
 
+def _validate_json(project_dir, capsys):
+    """`validate --json` as (rc, document). Not `machine_json`: that helper takes
+    the expected rc as an input, and these tests are ABOUT the rc — the sandbox's
+    baseline verdict comes from findings that have nothing to do with the relay,
+    so it must be observed, never asserted."""
+    rc = cli.main(["validate", "--project", str(project_dir), "--json"])
+    out, err = capsys.readouterr()
+    assert err == ""  # the machine.py purity contract still holds
+    return rc, json.loads(out)
+
+
+def test_validate_reports_a_fresh_relay_as_up_to_date(project, capsys):
+    """#494 Phase 4: a relay `init` just wrote matches the packaged source.
+
+    Pinned separately from the stale case because the two arms fail for opposite
+    reasons — a comparison wrong in the *other* direction (a raw byte compare
+    against a `write_text`-translated file, which on Windows calls every fresh
+    install stale) reddens here and nowhere else."""
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
+    args = argparse.Namespace(project=str(project.project), spec=None)
+
+    cli.cmd_validate(args)
+    text = _validate_output(capsys)
+    assert "hook relay script up to date" in text
+    assert "differs from this bmad-loop" not in text
+
+
+def test_validate_warns_when_the_installed_relay_is_stale(project, capsys):
+    """#494 Phase 4: the relay is COPIED into the project by `init`, so an
+    upgraded orchestrator drives sessions through whatever version the project
+    happens to hold — and a pre-#494 relay still writes its events INSIDE the
+    project tree. `hooks.relay-present` cannot see that: the file is there and
+    readable, so it reads green.
+
+    The verdict must not move — the dual-poll fallback keeps a stale relay
+    working, so this reports a lost property, not a broken run. Asserted as
+    "unchanged from the same project one edit earlier" rather than a literal 0:
+    the sandbox's baseline comes from unrelated findings, and hardcoding it would
+    pin this test to those instead of to the relay.
+
+    Ablation guard: deleting the `hook_script_current` block in cmd_validate (or
+    forcing it to `True`) makes this FAIL on the `hooks.relay-stale` lookup."""
+    from bmad_loop import install as install_mod
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
+    capsys.readouterr()  # drop init's chatter; _validate_json parses the WHOLE stream
+
+    baseline_rc, baseline = _validate_json(project.project, capsys)
+
+    relay = project.project / install_mod.HOOK_SCRIPT_REL
+    relay.write_text(
+        relay.read_text(encoding="utf-8") + "\n# an older wheel wrote this\n", encoding="utf-8"
+    )
+    rc, doc = _validate_json(project.project, capsys)
+
+    # The id is the matchable identity (checks.py) — match on it, not the prose.
+    stale = [f for f in doc["findings"] if f["check"] == "hooks.relay-stale"]
+    assert len(stale) == 1
+    assert stale[0]["severity"] == "warning"
+    assert stale[0]["detail"]["path"] == str(relay)
+    assert "bmad-loop init" in stale[0]["message"]
+
+    # The verdict and exit code are untouched by a warning.
+    assert (rc, doc["ok"]) == (baseline_rc, baseline["ok"])
+    # And the two checks it must not be confused with still read exactly as before.
+    by_id = {f["check"]: f["severity"] for f in doc["findings"]}
+    assert by_id["hooks.registered"] == "ok"
+    assert by_id["hooks.relay-present"] == "ok"
+
+
+def test_validate_is_silent_about_relay_staleness_when_hooks_are_unregistered(project, capsys):
+    """The check hangs off `any_hooks_registered`, like `hooks.relay-present`: a
+    project not routing events through any relay is not owed a note about which
+    version of one it holds — it is owed the registration FAIL, and nothing on
+    top of it.
+
+    The relay is left INSTALLED and STALE on purpose. A test that simply skips
+    `init` proves nothing: with no relay on disk the comparison degrades to
+    "unknowable" and emits no finding whether it is gated or not, so the gate
+    could be deleted outright and such a test would stay green (it was, and it
+    did). This shape is the one that separates them.
+
+    Ablation guard: hoisting the `hooks.relay-stale` block out of the
+    `if any_hooks_registered:` block makes this FAIL."""
+    from bmad_loop import install as install_mod
+    from bmad_loop.adapters.profile import load_profiles
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert cli.main(["init", "--project", str(project.project), "--no-skills"]) == 0
+
+    # Unregister: keep the relay, drop every registration that points at it.
+    for profile in load_profiles(project.project).values():
+        config = project.project / profile.hooks.config_path
+        if config.is_file():
+            config.write_text("{}\n", encoding="utf-8")
+    relay = project.project / install_mod.HOOK_SCRIPT_REL
+    relay.write_text(relay.read_text(encoding="utf-8") + "\n# stale\n", encoding="utf-8")
+    capsys.readouterr()
+
+    _rc, doc = _validate_json(project.project, capsys)
+    # The premise, asserted rather than assumed — a still-registered project would
+    # make the absence below prove nothing.
+    assert any(
+        f["check"] == "hooks.registered" and f["severity"] == "problem" for f in doc["findings"]
+    )
+    assert relay.is_file()  # and the stale artifact really is still there
+    assert not [f for f in doc["findings"] if f["check"] == "hooks.relay-stale"]
+
+
 def test_validate_sprint_mode_still_gates_on_sprint_status(project, capsys):
     """Item 8 regression: the default (sprint) mode still requires sprint-status."""
     install_bmad_config(project)
@@ -4017,11 +6484,17 @@ CLAUDE_ONLY_POLICY = '[adapter]\nname = "claude"\nmodel = "opus"\n'
 
 
 def _make_validate_pass(project, monkeypatch, capsys, *, policy=CLAUDE_ONLY_POLICY, skills=None):
-    """Set a project up so every validate gate passes, and pin the two gates whose
+    """Set a project up so every validate gate passes, and pin the three gates whose
     outcome is a property of the *host* rather than of the project: whether the CLI
-    binary is on PATH and whether a multiplexer is installed. Without those pins the
-    rc-0 leg would pass or fail by machine, which is exactly the kind of green that
-    means nothing.
+    binary is on PATH, whether it actually runs, and whether a multiplexer is
+    installed. Without those pins the rc-0 leg would pass or fail by machine, which
+    is exactly the kind of green that means nothing.
+
+    The liveness pin (#294) is doubly load-bearing: `which` is stubbed to
+    `/usr/bin/{tool}`, a path that does not exist on this host, so an unpinned
+    `binary_runs` would have every one of these tests spawn a nonexistent path on
+    every run and report `adapter.binary-unrunnable`. Stubbed to rc 0 — the "the
+    binary is fine" answer — because that is the premise of a pass fixture.
 
     ``policy`` and ``skills`` exist so the dev-primitive-rename tests can vary the
     project's *topology* (which CLIs on which roles, which primitive era in which
@@ -4040,10 +6513,14 @@ def _make_validate_pass(project, monkeypatch, capsys, *, policy=CLAUDE_ONLY_POLI
     git(project.project, "add", "-A")  # every file above is a worktree change
     git(project.project, "commit", "-q", "-m", "validate fixture")
     monkeypatch.setattr(cli.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(probe_mod, "binary_runs", lambda *_a, **_kw: 0)
     monkeypatch.setattr(
         cli,
         "_platform_preflight",
-        lambda: [cli.Finding("mux.backend", "ok", "multiplexer TmuxBackend available (tmux 3.4)")],
+        # arity follows runsetup.platform_preflight, which takes the project (#332)
+        lambda _project: [
+            cli.Finding("mux.backend", "ok", "multiplexer TmuxBackend available (tmux 3.4)")
+        ],
     )
     capsys.readouterr()  # drop `init`'s chatter — the next read must see only the document
 
@@ -4094,6 +6571,26 @@ def test_validate_reports_an_undecodable_policy_instead_of_crashing(project, cap
     assert "not valid UTF-8" in finding["message"]
 
 
+def test_validate_reports_a_wrong_typed_policy_field_instead_of_crashing(project, capsys):
+    """The undecodable-file leg's twin one layer in (#440, carried by #474): the file
+    decodes and parses as TOML, but a *value* has the wrong type. `int()` on it raised
+    a raw ValueError — again not an OSError, again straight past every
+    `except (PolicyError, OSError)`, including `_configure_mux`'s, which runs before
+    argument dispatch on EVERY command. `_typed_int` converts it, so the offending
+    `section.key` is a named finding like any other bad policy.
+
+    Routed through `machine_json` for the same reason as the leg above: `main`'s bare
+    `except Exception` backstop also returns 1, so an rc-only assertion stays green
+    with the conversion reverted. What bites is the document — stderr carries the
+    backstop's line and stdout carries nothing to parse."""
+    _write_policy(project.project, CLAUDE_ONLY_POLICY + '[scm]\nmax_parallel = "x"\n')
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = next(f for f in doc["findings"] if f["check"] == "policy")
+    assert finding["severity"] == "problem"
+    assert "scm.max_parallel must be an integer" in finding["message"]
+
+
 def test_validate_reports_an_undecodable_bmad_config_instead_of_crashing(project, capsys):
     """The `config.yaml` half of the same conversion. Separate from the policy leg
     because they are separate loaders with separate typed errors, and the callers that
@@ -4108,6 +6605,33 @@ def test_validate_reports_an_undecodable_bmad_config_instead_of_crashing(project
     finding = next(f for f in doc["findings"] if f["check"] == "bmad-config")
     assert finding["severity"] == "problem"
     assert "not valid UTF-8" in finding["message"]
+
+
+def test_validate_reports_an_undecodable_profile_overlay_instead_of_crashing(project, capsys):
+    """#473: the third loader, same conversion. `load_profiles` reads each overlay in
+    `.bmad-loop/profiles/` with `read_text(encoding="utf-8")`, so a non-UTF-8 file
+    raised `UnicodeDecodeError` — a ValueError, not a `ProfileError` — while the role
+    loop here catches only `ProfileError`. It is not the policy leg over again: these
+    are separate loaders with separate typed errors, and `get_profile` backs every
+    adapter resolution, so the raw escape also reached run/sweep preflight.
+
+    Routed through `machine_json` deliberately, for the reason the policy leg gives:
+    `main`'s bare `except Exception` backstop also returns 1, so an rc-only assertion
+    is green with the conversion reverted. What bites is the document — stderr carries
+    the backstop's line and stdout carries nothing to parse."""
+    _write_policy(project.project, '[adapter]\nname = "badcli"\nmodel = "opus"\n')
+    profiles = project.project / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    overlay = profiles / "badcli.toml"
+    overlay.write_bytes(b'name = "b\xffad"\n')
+    with pytest.raises(UnicodeDecodeError):  # the fixture is genuinely undecodable
+        overlay.read_text(encoding="utf-8")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = next(f for f in doc["findings"] if f["check"] == "adapter.profile")
+    assert finding["severity"] == "problem"
+    assert "not valid UTF-8" in finding["message"]
+    assert str(overlay) in finding["message"]  # the finding names the file at fault
 
 
 def test_validate_json_counts_and_ok_agree_with_findings(project, capsys):
@@ -4154,7 +6678,8 @@ def test_validate_json_detail_round_trips_for_every_real_shape(capsys):
     `machine.emit(validate_document(...))` still emits one whole, parseable document
     for every detail a caller actually builds. Each case below mirrors a real call
     site (str values, the nested `dict(role_names)` dict, str+int, install.py's
-    `{**detail, "marker": ...}`, and the `detail=None` leg). A future caller that
+    `{**detail, "marker": ...}`, #294's int and null `returncode`, and the
+    `detail=None` leg). A future caller that
     attaches a non-JSON-serializable detail fails here, by name, rather than at
     runtime on stdout.
     """
@@ -4175,6 +6700,16 @@ def test_validate_json_detail_round_trips_for_every_real_shape(capsys):
         "stale",
         {"tree": ".claude", "skill": "s", "file": "f", "marker": "m"},
     )
+    report.warn(  # str + int `returncode` (cli.py, #294)
+        "adapter.binary-unrunnable",
+        "claude will not run",
+        {"binary": "claude", "path": "/usr/bin/claude", "returncode": 127},
+    )
+    report.warn(  # the launch-fault leg: a null INSIDE a detail dict (cli.py, #294)
+        "adapter.binary-unrunnable",
+        "claude will not launch",
+        {"binary": "claude", "path": "/usr/bin/claude", "returncode": None},
+    )
     report.ok("git.worktree-clean", "clean")  # the detail=None leg
 
     # the exact production path: cli.py does `machine.emit(validate_document(...))`.
@@ -4186,6 +6721,10 @@ def test_validate_json_detail_round_trips_for_every_real_shape(capsys):
     assert by_check["queue.stories-manifest"]["detail"]["stories"] == 3  # int, not "3"
     assert by_check["skills.stories-dispatch-stale"]["detail"]["marker"] == "m"
     assert by_check["git.worktree-clean"]["detail"] is None  # None -> null round-trips
+    # Listed, not dict-indexed: both #294 legs share one check id, so a by-check map
+    # would keep only the last and silently stop covering the int shape.
+    unrunnable = [f for f in parsed["findings"] if f["check"] == "adapter.binary-unrunnable"]
+    assert [f["detail"]["returncode"] for f in unrunnable] == [127, None]  # int, and null-in-dict
 
 
 @pytest.mark.parametrize(
@@ -4226,6 +6765,169 @@ def test_validate_json_every_emitted_check_is_registered(project, capsys, monkey
     emitted = {f["check"] for f in (*passing["findings"], *failing["findings"])}
     assert emitted, "the run emitted findings"
     assert emitted <= VALIDATE_CHECKS
+
+
+@pytest.mark.parametrize("exit_code", [2, 127], ids=["rc-2", "rc-127"])
+def test_validate_warns_when_a_binary_on_path_refuses_to_run(
+    project, capsys, monkeypatch, tmp_path, exit_code
+):
+    """#294: `which` answering yes is not the same question as "this install runs".
+
+    A dead WSL/npm shim is a real file with the execute bit — `adapter.binary` went
+    green on it, and `opencode_http`'s own "binary not found" remedy sends the user
+    to `bmad-loop validate`, which then told them everything was fine. Driven with a
+    REAL non-runnable binary on a REAL PATH: a `which` stub cannot exercise the probe
+    at all, which is the whole of what this row is about.
+
+    The two host pins `_make_validate_pass` installs are lifted back off on purpose —
+    they exist so the OTHER rows do not pass or fail by machine, and here they would
+    stub out the code under test. Everything else it sets up stays, so rc 0 below is
+    a statement about this gate rather than about some unrelated one.
+
+    Both codes are #294's OWN evidence, not invented: its transcript reports rc 2 and
+    a reproduction of the same shim (`exec /nonexistent/opencode "$@"`) exits 127. The
+    pair is what pins the gate as `rc != 0` — an allowlist of shell-ish codes looks
+    right and would miss the case the issue is actually about.
+
+    Ablation target: change `report.warn` to `report.fail` in cli.py's
+    `adapter.binary-unrunnable` branch and the rc-0 assertion inside `machine_json`
+    reddens (severity IS the exit code — checks.py); delete the branch entirely and
+    the `len(...) == 1` assertion reddens on an empty list. Neither is redundant: the
+    first is the severity contract, the second is the finding existing at all.
+    Narrow the gate to `rc in {126, 127}` and the rc-2 leg alone reddens.
+    """
+    real_which, real_binary_runs = shutil.which, probe_mod.binary_runs
+    _make_validate_pass(project, monkeypatch, capsys)
+    monkeypatch.setattr(cli.shutil, "which", real_which)
+    monkeypatch.setattr(probe_mod, "binary_runs", real_binary_runs)
+
+    bin_dir = tmp_path / "shimbin"
+    bin_dir.mkdir()
+    launcher = write_script_launcher(bin_dir, "claude", f"import sys\nsys.exit({exit_code})\n")
+    # Prepended, so it shadows any real `claude` this host happens to carry.
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+
+    # rc=0 is machine_json's default and IS the exit-code assertion: a warning must
+    # not flip validate's verdict for a user whose CLI merely answers oddly.
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    assert doc["schema_version"] == 1, "purely additive — a new check id is not a break"
+    assert doc["ok"] is True  # the document's own verdict, not just the rc
+
+    unrunnable = [f for f in doc["findings"] if f["check"] == "adapter.binary-unrunnable"]
+    assert len(unrunnable) == 1, "one finding per binary, not per profile"
+    assert unrunnable[0]["severity"] == "warning"
+    assert unrunnable[0]["detail"]["binary"] == "claude"
+    assert unrunnable[0]["detail"]["returncode"] == exit_code
+    # The RESOLVED path, not the bare name — re-resolving in the probe would be a
+    # TOCTOU, and on Windows the PATHEXT shim `which` picked is the file at issue.
+    assert Path(unrunnable[0]["detail"]["path"]).samefile(launcher)
+
+    # The pre-existing gate is untouched: it still answers "is it on PATH", and the
+    # answer is still yes. A fix that folded liveness into it would redden this.
+    found = [f for f in doc["findings"] if f["check"] == "adapter.binary"]
+    assert len(found) == 1 and found[0]["severity"] == "ok"
+
+
+@pytest.mark.parametrize("shape", ["relative-path", "bare-name-on-path"])
+def test_validate_never_executes_a_binary_an_overlay_profile_named(
+    project, capsys, monkeypatch, tmp_path, shape
+):
+    """#294's liveness probe must not turn validate into a code-execution boundary.
+
+    `binary` is project-controlled all the way down: policy.toml picks the profile
+    and `.bmad-loop/profiles/*.toml` supplies its fields, both of which arrive with
+    a clone. validate is precisely the command a user runs to decide whether a
+    checkout is safe to run at all (the TUI runs it too), so probing a binary an
+    overlay named would execute untrusted code on the strength of reading config.
+
+    The two shapes are the same family reached by different spellings, which is why
+    they are parametrized rather than written as one row:
+
+    - `relative-path` — `shutil.which` returns a caller-supplied path UNCHANGED
+      instead of searching PATH, so `./pwn` names a file the repository carries.
+    - `bare-name-on-path` — the spelling is clean, and `which` still resolves it
+      into the checkout because a checkout-local directory is on PATH. A guard that
+      tested the spelling of `binary` (rejecting a separator) passed this row.
+
+    Only provenance covers both: an overlay profile is never probed whatever it is
+    called. `test_every_packaged_profile_names_a_bare_binary` holds the other half.
+
+    Driven with a REAL executable and a REAL overlay profile, from the project
+    directory as a user who just cloned it would be: a stubbed `which` or
+    `binary_runs` would assert nothing about the boundary this is here to hold.
+
+    The sentinel is the whole assertion — an absent `adapter.binary-unrunnable`
+    finding would also be produced by a probe that ran and returned 0, so it cannot
+    distinguish "not launched" from "launched and happy". Only a file the child
+    alone can create does.
+
+    Ablation target: drop the `if tool not in packaged_binaries` gate in cli.py and
+    BOTH rows create the sentinel. Restore it but gate on `os.path.dirname(tool)`
+    instead and `bare-name-on-path` alone reddens — that is the round-1 fix this
+    row exists to keep dead. The `adapter.binary` assertion below is NOT the gate:
+    it pins the surviving half (a rejected binary is still reported found) and
+    stays green under either ablation.
+    """
+    install_bmad_config(project)
+    _write_policy(project.project, '[adapter]\nname = "pwncli"\n')
+
+    sentinel = tmp_path / "pwned.txt"
+    launcher = write_script_launcher(
+        project.project,
+        "pwn",
+        f"import pathlib\npathlib.Path({str(sentinel)!r}).write_text('executed')\n",
+    )
+    if shape == "relative-path":
+        # `launcher.name`, not a bare "pwn": on Windows the launcher is `pwn.cmd`,
+        # and naming the real file keeps this about the gate, not about PATHEXT.
+        binary = f"./{launcher.name}"
+    else:
+        binary = "pwn"  # resolved through PATH, into the checkout
+        monkeypatch.setenv("PATH", str(project.project) + os.pathsep + os.environ.get("PATH", ""))
+
+    profiles = project.project / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    (profiles / "pwncli.toml").write_text(
+        f'name = "pwncli"\nbinary = "{binary}"\nbypass_args = ["--yes"]\n'
+        "\n[hooks]\n"
+        'dialect = "claude-settings-json"\n'
+        'config_path = ".pwncli/settings.json"\n'
+        'events = { SessionStart = "SessionStart", Stop = "Stop" }\n',
+        encoding="utf-8",
+    )
+
+    # A relative `binary` resolves against the PROCESS cwd — the clone the user is
+    # standing in when they run `bmad-loop validate`.
+    monkeypatch.chdir(project.project)
+    cli.main(["validate", "--project", str(project.project), "--json"])
+    doc = json.loads(capsys.readouterr().out)
+
+    assert not sentinel.exists(), "validate executed a repository-supplied binary"
+
+    # The surviving half: still resolved and reported, exactly as before #294.
+    found = [f for f in doc["findings"] if f["check"] == "adapter.binary"]
+    assert len(found) == 1 and found[0]["severity"] == "ok"
+
+
+def test_every_packaged_profile_names_a_bare_binary():
+    """The packaged half of the probe's trust boundary (#294).
+
+    `validate` executes the binary of any profile stamped `packaged`, and it trusts
+    provenance rather than spelling — so nothing in cli.py stops a packaged profile
+    whose `binary` carried a path from being launched out of the working directory.
+    Nothing needs to, as long as no packaged profile ships one, and that is a
+    property of the shipped TOML rather than of the code: pin it where it is true.
+
+    A future bundled profile that sets `binary = "./vendor/cli"` reddens here, at
+    the file that introduced it, rather than silently widening what a diagnostic
+    executes.
+    """
+    from bmad_loop.adapters.profile import load_profiles
+
+    packaged = {n: p for n, p in load_profiles(project=None).items() if p.packaged}
+    assert packaged, "no packaged profiles loaded — the gate would be vacuous"
+    assert [p.binary for p in packaged.values() if os.path.dirname(p.binary)] == []
 
 
 @pytest.mark.parametrize("passing", [True, False], ids=["rc-0", "rc-1"])
@@ -4286,7 +6988,7 @@ def test_validate_json_mux_detail_keeps_the_rows_the_text_flattens(mux_registry,
     )
     mux_registry.register_multiplexer("beta", lambda p: False, lambda: _MuxStub(avail=False))
 
-    found = cli._platform_preflight()
+    found = cli._platform_preflight(Path("C:/p"))
     listing = next(f for f in found if f.check == "mux.backends-detected")
     # unchanged text
     assert "alpha*" in listing.message and "beta (unavailable)" in listing.message
@@ -4312,7 +7014,7 @@ def test_platform_preflight_selection_detail_keeps_the_raw_reason(mux_registry, 
     monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "alpha")
     mux_registry.get_multiplexer.cache_clear()
 
-    selection = next(f for f in cli._platform_preflight() if f.check == "mux.selection")
+    selection = next(f for f in cli._platform_preflight(Path("C:/p")) if f.check == "mux.selection")
     assert selection.detail == {"backend": "alpha", "reason": "env"}
     assert "forced by BMAD_LOOP_MUX_BACKEND" in selection.message  # prose stays in the message
 
@@ -4331,7 +7033,9 @@ def test_external_backend_failure_is_a_warning_not_a_note(mux_registry, monkeypa
     monkeypatch.setattr(mux_registry, "_EXTERNAL_ERRORS", {"brokenmux": "ImportError: no ghost"})
     monkeypatch.setattr(mux_registry, "_EXTERNALS_LOADED", True)  # no rescan over the stub
 
-    finding = next(f for f in cli._platform_preflight() if f.check == "mux.external-backend")
+    finding = next(
+        f for f in cli._platform_preflight(Path("C:/p")) if f.check == "mux.external-backend"
+    )
     assert finding.severity == "warning"
     assert finding.detail == {"entry_point": "brokenmux", "error": "ImportError: no ghost"}
 
@@ -4413,20 +7117,74 @@ def test_dry_run_stories_relativizes_absolute_folder(project, capsys):
     assert f"Spec folder: {abs_folder}" not in out  # not the raw absolute path
 
 
+def test_dry_run_stories_unresolvable_absolute_folder_refused(project, monkeypatch, capsys):
+    """`relativize_spec_folder` reaches the CLI only here, and the refusal it
+    now raises (#560) is the one answer the dry-run cannot render: an absolute
+    `--spec` inside the project whose `.resolve()` faults has no knowable
+    location, so there is no folder string to preview. Print the reason and exit
+    1, in the shape of its `story_rows` sibling just below — minus that sibling's
+    `(spec folder: ...)` suffix, which would be a third printing of a path the
+    reason already names twice (this leg is reachable only from the absolute
+    branch, where `folder` is `spec_folder` re-spelled).
+
+    Measured ablations:
+    - B3 (delete the `try`/`except stories_mod.StoriesError` around the
+      `relativize_spec_folder` call in `cli._dry_run_stories`): FAILS at `assert
+      cli._dry_run(project, pol, args, True, abs_folder) == 1` — the
+      `StoriesError` propagates out of `_dry_run` uncaught, so the row errors on
+      that line and the two stderr assertions are never reached. That line alone
+      carries this row.
+    - B1 (collapse `relativize_spec_folder` back to one degrade arm): FAILS on
+      the same line with `assert 0 == 1`, and the captured stdout is the
+      regression itself — a rendered `BMAD_LOOP_SPEC_FOLDER=<absolute path into
+      the main checkout>` previewed as runnable.
+    - B2 (blanket raise): green — this row travels the `OSError` leg, which B2
+      leaves refusing."""
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    abs_folder = str(project.project / STORIES_SPEC_FOLDER)
+    pol = policy_mod.loads("")
+    args = argparse.Namespace(spec=abs_folder, epic=None, story=None, max_stories=None)
+    refuse_to_resolve(monkeypatch, Path(abs_folder))
+
+    assert cli._dry_run(project, pol, args, True, abs_folder) == 1
+
+    cap = capsys.readouterr()
+    assert f"stories mode: cannot canonicalize the spec folder {abs_folder!r}" in cap.err
+    assert "Run `bmad-loop validate` for what this host is doing." in cap.err
+    assert "linear schedule" not in cap.out  # no preview of a folder we cannot place
+
+
 # --------------- `bmad-loop mux`: backend listing + persisted choice (issue #87) ----
 
 
 class _MuxStub:
-    """Selection-surface double (available/version only — `mux` needs no more)."""
+    """Selection-surface double (available/version/registry — all `mux` reads)."""
 
-    def __init__(self, avail=True, version=None):
+    def __init__(
+        self, avail=True, version=None, version_error=None, registry=None, namespaced=None
+    ):
         self._avail, self._version = avail, version
+        self._version_error = version_error
+        self._registry = registry
+        # Same coupling as the bundled backends unless the test says otherwise:
+        # a root in force implies a namespace, no root implies none (tmux).
+        self._namespaced = (registry is not None) if namespaced is None else namespaced
+
+    def registry_root(self):
+        # Default None = "no registry namespace", the seam's tmux-shaped answer.
+        return self._registry
+
+    def has_registry_namespace(self):
+        return self._namespaced
 
     def available(self):
         return self._avail
 
     def version(self):
         return self._version
+
+    def version_error(self):
+        return self._version_error
 
 
 @pytest.fixture
@@ -4575,6 +7333,73 @@ def test_mux_keeps_the_placeholder_for_a_blank_version(mux_registry, tmp_path, c
     assert "-" in row and "* first available platform match" in row
 
 
+def test_mux_names_the_diagnostic_a_crashed_version_probe_dropped(mux_registry, tmp_path, capsys):
+    """VERSION `-` is the same cell for "reports no version" and "crashed being
+    asked" (#428). The table cannot carry the difference, so the probe's own
+    failure text goes to stderr — otherwise a corrupt/AV-blocked binary is
+    indistinguishable from a quiet one, with nothing left to diagnose it by."""
+    import sys as _sys
+
+    mux_registry.register_multiplexer(
+        "alpha",
+        lambda p: p == _sys.platform,
+        lambda: _MuxStub(avail=True, version_error="tmux -V failed: [WinError 5] Access is denied"),
+    )
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+
+    captured = capsys.readouterr()
+    row = next(line for line in captured.out.splitlines() if line.startswith("alpha"))
+    assert "-" in row  # the table is unchanged; the diagnostic is not a column
+    assert "warning: alpha version probe failed: tmux -V failed: [WinError 5]" in captured.err
+
+
+def test_mux_keeps_a_multiline_diagnostic_on_one_warning_line(mux_registry, tmp_path, capsys):
+    """The text carries the probe's own stderr, which is routinely multi-line —
+    left raw it reads as several unrelated warnings (the #321 lesson, applied to
+    the diagnostic rather than the table cell). Collapsed, not truncated: the
+    diagnostic is the payload here, not a sized column."""
+    import sys as _sys
+
+    mux_registry.register_multiplexer(
+        "alpha",
+        lambda p: p == _sys.platform,
+        lambda: _MuxStub(avail=True, version_error="tmux -V failed:\n  no server\n  running\n"),
+    )
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+
+    warnings = [ln for ln in capsys.readouterr().err.splitlines() if "version probe failed" in ln]
+    assert warnings == ["warning: alpha version probe failed: tmux -V failed: no server running"]
+
+
+def test_mux_warns_for_an_unavailable_backend_too(mux_registry, tmp_path, capsys):
+    """psmux's availability probe gates on its own version(), so the AV-blocked
+    binary the warning exists for lands on an available=no row. Warning only for
+    available backends would drop the diagnostic exactly where it is needed."""
+    import sys as _sys
+
+    mux_registry.register_multiplexer(
+        "alpha",
+        lambda p: p == _sys.platform,
+        lambda: _MuxStub(avail=False, version_error="psmux -V failed: [WinError 5]"),
+    )
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+
+    assert "warning: alpha version probe failed: psmux -V failed" in capsys.readouterr().err
+
+
+def test_mux_stays_silent_when_a_backend_simply_reports_no_version(mux_registry, tmp_path, capsys):
+    import sys as _sys
+
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(avail=True, version=None)
+    )
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+
+    # Owns one mutation: warning unconditionally rather than per version_error.
+    # It cannot own "the loop was deleted" — the two positive tests do that.
+    assert "version probe failed" not in capsys.readouterr().err
+
+
 def test_mux_omits_the_note_when_every_available_backend_matches(mux_registry, tmp_path, capsys):
     import sys as _sys
 
@@ -4605,7 +7430,7 @@ def test_platform_preflight_folds_a_multi_line_version(mux_registry):
         lambda: _MuxStub(avail=True, version="alpha 1.2\nextra build line"),
     )
 
-    finding = next(f for f in cli._platform_preflight() if f.check == "mux.backend")
+    finding = next(f for f in cli._platform_preflight(Path("p")) if f.check == "mux.backend")
     assert finding.detail["version"] == "alpha 1.2; extra build line"
     assert "\n" not in finding.message
 
@@ -4623,7 +7448,7 @@ def test_platform_preflight_bounds_an_over_long_version(mux_registry):
         lambda: _MuxStub(avail=True, version="alpha 1.2 " + "x" * 300),
     )
 
-    finding = next(f for f in cli._platform_preflight() if f.check == "mux.backend")
+    finding = next(f for f in cli._platform_preflight(Path("p")) if f.check == "mux.backend")
     assert len(finding.detail["version"]) == VERSION_MAX_CHARS
     assert finding.detail["version"].endswith("…")
 
@@ -4750,6 +7575,173 @@ def test_platform_preflight_notes_forced_selection_provenance(mux_registry, monk
     mux_registry.get_multiplexer.cache_clear()
     notes, problems = _preflight_notes_problems()
     assert any("forced by BMAD_LOOP_MUX_BACKEND" in n for n in notes)
+
+
+# ------------------------------------ native-Windows-from-WSL visibility (#332)
+#
+# WSL interop can hand a bash prompt a native-Windows bmad-loop (WSL appends the
+# Windows PATH to its own). That interpreter reports win32 and takes the psmux
+# default — correctly, for what it is. These pin the naming that makes the
+# mismatch visible.
+
+WSL_UNC_PROJECT = Path("\\\\wsl.localhost\\Ubuntu-24.04\\home\\u\\p")
+
+
+@pytest.fixture
+def fake_platform(monkeypatch):
+    """Patch `sys.platform` process-wide (`cli.runsetup.sys` is the same module
+    object — a module-qualified patch would silently miss the other readers on the
+    path under test: `mux_reason_label`, `_PLATFORM_DEFAULTS`, the process host's
+    `matches()`) and clear `get_process_host`'s lru_cache in both directions — without
+    the clears, the patched window caches the Windows host for every later test in
+    the worker. (`get_multiplexer` has the same shape; `mux_registry` clears it.)"""
+    from bmad_loop.process_host import get_process_host
+
+    def _set(platform_name: str) -> None:
+        get_process_host.cache_clear()
+        monkeypatch.setattr(sys, "platform", platform_name)
+
+    yield _set
+    get_process_host.cache_clear()
+
+
+def test_platform_preflight_names_the_platform_default_selection(mux_registry):
+    """`platform-default` is how a win32 interpreter silently lands on psmux — and
+    it used to be the one reason the emission gate dropped."""
+    default = mux_registry._PLATFORM_DEFAULTS.get(sys.platform, mux_registry._DEFAULT_BACKEND)
+    mux_registry.register_multiplexer(default, lambda p: True, lambda: _MuxStub(avail=True))
+    mux_registry.get_multiplexer.cache_clear()
+
+    selection = next(f for f in cli._platform_preflight(Path("C:/p")) if f.check == "mux.selection")
+    assert selection.severity == "ok"
+    assert selection.detail == {"backend": default, "reason": "platform-default"}
+    assert f"platform default for {sys.platform}" in selection.message
+
+
+def test_platform_preflight_selection_warns_when_the_reason_is_fallback(mux_registry):
+    """The fallback label itself says no available backend matches this platform —
+    printing that sentence green would contradict it."""
+    mux_registry.register_multiplexer("alpha", lambda p: True, lambda: _MuxStub(avail=False))
+    mux_registry.get_multiplexer.cache_clear()
+
+    selection = next(f for f in cli._platform_preflight(Path("C:/p")) if f.check == "mux.selection")
+    assert selection.detail == {"backend": "alpha", "reason": "fallback"}
+    assert selection.severity == "warning"
+    assert "no available backend matches this platform" in selection.message
+
+
+def test_win32_on_wsl_path_warns_and_keeps_the_path_out(mux_registry, fake_platform):
+    mux_registry.register_multiplexer("psmux", lambda p: True, lambda: _MuxStub(avail=True))
+    mux_registry.get_multiplexer.cache_clear()
+    fake_platform("win32")
+    finding = next(
+        f for f in cli._platform_preflight(WSL_UNC_PROJECT) if f.check == "host.win32-on-wsl-path"
+    )
+    assert "WSL/Linux Python" in finding.message
+    assert "psmux was selected" in finding.message
+    # win32 + a distro path is NOT proof of a WSL shell (native PowerShell reaches the
+    # same condition), so the only mention is the conditional remedy.
+    assert finding.message.count("WSL shell") == 1
+    assert "if you are running from a WSL shell" in finding.message
+    # The project path must not ride along: `validate --json` is unsanitized and a
+    # distro path ends in the Linux username.
+    assert finding.detail == {"backend": "psmux", "platform": "win32"}
+    assert str(WSL_UNC_PROJECT) not in str(finding.detail) + finding.message
+
+
+def test_win32_on_wsl_path_names_the_backend_actually_selected(
+    mux_registry, fake_platform, monkeypatch
+):
+    """A forced choice must not be described as psmux — the `mux.selection` line in the
+    same report would say otherwise, in the one check whose point is to stop misleading."""
+    mux_registry.register_multiplexer("herdr", lambda p: False, lambda: _MuxStub(avail=True))
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "herdr")
+    mux_registry.get_multiplexer.cache_clear()
+    fake_platform("win32")
+    findings = cli._platform_preflight(WSL_UNC_PROJECT)
+    warning = next(f for f in findings if f.check == "host.win32-on-wsl-path")
+    selection = next(f for f in findings if f.check == "mux.selection")
+    assert warning.detail == {"backend": "herdr", "platform": "win32"}
+    assert "herdr was selected" in warning.message
+    assert "psmux" not in warning.message
+    assert selection.detail == {"backend": "herdr", "reason": "env"}
+
+
+def test_win32_on_wsl_path_names_no_backend_when_selection_failed(
+    mux_registry, fake_platform, monkeypatch
+):
+    """A forced unknown name makes `_select` raise, so no row is selected. The warning
+    must then name no backend at all — inventing one ("the win32 default") is the exact
+    confident-wrong output this check exists to remove — and `mux.selection` is absent
+    because there is nothing to name; `mux.preflight` carries that failure instead."""
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "nosuchbackend")
+    mux_registry.get_multiplexer.cache_clear()
+    fake_platform("win32")
+    findings = cli._platform_preflight(WSL_UNC_PROJECT)
+
+    warning = next(f for f in findings if f.check == "host.win32-on-wsl-path")
+    assert warning.detail == {"backend": None, "platform": "win32"}
+    assert "was selected" not in warning.message
+    assert "win32 default" not in warning.message
+    assert not [f for f in findings if f.check == "mux.selection"]
+    assert [f for f in findings if f.check == "mux.preflight"]
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "project"),
+    [
+        # win32 on a real Windows path: psmux works, cwd is genuinely Windows.
+        ("win32", Path("C:/p")),
+        # the WSL/Linux interpreter on the same distro path — the correct install.
+        ("linux", WSL_UNC_PROJECT),
+        ("linux", Path("/home/u/p")),
+        # UNC, but somebody else's file server: the predicate matches wsl only.
+        ("win32", Path("\\\\fileserver\\share\\p")),
+    ],
+)
+def test_win32_on_wsl_path_stays_silent_off_the_shape(
+    mux_registry, fake_platform, platform_name, project
+):
+    fake_platform(platform_name)
+    assert not [f for f in cli._platform_preflight(project) if f.check == "host.win32-on-wsl-path"]
+
+
+def test_win32_on_wsl_path_survives_the_render_and_the_json_projection(mux_registry, fake_platform):
+    """The other tests read the finding straight off `_platform_preflight`, which cannot
+    catch it being dropped before a surface the operator actually sees — every
+    validate-rendering test stubs the preflight out wholesale. The severity and the
+    unmoved `ok` verdict pin that a warning never flips validate's exit code."""
+    mux_registry.register_multiplexer("psmux", lambda p: True, lambda: _MuxStub(avail=True))
+    mux_registry.get_multiplexer.cache_clear()
+    fake_platform("win32")
+
+    report = cli.ValidationReport()
+    report.extend(cli._platform_preflight(WSL_UNC_PROJECT))  # asserts the id is registered
+    doc = cli.validate_document(report, False, "")
+
+    rows = [f for f in doc["findings"] if f["check"] == "host.win32-on-wsl-path"]
+    assert len(rows) == 1
+    assert rows[0]["severity"] == "warning"
+    assert doc["ok"] is True  # a warning never moves the verdict
+    assert str(WSL_UNC_PROJECT) not in json.dumps(doc)  # unsanitized surface
+
+
+def test_mux_detection_failure_reports_instead_of_vanishing(mux_registry, monkeypatch):
+    """Detection is advisory, so it must not abort validate — but silence here reads as
+    "selection failed": `mux.selection` disappears while `mux.backend` (independent, from
+    `get_multiplexer`) still names a healthy backend right above it."""
+    mux_registry.register_multiplexer("alpha", lambda p: True, lambda: _MuxStub(avail=True))
+    mux_registry.get_multiplexer.cache_clear()
+    monkeypatch.setattr(
+        mux_registry, "detect_multiplexers", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+
+    findings = cli._platform_preflight(Path("C:/p"))
+    detected = next(f for f in findings if f.check == "mux.backends-detected")
+    assert detected.severity == "warning"
+    assert "boom" in detected.message
+    assert not [f for f in findings if f.check == "mux.selection"]  # the vanishing it explains
+    assert [f for f in findings if f.check == "mux.backend"]  # selection itself was fine
 
 
 # ---------------------------------------- bmad-loop confirm (#335 part 3, #356)
@@ -5059,6 +8051,151 @@ def test_confirm_reverify_success_lets_the_flip_through(project, capsys, monkeyp
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
 
 
+def test_confirm_reverify_reports_an_unusable_cwd_instead_of_crashing(
+    project, tmp_path, capsys, monkeypatch
+):
+    """A `repo_root` no command can run in refuses the confirmation; it does not
+    raise out of the CLI.
+
+    `_reverify` deliberately does not classify into the engine's vocabulary, but
+    it does reuse `env_fault_reason` — so it inherits the spawn-fault translation
+    with no edit of its own, and this row is what pins that inheritance. Before
+    it, the OSError from `subprocess.run` escaped `cmd_confirm` entirely and the
+    operator saw a traceback in place of "NOT confirmed".
+
+    The park record and the board must be untouched, for the same reason the
+    red-command row beside this one asserts it: a refused `--reverify` has to
+    leave every record exactly where it found it."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    missing = tmp_path / "no-such-code-root"
+    write_repo_root_override(project, missing)
+    sp = _park_story(project)
+    before = sp.read_text()
+    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 1
+
+    err = capsys.readouterr().err
+    assert "--reverify failed" in err and "NOT confirmed" in err
+    assert "could not run" in err and str(missing) in err
+    assert sp.read_text() == before
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
+def _diverge_repo_root(paths, code_root: Path) -> None:
+    """Compose the two shared conftest halves of the divergent fixture: the
+    `repo_root:` config override, and one cwd marker per root.
+
+    Both load-bearing halves are conftest's, not this module's.
+    `write_repo_root_override` writes the same three keys the two unusable-cwd
+    rows above need, and
+    `plant_root_markers` is the same planter the review-gate row in
+    `test_verify.py` uses — so the four `[verify] commands` callers graded by a
+    two-direction probe cannot end up asking subtly different questions.
+
+    Why this fixture exists at all: `cli._reverify` is handed `paths.repo_root` at
+    both of its call sites, and every pre-existing row here runs a cwd-INSENSITIVE
+    command (`python -c "pass"`) under the collapsed `project` fixture, so nothing
+    observed which root the commands ran in.
+
+    `code_root` is deliberately NOT a git repo, because that is what an operator's
+    `repo_root:` pointing at a non-checkout looks like and `_reverify` runs no git
+    there. Note the limit of that choice: `_land_confirmation` SWALLOWS the
+    `GitError` its `path_ignored`/`commit_paths` calls raise in such a root, so a
+    regression that started shelling out to git here would pass these rows
+    unnoticed. (`test_verify.py::test_verify_review_gates_run_commands_in_repo_root`
+    makes the stronger claim, about a gate that does not swallow it.)
+    """
+    write_repo_root_override(paths, code_root)
+    plant_root_markers(repo_root=code_root, project=paths.project)
+
+
+def _marker_policy(paths, marker_root: str) -> None:
+    """A `[verify] commands` policy holding the RELATIVE probe for one root.
+
+    A dict rather than `X if marker_root == "repo_root" else Y`: under the
+    conditional any value but that exact literal silently selected the project
+    probe, so a typo in the `parametrize` list would have graded BOTH legs in the
+    project direction and left both green — a false-green mechanism inside the
+    rows built to prevent false greens. An unknown key raises `KeyError` here.
+    """
+    command = {"repo_root": REPO_ROOT_MARKER_CMD, "project": PROJECT_MARKER_CMD}[marker_root]
+    _write_policy(paths.project, f"[verify]\ncommands = [{json.dumps(command)}]\n")
+
+
+@pytest.mark.parametrize("marker_root", ["repo_root", "project"])
+def test_confirm_reverify_runs_the_commands_in_the_code_tree(
+    project, tmp_path, capsys, monkeypatch, marker_root
+):
+    """`cmd_confirm`'s `_reverify` call site, pinned from BOTH directions.
+
+    The marker only `repo_root` holds must let the confirmation through AND the
+    marker only `project` holds must refuse it. The positive leg identifies
+    `repo_root`; the negative leg rules out the tempting `paths.project` regression
+    explicitly. No pre-existing row could see either: they all run cwd-insensitive
+    commands under the `project` fixture, where the two roots are the same object.
+
+    The refusal leg asserts the SPECIFIC failure (`NOT confirmed`) and that all
+    three records are byte-identical to before — a refused `--reverify` has to
+    leave the spec, the board and the park entry exactly where it found them, and
+    `rc == 1` alone is reachable from several other refusals in this command.
+
+    All three are compared as BYTES, which is what "untouched" means and what the
+    claim above says. A parsed read-back (`sprintstatus.story_status`, key
+    membership in `operatoractions.load`) answers a weaker question: a refusal
+    that rewrote the board's other rows, reordered its keys, or rewrote the record
+    in place would satisfy it. The semantic assertions are kept beside the byte
+    ones because they say WHAT the unchanged bytes are.
+
+    Ablation: pass `paths.project` at the `_reverify` call site in `cmd_confirm`
+    and both legs redden.
+    """
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    code_root = tmp_path / "code-root"
+    code_root.mkdir()
+    _diverge_repo_root(project, code_root)
+    sp = _park_story(project)
+    record = operatoractions.record_path(project.project, "1-1-a")
+    before_spec = sp.read_bytes()
+    before_board = project.sprint_status.read_bytes()
+    before_record = record.read_bytes()
+    _marker_policy(project, marker_root)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    classify_cwds: list[Path] = []
+    real_env_fault = verify.env_fault_reason
+
+    def classify_in(result, cwd):
+        classify_cwds.append(cwd)
+        return real_env_fault(result, cwd)
+
+    monkeypatch.setattr(verify, "env_fault_reason", classify_in)
+
+    rc = cli.main(_confirm_argv(project, "1-1-a", "--reverify"))
+    captured = capsys.readouterr()
+
+    assert classify_cwds == [code_root.resolve()]
+    if marker_root == "repo_root":
+        assert rc == 0
+        assert "verify commands passed" in captured.out
+        assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+        assert operatoractions.load(project.project) == {}
+    else:
+        assert rc == 1
+        assert "--reverify failed" in captured.err and "NOT confirmed" in captured.err
+        assert sp.read_bytes() == before_spec
+        assert project.sprint_status.read_bytes() == before_board
+        assert record.read_bytes() == before_record
+        assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+        assert "1-1-a" in operatoractions.load(project.project)
+
+
 def test_confirm_reverify_says_so_when_nothing_is_configured(project, capsys, monkeypatch):
     """An empty command list is not a green gate, and must not be reported as one."""
     install_bmad_config(project)
@@ -5128,6 +8265,57 @@ def test_confirm_commits_even_without_a_committed_record(project, capsys, monkey
     assert "confirm 1-1-a" in git(project.project, "log", "-1", "--format=%s")
     assert operatoractions.load(project.project) == {}  # legacy entry pruned too
     assert verify.worktree_clean(project.project)
+
+
+def test_confirm_lands_its_commit_over_a_gitignored_board(project, capsys, monkeypatch):
+    """A gitignored board must not sink the confirm commit with it.
+
+    `git add` refuses an explicitly named ignored pathspec with rc 1 — and refuses
+    the WHOLE operand list with it, staging nothing — so handing `commit_paths` a
+    gitignored board raises `GitError` before the spec and the record ever reach
+    the index. That error is swallowed as best-effort ("files are the state"),
+    which is right for the board and wrong for the other two: the spec's flip to
+    `done` and the record's DELETION stay uncommitted, and the record's deletion in
+    particular arrived in the park's commit (#356), so leaving it out dirties the
+    tree the next run's preflight refuses. The board carry (#350) makes
+    gitignored-board parks the ordinary shape rather than an exotic one.
+
+    Ablation: drop the `path_ignored` filter in `_land_confirmation` and this
+    reddens on the log assertion — HEAD still reads `park`, with the spec's flip
+    and the record's deletion left dirtying the tree under a `✓ confirmed`. The
+    other 30 confirm rows stay green, which is the point: a TRACKED board is
+    untouched by the filter."""
+    from bmad_loop import operatoractions, sprintstatus, verify
+
+    install_bmad_config(project)
+    # the rule first, so the park's `add -A` below cannot sweep the board in; the
+    # board is written by `_park_story` after it, and stays untracked forever.
+    ignore_before_commit(project, "sprint-status.yaml")
+    sp = _park_story(project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    rel = project.sprint_status.relative_to(project.project).as_posix()
+    # `check-ignore` is the oracle: a rule that is present is not necessarily
+    # effective, and a board that reads TRACKED here is the shape with no defect.
+    assert git(project.project, "check-ignore", rel).strip() == rel
+    assert not verify.path_tracked(project.project, rel)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+
+    # the board advanced ON DISK — an ignored file is still the state
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert not verify.path_tracked(project.project, rel)
+    # ...and the two records git DOES own moved into history together
+    assert operatoractions.load(project.project) == {}
+    assert "confirm 1-1-a" in git(project.project, "log", "-1", "--format=%s")
+    changed = git(project.project, "show", "--name-only", "--format=", "HEAD").split()
+    assert sp.relative_to(project.project).as_posix() in changed
+    assert ".bmad-loop/operator/1-1-a.json" in changed
+    assert rel not in changed  # the board is git's business to refuse, not ours
+    # the whole point: the next run's preflight finds nothing left behind
+    assert verify.worktree_clean(project.project)
+    assert "✓ 1-1-a confirmed" in capsys.readouterr().out
 
 
 def test_confirm_works_on_a_fresh_clone_of_a_parked_repo(project, capsys, monkeypatch, tmp_path):
@@ -5329,7 +8517,9 @@ def _interrupted_story(paths, key="1-1-a", *, board="awaiting-operator"):
     from bmad_loop import devcontract
 
     sp = _park_story(paths, key, spec_status="done", board=board)
-    devcontract.append_operator_confirmation(sp, CONFIRM_ACTIONS, date="2026-07-28")
+    devcontract.append_operator_confirmation(
+        sp, CONFIRM_ACTIONS, date="2026-07-28", confine_root=paths.project
+    )
     return sp
 
 
@@ -5424,6 +8614,96 @@ def test_a_resume_still_honors_reverify_and_says_what_was_not_done(project, caps
     assert "NOT advanced" in err and "NOT confirmed" not in err
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
     assert "1-1-a" in operatoractions.load(project.project)
+
+
+def test_a_resume_reverify_reports_an_unusable_cwd_without_losing_partial_state(
+    project, tmp_path, capsys, monkeypatch
+):
+    """The resumable confirmation caller gets the same spawn-fault translation
+    as the initial confirmation and preserves the already-written sign-off."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    missing = tmp_path / "no-such-resume-code-root"
+    write_repo_root_override(project, missing)
+    spec = _interrupted_story(project)
+    before = spec.read_text(encoding="utf-8")
+    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 1
+
+    err = capsys.readouterr().err
+    assert "NOT advanced" in err and "NOT confirmed" not in err
+    assert "could not run" in err and str(missing) in err
+    assert spec.read_text(encoding="utf-8") == before
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
+@pytest.mark.parametrize("marker_root", ["repo_root", "project"])
+def test_a_resume_reverify_runs_the_commands_in_the_code_tree(
+    project, tmp_path, capsys, monkeypatch, marker_root
+):
+    """The resumable confirmation's own `_reverify` call site — the second of the
+    two, and a separate line of code from `cmd_confirm`'s.
+
+    Same two-direction probe, and the refusal leg asserts the wording that
+    distinguishes this caller: "NOT advanced" and NOT "NOT confirmed". The
+    confirmation itself already happened here, so telling a human it was not
+    confirmed sends them looking for a sign-off to redo. Asserting the absence
+    matters as much as the presence — one shared message would satisfy a bare
+    "it refused".
+
+    The already-written sign-off must survive either way, which is what makes
+    this leg's "nothing was lost" claim testable at all — and it is compared as
+    BYTES, together with the board and the park record, for the reason the
+    `cmd_confirm` twin gives: a parsed read-back cannot see a record rewritten in
+    place.
+
+    Ablation: pass `paths.project` at the `_reverify` call site in
+    `_resume_confirmation` and both legs redden.
+    """
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    code_root = tmp_path / "code-root"
+    code_root.mkdir()
+    _diverge_repo_root(project, code_root)
+    spec = _interrupted_story(project)
+    record = operatoractions.record_path(project.project, "1-1-a")
+    before_spec = spec.read_bytes()
+    before_board = project.sprint_status.read_bytes()
+    before_record = record.read_bytes()
+    _marker_policy(project, marker_root)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    classify_cwds: list[Path] = []
+    real_env_fault = verify.env_fault_reason
+
+    def classify_in(result, cwd):
+        classify_cwds.append(cwd)
+        return real_env_fault(result, cwd)
+
+    monkeypatch.setattr(verify, "env_fault_reason", classify_in)
+
+    rc = cli.main(_confirm_argv(project, "1-1-a", "--reverify"))
+    captured = capsys.readouterr()
+
+    assert classify_cwds == [code_root.resolve()]
+    if marker_root == "repo_root":
+        assert rc == 0
+        assert "verify commands passed" in captured.out
+        assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+        assert operatoractions.load(project.project) == {}
+    else:
+        assert rc == 1
+        assert "NOT advanced" in captured.err and "NOT confirmed" not in captured.err
+        assert spec.read_bytes() == before_spec
+        assert project.sprint_status.read_bytes() == before_board
+        assert record.read_bytes() == before_record
+        assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+        assert "1-1-a" in operatoractions.load(project.project)
 
 
 def test_list_marks_an_interrupted_confirmation_as_signed_off_not_refused(project, capsys):
@@ -6263,22 +9543,402 @@ def test_auto_sweep_refuses_worktree_isolation_under_a_repo_root_override(projec
     the parent's own start was allowed not to check.
 
     It RAISES rather than returning, which is the whole point: `_maybe_auto_sweep`
-    has already journaled `sweep-auto-trigger` and latched the trigger by the time it
-    calls the factory, and it reads a plain return as success — so a quiet decline is
-    recorded as `sweep-auto-finished`, a child sweep that ran and finished when none
-    was launched. Raising lands on the `sweep-auto-failed` + notify path instead,
+    has already journaled `sweep-auto-trigger` by the time it calls the factory, and
+    it reads a plain return as a child that ran — so a quiet decline is recorded as
+    `sweep-auto-finished`, a child sweep that ran and finished when none was
+    launched. Raising lands on the `sweep-auto-not-started` + notify path instead,
     which is the same one an unparseable policy.toml already takes, and the parent
-    run is still unaffected (`_maybe_auto_sweep` swallows it)."""
+    run is still unaffected (`_maybe_auto_sweep` swallows it).
+
+    The `started` thunk turns "no launch" into a positive assertion rather than an
+    absence: the refusal has to precede the boundary `compose_sweep` fires it at,
+    or the parent spends a trigger on a child that never existed (#501)."""
     from bmad_loop import bmadconfig
 
     _split_root_project(project)
-    started = []
-    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
+    launched = []
+    monkeypatch.setattr(cli, "_start_sweep", _stub_start_sweep(launched))
 
-    factory = cli._sweep_factory(project.project, bmadconfig.load_paths(project.project))
+    # Hand it a MATCHING config digest so the #461 gate (which sits ahead of the
+    # isolation check) stays quiet and this test still measures the isolation
+    # refusal — otherwise it would pass off the wrong RuntimeError.
+    factory = cli._sweep_factory(
+        project.project,
+        bmadconfig.load_paths(project.project),
+        _config_pin(project),
+    )
     with pytest.raises(RuntimeError, match=REFUSAL):
-        factory("epic-boundary")
-    assert started == []
+        factory("epic-boundary", started=_never_started)
+    assert launched == []
+
+
+# --- #461 point 4: the auto-sweep child's config re-read is integrity-pinned ---
+
+# A project whose whole host-exec surface is expressible: the verify command the
+# parent would shell out, and a profile overlay carrying the launch `binary`. Both
+# live under the project tree, so a driven session can rewrite either one.
+PIN_POLICY = """\
+[adapter]
+name = "mycli"
+
+[verify]
+commands = ["true"]
+"""
+
+PIN_PROFILE = """\
+name = "mycli"
+binary = "mycli"
+bypass_args = ["--yes"]
+
+[hooks]
+dialect = "claude-settings-json"
+config_path = ".mycli/settings.json"
+events = { SessionStart = "SessionStart", Stop = "Stop" }
+"""
+
+DIGEST_REFUSAL = "changed under a running loop before an auto-sweep"
+
+
+def _never_started() -> None:
+    """The `started` thunk for every factory call that must be refused. Firing it
+    means the child sweep reached `compose_sweep`'s success boundary and the parent
+    would spend its trigger (#501), so a refusal that signals first is a bug even
+    when it goes on to raise — an assertion this makes positive, where `launched ==
+    []` alone would pass for any reason `_start_sweep` did not run.
+
+    Armed only because `_stub_start_sweep` relays the thunk: a stub that recorded
+    its kwargs and dropped them would make this decorative, since nothing could
+    then call it.
+
+    Ablation, one for all four rows that use it: move `_sweep_factory`'s digest
+    gate BELOW its `_start_sweep` call (the refusal still raises, just too late)
+    and the three `DIGEST_REFUSAL` rows fail with "started before the gate" —
+    naming the boundary, where the `launched == []` assert alone would only say
+    something launched."""
+    pytest.fail("started before the gate")
+
+
+def _stub_start_sweep(launched: list):
+    """A `cli._start_sweep` stand-in that records its kwargs AND relays
+    `on_started`, the way the real one does through `compose_sweep`. Relaying is
+    the point: it is what lets a refusal test assert the gate ran first rather
+    than merely that nothing launched."""
+
+    def stub(*_a, **kw):
+        launched.append(kw)
+        if kw.get("on_started") is not None:
+            kw["on_started"]()
+        return 0
+
+    return stub
+
+
+def _pin_profile(project, text=PIN_PROFILE) -> None:
+    profiles = project.project / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    (profiles / "mycli.toml").write_text(text, encoding="utf-8")
+
+
+def _pinned_sweep_factory(project, monkeypatch, *, policy_text=PIN_POLICY):
+    """A child-sweep factory pinned to the config as it stands right now — the
+    launch baseline `cmd_run` hands it. Anything a test writes AFTER this returns
+    is exactly the mid-run rewrite #461 point 4 describes: no human asked for it,
+    and the factory re-reads both files off disk on the engine's next trigger.
+
+    Returns the factory plus the `_start_sweep` kwargs it reached, one entry per
+    launch. The stub relays `on_started` (see `_stub_start_sweep`) so the refusal
+    rows can assert the gate ran BEFORE it; the real boundary inside
+    `compose_sweep` is driven by
+    `test_auto_sweep_launches_the_profile_bytes_the_gate_validated`."""
+    from bmad_loop import bmadconfig
+
+    install_bmad_config(project)
+    _write_policy(project.project, policy_text)
+    _pin_profile(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    launched = []
+    monkeypatch.setattr(cli, "_start_sweep", _stub_start_sweep(launched))
+    factory = cli._sweep_factory(
+        project.project, bmadconfig.load_paths(project.project), _config_pin(project)
+    )
+    return factory, launched
+
+
+def test_auto_sweep_refuses_a_rewritten_verify_command(project, monkeypatch):
+    """`[verify] commands` runs with shell=True on the HOST, outside any session's
+    sandbox — and policy.toml sits in the workspace every driven session can write.
+    The parent loop froze its Policy at launch, so this factory's fresh reload is
+    the one path where that rewrite reaches execution with no human in the loop."""
+    factory, launched = _pinned_sweep_factory(project, monkeypatch)
+    _write_policy(project.project, PIN_POLICY.replace('["true"]', '["touch pwned"]'))
+
+    with pytest.raises(RuntimeError, match=DIGEST_REFUSAL):
+        factory("epic-boundary", started=_never_started)
+    assert launched == []
+
+
+def test_auto_sweep_refuses_a_rewritten_profile_binary(project, monkeypatch):
+    """The case a `policy_snapshot`-only compare provably cannot catch: `binary`
+    is read from profiles/*.toml through get_profile and never appears in the
+    snapshot at all. This is why config_digest resolves profiles rather than
+    hashing the policy dict."""
+    factory, launched = _pinned_sweep_factory(project, monkeypatch)
+    _pin_profile(project, PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"'))
+
+    with pytest.raises(RuntimeError, match=DIGEST_REFUSAL):
+        factory("epic-boundary", started=_never_started)
+    assert launched == []
+
+
+def test_auto_sweep_refuses_a_widened_plugin_allowlist(project, monkeypatch):
+    """`[plugins] enabled` is the trust gate for in-process Python import
+    (plugins/trust.py) — adding a name to it mid-run is a straight path from a
+    workspace write to code running inside the orchestrator itself."""
+    factory, launched = _pinned_sweep_factory(project, monkeypatch)
+    _write_policy(project.project, PIN_POLICY + '\n[plugins]\nenabled = ["rogue"]\n')
+
+    with pytest.raises(RuntimeError, match=DIGEST_REFUSAL):
+        factory("epic-boundary", started=_never_started)
+    assert launched == []
+
+
+def test_auto_sweep_proceeds_after_a_benign_limits_edit(project, monkeypatch):
+    """Why the digest is field-scoped and not a whole-file hash. #189 documents
+    live-editing `[limits]` under a running loop as supported; a file hash would
+    refuse every auto-sweep after one, turning a correctness feature into a
+    regression. Nothing in `[limits]` reaches host exec, so nothing here fires."""
+    factory, launched = _pinned_sweep_factory(project, monkeypatch)
+    _write_policy(project.project, PIN_POLICY + "\n[limits]\ncache_read_weight = 0.5\n")
+    signalled: list[str] = []
+
+    factory("epic-boundary", started=lambda: signalled.append("started"))  # no raise
+
+    assert len(launched) == 1
+    # The thunk reaches `_start_sweep` rather than being dropped at this frame —
+    # the stub relays it, standing in for `compose_sweep`'s boundary (#501).
+    assert signalled == ["started"]
+
+
+def test_auto_sweep_proceeds_when_the_pinned_config_is_untouched(project, monkeypatch):
+    """The gate's own null case — and the one that would catch a digest that is
+    unstable across two reads of an unchanged tree, which would refuse every
+    auto-sweep in the product."""
+    factory, launched = _pinned_sweep_factory(project, monkeypatch)
+
+    factory("epic-boundary", started=lambda: None)  # no raise
+
+    assert len(launched) == 1
+
+
+def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monkeypatch):
+    """The gate is worth only as much as the read it protects: hashing one read of
+    profiles/*.toml and then launching from a *later* one is check-then-use over a
+    file the driven sessions can write. A session that leaves a background writer
+    behind swaps the overlay the instant the compare succeeds — modelled here by
+    flipping it from inside `config_digest`'s own return — and the window is not a
+    defense, because a lost round only raises `sweep-auto-not-started`, which
+    `_maybe_auto_sweep` swallows before the next trigger deals again.
+
+    So `_sweep_factory` resolves the profiles ONCE and threads that mapping through
+    the gate, the pin it stamps, and `make_adapters`. Both assertions below are the
+    harm, not the plumbing: the adapter must carry the validated `binary`, and the
+    child must not re-baseline itself onto the swapped config.
+
+    Doubles as the one place the `started` boundary runs FOR REAL — `_start_sweep`
+    is not stubbed here, so `compose_sweep` fires the thunk itself once the child
+    owns a published run dir. Every other #501 site either stubs `_start_sweep`
+    (kwargs only) or asserts the thunk never fires.
+
+    ABLATION: drop `profiles=` from either `runsetup.make_adapters` or
+    `_trusted_config_digest` in `_start_sweep` and the matching assert fails. Two
+    more lanes for the #501 thunk, and they redden different sets: dropping
+    `compose_sweep`'s `on_started()` call fails this row alone, while dropping
+    `on_started=` from the factory's `_start_sweep` call also reddens
+    `test_auto_sweep_proceeds_after_a_benign_limits_edit` — which is the seam
+    below this one, and the reason both exist."""
+    from bmad_loop import bmadconfig, runs
+    from bmad_loop.adapters import profile as profile_mod
+
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
+    install_bmad_config(project)
+    _write_policy(project.project, PIN_POLICY)
+    _pin_profile(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    pin = _config_pin(project)
+
+    real_digest = runsetup.config_digest
+
+    def digest_then_swap(*a, **kw):
+        digest = real_digest(*a, **kw)
+        # The writer wakes the moment the comparison has its answer.
+        _pin_profile(project, PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"'))
+        return digest
+
+    monkeypatch.setattr(runsetup, "config_digest", digest_then_swap)
+
+    captured: dict = {}
+
+    class _Recorder:
+        """Stands in for SweepEngine: records what compose_sweep wired, drives
+        nothing. `_start_sweep` renders the summary, so run() answers one."""
+
+        def __init__(self, **kw):
+            captured.update(kw)
+
+        def run(self):
+            return types.SimpleNamespace(render=lambda: "")
+
+    monkeypatch.setattr(cli, "SweepEngine", _Recorder)
+
+    signalled: list[str] = []
+    factory = cli._sweep_factory(project.project, bmadconfig.load_paths(project.project), pin)
+    # the gate saw the honest bytes and passed
+    factory("epic-boundary", started=lambda: signalled.append("started"))
+
+    assert (
+        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
+    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert captured["adapter"].profile.binary == "mycli"
+    assert signalled == ["started"]  # #501: the child composed, so the parent may latch
+    run_id = captured["state"].run_id
+    assert runs.read_trusted_config_digest(project.project, run_id) == pin
+    # Both copies, and the same validated bytes in each: the in-tree secondary is
+    # what survives a project rename (the state root is keyed by resolved path), so
+    # a launch that stamped only out of tree loses the pin on the first move.
+    assert captured["state"].trusted_config_digest == pin
+
+
+def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
+    """`cmd_run` STAMPS the baseline every later auto-sweep is held to. It used to
+    hash one read of profiles/*.toml and build its adapters from a second, so a
+    write landing between them pinned config this run never launched.
+
+    Deliberately NOT a security test — there is no attack here to refuse. At launch
+    the on-disk config IS the trust anchor, so a writer who can land in that gap
+    could just as well have written before it and been blessed with no timing at
+    all. The harm is over-refusal: the pin is the one baseline a session cannot
+    reach (`_sweep_factory` holds children to it from memory), so a pin over
+    unlaunched bytes makes those children refuse the config the parent is running —
+    every trigger, for the life of the run. (#501 stopped a refusal from *spending*
+    each trigger; nothing about a wrong pin gets better for that.)
+
+    Asserts the invariant, not the plumbing: the stamp and the adapter agree.
+
+    The writer fires from inside `resolve_profiles`' own return — the instant a
+    read completes — rather than from `config_digest`'s, so BOTH threads are
+    load-bearing. Swapping at the digest boundary would leave the stamp assert
+    vacuous: disk is still honest when the baseline is taken, so the pin comes out
+    right whether or not it was handed the resolution.
+
+    ABLATION, both lanes bite: drop `profiles=` from `compose_run` and the adapter
+    assert fails (it re-reads the swapped overlay); drop it from
+    `_trusted_config_digest` and the stamp assert fails (the digest re-resolves
+    after the swap and pins config the run never launched)."""
+    from conftest import git, install_base_skills
+
+    from bmad_loop import runs
+    from bmad_loop.adapters import profile as profile_mod
+
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
+    install_bmad_config(project)
+    install_base_skills(project)
+    _write_policy(project.project, PIN_POLICY)
+    _pin_profile(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "setup")
+    pin = _config_pin(project)
+
+    real_resolve = runsetup.resolve_profiles
+
+    def resolve_then_swap(*a, **kw):
+        resolved = real_resolve(*a, **kw)
+        # A concurrent writer wakes the instant a read of the overlay completes.
+        _pin_profile(project, PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"'))
+        return resolved
+
+    monkeypatch.setattr(runsetup, "resolve_profiles", resolve_then_swap)
+
+    captured: dict = {}
+
+    class _Recorder:
+        """Stands in for Engine: records what compose_run wired, drives nothing."""
+
+        def __init__(self, **kw):
+            captured.update(kw)
+
+        def run(self):
+            return types.SimpleNamespace(render=lambda: "")
+
+    monkeypatch.setattr(cli, "Engine", _Recorder)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+
+    assert (
+        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
+    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert captured["adapter"].profile.binary == "mycli"
+    run_id = captured["state"].run_id
+    assert runs.read_trusted_config_digest(project.project, run_id) == pin
+    # As in the sweep twin: the launch stamps both copies, out-of-tree (trusted) and
+    # in-tree (travels with the run dir when the project is renamed).
+    assert captured["state"].trusted_config_digest == pin
+
+
+def test_resume_pins_the_profile_bytes_it_launches(project, monkeypatch):
+    """The twin of `test_run_pins_the_profile_bytes_it_launches`, on the other
+    entrypoint that mints this baseline. A resume RE-stamps
+    `state.trusted_config_digest` and arms `_sweep_factory(..., new_digest)`, so
+    the children of a resumed run are held to a pin this function produced — the
+    same read-twice defect lands here, and fixing only `cmd_run` would leave one of
+    two identical call sites open.
+
+    ABLATION: drop `profiles=` from `_trusted_config_digest` or `compose_resume`
+    in `_resume_paused_run` and the matching assert fails."""
+    from conftest import install_base_skills
+
+    from bmad_loop import runs
+    from bmad_loop.adapters import profile as profile_mod
+
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
+    install_bmad_config(project)
+    install_base_skills(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    _write_policy(project.project, PIN_POLICY)
+    _pin_profile(project)
+    pin = _config_pin(project)
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-beef",
+        paused_reason="escalation",
+        paused_stage="escalation",
+    )
+
+    real_resolve = runsetup.resolve_profiles
+
+    def resolve_then_swap(*a, **kw):
+        resolved = real_resolve(*a, **kw)
+        _pin_profile(project, PIN_PROFILE.replace('binary = "mycli"', 'binary = "rogue-cli"'))
+        return resolved
+
+    monkeypatch.setattr(runsetup, "resolve_profiles", resolve_then_swap)
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+
+    captured: dict = {}
+
+    class _Recorder(_StubEngine):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(cli, "Engine", _Recorder)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert (
+        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
+    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert captured["adapter"].profile.binary == "mycli"
+    assert runs.read_trusted_config_digest(project.project, run_dir.name) == pin
 
 
 def test_dry_run_banner_names_the_isolation_refusal_first(project, capsys):
@@ -6302,3 +9962,1291 @@ def test_dry_run_banner_names_the_isolation_refusal_first(project, capsys):
     assert REFUSAL in fails[0]
     assert len(fails) > 1, "the base-skill problems the banner already reported"
     assert "1-1-a" in out  # the schedule itself still rendered
+
+
+# ------------------- a project root the OS refuses to canonicalize (#552) --------
+
+
+def test_project_degrades_when_the_os_cannot_canonicalize(monkeypatch, capsys, tmp_path):
+    """`_project` runs inside `main()` before dispatch, so a raise here took out every
+    subcommand at the broad backstop — `diagnose` and `validate` included, which are
+    the two that name the host responsible."""
+    refuse_to_resolve(monkeypatch, tmp_path)
+
+    got = cli._project(argparse.Namespace(project=str(tmp_path)))
+
+    assert got == tmp_path
+    assert UNRESOLVABLE in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["validate", "diagnose"])
+def test_diagnostic_commands_survive_an_unresolvable_project_root(
+    command, project, monkeypatch, capsys
+):
+    """The regression itself. Both commands exist to tell an operator what is wrong
+    with their host; on the one host that answers WinError 64 they were the two that
+    could not run. Asserted through `--json` because it proves three things at once:
+    the handler reached its end, the document is whole, and the stderr note did not
+    leak onto the one-object-on-stdout surface."""
+    install_bmad_config(project)
+    # `diagnose` has an early "no runs found" exit that would let it pass this row
+    # without ever building a document; give it one to report on.
+    escalated_run(project.project)
+    refuse_to_resolve(monkeypatch, project.project)
+
+    rc = cli.main([command, "--json", "--project", str(project.project)])
+
+    captured = capsys.readouterr()
+    # The pre-fix shape: nothing on stdout, `error: [WinError 64] ...` on stderr, rc 1.
+    assert f"error: {UNRESOLVABLE}" not in captured.err
+    assert "cannot canonicalize" in captured.err
+    doc = json.loads(captured.out)  # raises if the note leaked to stdout
+    assert doc["schema_version"] >= 1
+    assert rc in (0, 1)  # a verdict of either kind is a handler that ran
+
+
+def test_validate_records_the_refused_root_and_still_reaches_later_gates(
+    project, monkeypatch, capsys
+):
+    """The property the typed raise in `load_paths` has to preserve — the reason #552
+    exists: `cmd_validate` catches the BmadConfigError, records it as the
+    `bmad-config` finding, and keeps going, so the gates after the config load (the
+    platform preflight among them) still run on the one host that needs their
+    findings. Pinned on the document rather than the prose: the failure is recorded
+    AND a later gate contributed a finding of its own."""
+    install_bmad_config(project)
+    refuse_to_resolve(monkeypatch, project.project)
+
+    rc = cli.main(["validate", "--json", "--project", str(project.project)])
+
+    doc = json.loads(capsys.readouterr().out)
+    by_check = {}
+    for finding in doc["findings"]:
+        by_check.setdefault(finding["check"], finding)
+    assert by_check["bmad-config"]["severity"] == "problem"
+    assert "cannot canonicalize" in by_check["bmad-config"]["message"]
+    # policy loads after the config gate; its presence is the handler continuing
+    # past the raise rather than dying on it
+    assert "policy" in by_check
+    assert rc == 1
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="UNC resolution is a Windows behavior")
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "\\\\wsl.localhost\\Ubuntu-24.04\\home\\u\\proj",
+        "\\\\wsl$\\Ubuntu-24.04\\home\\u\\proj",
+    ],
+)
+def test_project_degrades_on_a_real_unc_refusal(spelling, monkeypatch, capsys):
+    """The whole bug, on the platform that has it, through real `Path.resolve()`.
+
+    Technique borrowed from the #536 guards in `test_platform_util.py`: stub the
+    syscall wrapper rather than aim at a live provider, so the row cannot flake on
+    whether a distro happens to be serving on the runner. Unlike those guards this one
+    answers ERROR_NETNAME_DELETED (64), which is *off* `ntpath`'s non-strict
+    allow-list — that is the difference between `realpath` degrading to its own
+    lexical walk and `realpath` raising, and raising is #552. No `_nt_readlink` stub
+    is needed here for exactly that reason: the walk never starts.
+
+    The final assertion is the point of the whole change. `host.win32-on-wsl-path` is
+    the finding that explains this host, `is_wsl_unc_path` is its predicate, and the
+    predicate has to still match what the fallback returns or the command survives
+    with nothing to say."""
+    calls: list[str] = []
+
+    def dead_provider(path):
+        calls.append(path)
+        raise OSError(0, "stubbed: the provider is registered but not serving", None, 64)
+
+    monkeypatch.setattr(ntpath, "_getfinalpathname", dead_provider)
+    monkeypatch.setattr(platform_util, "_LEXICAL_FALLBACK_NOTED", set())
+
+    got = cli._project(argparse.Namespace(project=spelling))
+
+    # Ablation guard: a pathlib that stopped routing resolve() through ntpath would
+    # leave the stub unused, resolve() would succeed, and everything below would pass
+    # while pinning nothing about the degrade.
+    assert calls, "resolve() no longer reaches ntpath._getfinalpathname"
+    assert str(got) == spelling, "absolute() must hand an already-absolute path back whole"
+    assert platform_util.is_wsl_unc_path(got) is True
+    assert "cannot canonicalize" in capsys.readouterr().err
+
+
+# ------------------------------------------------- the git support floor (GIT_FLOOR)
+
+
+def _fake_git_version(monkeypatch, reported, *, rc=0):
+    """Fake `git version` at the PREDICATE seam — `verify.git_bytes` — so the whole
+    chain under test (`git_below_floor` -> `git_version_at_least` -> the caller's
+    branch) runs for real. Patching `verify.git_below_floor` instead would fake the
+    predicate away and leave only the wiring proven; the two are separate ablation
+    axes and each needs its own seam."""
+    real = verify.git_bytes
+
+    def fake(repo, *args, timeout_s=None):
+        if args == ("version",):
+            return subprocess.CompletedProcess(
+                args=["git", "version"], returncode=rc, stdout=reported.encode(), stderr=b""
+            )
+        return real(repo, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "git_bytes", fake)
+
+
+UNDER_FLOOR_GIT = "git version 2.25.1\n"
+
+
+def test_run_refuses_an_under_floor_git(project, capsys, monkeypatch):
+    """A host below `verify.GIT_FLOOR` never reaches the engine.
+
+    2.25 is the load-bearing choice: it HAS every git feature bmad-loop uses, so a
+    capability check would wave it through. Only a support-floor gate refuses it.
+
+    Ablation: delete the `_reject_under_floor_git` call in `cmd_run` and this fails
+    — the run proceeds past the gate. (Wiring axis; the predicate axis is
+    `tests/test_verify.py::test_git_version_at_least_reads_only_a_git_version_line`.)"""
+    install_bmad_config(project)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "2.25.1" in err
+    assert verify.git_floor_text() in err
+
+
+def test_run_refuses_when_git_cannot_be_run_at_all(project, capsys, monkeypatch):
+    """ "Absent/unspawnable" is a different fact from "too old", and it is refused
+    too. A run that cannot ask git its version has no business reaching `git
+    worktree add` — the gate must not degrade to "assume it's fine"."""
+    install_bmad_config(project)
+
+    def boom(repo, *args, timeout_s=None):
+        raise verify.GitSpawnError("git failed to spawn in /x: [Errno 2] No such file")
+
+    monkeypatch.setattr(verify, "git_bytes", boom)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    assert "could not be run" in capsys.readouterr().err
+
+
+def test_run_gate_admits_a_git_exactly_at_the_floor(project, monkeypatch):
+    """The boundary is INCLUSIVE. Asserted on the helper rather than through a whole
+    run, so the pass leg cannot be green for some later gate's reason."""
+    _fake_git_version(monkeypatch, f"git version {verify.git_floor_text()}.0\n")
+    assert cli._reject_under_floor_git(project.project) is None
+
+
+def test_sweep_refuses_an_under_floor_git(project, capsys, monkeypatch):
+    """The refusal covers every Engine-construction entrypoint, not just `run`."""
+    install_bmad_config(project)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    assert cli.main(["sweep", "--project", str(project.project)]) == 1
+    assert verify.git_floor_text() in capsys.readouterr().err
+
+
+def test_validate_reports_an_under_floor_git_as_a_problem(project, capsys, monkeypatch):
+    """A `problem`, not a warning — `validate` exits 1 on the same host `run` aborts
+    on. The severity IS the contract here: a `report.warn` would still emit the
+    finding, so asserting only its presence would stay green through the regression
+    this guards.
+
+    Ablation: change the `report.fail` to `report.warn` and this fails on the rc."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert findings["git.version"]["severity"] == "problem"
+    assert findings["git.version"]["detail"]["reported"] == "git version 2.25.1"
+
+
+def test_validate_and_run_agree_on_an_under_floor_git(project, capsys, monkeypatch):
+    """The point of making this a `problem`: one host state, one verdict. `validate`
+    reporting green while `run` aborts is the disagreement `cmd_validate` is built to
+    avoid, and it is invisible unless both are asserted together."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    validate_rc = cli.main(["validate", "--project", str(project.project)])
+    capsys.readouterr()
+    run_rc = cli.main(["run", "--project", str(project.project)])
+    assert (validate_rc, run_rc) == (1, 1)
+
+
+def test_validate_passes_the_git_floor_on_a_current_host(project, capsys, monkeypatch):
+    """The ok leg, pinned rather than left to the machine: without the fake this row
+    would pass or fail by whatever git the box has."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _fake_git_version(monkeypatch, "git version 2.55.0\n")
+
+    findings = _validate_findings(project, capsys)
+    assert findings["git.version"]["severity"] == "ok"
+
+
+def test_validate_pays_a_hung_git_once(project, capsys, monkeypatch):
+    """`cmd_validate` spawns three git children in a row and `_run_git` gives each
+    one the whole `GIT_TIMEOUT_S`, so against a binary that never returns the two
+    probes AFTER the first spend two more deadlines to learn what `git.probe`
+    already reported — six minutes, on the 120s default, for a command whose only
+    job is to answer quickly.
+
+    The findings are asserted alongside the counters because the skip must cost the
+    operator nothing: both skipped branches were already silent on a git fault, so
+    the report has to read exactly as it did before. A cheaper validate that also
+    dropped a finding would be a different change.
+
+    Ablation: remove the `git_answers` guard from either probe and that probe's
+    counter goes to 1."""
+    _make_validate_pass(project, monkeypatch, capsys)
+
+    def hung(*_args, **_kwargs):
+        raise verify.GitTimeoutError(f"git status timed out after 120s in {project.project}")
+
+    version_probes = []
+    render_probes = []
+
+    def counted_version(_repo, *args, timeout_s=None):
+        version_probes.append(args)
+        return subprocess.CompletedProcess(
+            args=["git", *args], returncode=0, stdout=b"git version 2.55.0\n", stderr=b""
+        )
+
+    def counted_tracked(_repo, rel):
+        render_probes.append(rel)
+        return False
+
+    monkeypatch.setattr(verify, "worktree_clean", hung)
+    monkeypatch.setattr(verify, "git_bytes", counted_version)
+    monkeypatch.setattr(verify, "path_tracked", counted_tracked)
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert version_probes == [], "the version probe re-paid the deadline git already spent"
+    assert render_probes == [], "the render-tracked probe re-paid it a third time"
+    assert findings["git.probe"]["severity"] == "problem"
+    assert "timed out" in findings["git.probe"]["message"]
+    assert "git.version" not in findings  # silent before the skip, silent after
+    assert "git.render-tracked" not in findings
+
+
+def test_validate_still_reports_the_git_version_when_git_ran_and_failed(
+    project, capsys, monkeypatch
+):
+    """The skip is narrow on purpose, and this is the leg that pins it. A non-zero
+    rc — dubious ownership, a corrupt index, a directory that is not a repo — is git
+    ANSWERING: the next probe returns just as promptly, and it is the only finding
+    that names the host fact `run` will abort on. Dropping it to save a deadline
+    that was never going to be paid would send an operator whose git is both broken
+    here AND below the floor back for a second round trip.
+
+    Ablation: widen the `git_answers` guard to any `GitError` and `git.version`
+    vanishes from the report."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    def refused(*_args, **_kwargs):
+        raise verify.GitError(
+            f"git status failed in {project.project}: fatal: detected dubious ownership"
+        )
+
+    monkeypatch.setattr(verify, "worktree_clean", refused)
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert "dubious ownership" in findings["git.probe"]["message"]
+    assert findings["git.version"]["severity"] == "problem"
+    assert findings["git.version"]["detail"]["reported"] == "git version 2.25.1"
+
+
+def test_auto_sweep_factory_raises_on_an_under_floor_git(project, monkeypatch):
+    """The child sweep's arm of the same refusal, and the one that cannot report an
+    rc: `_sweep_factory` runs under the engine, so it RAISES — the disposition the
+    #414 isolation conflict already uses there.
+
+    `launched == []` is the load-bearing half. A refusal that still reached
+    `_start_sweep` would spawn the very session it exists to prevent, and the
+    exception alone cannot tell those apart: the factory's contract is that any
+    raise BEFORE `started` leaves the parent's trigger unspent, so the assertion
+    has to prove the launch did not happen, not merely that something was raised.
+
+    Ablation: delete the `git_below_floor` check in `_sweep_factory` and this fails
+    — the factory launches a child sweep on a 2.25 host."""
+    factory, launched = _pinned_sweep_factory(project, monkeypatch)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    with pytest.raises(RuntimeError, match="2\\.25\\.1"):
+        factory("epic-boundary", started=_never_started)
+    assert launched == []
+
+
+def test_resume_refuses_an_under_floor_git(project, capsys, monkeypatch):
+    """Resume re-reads config.yaml and policy.toml off disk, so it is a second
+    entrypoint into the same engine and takes the same refusal — a run started on a
+    supported git must not finish its remaining stories after a downgrade.
+
+    The gate sits ahead of the kill/journal work on purpose, so this asserts the rc
+    and the message rather than stubbing `runs.kill_session`: reaching that call at
+    all would already be the bug.
+
+    Ablation: delete the `_reject_under_floor_git` call in `_resume_paused_run` and
+    this fails — the resume proceeds past the gate."""
+    install_bmad_config(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-beef",
+        paused_reason="spec approval",
+        paused_stage="spec-approval",
+    )
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    err = capsys.readouterr().err
+    assert "2.25.1" in err
+    assert verify.git_floor_text() in err
+
+
+def test_dry_run_banner_names_an_under_floor_git(project, capsys, monkeypatch):
+    """`--dry-run` returns BEFORE `_reject_under_floor_git`, so without this the
+    preview renders a plausible schedule for a command guaranteed to exit 1.
+
+    The git floor belongs in this banner where the dirty-tree and queue gates
+    deliberately do not: those are transient tree state an operator can fix between
+    the preview and the run, while an under-floor git is a fact about the host that
+    the preview cannot honestly print around.
+
+    Ablation: drop the `git_below_floor` probe from `_warn_preflight_would_abort`
+    and this fails — the preview goes out with no banner at all."""
+    from conftest import install_base_skills
+
+    install_base_skills(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    assert cli._dry_run(project, pol, args) == 0
+    err = capsys.readouterr().err
+    assert "NOT runnable" in err
+    assert "2.25.1" in err and verify.git_floor_text() in err
+
+
+def test_sweep_archive_rejects_bad_before_date(project, capsys):
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    rc = cli.main(["sweep", "--archive", "--before", "bad-date", "--project", str(project.project)])
+    assert rc == 1
+    assert "date must be YYYY-MM-DD" in capsys.readouterr().err
+
+
+def test_sweep_archive_rejects_bad_before_date_without_a_ledger(project, capsys):
+    """The same malformed `--before` is refused whether or not the project has
+    a ledger. `archive_closed` validates dates ahead of its own `is_file`
+    short-circuit for that reason; a missing-ledger early return in the CLI
+    graded the invocation by optional project data instead (#711 review)."""
+    install_bmad_config(project)  # no ledger written
+    rc = cli.main(["sweep", "--archive", "--before", "bad-date", "--project", str(project.project)])
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "date must be YYYY-MM-DD" in captured.err
+    assert "no deferred-work ledger at" not in captured.out  # not reported as a clean run
+
+
+def test_sweep_archive_dry_run(project, capsys):
+    """--dry-run previews and writes nothing.
+
+    The "would archive" wording branches on ``args.dry_run``, not on whether
+    anything was written, so the message alone is a vacuous oracle: drop
+    ``dry_run=`` from the ``archive_closed`` call and the preview still reads
+    the same while the ledger is rewritten under it. The file asserts are what
+    make this test decide the wiring (#711 review).
+    """
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    before = project.deferred_work.read_text(encoding="utf-8")
+    rc = cli.main(["sweep", "--archive", "--dry-run", "--project", str(project.project)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "would archive 1 entry" in out
+    assert "DW-2" in out
+    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+
+
+def test_sweep_archive_writes_ledger_and_archive(project, capsys):
+    """The writing path is observed on disk: bodies move, stubs land, open
+    entries stay (#706 pass 2 — a plumbing regression must not ship green)."""
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "archived 1 entry" in out
+    assert "commit" in out  # durable-note printed; its wording is not a contract
+    ledger_path = project.deferred_work
+    archive_path = ledger_path.parent / "deferred-work-archive.md"
+    text = ledger_path.read_text(encoding="utf-8")
+    entries = {e.id: e for e in deferredwork.parse_ledger(text)}
+    assert entries["DW-2"].done  # stub parses as done
+    assert entries["DW-1"].open  # open entry untouched
+    assert "DW-2" in text  # grep-resolvable
+    assert archive_path.is_file()
+    assert "### DW-2:" in archive_path.read_text(encoding="utf-8")
+
+
+def test_sweep_archive_before_without_archive_refused(project, capsys):
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    rc = cli.main(["sweep", "--before", "2026-06-01", "--project", str(project.project)])
+    assert rc == 1
+    assert "--before requires --archive" in capsys.readouterr().err
+
+
+def test_sweep_archive_conflicting_flags_refused(project, capsys):
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    rc = cli.main(["sweep", "--archive", "--no-prompt", "--project", str(project.project)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--archive cannot combine with" in err
+    assert "--no-prompt" in err
+
+
+def test_sweep_archive_empty_before_without_archive_refused(project, capsys):
+    """`--before ""` is a provided value, not an absent one — the guard must
+    not test truthiness (#706 pass 2)."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    rc = cli.main(["sweep", "--before", "", "--project", str(project.project)])
+    assert rc == 1
+    assert "--before requires --archive" in capsys.readouterr().err
+
+
+def test_sweep_archive_missing_ledger_named(project, capsys):
+    """A missing ledger is named, not reported as a clean nothing-to-archive."""
+    install_bmad_config(project)
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no deferred-work ledger at" in out
+    assert "no closed entries" not in out
+
+
+def test_sweep_archive_refuses_while_run_live(project, monkeypatch, capsys):
+    """The out-of-band ledger writer refuses when any engine run is live —
+    a concurrent close between its read and writes would be lost (#706 pass 2).
+
+    "Nothing written" is asserted as byte equality plus an absent archive, not
+    as `"DW-2" in text`: archiving DW-2 *keeps* its heading in the ledger by
+    design, so the id-presence form passes just as well when the refusal never
+    happened (#711 review)."""
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    run_dir = project.project / ".bmad-loop" / "runs" / "20260824-100000-aaaa"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "alive")
+    before = project.deferred_work.read_text(encoding="utf-8")
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+    assert rc == 1
+    assert "may still be live" in capsys.readouterr().err
+    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+
+
+def test_sweep_archive_refuses_on_unknown_liveness(project, monkeypatch, capsys):
+    """An unverifiable pid is treated as live for this write op — the archive
+    must not run over a run it cannot prove is dead (#711 review)."""
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    run_dir = project.project / ".bmad-loop" / "runs" / "20260824-100000-aaaa"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "unknown")
+    before = project.deferred_work.read_text(encoding="utf-8")
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+    assert rc == 1
+    assert "may still be live" in capsys.readouterr().err
+    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
+    assert project.deferred_work.read_text(encoding="utf-8") == before  # ledger unchanged
+
+
+def test_sweep_archive_refuses_run_dir_without_state_json(project, monkeypatch, capsys):
+    """A run whose state.json was removed still owns its `engine.pid` — and its
+    ledger writes. `runs.list_run_dirs` is state.json-gated (it answers "which
+    runs can I resume"), so a guard built on it walks past exactly the run an
+    operator is mid-recovery on and archives out from under it (#711 review).
+
+    Ablation: restore `runs.list_run_dirs` in `_sweep_archive` and this fails —
+    the archive proceeds and returns 0 with a live engine beside it."""
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    run_dir = project.project / ".bmad-loop" / "runs" / "20260824-100000-aaaa"
+    run_dir.mkdir(parents=True)
+    (run_dir / "engine.pid").write_text("4242", encoding="utf-8")  # live, but no state.json
+    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "alive")
+    before = project.deferred_work.read_text(encoding="utf-8")
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+    assert rc == 1
+    assert "may still be live" in capsys.readouterr().err
+    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+
+
+def test_sweep_archive_proceeds_when_runs_are_dead(project, monkeypatch, capsys):
+    """The allow direction of the liveness gate: a run dir whose engine is dead
+    is not a reason to refuse, and the archive runs to completion.
+
+    Without this the three refusal tests are satisfied by a gate that refuses
+    unconditionally — every one of them would still pass (#711 review)."""
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    run_dir = project.project / ".bmad-loop" / "runs" / "20260824-100000-aaaa"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "dead")
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+    assert rc == 0
+    assert "archived 1 entry" in capsys.readouterr().out
+    archive = project.deferred_work.parent / deferredwork.ARCHIVE_REL
+    assert archive.is_file()
+    assert "### DW-2:" in archive.read_text(encoding="utf-8")
+
+
+def test_sweep_archive_refuses_when_runs_dir_unreadable(project, capsys):
+    """An unreadable runs root answers nothing about liveness, and this write op
+    takes the conservative side — the same doctrine as an unverifiable pid.
+
+    A plain file where the runs dir belongs is the portable way to make the
+    listing fail: `os.scandir` raises `NotADirectoryError` (an `OSError`, not a
+    `FileNotFoundError`), which is the "learned nothing" arm of `_run_dir_names`
+    rather than its "no runs" arm.
+
+    Two ablation axes, and they redden different lines. Drop the `run_dirs is
+    None` arm and the message assert fails: iterating `None` raises, the CLI's
+    top-level handler still returns 1, and the operator is told `'NoneType'
+    object is not iterable` instead of what refused. Restore the
+    `state.json`-gated `runs.list_run_dirs` and the rc assert fails: a file
+    where the runs dir belongs is simply not a dir, so it lists nothing and the
+    archive proceeds."""
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    runs_root = project.project / ".bmad-loop" / "runs"
+    runs_root.parent.mkdir(parents=True, exist_ok=True)
+    runs_root.write_text("not a directory", encoding="utf-8")
+    before = project.deferred_work.read_text(encoding="utf-8")
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+    assert rc == 1
+    assert "cannot list runs under" in capsys.readouterr().err
+    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+
+
+def test_sweep_archive_names_the_lock_on_failure(project, monkeypatch, capsys):
+    """A ledger lock `--archive` cannot take is reported as a lock, by name.
+
+    `archive_closed` serializes on the ledger's cross-process sidecar lock
+    (#286/#469). Without the dedicated arm the acquisition's `OSError` fell
+    through to `main`'s bare backstop, which prints `error: [Errno 11] Resource
+    deadlock avoided` from a command with no other lock in sight — a message
+    that reads as a bug in the archive rather than as "another bmad-loop process
+    holds this". `rc == 1` is therefore a vacuous oracle here: the backstop
+    already returns FAILURE, and the exit code is the same either way. The
+    stderr assert is what decides this test.
+
+    The lock is named as a POSSIBILITY rather than asserted, because the same arm
+    catches the archive's own read and write failures — see
+    `test_sweep_archive_write_failure_is_not_blamed_on_a_rival_process`.
+
+    Ablation: drop the `except (OSError, runs.StateRootError)` arm from
+    `_sweep_archive` — the rc assert still passes and the message assert reddens.
+    """
+    import contextlib
+
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    @contextlib.contextmanager
+    def unavailable(lock_path, **kwargs):
+        # The shape `msvcrt.locking` raises when its ~10s blocking retry runs
+        # out — a routine outcome on the Windows legs, not a contrived one. The
+        # dead `yield` keeps this a generator, which `contextmanager` requires.
+        raise OSError(11, "Resource deadlock avoided")
+        yield  # pragma: no cover — unreachable
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    before = project.deferred_work.read_text(encoding="utf-8")
+    monkeypatch.setattr(deferredwork, "file_lock", unavailable)
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "ledger lock" in err  # named, rather than left as a bare errno
+    assert "Resource deadlock avoided" in err  # the cause is carried, not swallowed
+    # A write that could not be serialized did not proceed unlocked.
+    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+
+
+def test_sweep_archive_write_failure_is_not_blamed_on_a_rival_process(project, monkeypatch, capsys):
+    """A disk failure during the archive is not reported as lock contention.
+
+    One `except (OSError, runs.StateRootError)` arm covers three causes: the
+    acquisition, deriving the sidecar path, and the archive's OWN I/O — the
+    ledger read and both atomic writes. A message that asserts "another
+    bmad-loop process may hold it" is therefore wrong for a full disk or a
+    permission error, and sends the operator hunting a rival that never existed.
+    The message names both possibilities and lets the carried cause decide.
+
+    Ablation: restore the message that asserts contention outright — the
+    "could not be read or written" assert reddens while `rc` stays 1, which is
+    again why the exit code is not the oracle here."""
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    def full_disk(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    # The archive's own write, not the lock: the acquisition succeeds normally.
+    monkeypatch.setattr(deferredwork, "atomic_write_text", full_disk)
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "No space left on device" in err  # the real cause is carried
+    assert "could not be read or written" in err  # ...and offered as an explanation
+    assert "may hold" in err  # the lock stays a possibility, not a verdict
+
+
+def test_sweep_archive_pid_gate_refuses_before_any_lock(project, monkeypatch, capsys):
+    """The pid-liveness gate still refuses ahead of the ledger lock beneath it.
+
+    The lock (#286/#469) makes this refusal belt-and-braces, and the temptation
+    once a lock exists is to drop the gate as redundant. It is not: the gate is
+    deliberately coarser — no archive rewrite AT ALL while a run is live, where
+    the lock would merely serialize the two writers' read-modify-writes and
+    happily move a live run's entries out from under a plan it has already read.
+
+    The zero-acquisition spy is what makes this a gate test rather than a
+    refusal test. "Nothing was written" cannot tell the two apart: a refused
+    acquisition and a refused archive both leave the ledger byte-identical, so
+    the count is the only thing that says the gate fired FIRST.
+
+    Ablation: move the `archive_closed` call above the liveness loop — the
+    refusal message still prints, and `acquired` goes to 1.
+    """
+    import contextlib
+
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    acquired = []
+    real_file_lock = deferredwork.file_lock
+
+    @contextlib.contextmanager
+    def counting(lock_path, **kwargs):
+        acquired.append(lock_path)
+        with real_file_lock(lock_path, **kwargs):
+            yield
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    run_dir = project.project / ".bmad-loop" / "runs" / "20260824-100000-aaaa"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "alive")
+    monkeypatch.setattr(deferredwork, "file_lock", counting)
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+
+    assert rc == 1
+    assert "may still be live" in capsys.readouterr().err
+    assert acquired == []  # refused BEFORE any acquisition, not merely before the write
+
+
+# ------------------------------------------------- registry disclosure (#537)
+
+
+def test_main_exports_the_registry_root_before_dispatch(force_psmux_backend, tmp_path, monkeypatch):
+    """The one chokepoint that both knows the project and precedes every psmux
+    spawn. Ablate the `runs.export_psmux_registry_root` call in `_configure_mux`
+    and the handler runs against whatever registry the launching shell had — the
+    cross-process failure the derivation exists to kill."""
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    seen = {}
+
+    def handler(args):
+        seen["root"] = os.environ.get(runs.PSMUX_DATA_DIR)
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_list", handler)
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert seen["root"] == str(runs.mux_registry_root(tmp_path))
+
+
+def test_main_derives_registry_before_automatic_availability_probe(tmp_path, monkeypatch):
+    """An automatic psmux availability probe must see the derived root.
+
+    Its result is cached by ``get_multiplexer``; probing an ambient relative
+    root first would therefore leave later launches unavailable in this process.
+    """
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "state"))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, "relative-registry")
+    seen = []
+
+    class _Namespaced:
+        def has_registry_namespace(self):
+            seen.append(os.environ[runs.PSMUX_DATA_DIR])
+            return True
+
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _Namespaced())
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert seen == [str(runs.mux_registry_root(tmp_path))]
+
+
+def test_main_says_once_when_it_overrode_an_operators_registry(
+    force_psmux_backend, tmp_path, capsys, monkeypatch
+):
+    """Overriding a variable the operator set, silently, is how someone spends an
+    hour on a `psmux ls` that shows nothing. bmad-loop derives its registry root
+    unconditionally — an ambient value cannot be told apart from an inherited one,
+    nor a shell-local pin from a profile-wide one — so the override is real and
+    has to be said.
+
+    stderr, not stdout: the `--json` contract is one object on stdout and nothing
+    else (the `unverifiable_pid` precedent). Ablate the report in `_configure_mux`
+    and this fails while the override goes on happening."""
+    theirs = str(tmp_path / "their-own-registry")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert str(runs.mux_registry_root(tmp_path)) in captured.err
+    assert theirs in captured.err
+
+
+@pytest.mark.parametrize("ambient", ["derived", None])
+def test_main_stays_quiet_when_it_overrode_nothing(
+    force_psmux_backend, tmp_path, capsys, monkeypatch, ambient
+):
+    """The other half, and the one that keeps the note from becoming noise every
+    operator learns to ignore: nothing was displaced, so nothing is said. The
+    `derived` case is a pane child of this project's own session, which is the
+    ordinary way the variable is already set."""
+    if ambient is None:
+        monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    else:
+        monkeypatch.setenv(runs.PSMUX_DATA_DIR, str(runs.mux_registry_root(tmp_path)))
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_main_warns_when_it_has_no_registry_of_its_own(
+    force_psmux_backend, tmp_path, capsys, monkeypatch
+):
+    """The arm an operator most needs told about, and the one the first version of
+    this report missed: no state root could be derived, so the export left their
+    `PSMUX_DATA_DIR` in force and every psmux verb this command runs addresses
+    THEIR registry. Silence there reads as "bmad-loop is using its own".
+
+    Ablate the `root is None` arm of the report in `_configure_mux` and this
+    fails."""
+    theirs = str(tmp_path / "their-own-registry")
+    monkeypatch.setenv(envvars.STATE_DIR, "relative-state-root")  # derivation fails
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    err = capsys.readouterr().err
+    assert theirs in err
+    assert envvars.STATE_DIR in err
+
+
+def test_main_warns_when_the_backend_is_left_on_its_default_registry(tmp_path, capsys, monkeypatch):
+    """The other degrade arm, which the first version of this report ALSO
+    missed: no state root, no ambient value — so nothing was exported and a
+    namespacing backend (psmux) runs on its own shared default registry. Silence
+    there reads as "bmad-loop is using its own registry" while every verb,
+    the kill path included, addresses the shared one.
+
+    Ablate the `namespaced` warning arm in `_configure_mux` and this fails."""
+    from bmad_loop.adapters import multiplexer as multiplexer_mod
+
+    class _Namespaced:
+        def has_registry_namespace(self):
+            return True
+
+    monkeypatch.setenv(envvars.STATE_DIR, "relative-state-root")  # derivation fails
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    monkeypatch.setattr(multiplexer_mod, "get_multiplexer", lambda: _Namespaced())
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    err = capsys.readouterr().err
+    assert "default registry" in err
+    assert envvars.STATE_DIR in err
+
+
+def test_main_stays_quiet_on_a_namespace_less_backend_with_no_root(tmp_path, capsys, monkeypatch):
+    """The half that keeps the new warning from firing on every tmux host with a
+    broken state root: with no registry namespace there is no registry for the
+    degrade to have cost, and the failure surfaces where it actually bites."""
+    from bmad_loop.adapters import multiplexer as multiplexer_mod
+
+    class _NamespaceLess:
+        def has_registry_namespace(self):
+            return False
+
+    monkeypatch.setenv(envvars.STATE_DIR, "relative-state-root")  # derivation fails
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    monkeypatch.setattr(multiplexer_mod, "get_multiplexer", lambda: _NamespaceLess())
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_main_leaves_psmux_data_dir_alone_on_a_namespace_less_transport(
+    force_tmux_backend, tmp_path, capsys, monkeypatch
+):
+    """`PSMUX_DATA_DIR` is psmux's variable, and on tmux psmux is not the
+    transport — so bmad-loop neither spends it nor announces a registry the
+    selected backend never consults.
+
+    Replacing it there is not merely untidy: a tmux server cold-started by this
+    process hands its environment to every pane child, so `psmux ls` typed in a
+    coding-CLI window would look at bmad-loop's registry instead of the
+    operator's own live sessions, on a host where bmad-loop is not using psmux
+    at all.
+
+    Ablate the `has_registry_namespace()` gate in `_configure_mux` and both
+    assertions fail: the value is replaced and the note is printed."""
+    theirs = str(tmp_path / "their-own-registry")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+    seen = {}
+
+    def handler(_args):
+        seen["root"] = os.environ.get(runs.PSMUX_DATA_DIR)
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_list", handler)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert seen["root"] == theirs  # untouched, all the way into the handler
+    assert capsys.readouterr().err == ""
+
+
+def test_main_hands_the_export_the_displaced_registry_not_the_probe_root(tmp_path, monkeypatch):
+    """The availability probe's override is temporary on the psmux arm too,
+    because `export_psmux_registry_root` is the last reader of the operator's own
+    root.
+
+    `_configure_mux` points `PSMUX_DATA_DIR` at the derived root before selection,
+    since automatic selection probes `available()` and caches a failure. Leave that
+    override standing and the export reads the DERIVED root back as the displaced
+    one, finds it equal to the value it is about to write, and records nothing — so
+    a machine that had an absolute `PSMUX_DATA_DIR` before the upgrade keeps its
+    pre-upgrade sessions in a registry `legacy_registries()` can no longer name,
+    and `cleanup` reports a clean machine while their coding processes run on.
+
+    The registry-level halves of this are pinned in test_runs.py; only the
+    composition can catch it, which is why it is asserted here.
+
+    Ablate by moving the restore back out of the `finally` and into the two
+    namespace-less arms alone: `_DISPLACED_ROOT` comes back `None`."""
+    from bmad_loop.adapters import multiplexer as multiplexer_mod
+    from bmad_loop.adapters import psmux_backend
+
+    class _Namespaced:
+        def has_registry_namespace(self):
+            return True
+
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    theirs = str(tmp_path / "their-own-registry")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+    monkeypatch.setattr(multiplexer_mod, "get_multiplexer", lambda: _Namespaced())
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert psmux_backend._DISPLACED_ROOT == theirs
+    # The restore is a hand-off, not an abandonment: the export still landed.
+    assert os.environ[runs.PSMUX_DATA_DIR] == str(runs.mux_registry_root(tmp_path))
+
+
+def test_main_leaves_psmux_data_dir_alone_when_no_backend_can_be_selected(
+    tmp_path, capsys, monkeypatch
+):
+    """The same gate's unanswerable arm. A persisted `[mux] backend` naming a
+    backend that is no longer registered cannot say whether the transport
+    namespaces, and a backend that cannot be selected runs no verb — so there is
+    nothing to point anywhere. Diagnostics keep working and the operator's
+    variable survives.
+
+    Ablate the `except MultiplexerError` arm and `bmad-loop list` dies in
+    `_configure_mux` on a misconfigured host instead of in the command that
+    needs the transport."""
+    from bmad_loop.adapters import multiplexer as multiplexer_mod
+
+    theirs = str(tmp_path / "their-own-registry")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+
+    def boom():
+        raise multiplexer_mod.MultiplexerError("[mux] backend = 'ghost' matches nothing")
+
+    monkeypatch.setattr(multiplexer_mod, "get_multiplexer", boom)
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert os.environ.get(runs.PSMUX_DATA_DIR) == theirs
+    assert capsys.readouterr().err == ""
+
+
+def test_relay_is_not_given_a_registry_root(tmp_path, monkeypatch):
+    """`relay` dispatches ahead of `_configure_mux` by contract — it touches
+    neither mux nor policy, and a hook that exits non-zero is surfaced as a
+    failed tool call inside the session it is reporting for."""
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    monkeypatch.setattr(cli, "cmd_relay", lambda _args: 0)
+    assert cli.main(["relay", "Stop"]) == 0
+    assert runs.PSMUX_DATA_DIR not in os.environ
+
+
+def test_mux_discloses_the_registry_root(mux_registry, tmp_path, capsys, monkeypatch):
+    """An operator's bare `psmux ls` reads psmux's default registry and answers
+    "no sessions" for this project — not an error, just a lie by omission. The
+    root and a paste-ready export are what make that actionable."""
+    import sys as _sys
+
+    root = str(tmp_path / "reg")
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(registry=root)
+    )
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, root)
+
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert f"registry: {root}" in out
+    assert f"$env:{runs.PSMUX_DATA_DIR} = '{root}'" in out
+
+
+def test_mux_says_when_the_registry_is_not_the_derived_one(
+    mux_registry, tmp_path, capsys, monkeypatch
+):
+    """bmad-loop always derives, so a root that is NOT the derived one means the
+    export degraded — an underivable state root, where it leaves what it found
+    rather than inventing one. Reporting that as "derived" would mislead about
+    the single case an operator most needs told."""
+    import sys as _sys
+
+    theirs = str(tmp_path / "theirs")
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(registry=theirs)
+    )
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert f"registry: {theirs} (NOT bmad-loop's" in out
+    assert "no state root could be derived" in out
+
+
+def test_mux_says_when_the_registry_was_derived(mux_registry, tmp_path, capsys, monkeypatch):
+    """The other half: a root matching the derivation is reported as derived, so
+    an operator can tell "bmad-loop put it here" from "your shell did"."""
+    import sys as _sys
+
+    derived = str(runs.mux_registry_root(tmp_path))
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(registry=derived)
+    )
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, derived)
+
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    assert f"registry: {derived} (derived from the project)" in capsys.readouterr().out
+
+
+def test_mux_says_nothing_about_a_registry_a_backend_does_not_have(mux_registry, tmp_path, capsys):
+    """tmux has no registry namespace; disclosing one would be an invention."""
+    import sys as _sys
+
+    mux_registry.register_multiplexer("alpha", lambda p: p == _sys.platform, _MuxStub)
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    assert "registry:" not in capsys.readouterr().out
+
+
+def test_mux_names_the_shared_default_registry_when_no_root_is_in_force(
+    mux_registry, tmp_path, capsys, monkeypatch
+):
+    """A namespacing backend with no root in force is on its transport's shared
+    default registry — the one case `registry:` staying silent about would read
+    as "per-project as usual". Reachable when the export degrades on an
+    underivable state root with no ambient value set.
+
+    Ablate the `has_registry_namespace()` arm in `_print_registry` and this
+    fails."""
+    import sys as _sys
+
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(namespaced=True)
+    )
+    monkeypatch.setenv(envvars.STATE_DIR, "relative-state-root")  # derivation fails
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "registry: the multiplexer's shared default" in out
+    assert envvars.STATE_DIR in out
+
+
+# --------------------------- registry disclosure, round 2 (#537)
+
+
+def test_mux_export_line_escapes_a_single_quote(mux_registry, tmp_path, capsys, monkeypatch):
+    """The line is printed as paste-ready, so it has to paste: a root under
+    `C:\\Users\\O'Brien\\...` ends its own single-quoted PowerShell literal unless
+    the quote is doubled. Ablate the `.replace` and this fails."""
+    import sys as _sys
+
+    root = str(tmp_path / "O'Brien" / "reg")
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(registry=root)
+    )
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, root)
+
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    export = next(line for line in out.splitlines() if "$env:" in line)
+    literal = export.split(" = ", 1)[1]
+    assert literal.startswith("'") and literal.endswith("'")
+    # The body of a single-quoted PowerShell literal holds only DOUBLED quotes;
+    # a lone one would terminate the string early.
+    assert "''" in literal and "'" not in literal[1:-1].replace("''", "")
+    # And it still round-trips to the real path.
+    assert literal[1:-1].replace("''", "'") == root
+
+
+def test_cleanup_names_what_the_migration_left_behind(project, capsys, monkeypatch):
+    """cleanup prints a removal count; a count that quietly excludes sessions the
+    migration pass declined to claim reads as "everything is clean". Ablate the
+    `_warn_legacy_leftovers` call and this fails."""
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): {
+            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl", "bmad-loop-old-1"]
+        },
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    assert "not migrated" in err
+    assert "bmad-loop-ctl" in err and "bmad-loop-old-1" in err
+
+
+def test_cleanup_dry_run_previews_what_the_migration_would_leave_behind(
+    project, capsys, monkeypatch
+):
+    """A preview that omits the remainder would disagree with the run it previews."""
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]},
+    )
+    monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: [])
+
+    assert cli.main(["cleanup", "--dry-run", "--project", str(project.project)]) == 0
+    assert "bmad-loop-old-1" in capsys.readouterr().err
+
+
+def test_cleanup_dry_run_hands_the_remainder_the_plan_it_printed(project, capsys, monkeypatch):
+    """The wiring, graded on its own, because the doubles above cannot grade it: a
+    parameter with a default absorbs a call site that stopped passing it, and both
+    the ablated and the wired build then return the same list.
+
+    `legacy_registry_leftovers` judges by presence, so on a dry run — where nothing
+    was killed — it has to be told which standing sessions this very command
+    already announced as would-kills, or the preview names them twice and reads as
+    "the migration declined these". It must be told by being *handed* the plan, not
+    by re-deriving it. Ablate `announced=killed if args.dry_run else ()` at the
+    call site and this fails.
+
+    A real cleanup hands over nothing: there, a killed session is gone from the
+    listing by presence, and one whose kill did not land must still be named."""
+    from bmad_loop.tui import launch
+
+    seen: list[object] = []
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: (["old-1"], [], set()))
+
+    def _leftovers(_p, announced=()):
+        seen.append(sorted(announced))
+        return {}
+
+    monkeypatch.setattr(runs, "legacy_registry_leftovers", _leftovers)
+    monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: [])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+
+    assert cli.main(["cleanup", "--dry-run", "--project", str(project.project)]) == 0
+    assert seen == [["old-1"]]
+
+    seen.clear()
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    assert seen == [[]]
+
+
+def test_cleanup_json_carries_the_remainder_and_leaves_stderr_empty(project, capsys, monkeypatch):
+    """The `unverifiable_pid` precedent: in --json mode the degradation travels in
+    the document, and stderr stays empty for a consumer reading both streams."""
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]},
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+
+    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
+    captured = capsys.readouterr()
+    doc = json.loads(captured.out)
+    assert doc["sessions"]["legacy_leftovers"] == ["bmad-loop-old-1"]
+    assert captured.err == ""
+
+
+def test_cleanup_names_the_registry_each_leftover_is_actually_in(project, capsys, monkeypatch):
+    """The reader's next action is to open the registry and look, so the message
+    has to name the right one.
+
+    There are two legacy registries now — psmux's default, and any absolute
+    `PSMUX_DATA_DIR` this process displaced — and the sweep reads both. A message
+    that called them all "the multiplexer's default registry" sent an operator
+    whose sessions are in their own exported root to a registry those sessions
+    are not in, and at documentation describing a registry that is not theirs.
+
+    One line per registry, and only for registries that hold something: a line
+    naming an empty one is the same wrong errand in miniature.
+
+    Ablate the per-registry loop in `_warn_legacy_leftovers` back to a single
+    line naming the default and the displaced root goes unnamed."""
+    from bmad_loop.tui import launch
+
+    theirs = r"D:\their-own-registry"
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): {
+            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+            theirs: ["bmad-loop-old-1"],
+        },
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    lines = [ln for ln in err.splitlines() if "not migrated" in ln]
+    assert len(lines) == 2
+    # each registry names its OWN sessions, and nobody else's
+    default_line = next(ln for ln in lines if runs.DEFAULT_REGISTRY_LABEL in ln)
+    theirs_line = next(ln for ln in lines if theirs in ln)
+    assert "bmad-loop-ctl" in default_line and "bmad-loop-old-1" not in default_line
+    assert "bmad-loop-old-1" in theirs_line and "bmad-loop-ctl" not in theirs_line
+
+
+def test_cleanup_json_flattens_the_remainder_to_the_documented_list(project, capsys, monkeypatch):
+    """`sessions.legacy_leftovers` is a documented list of NAMES in a
+    schema-versioned document, so the grouping serves the text mode only —
+    widening the field would be a contract change and a schema bump.
+
+    Ablate the flatten at the `cleanup_document` call and the field carries the
+    grouping instead, which no consumer of this schema version can read."""
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): {
+            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+            r"D:\theirs": ["bmad-loop-old-1"],
+        },
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+
+    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["sessions"]["legacy_leftovers"] == ["bmad-loop-ctl", "bmad-loop-old-1"]
+
+
+def test_cleanup_says_nothing_about_a_registry_with_no_remainder(project, capsys, monkeypatch):
+    """Silence on the normal path — every platform without a registry namespace,
+    and every already-migrated machine."""
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(runs, "legacy_registry_leftovers", lambda _p, announced=(): {})
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    assert "not migrated" not in capsys.readouterr().err

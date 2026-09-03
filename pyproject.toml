@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bmad-loop"
-version = "0.9.0"
+version = "0.11.1"
 description = "Deterministic ralph-loop orchestrator for the BMAD implementation phase"
 readme = "README.md"
 license = "MIT"
@@ -14,7 +14,7 @@ requires-python = ">=3.11"
 dependencies = [
   "pyyaml>=6.0",
   # stdlib `re` has no match timeout; the #194 env-fault classifier runs
-  # operator-supplied profile regexes over pane logs, so it matches with the
+  # operator-supplied profile regexes over session logs, so it matches with the
   # `regex` module's per-call timeout= to keep a pathological pattern from
   # hanging a session teardown. Core (all-platform) — classification is on the
   # main pipeline path.
@@ -28,7 +28,7 @@ dependencies = [
 bmad-loop = "bmad_loop.cli:main"
 
 [project.optional-dependencies]
-tui = ["textual>=8.0,<9", "tomlkit>=0.13", "pyte>=0.8.2"]
+tui = ["textual>=8.0,<9", "tomlkit>=0.13", "pyte>=0.8.2", "rich>=14.2"]
 # macOS opt-in for psutil (identity/force-kill niceties); win32 gets it as a core
 # dep above, Linux stays dep-free. `pip install bmad-loop[non-linux]` on macOS.
 non-linux = ["psutil>=7.2.2"]
@@ -42,7 +42,6 @@ dev = [
   "pytest>=8.0",
   "ruff>=0.15.17",
   "pytest-asyncio>=1.0",
-  "pytest-rerunfailures>=16.0",
   "pytest-xdist>=3.6",
   # the opencode-http adapter tests exercise the real httpx client
   "httpx>=0.28",

@@ -55,7 +55,7 @@ from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
 
-from . import sanitize
+from . import runs, sanitize
 from .adapters.multiplexer import MultiplexerError, get_multiplexer
 from .adapters.profile import CLIProfile
 from .install import merge_hooks, relay_registered
@@ -182,11 +182,58 @@ class Hints:
 
 def _run_capture(argv: list[str], timeout_s: float) -> str | None:
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+        # errors="replace" is what keeps run_version_help's documented "Never
+        # raises" true (#383): a banner byte the locale codec cannot decode is a
+        # UnicodeDecodeError — a ValueError, outside the guard below.
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, errors="replace", timeout=timeout_s
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     out = (proc.stdout or "") + (proc.stderr or "")
     return out.strip() or None
+
+
+def binary_runs(binary: str, timeout_s: float = 10) -> int | None:
+    """Return the exit code of ``binary --version``, or None if it never ran.
+
+    The liveness half of a PATH check. ``shutil.which`` answers "a file with that
+    name is on PATH and has the execute bit", which a dead WSL/npm shim satisfies
+    while every launch of it fails (#294) — so ``validate`` reported OK on an
+    install that could not start a session. Running the binary once is the only
+    thing that separates the two.
+
+    Never raises, and that is load-bearing rather than defensive style: machine.py
+    records that every gate in ``cmd_validate`` runs inside a ``try`` so "the
+    command has no error path of its own — its rc is purely the verdict". A probe
+    that raised would give it one. The guard is ``_run_capture``'s exactly, and
+    the return is deliberately left as bytes (no ``text=True``): nothing here reads
+    the output, so the locale decode that forced ``errors="replace"`` on that
+    function never happens and cannot raise the ``UnicodeDecodeError`` the guard
+    does not name.
+
+    None (could not launch, or timed out) and a nonzero code are separate answers
+    to the caller, not one sentinel: the first has no return code to report.
+
+    ``stdin=DEVNULL`` is required, not cosmetic. With the caller's tty inherited, a
+    shim that prompts blocks on the read for the whole timeout — measured 4.00s
+    against 0.00s — inside an interactive command.
+
+    Not folded into :func:`run_version_help`, which discards the return code by
+    design and spawns TWO children (``--version`` then ``--help``) at ``timeout_s``
+    each: reusing it would cost up to 20s per profile here.
+    """
+    try:
+        proc = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout_s,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.returncode
 
 
 def run_version_help(binary: str, timeout_s: float = 10) -> FlagFinding:
@@ -198,8 +245,16 @@ def run_version_help(binary: str, timeout_s: float = 10) -> FlagFinding:
     return FlagFinding(
         binary=binary,
         found=True,
-        version=sanitize.scrub_text(version, max_lines=5) if version else None,
-        help=sanitize.scrub_text(help_txt, max_lines=80) if help_txt else None,
+        version=(
+            sanitize.scrub_text(version, max_lines=5, max_chars=sanitize.SCRUB_TEXT_MAX_CHARS)
+            if version
+            else None
+        ),
+        help=(
+            sanitize.scrub_text(help_txt, max_lines=80, max_chars=sanitize.SCRUB_TEXT_MAX_CHARS)
+            if help_txt
+            else None
+        ),
     )
 
 
@@ -494,7 +549,17 @@ class _ProbeLauncher:
         try:
             self.mux.new_session(self.session_name, cwd, 220, 50)
             command = " ".join(shlex.quote(a) for a in argv)
-            window_id = self.mux.new_window(self.session_name, PROBE_TASK_ID, cwd, env, command)
+            # `env` carries the profile's own `[env]` table verbatim, and a
+            # profile declaring BMAD_LOOP_STATE_DIR would aim a bmad-loop
+            # wrapper in that window at a different state root — and so a
+            # different registry, where this very session reads as gone. The
+            # pin chokepoint forces the entry to this process's own answer in
+            # both arms, the underivable one included (runs.pin_state_root);
+            # the engine's window merge applies the same rule.
+            window_env = runs.pin_state_root(env)
+            window_id = self.mux.new_window(
+                self.session_name, PROBE_TASK_ID, cwd, window_env, command
+            )
         except MultiplexerError:
             return None
         # pipe-pane may race a window that dies instantly; tolerate failure.
@@ -745,7 +810,9 @@ def _log_tail(log_file: Path, max_lines: int = 20) -> str | None:
     if not text.strip():
         return None
     lines = text.splitlines()[-max_lines:]
-    return sanitize.scrub_text("\n".join(lines), max_lines=max_lines)
+    return sanitize.scrub_text(
+        "\n".join(lines), max_lines=max_lines, max_chars=sanitize.SCRUB_TEXT_MAX_CHARS
+    )
 
 
 # ------------------------------------------------------------------ rendering

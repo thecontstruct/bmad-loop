@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import errno
 import io
 import json
@@ -10,7 +11,7 @@ import stat
 import subprocess
 import sys
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 from conftest import (
@@ -19,6 +20,7 @@ from conftest import (
     git,
     install_build_auto_skill,
     install_dev_shim,
+    refuse_to_resolve,
 )
 
 import bmad_loop.install as install_mod
@@ -42,8 +44,8 @@ from bmad_loop.install import (
     SNAPSHOT_TOKEN_RE,
     _absent_renderer_sources,
     _copy_traversable,
-    _git_version_at_least,
     _is_dev_primitive_shim,
+    _register_hooks,
     _shield_undo_extension,
     _worktree_local_exclude,
     dev_primitive_or_default,
@@ -56,12 +58,15 @@ from bmad_loop.install import (
     renderer_stub_resolved,
     resolve_dev_primitive,
     resolve_review_layers,
+    strip_relay_hooks,
 )
 from bmad_loop.worktree_flow import (
     _bmad_scripts_seed_incomplete,
     _central_config_seed_incomplete,
+    _reconcile_tracked_patterns,
     _seed_bmad_tree,
     base_skills_seed_incomplete,
+    module_skills_seed_undelivered,
     worktree_seed_undelivered,
 )
 
@@ -397,6 +402,44 @@ def test_install_into_no_tracking_warning_outside_a_repo(tmp_path, capsys):
     assert "git rm --cached" not in capsys.readouterr().out
 
 
+def test_tracking_warning_probe_answers_through_the_chokepoint(tmp_path, capsys, monkeypatch):
+    """The probe consults `git_bytes`, not a bare spawn: an rc-0 chokepoint answer
+    produces the hint even though tmp_path is no repo, where a real git would say
+    "not tracked" and stay silent. Ablation: revert `_warn_if_policy_tracked` to a
+    direct `subprocess.run` and this fails — the fake is never consulted (#390)."""
+    real = install_mod.git_bytes
+
+    def tracked_answer(repo, *args, timeout_s=None):
+        if args == ("ls-files", "--error-unmatch", ".bmad-loop/policy.toml"):
+            # the pre-#390 10s probe bound must survive the reroute — a hint
+            # must not stall init for the 120s module default
+            assert timeout_s == 10
+            return subprocess.CompletedProcess(["git", *args], 0, b".bmad-loop/policy.toml\n", b"")
+        return real(repo, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", tracked_answer)
+    assert install_into(tmp_path) == 0
+    assert "git rm --cached .bmad-loop/policy.toml" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("fault", [verify.GitError, verify.GitSpawnError])
+def test_tracking_warning_degrades_on_a_chokepoint_fault(tmp_path, capsys, monkeypatch, fault):
+    """A timeout or failed spawn arrives as GitError / its GitSpawnError subclass,
+    not the raw `(OSError, SubprocessError)` pair the pre-#390 bare spawn guarded —
+    the hint is skipped and the install still succeeds, the guard re-derived the
+    way #389 re-derived the shield's."""
+    real = install_mod.git_bytes
+
+    def unanswerable(repo, *args, timeout_s=None):
+        if args == ("ls-files", "--error-unmatch", ".bmad-loop/policy.toml"):
+            raise fault("git ls-files did not answer")
+        return real(repo, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", unanswerable)
+    assert install_into(tmp_path) == 0
+    assert "git rm --cached" not in capsys.readouterr().out
+
+
 def test_hook_command_uses_selected_process_host(tmp_path, monkeypatch):
     # The hook interpreter is platform-selected: forcing the Windows host swaps the
     # registered command's prefix without `install` branching on sys.platform.
@@ -494,6 +537,178 @@ def test_provision_worktree_lays_down_skills_and_hook(tmp_path):
     cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
     assert str((repo / ".bmad-loop" / "bmad_loop_hook.py")) in cmd
     assert not (wt / ".bmad-loop").exists()
+
+
+def test_provision_worktree_rewrites_seeded_relative_hook_to_absolute(tmp_path):
+    """The main repo's .claude/settings.json carries a $CLAUDE_PROJECT_DIR-relative
+    relay command. Seeded into a worktree, that variable resolves to the worktree,
+    where no .bmad-loop/ relay exists — the hook fails, no Stop signal ever fires and
+    the run stalls. The registration must overwrite the seeded command, which
+    merge_hooks alone will not do (it treats the event as already registered)."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    assert _register_hooks(repo, claude) == 0
+    main_settings = json.loads((repo / claude.hooks.config_path).read_text())
+    assert "$CLAUDE_PROJECT_DIR" in main_settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+
+    provision_worktree(wt, [claude], repo, seed_files=[claude.hooks.config_path])
+
+    stop = json.loads((wt / claude.hooks.config_path).read_text())["hooks"]["Stop"]
+    assert len(stop) == 1  # replaced, not appended alongside
+    cmd = stop[0]["hooks"][0]["command"]
+    assert str(repo / ".bmad-loop" / "bmad_loop_hook.py") in cmd
+    assert "$CLAUDE_PROJECT_DIR" not in cmd
+
+
+def test_provision_worktree_tracked_config_rewrite_stays_out_of_commits(project, tmp_path):
+    """A project that TRACKS its hook config still gets the relay rewrite — the
+    checkout carries the same stale $CLAUDE_PROJECT_DIR command a seeded copy
+    would, so #352 stalls there identically — but the rewrite is machine-specific
+    and a tracked file cannot be shielded by the worktree exclude (#392): without
+    the skip-worktree pin, `git add -A` folds it into the story commit and the
+    merge-back hands every other checkout a relay path that does not exist there.
+    Asserted through git's own staging answer, since that is what finalize_commit
+    and the skill's own commits run."""
+    repo = project.project
+    claude = get_profile("claude")
+    hook_rel = claude.hooks.config_path
+    assert _register_hooks(repo, claude) == 0
+    assert "$CLAUDE_PROJECT_DIR" in (repo / hook_rel).read_text(encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the hook config")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+
+    cmd = json.loads((wt / hook_rel).read_text(encoding="utf-8"))["hooks"]["Stop"][0]["hooks"][0][
+        "command"
+    ]
+    assert str(repo / ".bmad-loop" / "bmad_loop_hook.py") in cmd
+    assert "$CLAUDE_PROJECT_DIR" not in cmd
+    git(wt, "add", "-A")
+    assert hook_rel not in git(wt, "diff", "--cached", "--name-only").splitlines()
+    # and the main checkout keeps the portable command it committed
+    assert "$CLAUDE_PROJECT_DIR" in (repo / hook_rel).read_text(encoding="utf-8")
+
+
+def test_provision_worktree_tracked_portable_config_is_left_alone(project, tmp_path):
+    """Non-claude dialects bake the absolute main-repo relay at init
+    (_hook_command), so a tracked codex config arrives in the worktree already
+    carrying exactly the command provisioning would register: strip-then-merge
+    nets to zero. No write may happen and no skip-worktree pin may be set —
+    pinning claims orchestrator ownership of a file this run never modified,
+    hiding a story's own edit to it for no benefit."""
+    repo = project.project
+    codex = get_profile("codex")
+    hook_rel = codex.hooks.config_path
+    assert _register_hooks(repo, codex) == 0
+    committed = (repo / hook_rel).read_bytes()
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the codex hook config")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [codex], repo)
+
+    assert (wt / hook_rel).read_bytes() == committed  # no rewrite happened
+    assert not git(wt, "ls-files", "-t", "--", hook_rel).startswith("S")  # and no pin
+    # a story's own edit to the un-pinned tracked config stays stageable
+    (wt / hook_rel).write_text((wt / hook_rel).read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    git(wt, "add", "-A")
+    assert hook_rel in git(wt, "diff", "--cached", "--name-only").splitlines()
+
+
+def test_provision_worktree_shared_config_path_keeps_first_profiles_events(tmp_path):
+    """Profiles can share a hooks.config_path (user-overlay aliases of one CLI)
+    with different event maps. The strip runs once per config file: a later
+    profile's pass must not tear out the relay events an earlier one registered —
+    otherwise a session completing on an event only the first profile declares
+    has no relay and idles to timeout. Events union, first registration wins."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    alias = dataclasses.replace(
+        claude,
+        name="claude-alias",
+        hooks=dataclasses.replace(claude.hooks, events={"Notification": "Notification"}),
+    )
+
+    provision_worktree(wt, [claude, alias], repo)
+
+    hooks = json.loads((wt / claude.hooks.config_path).read_text(encoding="utf-8"))["hooks"]
+    assert "Stop" in hooks  # claude's completion event survived the alias pass
+    assert "Notification" in hooks  # and the alias still merged its own event in
+    relay = str(repo / ".bmad-loop" / "bmad_loop_hook.py")
+    assert relay in hooks["Stop"][0]["hooks"][0]["command"]
+    assert relay in hooks["Notification"][0]["hooks"][0]["command"]
+
+
+def test_provision_worktree_tracked_pin_failure_raises(project, tmp_path):
+    """The pin is a repair write: when the config is KNOWN tracked and
+    `update-index --skip-worktree` fails (here: a held index.lock), provisioning
+    must raise rather than journal-and-continue — continuing knowingly leaves
+    `git add -A` free to commit the machine-specific relay rewrite and merge it
+    back. Observation faults (an unanswerable tracked-probe) still degrade."""
+    repo = project.project
+    claude = get_profile("claude")
+    assert _register_hooks(repo, claude) == 0
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the hook config")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    gitdir = Path(git(wt, "rev-parse", "--absolute-git-dir").strip())
+    (gitdir / "index.lock").touch()
+
+    with pytest.raises(verify.GitError, match="skip-worktree"):
+        provision_worktree(wt, [claude], repo)
+
+
+def test_strip_relay_hooks_leaves_foreign_handlers(tmp_path):
+    """Only bmad relay commands go. A project's own hooks must survive whether they
+    hold their own matcher entry or share OURS (a user appending to the relay's
+    nested list is an ordinary hand-edit) — as must a probe-capture hook, which
+    merge_hooks' dedup also owns but strip deliberately does not — and an event
+    that held nothing else is dropped rather than left as an empty list."""
+    probe = {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "python bmad_loop_probe_hook.py Stop"}],
+    }
+    config = {
+        "hooks": {
+            "Stop": [
+                {
+                    "matcher": "",
+                    "hooks": [{"type": "command", "command": "python bmad_loop_hook.py Stop"}],
+                },
+                {"matcher": "", "hooks": [{"type": "command", "command": "make lint"}]},
+                probe,
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {"type": "command", "command": "python bmad_loop_hook.py Stop"},
+                        {"type": "command", "command": "make fmt"},
+                    ],
+                },
+            ],
+            "SessionStart": [
+                {
+                    "matcher": "",
+                    "hooks": [{"type": "command", "command": "python bmad_loop_hook.py start"}],
+                }
+            ],
+        }
+    }
+    assert strip_relay_hooks(config, "claude-settings-json") is True
+    assert config["hooks"]["Stop"] == [
+        {"matcher": "", "hooks": [{"type": "command", "command": "make lint"}]},
+        probe,
+        {"matcher": "", "hooks": [{"type": "command", "command": "make fmt"}]},
+    ]
+    assert "SessionStart" not in config["hooks"]
+    # idempotent: nothing left to remove
+    assert strip_relay_hooks(config, "claude-settings-json") is False
 
 
 def test_provision_worktree_covers_multiple_profiles(tmp_path):
@@ -611,6 +826,202 @@ def test_register_hooks_refuses_a_config_path_symlinked_out_of_the_project(tmp_p
     assert "escapes the project" in capsys.readouterr().out
 
 
+# ------------------------------------------------ atomic hook-config rewrite (#379)
+#
+# `_register_hooks` and `provision_worktree` both PARSE the operator's hook config,
+# merge the relay registration into the parsed object, and write the whole thing
+# back. The permission allowlist, `env`, the MCP entries and the project's own hooks
+# survive only because they round-trip through that one rewrite — so a truncating
+# write does not lose "the hooks", it loses the file.
+
+_OPERATOR_SETTINGS = (
+    json.dumps(
+        {
+            "permissions": {"allow": ["Bash(git status:*)", "Read(//srv/notes/**)"], "deny": []},
+            "env": {"HOUSE_TOKEN": "keep-me"},
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "make lint"}]}
+                ]
+            },
+            "mcpServers": {"house": {"command": "node", "args": ["mcp.js"]}},
+        },
+        indent=2,
+    )
+    + "\n"
+)
+
+
+def _operator_keys(path: Path) -> dict:
+    """Everything in the operator's settings that is not ours to touch."""
+    parsed = json.loads(path.read_text(encoding="utf-8"))
+    return {
+        "permissions": parsed["permissions"],
+        "env": parsed["env"],
+        "mcpServers": parsed["mcpServers"],
+        "PreToolUse": parsed["hooks"]["PreToolUse"],
+    }
+
+
+def test_register_hooks_merge_preserves_the_operators_own_settings(tmp_path):
+    """The positive control for the two rows below, and the statement of what is at
+    risk: the merge keeps every key it did not come for.
+
+    Without this, the write-failure row could pass over a rewrite that had already
+    lost the allowlist before any fault — "the bytes did not change" says nothing
+    about what the successful path writes."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    claude = get_profile("claude")
+    config = project / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    before = _operator_keys(config)
+
+    assert _register_hooks(project, claude) == 0
+
+    assert _operator_keys(config) == before
+    hooks = json.loads(config.read_text(encoding="utf-8"))["hooks"]
+    assert set(claude.hooks.events) <= set(hooks)
+    # names the relay marker the write-failure row asserts ABSENT, so that row's
+    # negative is graded against a string this path provably produces
+    assert "bmad_loop_hook" in hooks["Stop"][0]["hooks"][0]["command"]
+
+
+def test_a_truncated_hook_config_makes_the_next_init_refuse(tmp_path, capsys):
+    """The PRE-FIX failure mode this phase makes unreachable, pinned as a property
+    of the FILE FORMAT rather than of the writer — deliberately green on both sides
+    of the fix, because nothing else in the suite states what a short write here
+    costs.
+
+    JSON has no partial-read: a prefix of an object is not a smaller object, it is
+    a parse error. So unlike the board and the ledgers, this truncation is LOUD —
+    and loud in the worst way. `init` refuses, and the message it prints tells the
+    human to go fix a file that this very tool shredded on its last run, with no
+    copy of the lost content anywhere. The re-run cannot repair it either: the
+    refusal comes before the merge, so init never writes again."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    claude = get_profile("claude")
+    config = project / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    assert _register_hooks(project, claude) == 0  # whole file: merged and moved on
+    whole = config.read_text(encoding="utf-8")
+    capsys.readouterr()
+
+    # a short write, cut deterministically inside the object rather than at a
+    # fraction of the length: what a torn ENOSPC write publishes is a prefix.
+    config.write_text(whole[: whole.index('"env"')], encoding="utf-8")
+
+    assert _register_hooks(project, claude) == 1
+
+    assert "is not valid JSON; fix it and re-run init" in capsys.readouterr().out
+    assert "HOUSE_TOKEN" not in config.read_text(encoding="utf-8")  # and it is gone
+
+
+def test_register_hooks_write_failure_raises_and_leaves_the_config_entire(tmp_path, monkeypatch):
+    """#379. The registration is a read-modify-rewrite, so the truncating
+    `write_text` it replaced could publish the prefix the row above characterizes.
+    The helper writes a temp and replaces it, so a fault leaves the original whole.
+
+    The raise is deliberate and is NOT caught into the `return 1` arm above: that
+    arm's message is "your file is broken, fix it", which would be a lie about a
+    file still sitting intact on disk. A write that could not happen is init
+    failing, and init already fails by exception elsewhere.
+
+    Patched at install's OWN binding of the helper, never `Path.write_text`: the
+    helper writes through an `mkstemp` fd via `os.fdopen`, so a `Path` patch never
+    fires and this would pass having exercised nothing.
+
+    Ablation: restore `config_path.write_text(...)` at the call site and this
+    reddens alone."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    claude = get_profile("claude")
+    config = project / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    before = config.read_bytes()
+
+    def boom(path, text, *, follow_symlinks=True, require_writable_target=False):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(install_mod, "atomic_write_text", boom)
+    with pytest.raises(OSError, match="no space left"):
+        _register_hooks(project, claude)
+
+    assert config.read_bytes() == before
+    assert _operator_keys(config)["env"] == {"HOUSE_TOKEN": "keep-me"}
+    assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")  # the lost mutation
+
+
+def test_register_hooks_refuses_a_readonly_config(tmp_path):
+    """#597 at this site. `os.replace` needs write permission on the parent
+    DIRECTORY, never on the entry it replaces, so a settings.json the operator
+    marked read-only was rewritten anyway — and because this site inherits the
+    target's mode it came back reading `0444`, leaving nothing in the permission
+    bits to record that init had edited it. This file is the operator's own: the
+    merge above round-trips their allowlist, env, MCP entries and their own hooks.
+
+    `require_writable_target=True` is the WHOLE change here — `follow_symlinks`
+    stays at the default (the row below depends on that), so this site is
+    deliberately not a confined writer.
+
+    `0o444` sets the READONLY attribute on win32 too, so this runs unskipped on
+    both platforms; the chmod is on a file in this test's own tmp_path and is
+    restored in a `finally`, because Windows rmtree refuses a READONLY leftover.
+
+    Ablation: drop `require_writable_target=True` at the call and this fails
+    `DID NOT RAISE`, with `bmad_loop_hook` registered into a file still `0444`."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    claude = get_profile("claude")
+    config = project / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    before = config.read_bytes()
+    config.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            _register_hooks(project, claude)
+    finally:
+        config.chmod(0o644)
+
+    assert config.read_bytes() == before
+    assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")
+    assert list(config.parent.glob("*.tmp")) == []  # a refusal stages nothing
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_register_hooks_writes_through_a_config_symlinked_inside_the_project(tmp_path):
+    """The row that grades this SITE's `follow_symlinks` argument — the default,
+    which is what preserves the behaviour of the `write_text` it replaced.
+
+    An out-of-project link is refused above by `_confined_to`, which resolves before
+    it compares, so the only links that REACH this write point back inside the
+    project: an in-repo indirection the operator arranged. Replacing the name
+    instead would turn the link into a regular file on the first `init` and leave
+    them editing a settings file nothing reads.
+
+    Ablation: pass `follow_symlinks=False` at the call site and this reddens
+    alone — the link becomes a regular file and `real` keeps its pre-init bytes."""
+    project = tmp_path / "proj"
+    claude = get_profile("claude")
+    link = project / claude.hooks.config_path
+    link.parent.mkdir(parents=True)
+    real = project / "config" / "claude-settings.json"
+    real.parent.mkdir(parents=True)
+    real.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    link.symlink_to(real)
+
+    assert _register_hooks(project, claude) == 0
+
+    assert link.is_symlink()  # still a link, not turned into a regular file
+    assert set(claude.hooks.events) <= set(json.loads(real.read_text())["hooks"])
+    assert _operator_keys(real)["env"] == {"HOUSE_TOKEN": "keep-me"}
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
 def test_provision_refuses_a_live_hook_config_symlink(tmp_path):
     wt, repo = tmp_path / "wt", tmp_path / "repo"
@@ -669,6 +1080,435 @@ def test_provision_refuses_a_cyclic_hook_config_symlink(tmp_path):
     provision_worktree(wt, [claude], repo)
 
     assert config.is_symlink()
+
+
+def test_provision_worktree_merge_preserves_the_operators_own_settings(tmp_path):
+    """The positive control for the row below, and the reason the write matters at
+    all here: the config being rewritten is the SEEDED copy of the operator's own,
+    so the allowlist, `env` and the MCP entries the isolated session needs all
+    round-trip through this one call.
+
+    It also establishes the precondition the fault row depends on — the write is
+    guarded by `if config != baseline_config`, so a shape where strip-then-merge
+    nets to zero never reaches it and any fault injected there passes vacuously.
+    This shape provably does reach it: the file changed."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    before = _operator_keys(config)
+
+    provision_worktree(wt, [claude], repo)
+
+    assert _operator_keys(config) == before
+    hooks = json.loads(config.read_text(encoding="utf-8"))["hooks"]
+    assert set(claude.hooks.events) <= set(hooks)
+    assert str(repo / ".bmad-loop" / "bmad_loop_hook.py") in hooks["Stop"][0]["hooks"][0]["command"]
+
+
+def test_provision_worktree_write_failure_raises_and_leaves_the_config_entire(
+    tmp_path, monkeypatch
+):
+    """#379, the second of the two hook-config rewriters. Same read-modify-rewrite
+    as `_register_hooks`, worse consequence: nothing re-reads this file to complain.
+    The isolated session simply starts against a settings file whose JSON no longer
+    parses, the CLI falls back to its defaults, the Stop hook is not registered, and
+    the run idles to timeout with no diagnostic naming the cause.
+
+    Patched at worktree_flow's OWN binding: the site reached is the module's only
+    user of `atomic_write_text`, so no filename filter is needed to know which write
+    the fault landed on — but it must not be `Path.write_text`, which the helper's
+    `mkstemp` fd never goes through.
+
+    That the raise arrives at all is the non-vacuity proof: the boom is unreachable
+    unless `config != baseline_config` let control past the guard, which is the
+    precondition the row above pins independently.
+
+    No symlink row pairs with this one, unlike `_register_hooks`: the component-wise
+    refusal walk above the write skips the profile entirely when any component of
+    the path is a link, so `follow_symlinks` is unobservable at this site and the
+    four `test_provision_refuses_*_symlink` rows are what grade it.
+
+    Ablation: restore `config_path.write_text(...)` at the call site and this
+    reddens alone."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    before = config.read_bytes()
+
+    import bmad_loop.worktree_flow as wtf
+
+    def boom(path, text, *, follow_symlinks=True, require_writable_target=False):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(wtf, "atomic_write_text", boom)
+    with pytest.raises(OSError, match="no space left"):
+        provision_worktree(wt, [claude], repo)
+
+    assert config.read_bytes() == before
+    assert _operator_keys(config)["mcpServers"] == {
+        "house": {"command": "node", "args": ["mcp.js"]}
+    }
+    assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")  # the lost mutation
+
+
+def test_provision_worktree_refuses_a_readonly_hook_config(tmp_path):
+    """#597 at the second hook-config rewriter. Same mechanism as
+    `_register_hooks` — a temp-and-replace never opens the entry it replaces, so a
+    read-only settings file was rewritten and its `0444` restored — and the same
+    fix, `require_writable_target=True` and nothing else: the component-wise
+    refusal walk above the write is stricter than a confined writer's, so
+    converting this site would relax it.
+
+    This is the operator's own settings file, seeded into the worktree and
+    round-tripped through the parse above, which is why a read-only one is a
+    refusal rather than a silent overwrite.
+
+    `0o444` sets the win32 READONLY attribute, so this runs on both platforms; the
+    chmod is restored in a `finally` because Windows rmtree refuses a READONLY
+    leftover.
+
+    Ablation: drop `require_writable_target=True` at the call and this fails
+    `DID NOT RAISE`, with the hook registered into a file still `0444`."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    before = config.read_bytes()
+    config.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            provision_worktree(wt, [claude], repo)
+    finally:
+        config.chmod(0o644)
+
+    assert config.read_bytes() == before
+    assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")
+    assert list(config.parent.glob("*.tmp")) == []  # a refusal stages nothing
+
+
+def test_provision_worktree_refuses_an_unparseable_hook_config(tmp_path):
+    """#592: a seeded config that will not parse stops provisioning; it is never read
+    as an empty document.
+
+    The swallowed `config = {}` this replaces was not a degrade but a destructive
+    write. `baseline_config` deep-copies whatever the parse produced, so an empty dict
+    GUARANTEES the `config != baseline_config` gate fires and the merge publishes a
+    hooks-only file over the allowlist, `env` and MCP entries the isolated session
+    needs — silently, and over the very evidence of the earlier fault that tore it.
+    `_register_hooks` has always refused this exact shape
+    (`test_a_truncated_hook_config_makes_the_next_init_refuse`); one file format, one
+    policy.
+
+    Truncated at `"env"` rather than at a fraction of the length: what a torn write
+    publishes is a prefix of the object, and JSON has no partial read.
+
+    Ablation: restore `config = {}` in the `except` and this reddens — no raise, and
+    the relay marker lands in a file that no longer holds HOUSE_TOKEN."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')], encoding="utf-8")
+    before = config.read_bytes()  # snapshot AFTER the write: Windows translates newlines
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo)
+
+    assert config.read_bytes() == before  # the operator's bytes, left for inspection
+    assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")  # nothing published
+    # Nothing seeded this copy, so the remedy sends the repair to the branch rather
+    # than to a main-checkout file that never supplied these bytes (the seeded lane
+    # is pinned by test_provision_worktree_refusal_sends_the_repair_to_the_main_checkout).
+    assert "commit a repaired" in str(excinfo.value)
+    assert "target branch" in str(excinfo.value)
+
+
+def test_provision_worktree_refuses_an_undecodable_hook_config(tmp_path):
+    """The same refusal for bytes that are not UTF-8 at all — the second member of the
+    `except` tuple, and the reason it is a tuple.
+
+    `read_text(encoding="utf-8")` raises `UnicodeDecodeError`, which is not a
+    `JSONDecodeError` and which `run_isolated` — catching only `GitError` — does not
+    handle either. Before this it left the parse site as an uncaught crash of the
+    engine loop rather than an escalation of the story; the tuple turns that crash
+    into the same clean refusal as the row above.
+
+    Written with `write_bytes` because there is no text form of these bytes.
+
+    Ablation: drop `UnicodeDecodeError` from the tuple and this reddens with the raw
+    `UnicodeDecodeError` while the truncated row above stays green."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_bytes(b'{"permissions": \xff}')
+    before = config.read_bytes()
+
+    with pytest.raises(verify.GitError, match="cannot be parsed"):
+        provision_worktree(wt, [claude], repo)
+
+    assert config.read_bytes() == before
+    assert b"bmad_loop_hook" not in config.read_bytes()
+
+
+def test_provision_worktree_refusal_sends_the_repair_to_the_main_checkout(tmp_path):
+    """#592: when the unparseable copy really was SEEDED, the refusal names the
+    main-checkout file it was seeded from and sends the repair there.
+
+    The worktree is disposable and repairing it is not what un-escalates the story:
+    `Phase.ESCALATED` is terminal with no transition out (`statemachine.py`), so the
+    only way back into the run is a re-arm — and a re-arm discards this worktree
+    (`engine._finish_inflight` -> `discard_worktree`) and mounts a fresh one, whose
+    copy-when-absent seeding pulls this config from `repo_root` again. A repair
+    applied only to the copy the parse read is therefore thrown away before the next
+    drive, and the identical refusal recurs.
+
+    Seeded for real rather than hand-placed: the destination is absent, so the seed
+    loop actually copies and records the entry, which is what the message reads.
+
+    Ablation: remove the `_record_seeded(...)` after the direct-file arm's
+    `seeded.append(rel)` and this reddens, falling back to target-branch guidance —
+    together with the whole-tree directory row and the failed-`copy2` row, which
+    reach the same call. The recursion and glob rows stay green, each having its
+    own."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    wt.mkdir()
+    claude = get_profile("claude")
+    truncated = _OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')]
+    source = repo / claude.hooks.config_path  # the only copy; seeding carries it in
+    source.parent.mkdir(parents=True)
+    source.write_text(truncated, encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo, seed_files=[claude.hooks.config_path])
+
+    message = str(excinfo.value)
+    assert str(source) in message  # where a durable repair has to land
+    assert "in the main checkout" in message
+    assert "re-arm" in message  # not a bare resume: a terminal story is skipped
+    assert "bmad-loop resolve <run-id> --no-interactive" in message  # runnable as given
+    assert source.read_text(encoding="utf-8") == truncated  # the source is never touched
+
+
+def test_provision_worktree_refusal_does_not_blame_a_config_it_never_seeded(tmp_path):
+    """#592: EXISTENCE IS NOT PROVENANCE. Seeding is copy-when-absent, so a config the
+    project tracks is skipped as an occupied destination and arrives with the branch
+    checkout — the main-checkout counterpart never supplied these bytes.
+
+    Reading a counterpart's mere existence as provenance sends the operator to repair
+    a file that can already be correct, exactly as it is here: the main checkout holds
+    the GOOD settings while the worktree copy is torn. Worse, the repair would not
+    take — a re-arm mounts a fresh worktree from the branch, checking the committed
+    (still torn) version out again. So this lane is told to commit on the target
+    branch, and the main-checkout path is not named at all.
+
+    Ablation: swap the `seeded_from` lookup back to an existence test
+    (`_is_file(repo_root / seed_rel)`) and this row reddens on all three assertions
+    while the seeded row above stays green."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    source = repo / claude.hooks.config_path  # exists, and is perfectly valid
+    source.parent.mkdir(parents=True)
+    source.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    config = wt / claude.hooks.config_path  # occupied -> the seed loop skips it
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')], encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo, seed_files=[claude.hooks.config_path])
+
+    message = str(excinfo.value)
+    assert "commit a repaired" in message  # the branch supplies it, so commit there
+    assert "target branch" in message
+    assert "in the main checkout" not in message  # never seeded from there
+    assert str(source) not in message  # and that file is not the one to repair
+
+
+def test_provision_worktree_refusal_names_a_config_seeded_as_a_directory_child(tmp_path):
+    """#592: the config need not be the seed ENTRY to have been seeded — a directory
+    entry carries it in as a child, and the refusal still names the file it came from.
+
+    `seeded` cannot answer this: a directory entry appends its own rel and nothing
+    else, so `.claude/settings.json` is missing from a ledger that recorded
+    `.claude` — even though seeding is exactly what wrote it. The seed list is not
+    fixed either; `.claude` reaches `seed_files` through the policy's own
+    `[scm] worktree_seed`, which is appended OUTSIDE the `seed_adapter_defaults`
+    block that appends `config_path`.
+
+    Ablation: read provenance from `seed_rel in seeded` again and this reddens on all
+    three assertions — it advises committing the file on the branch — while the
+    entry-seeded row above stays green."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    wt.mkdir()
+    claude = get_profile("claude")
+    seed_dir = str(PurePosixPath(claude.hooks.config_path).parent)  # ".claude"
+    truncated = _OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')]
+    source = repo / claude.hooks.config_path
+    source.parent.mkdir(parents=True)
+    source.write_text(truncated, encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo, seed_files=[seed_dir])
+
+    message = str(excinfo.value)
+    assert str(source) in message  # the file that really supplied the bytes
+    assert "in the main checkout" in message
+    assert "commit a repaired" not in message  # the branch never carried it
+    assert source.read_text(encoding="utf-8") == truncated  # the source is never touched
+
+
+def test_provision_worktree_refusal_names_a_config_seeded_into_an_existing_dir(tmp_path):
+    """The same lane through the OTHER directory arm: seeding recursed into a
+    destination that already existed and copied this config as a missing child.
+
+    `.claude` is only copied WHOLESALE when the worktree lacks it entirely (the row
+    above). A real worktree checks its tracked children out, so the directory is
+    normally already there and the entry takes the child-by-child recursion instead —
+    a separate call site, with its own provenance record. Distinguishing them matters
+    because it is the arm that skips occupied children, which is what the row below
+    grades.
+
+    Ablation: remove the `_record_seeded(...)` after the recursion arm's
+    `seeded.append(rel)` and this reddens alone — the whole-tree and glob rows go on
+    passing, since each records through its own call."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    seed_dir = str(PurePosixPath(claude.hooks.config_path).parent)
+    truncated = _OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')]
+    source = repo / claude.hooks.config_path
+    source.parent.mkdir(parents=True)
+    source.write_text(truncated, encoding="utf-8")
+    # the destination dir exists (a checkout carries its tracked children) but the
+    # gitignored config does not -> recursion copies exactly that child in
+    (wt / seed_dir).mkdir(parents=True)
+    (wt / seed_dir / "tracked.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo, seed_files=[seed_dir])
+
+    message = str(excinfo.value)
+    assert str(source) in message
+    assert "in the main checkout" in message
+    assert "commit a repaired" not in message
+
+
+def test_provision_worktree_refusal_names_a_config_seeded_by_a_glob(tmp_path):
+    """And through the third seeding arm: a `seed_globs` pattern whose expansion
+    supplied the config.
+
+    Each arm records its own copies, so each needs its own row — a plugin pulling a
+    generated tree in by pattern gets the same honest provenance as an explicit
+    entry, rather than the branch-lane advice to commit a gitignored file.
+
+    Ablation: remove the `_record_seeded(...)` after `seeded.append(rel.as_posix())`
+    and this reddens alone."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    wt.mkdir()
+    claude = get_profile("claude")
+    seed_dir = str(PurePosixPath(claude.hooks.config_path).parent)
+    truncated = _OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')]
+    source = repo / claude.hooks.config_path
+    source.parent.mkdir(parents=True)
+    source.write_text(truncated, encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo, seed_globs=[f"{seed_dir}/*.json"])
+
+    message = str(excinfo.value)
+    assert str(source) in message
+    assert "in the main checkout" in message
+    assert "commit a repaired" not in message
+
+
+def test_provision_worktree_refusal_does_not_blame_a_skipped_child_of_a_seeded_dir(tmp_path):
+    """#592: a directory entry in `seeded` proves at least ONE child landed, never
+    that THIS one did — so provenance is recorded per path written, never inferred
+    from the parent.
+
+    The distinguishing case, and the reason the ledger had to become exact rather
+    than parent-aware: `_copy_traversable` runs `skip_existing=True`, so the occupied
+    config is skipped one child at a time while its absent sibling lands. The entry
+    is a partial seed and is duly recorded, yet the bytes that failed to parse came
+    from the checkout. Blaming the seed here would tell the operator to commit a
+    gitignored settings file — the one that holds their tokens and MCP credentials —
+    and the repair would not take anyway, since a re-arm mounts a fresh worktree that
+    seeds this config in from a main checkout that is perfectly valid.
+
+    Ablation: widen the gate to accept the parent (`str(PurePosixPath(seed_rel).parent)
+    in seeded`) and this reddens on all four assertions while the directory-child row
+    above stays green."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    seed_dir = str(PurePosixPath(claude.hooks.config_path).parent)
+    healthy = repo / claude.hooks.config_path  # the main checkout's copy is fine
+    healthy.parent.mkdir(parents=True)
+    healthy.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    (repo / seed_dir / "mcp.json").write_text('{"servers": {}}', encoding="utf-8")
+    torn = wt / claude.hooks.config_path  # occupied -> the seed loop skips this child
+    torn.parent.mkdir(parents=True)
+    torn.write_text(_OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')], encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo, seed_files=[seed_dir])
+
+    message = str(excinfo.value)
+    # the entry really did seed something, which is what makes the parent ambiguous
+    assert (wt / seed_dir / "mcp.json").is_file()
+    assert "commit a repaired" in message  # the branch supplies it, so commit there
+    assert "target branch" in message
+    assert "in the main checkout" not in message
+    assert str(healthy) not in message  # never named: it supplied nothing
+
+
+def test_provision_worktree_refusal_survives_a_failed_copy2_on_the_seeded_config(
+    tmp_path, monkeypatch
+):
+    """#592: the copy that supplied these bytes counts even when it ended in an
+    OSError, because `shutil.copy2` writes the content BEFORE the `copystat` that a
+    destination filesystem can refuse.
+
+    The caller-side consequence of the helper row
+    `test_copy_traversable_records_a_file_a_failed_copy2_left_behind`, and the reason
+    that row matters: the config really is here, really is unparseable, and really
+    came from the main checkout — but a copy recorded only on the success path leaves
+    no provenance behind, so the refusal falls to the branch lane and asks the
+    operator to commit a gitignored settings file. Re-arming then re-seeds the same
+    malformed source and the refusal repeats, with the advice unchanged.
+
+    Ablation: restore the bare `continue` in `_copy_traversable`'s `except OSError`
+    and this reddens on all three message assertions."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    wt.mkdir()
+    claude = get_profile("claude")
+    truncated = _OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')]
+    source = repo / claude.hooks.config_path
+    source.parent.mkdir(parents=True)
+    source.write_text(truncated, encoding="utf-8")
+
+    def refuse_metadata(*_args, **_kwargs):
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(shutil, "copystat", refuse_metadata)
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo, seed_files=[claude.hooks.config_path])
+
+    # the copy did land, which is what makes the lost provenance a real misdirection
+    assert (wt / claude.hooks.config_path).read_text(encoding="utf-8") == truncated
+    message = str(excinfo.value)
+    assert str(source) in message
+    assert "in the main checkout" in message
+    assert "commit a repaired" not in message
 
 
 def test_provision_worktree_empty_profiles_is_noop(tmp_path):
@@ -1228,9 +2068,12 @@ def test_review_hunter_missing_without_merged_review_reported(tmp_path):
     assert "update bmm" in problems[0].message
 
 
-# Verbatim shape of BMAD-METHOD main's bmad-dev-auto/customize.toml: four review
-# layers, three invoking the merged `bmad-review` with one lens each, plus
-# intent-alignment — a self-contained prompt that invokes no skill at all.
+# The invoke-a-skill layer topology: four review layers, three invoking the merged
+# `bmad-review` with one lens each, plus intent-alignment — a self-contained prompt
+# that invokes no skill at all. This was BMAD-METHOD main's shape when the derived
+# requirement landed; 6.11 has since made all four self-contained (they read the
+# primitive's own review-prompts/*.md). Both topologies are supported, and this
+# fixture is what pins the handoff half — do not retire it as historical.
 LAYER_CUSTOMIZE = """
 [workflow]
 implementation_handoff = "irrelevant here"
@@ -2512,47 +3355,150 @@ def test_shield_tracked_hook_config_leaves_no_residue_after_teardown(project, tm
     assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
 
 
-def test_shield_tracked_skill_tree_keeps_its_pattern(project, tmp_path):
-    """The other half of the same predicate, and the reason it is not simply "never
-    exclude a tracked path": a tracked DIRECTORY's pattern measurably DOES hide new
-    children, so dropping it would leak the orchestrator's seeded skills into the
-    story commit — the exact harm the shield exists to prevent.
+def _track_house_skill(repo, tree):
+    """Make ``tree`` a TRACKED tool directory the shield has to reconcile (#484).
 
-    Its tracked children still answer `ls-files -ci`, and no pattern shape avoids that
-    (measured: `dir/*`, `dir/**` and a trailing negation all behave like `dir`, since
-    gitignore cannot re-include under an excluded parent). That tradeoff is deliberate."""
-    repo = project.project
-    claude = get_profile("claude")
-    tree = claude.skill_tree
+    One tracked child is all it takes: `ls-files` answers with that child's path, so
+    the probe reads the tree as a directory rather than a file. Returns nothing — the
+    preconditions are asserted here so an ambient ignore that quietly leaves the tree
+    UNTRACKED fails LOUD in the caller instead of silently rerouting it through the
+    untracked branch, where every #484 assertion passes for the wrong reason.
+    `conftest` shadows the two out-of-repo ignore sources; this catches the third (a
+    system excludes file, which cannot be suppressed without breaking Windows
+    autocrlf)."""
     (repo / tree / "house-skill").mkdir(parents=True, exist_ok=True)
     (repo / tree / "house-skill" / "SKILL.md").write_text("# tracked\n", encoding="utf-8")
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "track the skill tree")
+    assert verify.path_tracked(repo, tree)
+    assert not verify.path_tracked_file(repo, tree)
+
+
+def test_shield_tracked_skill_tree_substitutes_per_file_patterns(project, tmp_path):
+    """A TRACKED tool directory gets NO dir pattern. The shield substitutes one pattern
+    per untracked file provisioning actually wrote below it (#484, the maintainer
+    decision of 2026-08-08). This test is the deliberate re-pin of the assertion that
+    used to read `f"/{tree}" in exclude`.
+
+    Why the verdict reversed while the measurement stands: a dir pattern really does
+    hide new children, and no pattern SHAPE both hides them and keeps the report clean
+    — `dir/*`, `dir/**` and a trailing negation all behave like `dir`, since gitignore
+    cannot re-include under an excluded parent. But over a TRACKED tree that protection
+    is already mostly inert (every modification to a tracked child stages regardless),
+    so it bought new-child coverage alone at the price of reporting the whole tree as
+    tracked-and-ignored — the #392 reporter's own complaint, one step out. The fix
+    changes the PATHS, not the shape.
+
+    The `add -A` assertion is the surviving half of the old test and the anti-leak
+    guard: clearing the `-ci` report by weakening the shield is the failure mode the
+    issue's table documents — the one shape that did clear it leaked a new file into
+    the commit.
+
+    Ablation: restore `kept.add(pattern)` in `_reconcile_tracked_patterns`' `"dir"`
+    branch — the two `-ci` assertions redden on the tracked child.
+    INVERSE ablation: delete that branch's substitution line, keeping the drop — the
+    `add -A` assertion reddens on the leaked wheel skills."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    _track_house_skill(repo, tree)
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
 
     provision_worktree(wt, [claude], repo)
 
     exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
-    assert f"/{tree}" in exclude
-    # The shield still does its job: a file provisioning wrote is not stageable.
+    # #484's symptom first, in both checkouts: the tracked child no longer reads as
+    # ignored. Ordered ahead of the mechanism so the wide-pattern ablation reddens on
+    # the report the issue is about rather than on a pattern spelling.
+    assert git(wt, "ls-files", "-ci", "--exclude-standard") == ""
+    assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
+    assert f"/{tree}" not in exclude
+    # The shield still does its job: nothing provisioning wrote is stageable.
     git(wt, "add", "-A")
     staged = git(wt, "diff", "--cached", "--name-only").splitlines()
     assert not [p for p in staged if p.startswith(f"{tree}/")]
+    # And what replaced the dir pattern: one line per FILE the wheel copy landed.
+    assert (wt / tree / MODULE_SKILLS[0] / "SKILL.md").is_file()
+    assert f"/{tree}/{MODULE_SKILLS[0]}/SKILL.md" in exclude
+    # Never a directory. `_written_rels`' `_is_file` filter is the only thing keeping
+    # that true: `_copy_traversable`'s `copied_paths` records the directories it
+    # created as well as the files, and a dir rel here would reintroduce the very
+    # whole-directory shape #484 removes, one level down — invisible to every other
+    # row above, because the tracked child does not live under it.
+    # Ablation: drop that filter — `/{tree}/{MODULE_SKILLS[0]}` appears and this
+    # reddens alone.
+    assert not [ln for ln in exclude if ln.startswith(f"/{tree}/") and (wt / ln[1:]).is_dir()]
 
 
-def test_shield_keeps_patterns_when_tracked_probe_fails(project, tmp_path, monkeypatch):
-    """Uncertainty must keep the pattern, never drop it: a shield that stays too wide
-    is a cosmetic hygiene complaint, while one that drops a pattern on a fault leaks
-    seeded files into a story commit. The degrade is REPORTED so the wide shield is
-    not silent."""
+def test_shield_keeps_the_dir_pattern_when_a_written_rel_cannot_be_one_line(project, tmp_path):
+    """A provisioned file whose NAME cannot be spelled as one exclude line sends the
+    WHOLE tracked directory back to its dir pattern (#484).
+
+    The exclude is line-oriented with no escape for its own boundary, so two characters
+    defeat substitution in a way `_escape_exclude_pattern` cannot quote (#476 handles
+    the wildmatch specials, which CAN be escaped). `_worktree_local_exclude` writes each
+    pattern `\n`-terminated and git reads lines back `\n`-split with one trailing `\r`
+    trimmed — #472's measurement, in this same branch:
+
+    * an embedded `\n` SPLITS the substituted pattern in two. Neither half names the
+      file, so it is not shielded, and the orphan half is an UNANCHORED pattern that
+      hides an unrelated file at any depth (#401's direction, arriving through the one
+      character escaping cannot reach).
+    * a TRAILING `\r` is eaten as the terminator's other half, so the pattern names the
+      path WITHOUT it — shielding some other file and not this one (#476's direction).
+
+    Both are legal POSIX names and reach `written` verbatim: `_written_rels` renders
+    whatever the copy landed. The dir pattern this substitution replaces DID cover them,
+    so substituting regardless would trade a cosmetic report for a real leak. Keeping it
+    is the same trade the degrade below makes, for the same reason.
+
+    Ablation: drop the `unrepresentable` guard in `_reconcile_tracked_patterns`' `"dir"`
+    branch so it substitutes unconditionally — both bad arms redden (they get the
+    per-file set and a None reason). The CONTROL arm is what keeps that honest: the same
+    call with only representable rels must still substitute, so the guard cannot pass by
+    quietly disabling substitution altogether."""
+    repo = project.project
+    tree = get_profile("claude").skill_tree
+    _track_house_skill(repo, tree)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    ok = f"{tree}/seeded/SKILL.md"
+
+    # Control arm: representable rels still substitute, on the identical call shape.
+    kept, reason = _reconcile_tracked_patterns(wt, {f"/{tree}"}, {ok})
+    assert kept == {f"/{ok}"}
+    assert reason is None
+
+    for bad in (f"{tree}/we\nird.md", f"{tree}/trailing\r"):
+        kept, reason = _reconcile_tracked_patterns(wt, {f"/{tree}"}, {ok, bad})
+        # The dir pattern comes back whole — not the per-file set, and not nothing.
+        assert kept == {f"/{tree}"}
+        assert reason is not None and f"/{bad}" in reason
+
+
+def test_shield_degrade_keeps_the_dir_pattern_not_the_substitution(project, tmp_path, monkeypatch):
+    """Uncertainty must keep the pattern in its ORIGINAL shape, never drop it and never
+    narrow it to the substitution. A shield that stays too wide is a cosmetic hygiene
+    complaint; one that drops or narrows a pattern on a fault leaks seeded files into a
+    story commit. The degrade is REPORTED so the wide shield is not silent.
+
+    Pinned over a tracked TREE rather than a tracked FILE, because #484 gave the
+    unprobed case a second wrong answer to avoid: substituting per-file patterns for
+    what `written` happens to hold would look like a fix while shielding strictly less
+    than the dir pattern does — and the run that could not answer the probe is exactly
+    the one whose bookkeeping deserves the least trust.
+
+    `path_tracked_kind` is the retargeted mutation site: since #484's phase 3 the
+    boolean `path_tracked_file` delegates to it, so failing the tri-state fails both
+    readers, which is why the hook-config pin degrades in the same run.
+
+    Ablation: degrade to the substitution (`kept |= {f"/{w}" ...}`) instead of
+    `kept.add(pattern)` in the `except` arm — the `f"/{tree}"` assertion reddens."""
     repo = project.project
     claude = get_profile("claude")
-    hook_rel = claude.hooks.config_path
-    (repo / hook_rel).parent.mkdir(parents=True, exist_ok=True)
-    (repo / hook_rel).write_text('{"hooks": {}}\n', encoding="utf-8")
-    git(repo, "add", "-A")
-    git(repo, "commit", "-q", "-m", "track the hook config")
+    tree = claude.skill_tree
+    _track_house_skill(repo, tree)
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
 
@@ -2561,14 +3507,259 @@ def test_shield_keeps_patterns_when_tracked_probe_fails(project, tmp_path, monke
     def boom(_repo, _rel):
         raise verify.GitError("ls-files timed out")
 
-    monkeypatch.setattr(wtf.verify, "path_tracked_file", boom)
+    monkeypatch.setattr(wtf.verify, "path_tracked_kind", boom)
     msgs: list[str] = []
 
     provision_worktree(wt, [claude], repo, on_degraded=msgs.append)
 
     exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
-    assert f"/{hook_rel}" in exclude
+    assert f"/{tree}" in exclude
+    assert not [ln for ln in exclude if ln.startswith(f"/{tree}/")]
     assert any("could not check whether these paths are tracked" in m for m in msgs)
+
+
+def test_shield_tracked_dir_with_nothing_landed_drops_cleanly(project, tmp_path):
+    """A TRACKED tool directory that received nothing gets no pattern at all — not the
+    dir pattern, and no per-file substitutes either. There is nothing of OURS below it
+    to shield, so the shield has nothing to say about it, and saying it anyway is the
+    #484 false report for free.
+
+    Pre-copying every wheel MODULE_SKILL into the repo and committing is what makes
+    provisioning a total no-op there: copy-when-absent skips each destination one at a
+    time, so `written` records nothing under the tree.
+
+    Ablation: restore `kept.add(pattern)` in the `"dir"` branch — the `-ci` assertions
+    redden, on the wheel skills the project now tracks itself."""
+    from importlib import resources
+
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    wheel = resources.files("bmad_loop.data").joinpath("skills")
+    for skill in MODULE_SKILLS:
+        _copy_traversable(wheel.joinpath(skill), repo / tree / skill)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "the project tracks the wheel skills itself")
+    assert verify.path_tracked(repo, tree)
+    assert not verify.path_tracked_file(repo, tree)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert git(wt, "ls-files", "-ci", "--exclude-standard") == ""
+    assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
+    assert f"/{tree}" not in exclude
+    assert not [ln for ln in exclude if ln.startswith(f"/{tree}/")]
+
+
+def test_shield_untracked_skill_tree_keeps_dir_pattern_without_per_file_noise(project, tmp_path):
+    """An UNTRACKED tool directory keeps the ambient `/dir` pattern and gains nothing
+    else: substitution is the TRACKED branch's answer only. Byte-identical behavior to
+    before #484, which is half the decision — full protection is still available and is
+    still what an untracked tree gets, including for files the SESSION creates later.
+
+    The guard is against over-application: substituting here too would work (every
+    file we wrote would still be shielded) while quietly surrendering new-child
+    coverage for a tree that had no reason to give it up, and no `-ci` assertion
+    anywhere would notice, because an untracked tree has no tracked child to report.
+
+    Ablation: add the `"dir"` branch's substitution line to the `"untracked"` branch
+    too, alongside its `kept.add(pattern)` — the no-per-file-lines assertion reddens as
+    the wheel skills' own lines appear."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    assert not verify.path_tracked(repo, tree)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert f"/{tree}" in exclude
+    assert not [ln for ln in exclude if ln.startswith(f"/{tree}/")]
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert not [p for p in staged if p.startswith(f"{tree}/")]
+
+
+def test_shield_tracked_bmad_keeps_render_carve_out(project, tmp_path):
+    """`_bmad` reaches #484's outcome by a different road, and the render carve-out has
+    to survive the trip. `_seed_bmad_tree` already collapses to the root ONLY when the
+    root was absent before seeding, so a tracked `_bmad` contributes per-file rels and
+    `f"/{BMAD_DIR}"` never enters `patterns` at all — the substitution branch is never
+    reached for it, and cannot be: a fresh checkout materializes every tracked path, so
+    "root absent AND tracked" does not arise.
+
+    What that means for the carve-out at the construction site: with no root pattern to
+    subsume it, `/{RENDER_DIR_REL}/` must still be added, or the renderer's generated
+    output — written AFTER provisioning returns — rides the unit's `git add -A`.
+
+    Ablation: drop the `if f"/{BMAD_DIR}" not in patterns` guard's body — the
+    `/{RENDER_DIR_REL}/` assertion reddens."""
+    repo = project.project
+    claude = get_profile("claude")
+    custom = repo / BMAD_DIR / "custom"
+    custom.mkdir(parents=True, exist_ok=True)
+    (custom / "x.toml").write_text("x = 1\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the bmad tree")
+    # Untracked, so the checkout does not carry it and the seed really lands it.
+    (custom / "local.toml").write_text("local = true\n", encoding="utf-8")
+    assert verify.path_tracked(repo, BMAD_DIR)
+    assert not verify.path_tracked_file(repo, BMAD_DIR)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert f"/{BMAD_DIR}" not in exclude
+    assert f"/{BMAD_DIR}/custom/local.toml" in exclude
+    assert f"/{RENDER_DIR_REL}/" in exclude
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert not [p for p in staged if p.startswith(f"{BMAD_DIR}/")]
+    assert git(wt, "ls-files", "-ci", "--exclude-standard") == ""
+    assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
+
+
+def test_shield_substituted_pattern_survives_gitignore_specials(project, tmp_path):
+    """#476's escaping and #484's substitution have to compose, and only their product
+    is exercised here: the substituted rels are new patterns that never existed before
+    this phase, and they reach the renderer by a path no #476 test walks.
+
+    Both harm directions live in one file name. Unescaped, `/{tree}/weird[1].md` is a
+    wildmatch class over `1`, so it shields nothing it names (the file we wrote leaks
+    into the story commit) while hiding neighbours it does not name. The escape at the
+    render is what makes the line mean the literal path — asked of git itself, since
+    the property under test is git's reading of the line, not its bytes.
+
+    Ablation: delete the `_escape_exclude_pattern` call at the render — the `add -A`
+    assertion reddens on the leaked file, and `check-ignore` answers rc 1 for the
+    literal name behind it."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    _track_house_skill(repo, tree)
+    # Untracked in the main repo, so the checkout does not carry it and the seed entry
+    # (the tree itself, partially present) really copies it in.
+    weird = "weird[1].md"
+    (repo / tree / weird).write_text("# specials\n", encoding="utf-8")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo, seed_files=[tree])
+
+    assert (wt / tree / weird).is_file()
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert not [p for p in staged if p.startswith(f"{tree}/")]
+    # git's own reading of the substituted line, for the LITERAL name.
+    assert verify.git_bytes(wt, "check-ignore", "--", f"{tree}/{weird}").returncode == 0
+    # ...and the line it read.
+    assert f"/{tree}/weird\\[1].md" in exclude
+
+
+def test_shield_tracked_tree_hookless_profile_substitutes(project, tmp_path):
+    """Substitution over a tracked tree for a HOOKLESS profile (the opencode shape),
+    which has no `config_path` to contribute. The interplay worth pinning is with the
+    empty-rel carve-out: the reconcile loop keeps a pattern whose rel is empty rather
+    than probing it, so a profile that contributes no config must not come out of this
+    step having gained a bare `/` line — and must still get its per-file substitutes.
+
+    Ablation: drop the `if not p.hookless` filter at the pattern-construction site —
+    the empty `config_path` renders as a bare `/` and the first assertion reddens.
+    (Ablating the reconcile loop's `not rel` carve-out instead is NOT the honest
+    mutation: `ls-files` answers an empty pathspec with the whole index, so the pattern
+    would read as a tracked dir and be substituted away — a different bug, and this
+    test would still pass.)"""
+    repo = project.project
+    opencode = get_profile("opencode")
+    assert opencode.hookless and not opencode.hooks.config_path
+    tree = opencode.skill_tree
+    _track_house_skill(repo, tree)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [opencode], repo)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert "/" not in exclude
+    assert f"/{tree}" not in exclude
+    assert f"/{tree}/{MODULE_SKILLS[0]}/SKILL.md" in exclude
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert not [p for p in staged if p.startswith(f"{tree}/")]
+
+
+def test_shield_reprovision_tracked_tree_appends_no_duplicates(project, tmp_path):
+    """Re-provisioning the same worktree must leave the private exclude byte-identical
+    with substitution in play too. The second run lands nothing (copy-when-absent finds
+    every wheel skill present), so `written` is EMPTY and it offers no per-file pattern
+    at all — the first run's lines survive only because `_worktree_local_exclude` is
+    append-only, which is exactly the documented residue behavior read from the
+    harmless direction.
+
+    Re-provisioning the same worktree is a real arc, not a hypothetical: an
+    unparseable seeded hook config raises mid-loop, and the resume after that
+    escalation runs provisioning again over the paths already laid down (the
+    reasoning is recorded at `worktree_flow.py`'s hook-config `except`). Companion to
+    `test_shield_reprovision_does_not_duplicate_patterns`, which pins the same property
+    over the UNTRACKED tree's stable pattern set."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    _track_house_skill(repo, tree)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    msgs: list[str] = []
+
+    provision_worktree(wt, [claude], repo, on_degraded=msgs.append)
+    first = _wt_private_exclude(wt).read_bytes()
+    provision_worktree(wt, [claude], repo, on_degraded=msgs.append)
+
+    assert msgs == []
+    assert _wt_private_exclude(wt).read_bytes() == first
+    lines = first.decode("utf-8").splitlines()
+    per_file = [ln for ln in lines if ln.startswith(f"/{tree}/")]
+    assert per_file and len(set(per_file)) == len(per_file)
+    assert len(set(lines)) == len(lines)
+
+
+def test_shield_tracked_tree_session_created_file_is_staged(project, tmp_path):
+    """THE ACCEPTED RESIDUAL, pinned so nobody "fixes" it back to a dir pattern.
+
+    Maintainer decision on #484 (2026-08-08): a file the SESSION creates under a
+    TRACKED tool directory can be staged. That is the price of clearing the false
+    tracked-and-ignored report, and it is deliberate — it matches the project's own
+    decision to TRACK that tree, and everything the ORCHESTRATOR put there still has a
+    pattern of its own (pinned by
+    `test_shield_tracked_skill_tree_substitutes_per_file_patterns`).
+
+    Green-ablation record, not a guard: restoring `kept.add(pattern)` in the `"dir"`
+    branch makes this test FAIL — which is the point. It fails on a change that is
+    otherwise invisible except through `-ci`, so it is the line that forces the
+    reviewer back to the decision instead of letting the wide pattern quietly return.
+    Under the UNTRACKED tree the same file is hidden, which is
+    `test_shield_untracked_skill_tree_keeps_dir_pattern_without_per_file_noise`'s
+    `add -A` row."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    _track_house_skill(repo, tree)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+    (wt / tree / "house-skill" / "SESSION-WROTE-THIS.md").write_text("# new\n", encoding="utf-8")
+
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert f"{tree}/house-skill/SESSION-WROTE-THIS.md" in staged
 
 
 def test_missing_stories_support_findings_split_absent_from_stale(tmp_path):
@@ -2821,6 +4012,85 @@ def test_provision_worktree_seed_rejects_escaping_path(tmp_path):
     (tmp_path / "outside.txt").write_text("SECRET", encoding="utf-8")
     provision_worktree(wt, [], repo, seed_files=["../outside.txt"])
     assert not wt.exists()  # nothing copied, no dirs created
+
+
+@pytest.mark.parametrize("refused_root", ["worktree", "repo"])
+def test_provision_worktree_root_resolution_fault_is_typed_and_precedes_writes(
+    tmp_path, monkeypatch, refused_root
+):
+    """Provisioning cannot write against roots whose identity is uncertain.
+
+    Ablation: delete the provisioning-root translation and this raises raw
+    ``OSError`` instead of typed ``GitError`` before the seed or hook config write.
+    """
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    (repo / "seed.json").write_text("FROM_REPO\n", encoding="utf-8")
+    profile = get_profile("claude")
+    refused = wt if refused_root == "worktree" else repo
+    refuse_to_resolve(monkeypatch, refused)
+
+    with pytest.raises(verify.GitError) as excinfo:
+        provision_worktree(wt, [profile], repo, seed_files=["seed.json"])
+
+    assert "provisioning roots" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, OSError)
+    assert not (wt / "seed.json").exists()
+    assert not (wt / profile.hooks.config_path).exists()
+
+
+@pytest.mark.parametrize("refused_side", ["source", "destination"])
+def test_provision_worktree_refuses_one_explicit_seed_but_copies_healthy_sibling(
+    tmp_path, monkeypatch, refused_side
+):
+    """Resolution uncertainty is scoped to one explicit seed entry.
+
+    Ablation: delete the explicit-entry resolution guard and the provider fault
+    aborts provisioning before the healthy sibling can be copied.
+    """
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    (repo / "refused.json").write_text("REFUSED\n", encoding="utf-8")
+    (repo / "healthy.json").write_text("HEALTHY\n", encoding="utf-8")
+    refused = repo / "refused.json" if refused_side == "source" else wt / "refused.json"
+    refuse_to_resolve(monkeypatch, refused)
+
+    provision_worktree(
+        wt,
+        [],
+        repo,
+        seed_files=["refused.json", "healthy.json"],
+    )
+
+    assert not (wt / "refused.json").exists()
+    assert (wt / "healthy.json").read_text(encoding="utf-8") == "HEALTHY\n"
+
+
+@pytest.mark.parametrize("refused_side", ["source", "destination"])
+def test_provision_worktree_refuses_one_glob_match_but_copies_healthy_sibling(
+    tmp_path, monkeypatch, refused_side
+):
+    """One uncertain glob match cannot abort the rest of a stable expansion.
+
+    Ablation: delete the glob-entry resolution guard and the provider fault aborts
+    provisioning before the healthy match can be copied.
+    """
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    matches = repo / "plugins"
+    matches.mkdir(parents=True)
+    (matches / "a-refused.json").write_text("REFUSED\n", encoding="utf-8")
+    (matches / "z-healthy.json").write_text("HEALTHY\n", encoding="utf-8")
+    refused = (
+        matches / "a-refused.json"
+        if refused_side == "source"
+        else wt / "plugins" / "a-refused.json"
+    )
+    refuse_to_resolve(monkeypatch, refused)
+
+    provision_worktree(wt, [], repo, seed_globs=["plugins/*.json"])
+
+    assert not (wt / "plugins" / "a-refused.json").exists()
+    assert (wt / "plugins" / "z-healthy.json").read_text(encoding="utf-8") == "HEALTHY\n"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
@@ -3087,6 +4357,140 @@ def test_shield_excludes_only_inside_the_worktree(project, tmp_path):
     assert git(wt, "diff", "--cached", "--name-only") == ""
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="a trailing space is not a legal Windows path")
+def test_shield_escapes_trailing_space_seed(project, tmp_path):
+    """#476: a seed rel ending in a SPACE renders as a pattern naming another path.
+    Git drops a pattern's unescaped trailing whitespace, so `/kept ` shields `kept/`
+    and leaves the seeded `kept /` fully stageable — the orchestrator's own config
+    rides into the story commit, which is the one harm the shield exists to prevent
+    (#384). Escaped per gitignore(5), `/kept\\ ` keeps the space and names the real
+    directory. Measured identical on git 2.20.4 (the shield's floor) and 2.55.0.
+
+    Ablation: render `sorted(patterns)` again in `worktree_flow.provision_worktree`,
+    dropping the `_escape_exclude_pattern` call, and the staged-files assertion
+    reddens — `kept /conf.json` leaks into the index."""
+    repo = project.project
+    claude = get_profile("claude")
+    seed = "kept "
+    (repo / seed).mkdir()
+    (repo / seed / "conf.json").write_text("{}\n", encoding="utf-8")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo, seed_files=[seed])
+
+    # the seed landed, so there is something for the shield to be wrong about
+    assert (wt / seed / "conf.json").is_file()
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+
+    assert not [p for p in staged if p.startswith(f"{seed}/")]  # the harm
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert "/kept\\ " in exclude  # the mechanism
+
+
+def test_shield_escapes_wildmatch_class_seed(project, tmp_path):
+    """#476 on the wildmatch axis: `[env]` in a seed rel is a CHARACTER CLASS, so the
+    rendered `/cfg[env]` matches `cfge`, `cfgn` and `cfgv` and never the literal
+    `cfg[env]` it was built from — the seeded directory stays stageable. Reachable
+    without exotic config: a `seed_globs` expansion over a tree holding `config/[env].json`
+    yields exactly this rel.
+
+    `/cfg\\[env]` names it. `]` needs no escape of its own — it is not special without
+    an opening `[`, which the renderer escapes.
+
+    Ablation: render `sorted(patterns)` again in `worktree_flow.provision_worktree`,
+    dropping the `_escape_exclude_pattern` call, and the staged-files assertion
+    reddens — `cfg[env]/conf.json` leaks into the index."""
+    repo = project.project
+    claude = get_profile("claude")
+    seed = "cfg[env]"
+    (repo / seed).mkdir()
+    (repo / seed / "conf.json").write_text("{}\n", encoding="utf-8")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo, seed_files=[seed])
+
+    assert (wt / seed / "conf.json").is_file()
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+
+    assert not [p for p in staged if p.startswith(f"{seed}/")]  # the harm
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert "/cfg\\[env]" in exclude  # the mechanism
+
+
+def test_shield_escaped_class_does_not_hide_neighbour(project, tmp_path):
+    """The OTHER direction of the same defect (#401, consolidated into #476): a broken
+    pattern does not merely fail to shield ours, it silently hides someone else's. The
+    unescaped `/foo[1].json` matches `foo1.json` — a file that is not the
+    orchestrator's to hide — so the unit's own `git add -A` skipped it and the story
+    commit went out incomplete, with nothing in the diff able to say why.
+
+    Both assertions are needed and they are the pairing that matters: shielding ours
+    must not cost theirs. A renderer that simply stopped emitting the pattern would
+    satisfy the neighbour row while leaking the seeded file.
+
+    Ablation: render `sorted(patterns)` again in `worktree_flow.provision_worktree`,
+    dropping the `_escape_exclude_pattern` call, and the neighbour assertion reddens —
+    the class hides `foo1.json`, which never reaches the index."""
+    repo = project.project
+    claude = get_profile("claude")
+    (repo / "foo[1].json").write_text("{}\n", encoding="utf-8")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo, seed_files=["foo[1].json"])
+
+    # The neighbour is written into the WORKTREE, not the repo: a linked checkout
+    # materializes only tracked paths, and the file this stands for is one the unit
+    # creates during its own session and means to commit.
+    (wt / "foo1.json").write_text("{}\n", encoding="utf-8")
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+
+    assert "foo1.json" in staged  # not ours to hide
+    assert "foo[1].json" not in staged  # ours, and still shielded
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert "/foo\\[1].json" in exclude
+
+
+def test_shield_ordinary_patterns_render_byte_identical(project, tmp_path):
+    """Escaping (#476) is a no-op on every path the shield has ever written: an
+    ordinary rel carries no wildmatch special and no trailing space, so its line is
+    byte-identical to the pre-escape spelling. Pinned because the escape runs over
+    EVERY pattern — a renderer that also quoted `.`, `/` or `-` would silently stop
+    shielding the tool dirs the whole mechanism exists for.
+
+    Compared against the file's tail rather than by containment: the writer is
+    append-only and sorts what it adds, so the shield's own lines are exactly the last
+    three. Still exact after #484 — substitution replaces a tracked tool directory's
+    pattern with per-file ones, and this fixture's tree is UNTRACKED, so the count is
+    unchanged.
+
+    INVERSE ablation: deleting the escape cannot redden this — that is the property.
+    Add `"."` to `_escape_exclude_pattern`'s specials tuple instead and all three lines
+    move to their `/\\.claude...` spellings, reddening here while every HARM row above
+    stays green: `\\.` still matches a literal dot, so the over-escaped shield goes on
+    shielding. This test remains the only one whose SUBJECT is the over-reach, but it
+    is no longer the only witness — since #484 the substituted per-file patterns are
+    compared by raw spelling too, so the same mutation reddens most of the tracked-tree
+    tests as collateral."""
+    repo = project.project
+    claude = get_profile("claude")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+
+    lines = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert lines[-3:] == sorted(
+        [f"/{claude.hooks.config_path}", f"/{claude.skill_tree}", f"/{RENDER_DIR_REL}/"]
+    )
+    assert not [ln for ln in lines[-3:] if "\\" in ln]
+
+
 @pytest.mark.parametrize("channel", ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"])
 def test_shield_degrades_when_a_command_scope_excludesfile_outranks_it(
     project, tmp_path, monkeypatch, channel
@@ -3102,7 +4506,12 @@ def test_shield_degrades_when_a_command_scope_excludesfile_outranks_it(
 
     PARAMETRIZED BECAUSE THE ENUMERATION FIX WOULD PASS ONE AND FAIL THE OTHER, which is
     the whole argument for verifying the post-condition instead of detecting the
-    override's origin. The channels themselves differ across the supported git range:
+    override's origin. Both arms run unconditionally: `GIT_CONFIG_COUNT` arrived in git
+    2.31, below `verify.GIT_FLOOR`, so on every supported git both channels exist and
+    both defeat a shield that only checked its own write succeeded.
+
+    The table is a HISTORICAL measurement — the evidence for that argument, not a claim
+    about the supported range, since 2.20.4 now sits far below the floor:
 
                                         git 2.20.4        git 2.55.0
         GIT_CONFIG_COUNT/KEY_n/VALUE_n  inert (2.31)      shield defeated
@@ -3110,13 +4519,20 @@ def test_shield_degrades_when_a_command_scope_excludesfile_outranks_it(
         GIT_CONFIG_PARAMETERS 'k'='v'   fatal: bogus      shield defeated
         what `git -c` itself emits      'k=v'             'k'='v'
 
-    So the channel the finding named does not exist at this shield's own 2.20 floor,
-    the one that does exist there uses an encoding the newer git rewrote, and a `git -c`
-    on a session's own command line is a third that never appears in our environment at
-    all. The fix names none of them.
+    Read across it: WHICH channels exist, and the encoding each one carries, both moved
+    under git's feet — and a `git -c` on a session's own command line is a third that
+    never appears in our environment at all. An enumeration would have had to track
+    every one of those moves. The fix names none of them.
 
-    `'k=v'` is the encoding used below because it is the only one honored at BOTH ends;
-    the newer `'k'='v'` form is `fatal: bogus format in GIT_CONFIG_PARAMETERS` at 2.20.4.
+    Since #692 the shield asks with `--show-scope`, and git answers the SAME token —
+    `command` — for both channels in the table and for the `git -c` that never reaches
+    our environment, so the reason below is git's own attribution rather than this
+    suite's inference. That is what the assertion keys on, and it is why the parametrize
+    still buys something: one token covering both arms is a claim about git, so both
+    arms are still run against it rather than one being taken as proof of the other.
+
+    `'k=v'` is the encoding used below because it is honored at both ends of that table,
+    so this case pins the same behavior it pinned before the floor moved.
 
     The reason string is the discriminator here, and deliberately so: `git status` shows
     the tool file with the bug AND with the fix; what changes is whether the operator is
@@ -3131,10 +4547,6 @@ def test_shield_degrades_when_a_command_scope_excludesfile_outranks_it(
     `reason is not None` — the shield reports success while `git status` in the worktree
     still shows `probe-384`."""
     repo = project.project
-    if channel == "GIT_CONFIG_COUNT" and not install_mod._git_version_at_least(
-        git(repo, "version"), (2, 31)
-    ):
-        pytest.skip("GIT_CONFIG_COUNT is git 2.31; the GIT_CONFIG_PARAMETERS case covers older git")
     if channel == "GIT_CONFIG_PARAMETERS" and sys.platform == "win32":
         # POSIX-only: the pre-2.31 encoding is sq-quoted, so a Windows path's
         # backslashes would be exercising git's own quoting rules rather than this
@@ -3161,7 +4573,7 @@ def test_shield_degrades_when_a_command_scope_excludesfile_outranks_it(
         assert git(wt, "config", "--type=path", "--get", "core.excludesFile") == str(operator)
 
     assert reason is not None
-    assert "another configuration scope outranks it" in reason
+    assert "command-scope override" in reason
     # The reason renders the path with `!r`, deliberately — a legal POSIX path can
     # carry edge whitespace or control bytes, and only the repr discloses them. So
     # compare against the REPR, not the raw string: on Windows `repr()` doubles every
@@ -3190,8 +4602,6 @@ def test_shield_outranked_degrade_leaves_no_permanent_repo_format_change(
     Ablation: drop the `needs_enable` rollback and the first assertion fails —
     `worktreeConfig` survives a degrade that shielded nothing."""
     repo = project.project
-    if not install_mod._git_version_at_least(git(repo, "version"), (2, 31)):
-        pytest.skip("GIT_CONFIG_COUNT is git 2.31")
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
     shared = repo / ".git" / "config"
@@ -3237,11 +4647,15 @@ def test_shield_degrades_when_git_will_not_confirm_the_activation(
     knowing whether the written key is the one git resolves has exactly the standing of
     knowing it is not.
 
-    THE FAKE MUST TELL THE TWO READS APART BY STATE, not by argv, and that is the trap
-    this test exists on top of. The seed read and the verification read use byte-identical
-    arguments — real git distinguishes them only by what has been written in between — so
-    a fake keyed on the arguments alone would fault the SEED instead and this would pass
-    while testing a completely different arm.
+    THE FAKE TELLS THE TWO READS APART BY STATE, not by argv, and deliberately keeps
+    doing so. The two used to be byte-identical in argv — real git distinguished them
+    only by what had been written in between — and a fake keyed on the arguments alone
+    would have faulted the SEED instead, passing while testing a completely different
+    arm. Since #692 the verification carries `--show-scope` and the seed read must not,
+    so argv WOULD now separate them; keying on state anyway is what keeps this test
+    honest if that ever stops being true, and it means this test asserts nothing about
+    the flag's presence. That is pinned separately, by
+    `test_shield_degrades_when_a_lower_scope_answers_after_the_write`.
 
     Parametrized over both classes because `GitSpawnError` is a subclass, so a
     `GitError`-only test would keep passing against a handler narrowed to the parent.
@@ -3286,11 +4700,15 @@ def test_shield_degrades_when_the_activation_read_back_is_unreadable(
 
     Ablation: treat any rc as an answer. THE DELETION DOES NOT FALL THROUGH TO SUCCESS,
     which is why the assertions below are on the wording rather than on
-    `reason is not None` — measured, not predicted: an unread stdout is `b""`, which
-    compares unequal to the written path, so the mismatch arm one line down still
-    degrades and still returns a reason. It just returns the WRONG one, claiming another
-    scope outranks us and naming `''` as what git reads. A reason-is-not-None assertion
-    would pass against that bug."""
+    `reason is not None` — measured, not predicted, and RE-measured after #692 moved
+    where that deletion lands. An unread stdout is `b""`, which carries no seam NUL, so
+    it is the missing-separator branch that catches it now: the shield still degrades and
+    still returns a reason, but the reason reads `git answered the activation check
+    without naming a scope (b'')` — blaming an unparseable answer for what was actually a
+    refused call. Before #692 the same deletion fell one arm further down, into the
+    mismatch branch, blaming another scope and naming `''` as what git reads. The arm
+    moved; the conclusion did not. Either way the reason is WRONG about the fault, and
+    either way a reason-is-not-None assertion would pass against the bug."""
     repo = project.project
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
@@ -3318,6 +4736,270 @@ def test_shield_degrades_when_the_activation_read_back_is_unreadable(
     assert reason is not None
     assert "would not confirm which excludes file now applies" in reason
     assert "bad config line 1" in reason
+
+
+def test_shield_degrades_when_a_lower_scope_answers_after_the_write(project, tmp_path, monkeypatch):
+    """A scope BELOW `worktree` answering the verification is the pathology the
+    `--show-scope` adoption made legible (#692): the worktree-scoped write reported rc 0
+    and git still resolves the key from `local`, so the write is not outranked — it is
+    not in force AT ALL. That is a different repair from an ambient override (the
+    operator's `extensions.worktreeConfig` never took effect, or the write landed in a
+    config git is not reading) and the reason has to say so, because the two send an
+    operator to opposite places.
+
+    Before the scope was answered this arm and the command-scope arm shared one
+    message — "another configuration scope outranks it" — which is precisely the wrong
+    thing to tell someone whose worktree config is inert: it sends them hunting an
+    ambient override that does not exist.
+
+    This is also where the flag itself is pinned. The verification's argv is captured
+    and asserted to carry `--show-scope`, and this is the ONE test that does that: the
+    fault-injection tests above key on STATE deliberately (their own docstrings say
+    why), so none of them would notice the flag being dropped, and every wording
+    assertion in this family would keep passing against a probe that never asked for the
+    scope — the fake supplies the scope-prefixed answer regardless.
+
+    Ablation: fold this arm into the command arm's message and this fails on the
+    wording."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+    activated = []
+    verified = []
+
+    def lower_scope_after_activation(worktree, *args):
+        if args[:2] == ("config", "--worktree"):
+            activated.append(args)
+            return real(worktree, *args)
+        if activated and "--get" in args and "core.excludesFile" in args:
+            verified.append(args)
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=0,
+                stdout=b"local\0/somewhere/else\0",
+                stderr=b"",
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", lower_scope_after_activation)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert activated, "the fake never saw the activation — it answered the seed read instead"
+    assert reason is not None
+    assert "not in force at all" in reason
+    # the token git supplied, in the slot the message interpolates it into — not merely
+    # the substring "local", which a temp path could supply on its own
+    assert "from local scope" in reason
+    # repr, not the raw string, for the reason the command-scope test above records
+    assert repr("/somewhere/else")[1:-1] in reason
+    # THE flag pin for this family: the probe really asked git to name the scope
+    assert verified and "--show-scope" in verified[0]
+    # the permanent format change does not outlive a shield that never activated
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
+def test_shield_degrades_when_worktree_scope_answers_a_different_value(
+    project, tmp_path, monkeypatch
+):
+    """`worktree` scope answering a value that is not the one just written to
+    `worktree` scope. Nothing outranks anything here — the scope we wrote is the scope
+    that answered, and it answered something else — so both of the other mismatch
+    messages would be lies, and the reason says only what was measured: git reads a
+    different value from the same scope.
+
+    Unreachable through any operator configuration, which is why it is faked rather
+    than staged: it takes a concurrent writer, a config git parses differently from the
+    one it wrote, or a bug in this helper's own path computation. Kept as a live branch
+    rather than folded into the fallthrough because it is the one mismatch that
+    indicts THIS code rather than the environment, and an operator reading
+    "another scope outranks it" would go looking outward for a fault that is inward.
+
+    Ablation (measured): delete this arm and it falls through to the unknown-scope one,
+    which then reports `a scope this code does not know, 'worktree'` — this code
+    disowning the very scope it just wrote to."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+    activated = []
+
+    def worktree_scope_after_activation(worktree, *args):
+        if args[:2] == ("config", "--worktree"):
+            activated.append(args)
+            return real(worktree, *args)
+        if activated and "--get" in args and "core.excludesFile" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=0,
+                stdout=b"worktree\0/not/what/we/wrote\0",
+                stderr=b"",
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", worktree_scope_after_activation)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert activated, "the fake never saw the activation — it answered the seed read instead"
+    assert reason is not None
+    assert "worktree scope answers a different value" in reason
+    assert repr("/not/what/we/wrote")[1:-1] in reason
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
+def test_shield_degrades_on_a_scope_token_it_does_not_know(project, tmp_path, monkeypatch):
+    """A scope token this code has no arm for. git documents five, and the adoption
+    hard-codes all five — so a sixth is either a git that grew one or an answer this
+    code has misread, and in both cases the honest reason is that the token is unknown,
+    quoted verbatim for whoever reads the journal.
+
+    This is a MESSAGE gate, not a DECISION gate, and the distinction is the point: the
+    value mismatched, so the shield degrades on the mismatch regardless of what the
+    token says. An unrecognized scope can never be the reason a shield activates, which
+    is what keeps a future git from widening this helper's proceed surface by adding a
+    scope name. The unknown-token arm only decides what the operator is told.
+
+    Ablation: reword the fallthrough to reuse the command arm's text and both
+    assertions fail — the journal would blame an ambient override for a token git
+    invented."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+    activated = []
+
+    def unknown_scope_after_activation(worktree, *args):
+        if args[:2] == ("config", "--worktree"):
+            activated.append(args)
+            return real(worktree, *args)
+        if activated and "--get" in args and "core.excludesFile" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=0,
+                stdout=b"futurescope\0/x\0",
+                stderr=b"",
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", unknown_scope_after_activation)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert activated, "the fake never saw the activation — it answered the seed read instead"
+    assert reason is not None
+    assert "a scope this code does not know" in reason
+    assert "'futurescope'" in reason
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
+def test_shield_degrades_when_the_scope_answer_is_unparseable(project, tmp_path, monkeypatch):
+    """rc 0 with no seam NUL. `-z --show-scope` emits `scope NUL value NUL` — measured
+    at git 2.34.1 and 2.55.0, both ends of the supported range — so an rc-0 answer
+    carrying no NUL at all is not an answer in the shape this code parses, and the only
+    safe reading of it is that which excludes file applies is unconfirmed.
+
+    THE BRANCH IS THE WHOLE TEST, because without it the parse does not fail loudly —
+    it fails QUIETLY and confidently. `partition` on a missing separator returns the
+    entire answer as the head, so the garbage becomes the scope token and the value
+    becomes empty; the empty value mismatches the written path, and the unknown-scope
+    arm then names the garbage as the scope that outranks us. That is a degrade either
+    way, so the decision is safe — but the reason is fabricated from a string git never
+    meant as a scope. Fail-closed AND honest is the bar here, not fail-closed alone.
+
+    Ablation (measured): drop the missing-separator branch and this fails on
+    `without naming a scope` — the reason becomes the unknown-scope one, blaming a
+    scope named `'garbage-with-no-nul'`."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+    activated = []
+
+    def unparseable_after_activation(worktree, *args):
+        if args[:2] == ("config", "--worktree"):
+            activated.append(args)
+            return real(worktree, *args)
+        if activated and "--get" in args and "core.excludesFile" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=0,
+                stdout=b"garbage-with-no-nul",
+                stderr=b"",
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", unparseable_after_activation)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert activated, "the fake never saw the activation — it answered the seed read instead"
+    assert reason is not None
+    assert "without naming a scope" in reason
+    # the raw answer is disclosed, repr'd as bytes: whoever reads the journal needs the
+    # thing git actually said, not this code's paraphrase of it
+    assert repr(b"garbage-with-no-nul") in reason
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
+def test_shield_accepts_a_command_scope_value_matching_its_own_write(
+    project, tmp_path, monkeypatch
+):
+    """The DECISION pin for #692: a byte-identical value activates the shield whatever
+    scope supplied it — including `command`, the scope every other test in this family
+    treats as the villain.
+
+    The post-condition this helper verifies is "git reads the file we wrote", and that
+    holds here: the ambient override names the shield's OWN private exclude, so the
+    patterns apply and the tool files are shielded. Refusing it for its PROVENANCE
+    would widen the degrade surface over a shield that demonstrably works, and the
+    natural shape of a scope-aware rewrite — `if scope != b"worktree": degrade` — does
+    exactly that. This test is what a future refactor hits.
+
+    Real git and a real environment channel rather than a fake, because the claim is
+    about what git resolves, and a fake that returns `command` plus the right path
+    would pin this code's arithmetic instead of git's precedence. `GIT_CONFIG_COUNT`
+    is the channel (it needs no quoting, so this runs on Windows too, unlike the
+    `GIT_CONFIG_PARAMETERS` arm above).
+
+    The private exclude's path is computed BEFORE the shield runs, because it is what
+    the override has to name — the shield writes and then re-reads it, so a path
+    composed after the fact would be reading the answer off the code under test.
+
+    NOTE, not a fault: the SEED read sees the override value too, since the override
+    points at the private exclude and the seed read runs before that file exists. It
+    therefore inherits nothing — which is correct, there being nothing yet to inherit —
+    and is why this test asserts the shield APPLIES rather than asserting on seeded
+    content.
+
+    Ablation: degrade whenever the answering scope is not `worktree` and this fails on
+    `reason is None` — a byte-identical answer refused for where it came from."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    private = _wt_private_exclude(wt)
+
+    with monkeypatch.context() as env:
+        env.setenv("GIT_CONFIG_COUNT", "1")
+        env.setenv("GIT_CONFIG_KEY_0", "core.excludesFile")
+        env.setenv("GIT_CONFIG_VALUE_0", str(private))
+
+        # Non-vacuity, inside the same environment and BEFORE the shield runs: the
+        # override really is in force and really is `command` scope. Without this the
+        # test would also pass on a git where the channel is inert — which is the exact
+        # failure mode that would make a proceed assertion meaningless.
+        assert (
+            git(wt, "config", "--show-scope", "--type=path", "--get", "core.excludesFile")
+            == f"command\t{private}"
+        )
+
+        reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is None
+    # and the shield is really in force, not merely un-refused
+    (wt / "probe-384").write_text("noise\n", encoding="utf-8")
+    assert "probe-384" not in git(wt, "status", "--porcelain", "-uall")
 
 
 def test_shield_dies_with_the_worktree(project, tmp_path):
@@ -3404,6 +5086,138 @@ def test_shield_refuses_to_enable_extension_over_core_bare(project, tmp_path):
     assert reason is not None and "core.bare" in reason
     assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     assert shared_exclude.read_bytes() == before
+
+
+def _trap_worktree_config_writes(monkeypatch):
+    """Booby-trap every WRITE of `extensions.worktreeConfig`, leaving every read real.
+
+    The refusal arm's whole claim is that nothing is written, and "the key still says
+    `off` afterwards" cannot carry that alone: `git config` rewriting a value the file
+    already holds leaves it byte-identical, so an enable that fired and was rolled back
+    reads exactly like one that never fired.
+
+    Patches BOTH bindings for the reason `_shield_on_git` gives, and guards the argv by
+    PREFIX rather than exact token: `"--get" not in args` is an exact-token test, so a
+    `--get-all` or `--get-regexp` READ misses it and would be raised on as a write — the
+    `_is_unset` trap above, run in the other direction. `--unset` spellings are writes
+    here too, which is deliberate: the rollback deleting an operator's line is the very
+    thing #396 is about."""
+    real = verify.git_bytes
+
+    def no_format_change(worktree, *args, timeout_s=None):
+        reads = any(a.startswith("--get") for a in args)
+        if args[:1] == ("config",) and "extensions.worktreeConfig" in args and not reads:
+            raise AssertionError(f"wrote the flag over an operator's own line: {args}")
+        return real(worktree, *args)
+
+    monkeypatch.setattr(verify, "git_bytes", no_format_change)
+    monkeypatch.setattr(install_mod, "git_bytes", no_format_change)
+
+
+def test_shield_refuses_to_enable_over_an_operator_explicit_false(project, tmp_path, monkeypatch):
+    """An `extensions.worktreeConfig` the operator explicitly turned OFF is a declaration,
+    and the shield stands down rather than overruling it (#396).
+
+    Before this the `--type=bool` probe read `off` as "not `true`" and reported
+    `needs_enable=True`: the SUCCESS path then rewrote the operator's line to `true`
+    permanently with nothing journaling what it replaced, and a failed activation's
+    `--unset-all` deleted the line outright and reported a clean rollback.
+
+    The fixture spells it `off` rather than `false` on purpose. The reason has to quote
+    what is really in the file, and `--type=bool` normalizes `off`/`no`/`0`/`FALSE` all to
+    `false` (measured rc 0 at 2.34.1 and 2.55.0), so a reason built from the probe's own
+    answer would tell the operator about a line they never wrote.
+
+    Ablation: delete the `carried is not None` refusal arm in
+    `_shield_enable_worktree_config` and this fails — the enable fires and the trap
+    raises."""
+    repo = project.project
+    shared = repo / ".git" / "config"
+    # `--file` rather than a scope, and BEFORE the worktree is mounted: this is the state
+    # an operator's repo is already in when provisioning arrives, not one this run made.
+    git(repo, "config", "--file", str(shared), "extensions.worktreeConfig", "off")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    shared_exclude = repo / ".git" / "info" / "exclude"
+    before = shared_exclude.read_bytes()
+    _trap_worktree_config_writes(monkeypatch)
+
+    reason = _worktree_local_exclude(wt, ["/probe-396"])
+
+    assert reason is not None and "explicitly disabling it" in reason
+    assert "'off'" in reason  # the RAW spelling, re-read for the reason
+    assert "'false'" not in reason  # non-vacuity: the bool probe's normalization did not win
+    assert "worktreeConfig = off" in shared.read_text(encoding="utf-8")
+    assert not _wt_private_exclude(wt).exists()
+    assert shared_exclude.read_bytes() == before
+
+
+def test_shield_refusal_preserves_a_doubled_disabled_flag(project, tmp_path, monkeypatch):
+    """The doubled-key shape, which is where the rollback did its most visible damage:
+    `--unset-all` removes EVERY line, so a repo declaring the flag twice lost both.
+
+    Written by hand rather than through `git config`, which de-duplicates. The two lines
+    are both disabled but spelled differently, which pins the measured reading the arm
+    rests on: `--type=bool --get` validates the whole file and answers the LAST line, so a
+    doubled disabled flag reaches the refusal at rc 0 rather than degrading, and the raw
+    read quotes that last spelling — `off`, not the leading `false` (2.34.1 and 2.55.0).
+
+    Ablation: delete the `carried is not None` refusal arm and this fails — the enable
+    fires and the trap raises."""
+    repo = project.project
+    shared = repo / ".git" / "config"
+    shared.write_text(
+        shared.read_text(encoding="utf-8")
+        + "[extensions]\n\tworktreeConfig = false\n\tworktreeConfig = off\n",
+        encoding="utf-8",
+    )
+    assert shared.read_text(encoding="utf-8").count("worktreeConfig") == 2  # non-vacuity
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    before = shared.read_bytes()
+    _trap_worktree_config_writes(monkeypatch)
+
+    reason = _worktree_local_exclude(wt, ["/probe-396"])
+
+    assert reason is not None and "explicitly disabling it" in reason
+    assert "'off'" in reason  # the LAST line's spelling, which is the one git answers
+    assert shared.read_bytes() == before  # byte-identical: neither line was touched
+    assert not _wt_private_exclude(wt).exists()
+
+
+def test_shield_valueless_flag_counts_as_carried_not_refused(project, tmp_path, monkeypatch):
+    """A VALUELESS `worktreeConfig` line is not an explicit disable, and the refusal above
+    must not swallow it: git reads a key written with no `=` as boolean TRUE (measured rc
+    0, `true`, at 2.34.1 and 2.55.0), so the repo already carries the flag and the shield
+    proceeds with nothing to write.
+
+    This is the claim the refusal arm rests on, which is why it is pinned rather than
+    argued. The arm tests the `--type=bool` probe's NORMALIZED answer instead of the
+    stored text precisely because the stored text here is the empty string, which any
+    truthiness reading calls false.
+
+    Ablation: make the already-carried test read raw truthiness (drop `--type=bool` and
+    test the value) and this fails — the empty stored value reads falsy, the valueless
+    line is refused as a disable, and the shield stands down over a repo that carried the
+    flag all along."""
+    repo = project.project
+    shared = repo / ".git" / "config"
+    shared.write_text(
+        shared.read_text(encoding="utf-8") + "[extensions]\n\tworktreeConfig\n",
+        encoding="utf-8",
+    )
+    # non-vacuity, and this test's own precondition: git must read the hand-written line
+    # as boolean true while the RAW read answers rc 0 with nothing at all.
+    assert git(repo, "config", "--type=bool", "--get", "extensions.worktreeConfig") == "true"
+    assert git(repo, "config", "--get", "extensions.worktreeConfig") == ""
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    _trap_worktree_config_writes(monkeypatch)
+
+    reason = _worktree_local_exclude(wt, ["/probe-396"])
+
+    assert reason is None  # already carried: the shield applied, with nothing to enable
+    assert _wt_private_exclude(wt).exists()
 
 
 def test_shield_refuses_a_repository_shared_between_os_users(project, tmp_path):
@@ -3761,30 +5575,6 @@ def test_shield_keeps_edge_whitespace_in_the_common_dir(tmp_path):
     assert not (tmp_path / "common").exists()  # no stripped sibling was created
 
 
-@pytest.mark.parametrize(
-    ("reported", "supported"),
-    [
-        ("git version 2.20.0\n", True),  # the boundary itself
-        ("git version 2.19.4\n", False),  # one minor below it
-        ("git version 2.9.5\n", False),  # numeric, not lexicographic: "9" > "20" as text
-        ("git version 2.44.0.windows.1\n", True),
-        ("git version 2.39.5 (Apple Git-154)\n", True),
-        ("git version 3.0\n", True),
-        ("", False),  # nothing at all: a spawn that produced no stdout
-        ("fatal: not a git repository\n", False),
-        # No `git version` prefix. Refused deliberately: a bare-number answer is
-        # not this program's output, and the caller is about to make a permanent
-        # repo-format change on the strength of it.
-        ("2.55.0\n", False),
-    ],
-)
-def test_git_version_at_least_reads_only_a_git_version_line(reported, supported):
-    """The parse behind the shield's 2.20 gate. Unreadable answers must come back
-    False, because the caller reads False as "do not touch this repository" — an
-    optimistic parse is the only failure mode that costs anything."""
-    assert _git_version_at_least(reported, (2, 20)) is supported
-
-
 def test_shield_refuses_when_the_core_worktree_probe_cannot_answer(project, tmp_path, monkeypatch):
     """A safety probe that could not be ANSWERED must not read as "that key is unset".
     `core.worktree` is genuinely set here, and the shield must refuse exactly as it
@@ -3841,9 +5631,10 @@ def test_shield_refuses_when_the_core_bare_probe_cannot_answer(project, tmp_path
     both, and a fix applied to one arm only would leave this one open.
 
     `--type=bool` gives this probe a second way to fail that the plain read has not:
-    across the supported git range, `--type=bool` over a non-bool value exits 128
-    (the wording differs by version — "bad numeric config value" at the floor, "bad
-    boolean config value" at current — same rc). Note that no STATIC config value
+    across the supported git range, `--type=bool` over a non-bool value exits 128. The
+    MESSAGE is deliberately not relied on — older git says "bad numeric config value"
+    where current git says "bad boolean config value" — and the rc being the stable
+    half is exactly why the code keys on it. Note that no STATIC config value
     can reach that: a repo whose
     `core.bare` is a non-bool fatals the caller's earlier `rev-parse` first (measured
     128 at both). What reaches here is a transient fault inside the caller's lock.
@@ -3923,21 +5714,42 @@ def test_shield_refuses_when_the_extension_probe_cannot_answer(project, tmp_path
     assert not _wt_private_exclude(wt).exists()
 
 
+def _shield_on_git(monkeypatch, reported):
+    """Run the shield against a faked `git version`, with the format-change write
+    booby-trapped. Every other call reaches the real repo, so the callers' assertions
+    read the actual shared config rather than a stub's log — and the enable RAISES
+    rather than no-oping, because "the key is absent afterwards" would also hold if
+    the write had merely failed.
+
+    Patches BOTH bindings on purpose. `install.py` does `from .verify import
+    git_bytes`, which is a separate name from `verify.git_bytes`: the version probe
+    now runs inside `verify.git_below_floor` and resolves the latter, while the
+    booby-trapped config write runs in `install` and resolves the former. Patching
+    one alone leaves the other live — silently, and in the direction that fakes
+    nothing."""
+    real = verify.git_bytes
+
+    def ancient(worktree, *args, timeout_s=None):
+        if args == ("version",):
+            return subprocess.CompletedProcess(
+                args=["git", "version"], returncode=0, stdout=reported.encode(), stderr=b""
+            )
+        if args[:1] == ("config",) and "extensions.worktreeConfig" in args and "--get" not in args:
+            raise AssertionError(f"made a permanent format change on {reported!r}: {args}")
+        return real(worktree, *args)
+
+    monkeypatch.setattr(verify, "git_bytes", ancient)
+    monkeypatch.setattr(install_mod, "git_bytes", ancient)
+
+
 def test_shield_refuses_to_enable_extension_over_old_git(project, tmp_path, monkeypatch):
-    """`extensions.worktreeConfig` and `git config --worktree` are both git 2.20.
-    Below that the write buys a PERMANENT repo-format change that shields nothing —
-    and git-worktree(1) says older git refuses a repository carrying the extension.
-    So the version is checked before any of it.
+    """A git far below the floor never reaches the permanent repo-format change.
 
-    The gate also sits above the two probes underneath it on purpose: `--type=` is
-    git 2.18, so on an older git the `core.bare` read exits non-zero and is read as
-    "not bare" — the safety gate opening silently. Refusing here keeps that pair
-    unreachable.
-
-    Only the `version` call is faked; every other call runs against the real repo,
-    so the assertion below reads the actual shared config rather than a stub's log.
-    The enable is ALSO made to raise, because "the key is absent afterwards" would
-    hold if the write merely failed.
+    2.19.4 also predates the features themselves (`extensions.worktreeConfig` and
+    `git config --worktree` are git 2.20, `--type=` is 2.18), so this case was
+    refused before the floor moved and is refused after — it pins the FLOOR-INDEPENDENT
+    half. `test_shield_refuses_to_enable_extension_at_the_old_capability_floor` is the
+    one that proves the floor itself moved.
 
     Ablation: delete the version gate in `_shield_enable_worktree_config` and this
     fails — the enable fires, the fake raises, and the key lands in the config."""
@@ -3945,27 +5757,44 @@ def test_shield_refuses_to_enable_extension_over_old_git(project, tmp_path, monk
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
     shared_before = (repo / ".git" / "info" / "exclude").read_bytes()
-    real = install_mod.git_bytes
-
-    def ancient(worktree, *args):
-        if args == ("version",):
-            return subprocess.CompletedProcess(
-                args=["git", "version"], returncode=0, stdout=b"git version 2.19.4\n", stderr=b""
-            )
-        if args[:1] == ("config",) and "extensions.worktreeConfig" in args and "--get" not in args:
-            raise AssertionError(f"made a permanent format change on git 2.19.4: {args}")
-        return real(worktree, *args)
-
-    monkeypatch.setattr(install_mod, "git_bytes", ancient)
+    _shield_on_git(monkeypatch, "git version 2.19.4\n")
 
     reason = _worktree_local_exclude(wt, ["/probe-384"])
 
-    assert reason is not None and "2.19.4" in reason and "git 2.20" in reason
+    assert reason is not None and "2.19.4" in reason and verify.git_floor_text() in reason
     # the repo's own format is untouched. Read as TEXT for the reason the sibling
     # refusal tests give: conftest's git() is check=True and an unset key exits 1.
     assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     assert not _wt_private_exclude(wt).exists()
     assert (repo / ".git" / "info" / "exclude").read_bytes() == shared_before
+
+
+def test_shield_refuses_to_enable_extension_at_the_old_capability_floor(
+    project, tmp_path, monkeypatch
+):
+    """git 2.25 HAS `extensions.worktreeConfig`, `git config --worktree` and
+    `--type=`. The shield would work on it. It is refused anyway, because the gate is
+    the PROJECT support floor rather than a capability threshold — this is the
+    behavior the floor bump actually changed, and the 2.19.4 sibling above cannot
+    show it (that one was refused under the old 2.20 gate too).
+
+    The message must read as a POLICY refusal. A capability sentence here would be
+    false: 2.25 is not missing anything the shield uses.
+
+    Ablation: point the gate back at (2, 20) — restore a local constant or pass it
+    explicitly — and this fails: 2.25 clears 2.20, the enable fires, the fake
+    raises."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    _shield_on_git(monkeypatch, "git version 2.25.1\n")
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "2.25.1" in reason and verify.git_floor_text() in reason
+    assert "supports git" in reason  # policy wording, not a capability claim
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    assert not _wt_private_exclude(wt).exists()
 
 
 def test_shield_degrade_leaves_no_permanent_repo_format_change(project, tmp_path, monkeypatch):
@@ -4593,6 +6422,72 @@ def test_shield_rollback_scan_fault_is_reported_not_raised(project, tmp_path, mo
     assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
 
 
+def test_shield_rollback_stderr_decode_fault_is_reported_not_raised(project, tmp_path, monkeypatch):
+    """The OTHER block of the same never-raises promise, and the same fault shape (#394).
+
+    Where the sibling test above covers the dependents scan, this covers the `--unset-all`
+    block one down: it decodes git's stderr with `os.fsdecode` to name why the rollback
+    failed, and that decode was guarded for `GitError` alone — so a codec fault escaped a
+    function contracted never to raise, replacing BOTH the activation fault and the
+    retained-flag disclosure with the caller's generic tail reason.
+
+    The fault is INJECTED rather than produced from real bytes, for the reason the issue's
+    testability note gives: POSIX `os.fsdecode` decodes with `surrogateescape` and cannot
+    raise, so the real-world trigger is Windows-only (utf-8/surrogatepass rejects a lone
+    invalid byte). Same justification as the sibling's injected `resolve()` fault.
+
+    Driven at the helper rather than through `_worktree_local_exclude`, and for the same
+    reason: an end-to-end injection would fire on an earlier same-shaped `fsdecode` — the
+    caller decodes `rev-parse`'s stderr before the rollback is ever reached — and prove
+    something else. The `os.fsdecode` fake is predicate-scoped to the marker bytes so
+    every other decode in the process keeps working.
+
+    Ablation: restore the bare `except GitError` at the `--unset-all` block and this test
+    errors — the injected UnicodeDecodeError escapes a function contracted never to
+    raise."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    git_dir = Path(git(wt, "rev-parse", "--absolute-git-dir")).resolve()
+    common = Path(git(wt, "rev-parse", "--git-common-dir")).resolve()
+    # the scan must find no dependent, or the helper returns before the decode under test
+    assert not (common / "config.worktree").exists()
+    marker = b"fatal: could not lock config file \xff"
+    real_git_bytes, real_fsdecode = install_mod.git_bytes, os.fsdecode
+
+    def unset_fails(worktree, *args, timeout_s=None):
+        # An exact-argv match, and the `_is_unset` tripwire lesson does not bite here:
+        # a spelling drift makes this fake stop matching, the REAL unset then answers
+        # rc 5 for an absent key, and the helper returns "" — which reddens the clause
+        # assertions below rather than going quiet.
+        if args == ("config", "--unset-all", "extensions.worktreeConfig"):
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=2, stdout=b"", stderr=marker
+            )
+        return real_git_bytes(worktree, *args, timeout_s=timeout_s)
+
+    def undecodable(value):
+        if value == marker:
+            raise UnicodeDecodeError("utf-8", b"\x62", 0, 1, "injected")
+        return real_fsdecode(value)
+
+    monkeypatch.setattr(install_mod, "git_bytes", unset_fails)
+    monkeypatch.setattr(os, "fsdecode", undecodable)
+
+    clause = _shield_undo_extension(wt, git_dir, common)
+
+    # before ANY assertion: a globally patched `os.fsdecode` must not outlive the call
+    monkeypatch.undo()
+    assert isinstance(clause, str) and clause  # reported, not raised...
+    assert "could NOT be" in clause  # ...with the hedge the caller's tail cannot give
+    # names the injected decode as the cause, separating it from "git exited 2": the
+    # rc-2 branch is what the escape used to skip past
+    assert "injected" in clause
+    # the flag survives — the fake is why, and the clause is the only thing that says so
+    assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
 def test_shield_rolls_back_inside_the_lock(project, tmp_path, monkeypatch):
     """The ROLLBACK has to happen while the lock is still held, and that placement is
     load-bearing rather than incidental: released first, a second run probes in the
@@ -5083,9 +6978,11 @@ def test_shield_dedupe_does_not_split_on_non_git_line_breaks(project, tmp_path):
     `\\x85` as well as on newlines; git treats none of those as a line boundary, and
     every one of them is a legal byte in a POSIX filename. So a legitimate pattern
     containing one fragmented into two wrong dedupe keys, the identical pattern then
-    read as absent, and it was appended a second time. `bytes.splitlines()` splits on
-    `\\n`, `\\r` and `\\r\\n` only — git's own boundary set (it also strips a trailing
-    `\\r`, which is why `\\r` costs nothing here).
+    read as absent, and it was appended a second time. Splitting the bytes on `\\n`
+    keeps every one of those inside its line, which is what git does. (`bytes.splitlines()`
+    was the first cure and is close enough for THIS row, since it does not break on
+    `\\x0c` either — but it breaks on a lone `\\r`, which git does not, and that is a
+    separate fault with its own tests below (#472).)
 
     Asserted on the bytes rather than through `git status`: the subject is which
     dedupe KEY the pattern produces, and a `\\x0c` in a filename is POSIX-only
@@ -5104,6 +7001,102 @@ def test_shield_dedupe_does_not_split_on_non_git_line_breaks(project, tmp_path):
     assert _worktree_local_exclude(wt, ["weird\x0cpattern", "/probe-384"]) is None
 
     assert _wt_private_exclude(wt).read_bytes() == b"weird\x0cpattern\n/probe-384\n"
+
+
+def test_shield_dedupe_survives_lone_cr_operator_line(project, tmp_path):
+    """A lone `\\r` is CONTENT to git, not a line boundary (#472) — and the dedupe has to
+    agree with git or it skips an append the shield needs.
+
+    `bytes.splitlines()` breaks on a bare `\\r`, so an operator line spelled
+    `/.claude/skills\\rjunk` — which ignores NOTHING (measured, git 2.55.0) — fragmented
+    into a `/.claude/skills` dedupe key. The writer read its own pattern as ALREADY
+    PRESENT, declined to append it, and the shield produced a file that does not shield:
+    silent, because nothing failed and no degrade reason was reported. The settled-set
+    rule cannot save this one — the fragment sits after the last negation, which is
+    precisely the window that rule trusts.
+
+    Both halves are asserted and neither substitutes for the other: the exclude's bytes
+    say the append happened, and git's own answer says the seeded skills are unstageable.
+    A file whose content is right can still be pointed at by nothing.
+
+    Read as BYTES throughout: `Path.read_text()` normalizes a lone `\\r` to `\\n`, which
+    would launder the exact byte under test out of the fixture and the assertion alike.
+
+    Ablation (run): restore `lines = existing.splitlines()`. The append assertion is the
+    first to fail, on an exclude holding `/.claude/skills\\rjunk` and no plain spelling;
+    neutralize that line and THE HARM row fails too, staging the seeded
+    `.claude/skills/**/SKILL.md` files. Both were run — the harm is the reason, the
+    append assertion is only the earlier symptom."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    pattern = os.fsencode(f"/{tree}")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    users = tmp_path / "my-global-ignores"
+    operator = b"!x\n" + pattern + b"\rjunk\n"
+    # Non-vacuity, both directions, before anything runs: the fixture really does express
+    # the fault. The OLD tokenizer yields the wanted pattern as a settled fragment (so it
+    # skips), and the git-faithful one does not (so the append is genuinely owed).
+    assert pattern in operator.splitlines()[1:]
+    assert pattern not in operator.split(b"\n")
+    users.write_bytes(operator)
+    git(repo, "config", "core.excludesFile", str(users))
+
+    provision_worktree(wt, [claude], repo)
+
+    assert pattern in _wt_private_exclude(wt).read_bytes().split(b"\n")
+    # Non-vacuity: there is something under the tree to leak, so "nothing staged" below
+    # is the shield holding rather than an empty directory.
+    assert any((wt / tree).rglob("*"))
+    # THE HARM, through git's own answer.
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert not [p for p in staged if p.startswith(f"{tree}/")]
+
+
+def test_shield_dedupe_still_skips_a_settled_effective_line(project, tmp_path):
+    """The other direction of the same tokenizer (#472): a line git DOES read as the
+    wanted pattern must still dedupe, or every re-provision appends another copy and the
+    private exclude grows without bound.
+
+    The fixture is CRLF, which is the half of the tokenizer nothing else pins. Git trims
+    exactly ONE trailing `\\r` from an exclude line (measured, 2.55.0: `/hidden\\r\\n`
+    ignores `hidden`, `/hidden\\r\\r\\n` does not), so a CRLF `/.claude/skills` line IS the
+    wanted pattern and a second copy would be pure noise. An operator on Windows editing
+    their global ignores is the ordinary way to arrive here.
+
+    Occurrence-counted rather than compared against a whole expected file: the operator's
+    prefix rides along verbatim, and the subject is how many times this one pattern lands.
+
+    Ablation (run): drop the `removesuffix(b"\\r")` — the settled key keeps its `\\r`, the
+    pattern reads as absent, and this fails on the count with `/.claude/skills` present
+    twice. Note the byte-identical re-provision assertion does NOT redden under it: the
+    appended plain-spelled copy dedupes the SECOND run, so the count is what bites."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    pattern = os.fsencode(f"/{tree}")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    users = tmp_path / "my-global-ignores"
+    users.write_bytes(b"!x\r\n" + pattern + b"\r\n")
+    git(repo, "config", "core.excludesFile", str(users))
+    msgs: list[str] = []
+
+    provision_worktree(wt, [claude], repo, on_degraded=msgs.append)
+    first = _wt_private_exclude(wt).read_bytes()
+    provision_worktree(wt, [claude], repo, on_degraded=msgs.append)
+
+    assert msgs == []
+    assert _wt_private_exclude(wt).read_bytes() == first
+    # The operator's own line is the only occurrence: the dedupe skipped the append.
+    assert first.count(pattern) == 1
+    # ... and skipping was SAFE, because that line is effective. Asserted through git,
+    # since "present" and "effective" are the two things #384 proved are not the same.
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert not [p for p in staged if p.startswith(f"{tree}/")]
 
 
 def test_shield_appends_a_pattern_an_inherited_negation_would_cancel(project, tmp_path):
@@ -5342,6 +7335,275 @@ def test_shield_degrades_when_git_will_not_resolve_its_home_directory(
     assert "probe-384" in git(wt, "status", "--porcelain", "-uall")
 
 
+def _shield_on_reported_git_version(monkeypatch, reported):
+    """Answer `git version` with `reported`; every other call reaches the real git.
+
+    The APPDATA arm of `_shield_home_git_ignore` asks git what it IS rather than
+    asking the OS what it is running on (#403), so the only thing a test has to fake
+    is that one answer — no `sys.platform` patch, and the rest of the shield runs
+    against the real repo and the real linked worktree.
+
+    Patches BOTH bindings, like `_shield_on_git` above and for the same reason:
+    `install.py` does `from .verify import git_bytes`, which is a name distinct from
+    `verify.git_bytes`. The new arm resolves the `install` one while
+    `verify.git_below_floor`'s own floor probe resolves the `verify` one, and patching
+    either alone leaves the other live — silently, in the direction that fakes
+    nothing. Unlike `_shield_on_git` the config write is NOT booby-trapped: these
+    tests drive the shield to completion and then read the file it seeded.
+
+    Returns the argv log, so a test can refuse to pass on a fake that was never
+    consulted."""
+    real = verify.git_bytes
+    seen: list[tuple[str, ...]] = []
+
+    def reporting(worktree, *args, timeout_s=None):
+        if args == ("version",):
+            seen.append(args)
+            return subprocess.CompletedProcess(
+                args=["git", "version"], returncode=0, stdout=reported.encode(), stderr=b""
+            )
+        return real(worktree, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "git_bytes", reporting)
+    monkeypatch.setattr(install_mod, "git_bytes", reporting)
+    return seen
+
+
+def _appdata_and_home_ignores(tmp_path, *, appdata_shape="file"):
+    """A `$HOME` global ignore and (optionally) an `%APPDATA%` one, distinguishable.
+
+    Both carry a pattern of their own so that "seeded the wrong file" and "seeded
+    nothing" are different observations — the second is exactly the silent failure
+    #403 describes, so a test that cannot tell them apart proves nothing."""
+    home = tmp_path / "githome"
+    (home / ".config" / "git").mkdir(parents=True)
+    (home / ".config" / "git" / "ignore").write_text("home-junk.tmp\n", encoding="utf-8")
+    appdata = tmp_path / "appdata"
+    # The four shapes git's `lstat` predicate can meet at `%APPDATA%/Git/ignore`. They
+    # are NOT interchangeable: git reads a file, silently skips a broken symlink, and
+    # dies on a directory, so the shield owes each a different answer.
+    if appdata_shape == "directory":
+        (appdata / "Git" / "ignore").mkdir(parents=True)
+    elif appdata_shape == "broken-symlink":
+        (appdata / "Git").mkdir(parents=True)
+        (appdata / "Git" / "ignore").symlink_to(tmp_path / "nowhere")
+    elif appdata_shape == "file":
+        (appdata / "Git").mkdir(parents=True)
+        (appdata / "Git" / "ignore").write_text("appdata-junk.tmp\n", encoding="utf-8")
+    else:
+        assert appdata_shape == "absent", appdata_shape
+        appdata.mkdir(parents=True)
+    return home, appdata
+
+
+def _drive_shield(project, tmp_path, monkeypatch, *, reported, appdata_shape="file"):
+    """Run the shield over a real worktree against a faked `git version`; return its
+    degrade reason (None when it applied) and the private exclude's lines.
+
+    The env is pinned inside a `monkeypatch.context()` because conftest's
+    session-scoped `_isolate_ambient_git_ignores` pins `XDG_CONFIG_HOME` for every
+    test, and the caller only reaches `_shield_home_git_ignore` when that variable is
+    unset AND `core.excludesFile` is unset (which conftest already arranges by
+    pointing `GIT_CONFIG_GLOBAL` at a file that does not exist). `GIT_CONFIG_NOSYSTEM`
+    is deliberately NOT pinned, for the reason conftest records: it would suppress Git
+    for Windows' system `core.autocrlf`. A system-level `core.excludesFile` would send
+    the shield down the branch above instead, and every caller here asserts on BOTH a
+    pattern that must be seeded and one that must not, so that case fails loudly
+    rather than passing vacuously."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    home, appdata = _appdata_and_home_ignores(tmp_path, appdata_shape=appdata_shape)
+    seen = _shield_on_reported_git_version(monkeypatch, reported)
+
+    with monkeypatch.context() as pinned:
+        pinned.delenv("XDG_CONFIG_HOME", raising=False)
+        pinned.setenv("HOME", str(home))
+        pinned.setenv("APPDATA", str(appdata))
+        reason = _worktree_local_exclude(wt, ["/probe-403"])
+
+    assert seen, "the fake never answered `git version` — the shield read a real one"
+    private = _wt_private_exclude(wt)
+    lines = private.read_text(encoding="utf-8").splitlines() if private.is_file() else []
+    return reason, lines
+
+
+def _seed_with(project, tmp_path, monkeypatch, *, reported, appdata_shape="file"):
+    """`_drive_shield` for the APPLIED case: refuses a degrade, returns the lines."""
+    reason, lines = _drive_shield(
+        project, tmp_path, monkeypatch, reported=reported, appdata_shape=appdata_shape
+    )
+    assert reason is None, f"the shield degraded instead of applying: {reason}"
+    return lines
+
+
+def test_shield_prefers_appdata_ignore_on_the_windows_fork(project, tmp_path, monkeypatch):
+    """On Git for Windows >= 2.46 the operator's global ignores live at
+    `%APPDATA%\\Git\\ignore`, and that is the file the shield must copy (#403).
+
+    The fork patches `xdg_config_home_for` (`git-for-windows/git`, `path.c`) to prefer
+    `%APPDATA%/Git/<file>` over the `$HOME/.config/git/<file>` upstream computes,
+    whenever the APPDATA one exists — and when BOTH exist it warns that the `$HOME`
+    one "was ignored because" the APPDATA one is there. They are alternative
+    locations, not a search path.
+
+    PROVENANCE: that is a SOURCE READ of the fork (counted per tag through #403:
+    present at 2.46 and 2.55, absent at 2.45 and 2.20, absent upstream), **not a
+    measurement**. No Windows machine was available to observe it, and Windows CI
+    could not have supplied one either — its runners carry no `%APPDATA%\\Git\\ignore`.
+    So this test pins OUR selection logic against a version string we state; it cannot
+    and does not claim Git for Windows agrees.
+
+    Both files exist here, which folds the mirror direction in: preferring APPDATA is
+    the same assertion as not seeding the `$HOME` file git itself is ignoring. Seeding
+    that one would copy patterns git is not applying, and the worktree would
+    OVER-ignore — session-created files going silently missing from `git add -A`,
+    #384's harm inverted.
+
+    Ablation: delete the whole APPDATA arm and this fails — `home-junk.tmp` is seeded
+    and `appdata-junk.tmp` is not, which is the pre-fix behavior exactly."""
+    seeded = _seed_with(project, tmp_path, monkeypatch, reported="git version 2.46.0.windows.1\n")
+
+    assert "appdata-junk.tmp" in seeded
+    assert "home-junk.tmp" not in seeded
+
+
+def test_shield_appdata_ignore_needs_the_246_fork(project, tmp_path, monkeypatch):
+    """2.45.0.windows.1 is the same FORK without the patch, and it reads `$HOME`.
+
+    The preference arrived at 2.46 (`APPDATA` is absent from `path.c` at
+    2.45.0.windows.1 and 2.20.0.windows.1, counted per tag through #403), far above
+    this project's own `GIT_FLOOR`. So "APPDATA exists, prefer it" is not enough on
+    its own: on an older Git for Windows it would seed a file git is not reading and
+    the worktree would over-ignore — the same silent loss the fix exists to stop,
+    aimed the other way.
+
+    Ablation: delete the `git_version_at_least` conjunct and this fails —
+    `appdata-junk.tmp` is seeded off a fork that never had the patch."""
+    seeded = _seed_with(project, tmp_path, monkeypatch, reported="git version 2.45.0.windows.1\n")
+
+    assert "home-junk.tmp" in seeded
+    assert "appdata-junk.tmp" not in seeded
+
+
+def test_shield_appdata_ignore_is_the_forks_not_the_platforms(project, tmp_path, monkeypatch):
+    """A current UPSTREAM git ignores `%APPDATA%` however new it is, so the gate reads
+    the fork string rather than the platform (#403).
+
+    `APPDATA` appears nowhere in `git/git`'s `path.c` at any version, so 2.55.0
+    upstream is above the 2.46 floor and still has no such preference. That is why
+    this gate is not `sys.platform == "win32"`: Cygwin, MSYS2 and WSL gits all run on
+    Windows hardware and are all upstream builds, and a platform test would hand every
+    one of them the wrong file. Asking git what it IS also keeps this test honest —
+    it fakes a version string, never a platform, and so it exercises the real code
+    path on the box it runs on.
+
+    Ablation: delete the `".windows." in reported` conjunct and this fails —
+    `appdata-junk.tmp` is seeded off an upstream git that would never read it."""
+    seeded = _seed_with(project, tmp_path, monkeypatch, reported="git version 2.55.0\n")
+
+    assert "home-junk.tmp" in seeded
+    assert "appdata-junk.tmp" not in seeded
+
+
+def test_shield_appdata_ignore_directory_degrades_instead_of_seeding_empty(
+    project, tmp_path, monkeypatch
+):
+    """A DIRECTORY at `%APPDATA%\\Git\\ignore` is selected by git and then UNUSABLE by it,
+    so the shield stands down rather than modelling that fatal as an empty seed.
+
+    Git's predicate is `lstat` (`file_exists`, `dir.c`), so `xdg_config_home_for`
+    selects a directory exactly as it selects a file. Reading it is where the two part:
+    `access(R_OK)` succeeds on a readable directory, so git reaches
+    `add_patterns_from_file_1` and dies — "cannot use %s as an exclude file".
+
+    Seeding nothing here would be the WRONG mirror. The shield's activation writes a
+    worktree-scoped `core.excludesFile`, which SHADOWS the broken path, so the unit's
+    `git add -A` would run happily inside the worktree where the operator's own git
+    refuses to run at all — a misconfiguration silently masked, and files staged where
+    the unshielded command would have halted. An unusable answer is UNKNOWN, not empty,
+    which is the same reading this module already gives an unresolvable `$HOME`.
+
+    PROVENANCE: source read of the fork, as the sibling tests record — the version
+    string is faked and nothing here was measured on Windows.
+
+    Ablation: drop the `is_dir()` refusal and this fails — the shield applies, `reason`
+    comes back None, and the private exclude carries `/probe-403` with no inherited
+    patterns, which is the masked-fatal shape exactly."""
+    reason, _lines = _drive_shield(
+        project,
+        tmp_path,
+        monkeypatch,
+        reported="git version 2.46.0.windows.1\n",
+        appdata_shape="directory",
+    )
+
+    assert reason is not None
+    assert "is a directory" in reason
+    # ...and it named the path, so the operator can find the thing to repair.
+    assert str(tmp_path / "appdata") in reason
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_shield_appdata_ignore_broken_symlink_seeds_empty_not_a_refusal(
+    project, tmp_path, monkeypatch
+):
+    """A BROKEN SYMLINK there is selected too, and unlike a directory it must NOT refuse.
+
+    This is the discriminator for the refusal above: git's `lstat` predicate accepts
+    both shapes, but its READ path treats them differently. `access(R_OK)` follows the
+    link to a missing target, giving `ENOENT`, which `access_error_is_ok` classifies as
+    an ignorable missing file — so git prints nothing, loads no patterns, and runs on.
+
+    An empty inherited seed mirrors that precisely, and refusing here instead would
+    stand the shield down over a configuration git itself is perfectly happy with. The
+    `$HOME` file must not be seeded either: git selected the APPDATA path and is not
+    reading `$HOME` at all.
+
+    Ablation: widen the `is_dir()` refusal to any non-regular candidate and this fails —
+    the shield degrades over a repo whose git runs fine."""
+    reason, lines = _drive_shield(
+        project,
+        tmp_path,
+        monkeypatch,
+        reported="git version 2.46.0.windows.1\n",
+        appdata_shape="broken-symlink",
+    )
+
+    assert reason is None, reason
+    assert "home-junk.tmp" not in lines
+    assert "appdata-junk.tmp" not in lines
+    # ...and the shield still RAN: the inherited seed is empty, not the whole file.
+    assert "/probe-403" in lines
+
+
+def test_shield_appdata_absent_file_keeps_the_home_fallback(project, tmp_path, monkeypatch):
+    """`%APPDATA%` set with no `Git/ignore` under it is the ORDINARY case on the fork,
+    and it must reach `$HOME` — the preference is conditional on the file existing.
+
+    The `_shield_file_exists` precondition mirrors the fork's own `file_exists` guard:
+    git does not prefer a path that is not there, it computes the `$HOME` one instead.
+    Dropping it
+    would not merely seed the wrong file, it would seed NOTHING — a non-existent
+    source reads as an empty seed with `reason is None`, after which the caller
+    activates a worktree-scoped `core.excludesFile` that SHADOWS the operator's real
+    global ignores. That is #403's own harm, and it is silent.
+
+    Ablation: drop the `_shield_file_exists` precondition and this fails — the arm
+    returns the absent candidate, the seed comes back empty, and `home-junk.tmp` is
+    missing."""
+    seeded = _seed_with(
+        project,
+        tmp_path,
+        monkeypatch,
+        reported="git version 2.46.0.windows.1\n",
+        appdata_shape="absent",
+    )
+
+    assert "home-junk.tmp" in seeded
+    assert "/probe-403" in seeded  # ...and the seed is not empty for some other reason
+
+
 def test_shield_seeds_a_relative_xdg_config_home_resolved_like_git(project, tmp_path, monkeypatch):
     """The relative-path defect of the `core.excludesFile` branch, at the XDG fallback
     branch (#384). This branch exists to REPRODUCE git's fallback, so
@@ -5405,10 +7667,9 @@ def test_shield_honors_an_explicitly_empty_excludesfile(project, tmp_path, monke
     status` shows it untracked. The mechanism is in git's source rather than inferred —
     `dir.c::setup_standard_excludes` guards the XDG fallback on `if (!excludes_file)`, a
     NULL POINTER, while an empty value resolves through `interpolate_path("")` to a
-    non-NULL empty string, and that guard is unchanged from this shield's 2.20 floor to
-    current. It is undocumented: `core.adoc` says only "Defaults to
-    $XDG_CONFIG_HOME/git/ignore" — the same standing as the relative-value behavior
-    the sibling test above pins.
+    non-NULL empty string, and that guard is unchanged from git 2.20 to current. It is
+    undocumented: `core.adoc` says only "Defaults to $XDG_CONFIG_HOME/git/ignore" — the
+    same standing as the relative-value behavior the sibling test above pins.
 
     `GIT_CONFIG_NOSYSTEM` is deliberately NOT pinned, unlike the XDG sibling: a
     repo-LOCAL key already outranks a global one, so there is nothing to suppress, and
@@ -5804,7 +8065,7 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
     # Dispatches on the subcommand, because the shield asks git several questions
     # now and a stub that answered them all identically would not get past the
     # first. `shift 2` drops the `-C <worktree>` every call carries. The version
-    # clears the 2.20 gate and the extension reads as already enabled, so the stub is
+    # clears the version gate and the extension reads as already enabled, so the stub is
     # never asked to change repo state.
     #
     # `rev-parse` dispatches one level further, on the FLAG, because the shield asks
@@ -5813,18 +8074,31 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
     # of the flag is what real git does not do, and it would hand the helper one
     # two-line "path" for each dir, making them equal and reading as a main checkout.
     #
-    # `core.excludesFile` is asked TWICE with byte-identical argv — once to seed the
-    # private file from whatever applies now, and once after the activation to verify
-    # the written key is the one git resolves. Real git tells them apart by STATE, not
-    # by the arguments, so the stub has to as well: unset before the activation (git's
+    # `core.excludesFile` is asked TWICE, and since #692 the two reads are no longer
+    # byte-identical in argv: the seed read asks plainly, the post-activation
+    # verification adds `--show-scope`. They are still told apart by STATE below,
+    # because that is how real git tells them apart — unset before the activation (git's
     # own rc 1, which sends the seed down its XDG branch) and the activated path after.
-    # A stub that answered one way for both would either strand the seed or fail the
-    # verification, and in each case for a reason having nothing to do with #374.
+    # The `--show-scope` arm is keyed on the flag only so it can answer in the SHAPE
+    # that read now parses; it must precede the plain arm, which would otherwise catch
+    # it. A stub that answered one way for both would either strand the seed or fail the
+    # verification, in each case for a reason having nothing to do with #374.
+    #
+    # That shape is `scope NUL value`, and the seam NUL is now REQUIRED: without it the
+    # verification reads the whole answer as a scope token and degrades as unparseable.
+    # So an un-updated stub reds the tail assertion with "could not activate … without
+    # naming a scope", which looks like a #374 regression and is not one.
+    #
     # No external commands — PATH is replaced below, so `cat` would not resolve;
-    # `read`, `printf` and `[` are shell builtins. Written without a trailing NUL on
-    # purpose: the reader splits on the first one and takes what precedes it, so
-    # emitting none leaves the whole payload, and `\000` through `printf` is not
-    # portable across the shells that may be /bin/sh here.
+    # `read`, `printf` and `[` are shell builtins. `printf '\000'` emitting a real NUL is
+    # MEASURED, not assumed, on both shells that can be `/bin/sh` where this test runs:
+    # bash, and the dash that is `/bin/sh` on the Ubuntu CI runner (measured in
+    # ubuntu:22.04 and ubuntu:latest). An earlier version of this comment asserted the
+    # opposite — that `\000` through `printf` was not portable here — which the
+    # measurement refutes; a shell that did drop it would red this test loudly on that
+    # seam, and the fallback is a `#!{sys.executable}` stub. The payload still carries no
+    # TRAILING NUL on purpose: the reader splits on the first one and takes what
+    # precedes it, so emitting none leaves the whole value.
     activated = os.fsencode(str(tmp_path / "activated"))
     stub.write_bytes(
         b'#!/bin/sh\nshift 2\ncase "$1" in\n'
@@ -5836,6 +8110,11 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
         b'config) case "$*" in\n'
         b"  *--worktree*) printf '%s' \"$4\" > " + sq(activated) + b" ;;\n"
         b"  *extensions.worktreeConfig*) printf 'true\\n' ;;\n"
+        b"  *--show-scope*)\n"
+        b"      if [ -f " + sq(activated) + b" ]; then\n"
+        b"        printf 'worktree\\000'\n"
+        b"        IFS= read -r seen < " + sq(activated) + b'; printf %s "$seen"\n'
+        b"      else exit 1 ; fi ;;\n"
         b"  *core.excludesFile*)\n"
         b"      if [ -f " + sq(activated) + b" ]; then\n"
         b"        IFS= read -r seen < " + sq(activated) + b'; printf %s "$seen"\n'
@@ -6658,6 +8937,31 @@ def test_walk_keeps_sibling_symlinks_to_one_shared_tree(tmp_path):
     ]
 
 
+def test_walk_resolution_refusal_obeys_the_existing_suppression_split(tmp_path, monkeypatch):
+    """Cycle-key uncertainty is a named leaf only for observation/copy walks.
+
+    Ablation: delete the cycle-key resolution guard and the suppressing walk raises
+    instead of yielding ``refused``; forcing suppression in both arms makes the
+    repair walk fail to re-raise the original provider ``OSError``.
+    """
+    from bmad_loop.install import _walk_traversable_files
+
+    root = tmp_path / "tree"
+    refused = root / "refused"
+    refused.mkdir(parents=True)
+    (refused / "hidden.md").write_text("hidden\n", encoding="utf-8")
+    (root / "sibling.md").write_text("sibling\n", encoding="utf-8")
+    refuse_to_resolve(monkeypatch, refused)
+
+    walked = dict(_walk_traversable_files(root, _suppress_errors=True))
+    assert sorted(walked) == ["refused", "sibling.md"]
+    assert walked["refused"] == refused
+
+    with pytest.raises(OSError) as excinfo:
+        list(_walk_traversable_files(root, _suppress_errors=False))
+    assert "stubbed: the provider is registered but not serving" in str(excinfo.value)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
 def test_guarded_copy_treats_a_dangling_destination_leaf_as_occupied(tmp_path):
     repo, wt = tmp_path / "repo", tmp_path / "wt"
@@ -6886,6 +9190,113 @@ def test_copy_traversable_skip_existing_reports_total_noop(tmp_path):
     assert (dst / "d" / "f.txt").read_text() == "ON_DISK"
 
 
+def test_copy_traversable_records_the_paths_it_actually_wrote(tmp_path):
+    """`copied_paths` answers per PATH what the boolean only answers per CALL.
+
+    That gap is the whole reason for the parameter: under `skip_existing` a True
+    result means "at least one descendant landed", so a caller asking whether one
+    NAMED path was copied cannot read it off the boolean — and cannot read it off the
+    entry either, since the skipped child and the written one live under the same
+    directory. `provision_worktree` reads this to name the source of an unparseable
+    hook config, where inferring from the parent blames a file that supplied nothing
+    (#592). The list is append-only and the boolean stays exactly `bool(record)`.
+
+    Ablation: drop the `copied_paths.append(target)` in the file leg and the first
+    scenario reddens; drop the one in `visit_dir` and the second does."""
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    (src / "d").mkdir(parents=True)
+    (src / "d" / "kept.txt").write_text("FROM_SRC", encoding="utf-8")
+    (src / "d" / "new.txt").write_text("FROM_SRC", encoding="utf-8")
+    (dst / "d").mkdir(parents=True)
+    (dst / "d" / "kept.txt").write_text("ON_DISK", encoding="utf-8")
+
+    record: list[Path] = []
+    assert _copy_traversable(src, dst, skip_existing=True, copied_paths=record) is True
+
+    # the occupied sibling is absent from the ledger the True result covers
+    assert record == [dst / "d" / "new.txt"]
+    assert (dst / "d" / "kept.txt").read_text(encoding="utf-8") == "ON_DISK"
+
+    # nothing left to copy -> False AND an untouched list: the two agree
+    again: list[Path] = []
+    assert _copy_traversable(src, dst, skip_existing=True, copied_paths=again) is False
+    assert again == []
+
+    # a fresh destination records the directories it creates as well as the files
+    fresh = tmp_path / "fresh"
+    made: list[Path] = []
+    assert _copy_traversable(src, fresh, skip_existing=True, copied_paths=made) is True
+    assert made == [
+        fresh,
+        fresh / "d",
+        fresh / "d" / "kept.txt",
+        fresh / "d" / "new.txt",
+    ]
+
+
+def test_copy_traversable_records_a_file_a_failed_copy2_left_behind(tmp_path, monkeypatch):
+    """`shutil.copy2` is `copyfile` FOLLOWED BY `copystat`, so a destination that
+    refuses the utime/chmod raises with the bytes already fully written — measured,
+    not assumed: the probe below leaves the complete content on disk.
+
+    Degrading that to "nothing happened" would under-report a file the run really did
+    write: the entry reads as a no-op seed and loses its `git add -A` shield, and its
+    provenance is missing, so an unparseable hook config seeding supplied would be
+    blamed on the branch (#592). Deleting the survivor is the wrong repair in the
+    other direction — the CONTENT copied fine and only its metadata was refused, so
+    dropping it recreates the absent-config stall (#471).
+
+    Only reachable through the degrading `worktree=` leg; with no worktree the
+    OSError re-raises and nothing is recorded either way.
+
+    Ablation: restore the bare `continue` in the `except OSError` and this reddens on
+    the boolean, as does
+    `test_provision_worktree_refusal_survives_a_failed_copy2_on_the_seeded_config`."""
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()  # pre-made, so the result is about the FILE leg and not a new directory
+    (src / "settings.json").write_text("REAL BYTES", encoding="utf-8")
+
+    def refuse_metadata(*_args, **_kwargs):
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(shutil, "copystat", refuse_metadata)
+
+    record: list[Path] = []
+    assert _copy_traversable(src, dst, worktree=tmp_path, copied_paths=record) is True
+
+    landed = dst / "settings.json"
+    assert landed.read_text(encoding="utf-8") == "REAL BYTES"  # the bytes really landed
+    assert record == [landed]  # so the ledger the True result covers names them
+
+
+def test_copy_traversable_ignores_a_target_a_failed_copy_never_created(tmp_path, monkeypatch):
+    """The other side of the same branch: when the copy leaves NOTHING at the
+    destination the entry is still a no-op, so the survivor check cannot be a blanket
+    "an OSError counts anyway".
+
+    `copyfile` itself failing is the ordinary shape — an unreadable source, a full
+    disk — and it writes no destination.
+
+    Ablation: drop the `if not _occupied(target)` guard so every OSError counts, and
+    this reddens on both assertions."""
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()  # same isolation as the row above: the FILE leg is what is graded
+    (src / "settings.json").write_text("REAL BYTES", encoding="utf-8")
+
+    def refuse_copy(*_args, **_kwargs):
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(shutil, "copy2", refuse_copy)
+
+    record: list[Path] = []
+    assert _copy_traversable(src, dst, worktree=tmp_path, copied_paths=record) is False
+
+    assert not (dst / "settings.json").exists()
+    assert record == []
+
+
 def test_copy_traversable_skip_existing_never_mkdirs_over_file(tmp_path):
     """A destination FILE standing where the source has a directory is left alone:
     without the guard, mkdir(exist_ok=True) on the file raises FileExistsError."""
@@ -6921,14 +9332,47 @@ def test_seed_bmad_tree_merges_per_file_and_excludes_render_output(tmp_path):
     carried.parent.mkdir(parents=True)
     carried.write_text("[checkout]\n", encoding="utf-8")
 
-    seeded = _seed_bmad_tree(wt, repo)
+    shield_rels, written = _seed_bmad_tree(wt, repo)
 
     assert carried.read_text(encoding="utf-8") == "[checkout]\n"
     assert (wt / BMAD_SCRIPTS_SEED_REL / "render_skill.py").is_file()
     assert (wt / BMAD_DIR / "custom" / "style.toml").is_file()
     assert not (wt / RENDER_DIR_REL).exists()
-    assert seeded == [
+    landed = [
         f"{BMAD_DIR}/custom/style.toml",
+        f"{BMAD_SCRIPTS_SEED_REL}/config_utils.py",
+        f"{BMAD_SCRIPTS_SEED_REL}/render_skill.py",
+    ]
+    # The root PRE-EXISTED here (the checkout carries `carried`), so there is no
+    # collapse and both halves read the same. The half that always stays per-file is
+    # pinned where they differ, in the test below.
+    assert shield_rels == landed
+    assert written == landed
+
+
+def test_seed_bmad_tree_collapses_the_shield_rel_but_keeps_written_per_file(tmp_path):
+    """The two halves diverge exactly when the `_bmad` root was ABSENT before seeding:
+    the shield rel collapses to the root (one pattern covers a tree that is wholly
+    ours) while `written` stays per-file.
+
+    That second half is load-bearing since #484: if the tool directory turns out to be
+    TRACKED, the shield drops the whole-dir pattern and substitutes patterns for the
+    files this run wrote — a question the collapsed rel cannot answer. Returning the
+    collapse twice would silently shield nothing there.
+
+    (The pairing is belt-and-braces: a fresh worktree checkout materializes every
+    tracked path, so "root absent AND tracked" cannot actually arise. The contract is
+    pinned anyway, because the caller reads the two halves for different purposes.)"""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    _write_worktree_renderer_surface(repo)
+    wt.mkdir()
+
+    shield_rels, written = _seed_bmad_tree(wt, repo)
+
+    assert (wt / BMAD_DIR).is_dir()  # absent before the call; the seed created it
+    assert shield_rels == [BMAD_DIR]
+    assert written == [
+        CENTRAL_CONFIG_REL,
         f"{BMAD_SCRIPTS_SEED_REL}/config_utils.py",
         f"{BMAD_SCRIPTS_SEED_REL}/render_skill.py",
     ]
@@ -7019,6 +9463,35 @@ def test_base_skills_seed_incomplete_ignores_inactive_catalog_symlink(tmp_path):
 
     assert not (wt / tree / obsolete).exists()
     assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+def test_provision_worktree_refuses_one_upstream_skill_and_preserves_required_result_gate(
+    tmp_path, monkeypatch
+):
+    """An uncertain upstream source is skipped while healthy skills still copy.
+
+    Ablation: delete the upstream-skill resolution guard and the provider fault
+    aborts provisioning instead of reaching the required-skill result re-probe.
+    """
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    tree = ".claude/skills"
+    required_review = "bmad-review"
+    _install_dev_auto(
+        repo,
+        tree,
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n" + _layer("blind", required_review),
+    )
+    _install_skills(repo, tree, {required_review: ()})
+    refuse_to_resolve(monkeypatch, repo / tree / required_review)
+
+    skipped = provision_worktree(wt, [get_profile("claude")], repo)
+
+    missing_rel = f"{tree}/{required_review}"
+    assert (wt / tree / DEV_PRIMITIVE_NEW / "SKILL.md").is_file()
+    assert not (wt / tree / required_review).exists()
+    assert missing_rel in skipped
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == [missing_rel]
 
 
 def test_advisory_review_skill_is_copied_best_effort_but_not_fatal(tmp_path):
@@ -7212,6 +9685,30 @@ def test_worktree_seed_undelivered_names_an_escaped_source_despite_stale_destina
     assert worktree_seed_undelivered(wt, repo, seed_files=[".mcp.json"]) == [".mcp.json"]
 
 
+@pytest.mark.parametrize("refused_root", ["worktree", "repo"])
+def test_worktree_seed_undelivered_reports_coarse_names_when_a_root_is_unresolvable(
+    tmp_path, monkeypatch, refused_root
+):
+    """The journal-only probe reports uncertainty without becoming a run failure.
+
+    Ablation: delete the root-resolution guard and this raises the scoped provider
+    fault instead of returning the configured and safely enumerable coarse names.
+    """
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    (repo / "plugins").mkdir(parents=True)
+    (repo / "plugins" / "b.json").write_text("{}\n", encoding="utf-8")
+    (repo / "plugins" / "a.json").write_text("{}\n", encoding="utf-8")
+    refused = wt if refused_root == "worktree" else repo
+    refuse_to_resolve(monkeypatch, refused)
+
+    assert worktree_seed_undelivered(
+        wt,
+        repo,
+        seed_files=["configured.json", "configured.json"],
+        seed_globs=["plugins/*.json"],
+    ) == ["configured.json", "plugins/a.json", "plugins/b.json"]
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 @pytest.mark.parametrize("escaped_kind", ["file", "directory"])
 def test_worktree_seed_undelivered_rejects_stale_nested_escaped_source(tmp_path, escaped_kind):
@@ -7277,3 +9774,201 @@ def test_hook_config_cannot_supply_its_dropped_seed_alibi(tmp_path):
     assert (wt / rel).is_file(), "the in-worktree link looks delivered generically"
     assert worktree_seed_undelivered(wt, repo, seed_files=[rel]) == []
     assert worktree_seed_undelivered(wt, repo, seed_files=[rel], config_paths=[rel]) == [rel]
+
+
+# ------------------------------------------------- wheel module-skill seed completeness
+
+_MODULE_SKILL_TREE = ".claude/skills"
+
+
+class _StubTraversable:
+    """A minimal Traversable node: a file, a listable dir, or one that refuses iterdir.
+
+    A `chmod 0o000` fixture cannot express the last case portably — CI may run as
+    root, where the mode is ignored — so the refusal is modelled directly.
+    """
+
+    def __init__(self, name, kind, children=None, *, readable=True):
+        self.name = name
+        self._kind = kind
+        self._children = children or {}
+        self._readable = readable
+
+    def is_file(self):
+        return self._kind == "file"
+
+    def is_dir(self):
+        return self._kind == "dir"
+
+    def iterdir(self):
+        if not self._readable:
+            raise OSError(errno.EACCES, "Permission denied")
+        return iter(self._children.values())
+
+    def joinpath(self, name):
+        return self._children.get(name, _StubTraversable(name, "absent"))
+
+
+def test_module_skills_seed_undelivered_reports_only_missing_content(tmp_path):
+    """The wheel's bundled skills, re-probed on disk after a real provision.
+
+    Ablation: delete the `_is_file(target)` conjunct in the predicate's file arm and
+    this fails — every unlinked file still counts as delivered."""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    wt.mkdir()
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE]) == []
+
+    (wt / _MODULE_SKILL_TREE / "bmad-loop-sweep" / "migration-mode.md").unlink()
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE]) == [
+        f"{_MODULE_SKILL_TREE}/bmad-loop-sweep"
+    ]
+
+    shutil.rmtree(wt / _MODULE_SKILL_TREE / "bmad-loop-resolve")
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE]) == [
+        f"{_MODULE_SKILL_TREE}/bmad-loop-resolve",
+        f"{_MODULE_SKILL_TREE}/bmad-loop-sweep",
+    ]
+
+
+def test_module_skills_seed_undelivered_reports_coarse_names_when_root_is_unresolvable(
+    tmp_path, monkeypatch
+):
+    """The journal-only wheel probe names existing skills in stable tree order.
+
+    Ablation: delete the worktree-root guard and this raises the provider fault
+    instead of reporting coarse uncertainty for the bundled skill surface.
+    """
+    wt = tmp_path / "wt"
+    refuse_to_resolve(monkeypatch, wt)
+
+    assert module_skills_seed_undelivered(
+        wt, [_MODULE_SKILL_TREE, ".agents/skills", _MODULE_SKILL_TREE]
+    ) == [
+        f"{tree}/{skill}"
+        for tree in (_MODULE_SKILL_TREE, ".agents/skills")
+        for skill in MODULE_SKILLS
+    ]
+
+
+def test_module_skills_seed_undelivered_answers_through_a_zip_source(tmp_path):
+    """A zip-imported wheel is a Traversable with no filesystem path, so the probe
+    must enumerate it through the shared walk rather than `rglob`. Skills the source
+    does not carry are the sync test's concern and are skipped, not reported.
+
+    Ablation: swap `_walk_traversable_files` for a `Path.rglob` enumeration and this
+    fails — a zipfile.Path has no rglob at all."""
+    zf_path = tmp_path / "wheel.zip"
+    with zipfile.ZipFile(zf_path, "w") as zf:
+        zf.writestr("skills/bmad-loop-sweep/SKILL.md", "FROM_ZIP")
+        zf.writestr("skills/bmad-loop-sweep/notes/extra.md", "FROM_ZIP")
+    skills_root = zipfile.Path(zf_path, "skills/")
+    wt = tmp_path / "wt"
+    wt.mkdir()
+
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE], skills_root) == [
+        f"{_MODULE_SKILL_TREE}/bmad-loop-sweep"
+    ]
+
+    dst = wt / _MODULE_SKILL_TREE / "bmad-loop-sweep"
+    (dst / "notes").mkdir(parents=True)
+    (dst / "SKILL.md").write_text("FROM_ZIP", encoding="utf-8")
+    (dst / "notes" / "extra.md").write_text("FROM_ZIP", encoding="utf-8")
+
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE], skills_root) == []
+
+
+def test_module_skills_divergent_fork_counts_as_delivered(tmp_path):
+    """Seeding is per-FILE no-clobber, so a checkout that carries its own fork of a
+    bundled skill keeps those bytes while its absent siblings are filled in. Presence
+    is the contract: comparing content would report that healthy shape as a drop."""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    fork = wt / _MODULE_SKILL_TREE / "bmad-loop-sweep" / "SKILL.md"
+    fork.parent.mkdir(parents=True)
+    fork.write_text("# FORKED IN THIS CHECKOUT\n", encoding="utf-8")
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    assert fork.read_text(encoding="utf-8") == "# FORKED IN THIS CHECKOUT\n"
+    assert (fork.parent / "migration-mode.md").is_file(), "absent siblings still seeded"
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE]) == []
+
+
+def test_module_skills_squatting_file_is_reported(tmp_path):
+    """A checkout file standing where a bundled skill's directory goes: the copier
+    refuses the whole subtree rather than mkdir over it, so nothing is delivered.
+
+    Ablation: delete the predicate's `_is_file(target)` conjunct and this fails — the
+    squatting file's rel is never probed, so the skill reads as delivered."""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    squatter = wt / _MODULE_SKILL_TREE / "bmad-loop-sweep"
+    squatter.parent.mkdir(parents=True)
+    squatter.write_text("A FILE, NOT A SKILL\n", encoding="utf-8")
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    assert squatter.read_text(encoding="utf-8") == "A FILE, NOT A SKILL\n"
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE]) == [
+        f"{_MODULE_SKILL_TREE}/bmad-loop-sweep"
+    ]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_module_skills_symlinked_out_destination_is_not_delivery(tmp_path):
+    """A skill directory linked to a complete copy OUTSIDE the worktree reads as
+    present through the link, but the unit commits its own checkout — content that
+    lives outside it was never delivered.
+
+    Ablation: delete the `contained(target)` conjunct in the predicate's file arm and
+    this fails — every file answers `is_file` through the link."""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    wt.mkdir()
+    provision_worktree(wt, [get_profile("claude")], repo)
+    skill = wt / _MODULE_SKILL_TREE / "bmad-loop-sweep"
+    outside = tmp_path / "shared-skill"
+    shutil.move(skill, outside)
+    skill.symlink_to(outside, target_is_directory=True)
+
+    assert (skill / "SKILL.md").is_file(), "the link looks delivered generically"
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE]) == [
+        f"{_MODULE_SKILL_TREE}/bmad-loop-sweep"
+    ]
+
+
+def test_module_skills_unreadable_source_dir_is_reported(tmp_path):
+    """A source directory the walk could not enumerate is yielded as a leaf: its
+    unknown descendants cannot be claimed as delivered, however complete the
+    destination looks.
+
+    Ablation: delete the predicate's `_is_dir(entry)` arm and this fails — the
+    unlistable directory falls through to the neither-file-nor-dir case and the skill
+    reads as delivered."""
+    skills_root = _StubTraversable(
+        "skills",
+        "dir",
+        {
+            "bmad-loop-sweep": _StubTraversable(
+                "bmad-loop-sweep",
+                "dir",
+                {
+                    "SKILL.md": _StubTraversable("SKILL.md", "file"),
+                    "notes": _StubTraversable("notes", "dir", readable=False),
+                },
+            )
+        },
+    )
+    wt = tmp_path / "wt"
+    dst = wt / _MODULE_SKILL_TREE / "bmad-loop-sweep"
+    (dst / "notes").mkdir(parents=True)
+    (dst / "SKILL.md").write_text("x\n", encoding="utf-8")
+    (dst / "notes" / "extra.md").write_text("x\n", encoding="utf-8")
+
+    assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE], skills_root) == [
+        f"{_MODULE_SKILL_TREE}/bmad-loop-sweep"
+    ]

@@ -38,6 +38,14 @@ class BaseDialog(ModalScreen):
     }
     BaseDialog #dialog {
         width: 64;
+        /* the clamp lives on the SHARED rule on purpose: the five subclasses that
+           widen the dialog (Decision 86, Escalation 90, DeferredEntry/Validate/
+           TextOutput 96, SpecReview 100) override only `width`, never `max-width`,
+           so this one declaration covers all ten and a subclass cannot silently
+           opt out of it. Without it a fixed column count is laid out wider than a
+           narrow terminal and the right-hand side — i.e. the docked button row,
+           which is align-horizontal: right — is clipped off-screen (#281). */
+        max-width: 100%;
         /* height is intentionally auto (not a definite %). Two-tier by design:
            list-heavy modals (Decision/Escalation/StartRun/...) override #dialog
            with a definite height + a 1fr body; the bounded modals (Confirm/
@@ -63,7 +71,79 @@ class BaseDialog(ModalScreen):
     BaseDialog .buttons Button {
         margin-left: 2;
     }
+    /* Clamping #dialog is not enough on its own: Textual's Button is
+       `width: auto; min-width: 16` and the rule above adds a 2-column margin per
+       button, so a three-button row demands 3*16 + 3*2 = 54 columns while a
+       dialog clamped to a 50-column terminal only has 50 - 2 (thick border)
+       - 4 (padding `1 2`) = 44 columns of content — the row still overflows and
+       the right-most button is clipped. Dropping the floor lets each button size
+       to its own label instead. Scoped to `-narrow` so terminals 60 columns and
+       wider keep today's button sizing byte-for-byte. */
+    BaseDialog.-narrow .buttons Button {
+        min-width: 4;
+        margin-left: 1;
+    }
+    /* The vertical twin. Before any body content a dialog spends 10 rows of
+       chrome: 2 border (1 per side — every Textual border STYLE is exactly one
+       cell, so `thick` -> `round` would save nothing), 2 padding, 1 title,
+       1 title margin-bottom, 1 .buttons margin-top and 3 for the button row
+       (Textual's Button is `border: tall`, so a one-line label is 3 rows).
+       `max-height: 90%` then turns those 10 rows into a per-modal terminal-height
+       floor of 12-14. Under `-short` the chrome collapses to 4 rows — padding
+       0 1, no title margin, no button margin, a 1-row borderless button — and
+       max-height goes to 100% so the dialog may use the last row. The `#dialog`
+       BORDER IS DELIBERATELY KEPT: it is the only thing separating the dialog
+       from the dashboard rendered behind a ModalScreen, and the 2 rows it costs
+       are not needed to clear the floor. Nothing here sets a definite `height`
+       — that would balloon the bounded tier, see
+       test_short_confirm_modal_stays_compact — and nothing here touches `width`,
+       which is the `-narrow` axis above. */
+    BaseDialog.-short #dialog {
+        max-height: 100%;
+        padding: 0 1;
+    }
+    BaseDialog.-short .title {
+        margin-bottom: 0;
+    }
+    BaseDialog.-short .buttons {
+        margin-top: 0;
+    }
+    BaseDialog.-short .buttons Button {
+        height: 1;
+        border: none;
+    }
     """
+
+    # Textual applies the matching breakpoint class to the Screen itself on
+    # resize, and BaseDialog IS a ModalScreen — so `-narrow` lands on the dialog
+    # screen and CSS can select `BaseDialog.-narrow ...`. `-narrow` therefore
+    # means "the terminal is under 60 columns". 60 is where an un-narrowed
+    # three-button row (3 * Textual's `min-width: 16` + 3 * `margin-left: 2`
+    # = 54) still fits a clamped dialog's content region (60 - 2 border
+    # - 4 padding = 54). Declaring this here scopes it to dialogs: the App and
+    # DashboardScreen leave their breakpoints at the default, so the dashboard
+    # is unaffected.
+    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (60, "-wide")]
+
+    # Same mechanism on the other axis: `-short` means "the terminal is under 20
+    # rows". 20 is chosen to sit clear of the tallest measured pre-fix frame
+    # floor — the height at which every docked control of a modal is fully
+    # on-screen: ConfirmModal 12, StartSweep 13, StoryCheckpoint 13, and 14 for
+    # ConfirmModal WITH a warning (the ConfirmResumeModal case, whose
+    # double-drive warning gates a destructive confirm and is docked outside
+    # #body). The compact layout has to engage before anything clips, not at the
+    # moment it does, so the threshold is above 14 rather than on it. It is also
+    # below the 24 rows of a default terminal, so an ordinary window still gets
+    # the full chrome. Every figure above is a CHROME measurement, taken with
+    # short titles: a title, header, warning or path is docked outside the
+    # scrolling body, so a long enough one wraps and costs rows this layout
+    # cannot reclaim — the body is already at its 1-row minimum. Nothing bounds
+    # that caller-supplied text, so a long enough value clips the docked controls
+    # at ANY fixed size and those dialogs have no floor to state. That is why
+    # docs/tui-guide.md gives its figures as sizes measured to be sufficient for
+    # the content it exercised rather than as a minimum — 80x24 included
+    # (#628, #629).
+    VERTICAL_BREAKPOINTS = [(0, "-short"), (20, "-tall")]
 
     BINDINGS = [Binding("escape", "cancel", "cancel")]
 
@@ -425,7 +505,7 @@ class SpecReviewModal(BaseDialog):
     """Read-only story-spec viewer with a configurable action row.
 
     Shared by the plan-checkpoint viewer (Approve & resume / Request replan) and
-    the spec-approval / epic gate viewer (Approve & resume). Dismisses with the
+    the spec-approval gate viewer (Approve & resume). Dismisses with the
     chosen action verb, or None on close/escape. The spec path is shown
     prominently with a copy-path action; the spec body is LLM-written markdown so
     it renders as plain Text, never markup. The modal owns no logic — the caller
@@ -455,6 +535,7 @@ class SpecReviewModal(BaseDialog):
         spec_path: Path | None,
         spec_text: str,
         actions: list[tuple[str, str, str]],
+        unreadable: bool = False,
     ):
         super().__init__()
         self._title = title
@@ -462,6 +543,7 @@ class SpecReviewModal(BaseDialog):
         self._spec_path = spec_path
         self._spec_text = spec_text
         self._actions = actions
+        self._unreadable = unreadable
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
@@ -475,12 +557,28 @@ class SpecReviewModal(BaseDialog):
             yield Static(path_line, classes="path")
             with VerticalScroll(id="spec"):
                 body = self._spec_text.strip()
-                yield Static(Text(body) if body else Text("(empty spec)", style="dim"))
+                if self._unreadable:
+                    # Dimmed like "(empty spec)", never as plain body text: this string
+                    # is THIS modal's report of a failed read, and rendering it in the
+                    # style reserved for the spec's own words invites it to be read as
+                    # spec content that happens to open with that sentence.
+                    yield Static(Text(body, style="dim"))
+                else:
+                    yield Static(Text(body) if body else Text("(empty spec)", style="dim"))
             with Horizontal(classes="buttons"):
                 if self._spec_path is not None:
                     yield Button("copy path", id="copy-path")
                 for verb, label, variant in self._actions:
-                    yield Button(label, variant=variant, id=f"act-{verb}")  # type: ignore[arg-type]
+                    # Every verb this modal offers acts ON the spec — approve resumes the
+                    # run past the gate, replan rewrites the file. A spec nobody could
+                    # read is one nobody reviewed, so the actions are refused at the
+                    # source rather than left to fail (or worse, succeed) downstream.
+                    yield Button(
+                        label,
+                        variant=variant,  # type: ignore[arg-type]
+                        id=f"act-{verb}",
+                        disabled=self._unreadable,
+                    )
                 yield Button("close", id="cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -493,6 +591,44 @@ class SpecReviewModal(BaseDialog):
             self.dismiss(bid[len("act-") :])
             return
         self.dismiss(None)
+
+
+class PauseReasonModal(BaseDialog):
+    """Spec-less gate viewer: a story gate fires before its story is registered
+    and an epic boundary has no story at all, so the pause reason IS the payload
+    — it names the blocking entries and the remedy. Dismisses with 'resume', or
+    None on close/escape. Reasons are arbitrary engine text → plain Text, never
+    markup. The modal owns no logic — the caller maps the verb to _do_resume."""
+
+    DEFAULT_CSS = """
+    PauseReasonModal #reason {
+        height: auto;
+        max-height: 60%;
+    }
+    """
+
+    def __init__(self, *, title: str, subtitle: str | Text, reason: str):
+        super().__init__()
+        self._title = title
+        self._subtitle = subtitle if isinstance(subtitle, Text) else Text(subtitle)
+        self._reason = reason
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(self._title, classes="title")
+            yield Static(self._subtitle, id="subtitle")
+            with VerticalScroll(id="reason"):
+                body = self._reason.strip()
+                yield Static(
+                    Text(body) if body else Text("(no pause reason recorded)", style="dim")
+                )
+            with Horizontal(classes="buttons"):
+                yield Button("Resume", variant="primary", id="act-resume")
+                yield Button("close", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        self.dismiss(bid[len("act-") :] if bid.startswith("act-") else None)
 
 
 class StoryCheckpointModal(BaseDialog):
@@ -586,6 +722,7 @@ class EscalationModal(BaseDialog):
         resolution_ready: bool,
         engine_live: bool,
         restore_recorded: bool = False,
+        unreadable: bool = False,
     ):
         super().__init__()
         self._story_key = story_key
@@ -596,6 +733,7 @@ class EscalationModal(BaseDialog):
         self._resolution_ready = resolution_ready
         self._engine_live = engine_live
         self._restore_recorded = restore_recorded
+        self._unreadable = unreadable
 
     def compose(self) -> ComposeResult:
         head = Text()
@@ -617,11 +755,31 @@ class EscalationModal(BaseDialog):
                     )
                 with Vertical(id="blocking"):
                     body = self._blocking.strip()
-                    yield Static(
-                        Text(body)
-                        if body
-                        else Text("(no blocking condition recorded)", style="dim")
-                    )
+                    if self._unreadable:
+                        # The spec could not be READ at the anchored path, so there is
+                        # no blocking condition to parse and "(no blocking condition
+                        # recorded)" would be a lie indistinguishable from a readable
+                        # spec that simply halted without one. `_blocking_condition`
+                        # reduces the read-failure body to "" like any other non-halt
+                        # text, so this arm cannot be inferred downstream — it has to
+                        # be carried in.
+                        #
+                        # REPLACES the body rather than prefixing it: `body` is always
+                        # "" on this arm (the failure sentence carries no halt block),
+                        # so an `if` that fell through still rendered the very sentence
+                        # the paragraph above calls a lie, directly under the warning
+                        # denying it.
+                        yield Static(
+                            Text(
+                                "⚠ the spec could not be read at the anchored path — "
+                                "the blocking condition is unknown, not absent",
+                                style="red",
+                            )
+                        )
+                    elif body:
+                        yield Static(Text(body))
+                    else:
+                        yield Static(Text("(no blocking condition recorded)", style="dim"))
                 if self._engine_live:
                     yield Static(
                         Text("engine may still be live — stop it before resolving", style="yellow")
@@ -629,7 +787,18 @@ class EscalationModal(BaseDialog):
             # The restore-discard branch below gates an enabled Re-arm, so the hint
             # is docked outside #body (never scrolled off) — directly above the buttons.
             hint = Text()
-            if self._restore_recorded:
+            if self._unreadable:
+                # Precedence over both branches below: they explain when Re-arm
+                # unlocks, and neither is true while the evidence cannot be read.
+                hint.append(
+                    "re-arm is refused while the spec is unreadable — it flips the "
+                    "frontmatter, strips the result and re-stamps the baseline on "
+                    "evidence nobody could read. Resolve stays OPEN: it is the "
+                    "non-destructive remedy, and a bad anchor is exactly what it "
+                    "repairs — `bmad-loop resolve` does the same from the CLI",
+                    style="red",
+                )
+            elif self._restore_recorded:
                 # honoring the latch from here would be unsafe (a stale marker is
                 # indistinguishable from a fresh one), so Re-arm stays a plain
                 # from-scratch re-drive — but never a silent drop of the decision.
@@ -649,14 +818,24 @@ class EscalationModal(BaseDialog):
                 )
             yield Static(hint, id="hint")
             with Horizontal(classes="buttons"):
+                # NOT gated on `_unreadable`. Resolve opens an interactive agent to
+                # repair the frozen spec and writes nothing itself, so it is the one
+                # verb an unreadable spec is a REASON to offer — refusing it left the
+                # modal with `close` as its only action, on the very failure the
+                # resolve agent exists to fix. It also kept the modal out of step with
+                # `action_resolve_run` (the `R` binding), which has no readability
+                # check, so the refusal was advisory rather than enforced.
                 yield Button(
-                    "Resolve", variant="primary", id="act-resolve", disabled=self._engine_live
+                    "Resolve",
+                    variant="primary",
+                    id="act-resolve",
+                    disabled=self._engine_live,
                 )
                 yield Button(
                     "Re-arm & resume",
                     variant="warning",
                     id="act-rearm",
-                    disabled=not self._resolution_ready or self._engine_live,
+                    disabled=not self._resolution_ready or self._engine_live or self._unreadable,
                 )
                 yield Button("close", id="cancel")
 

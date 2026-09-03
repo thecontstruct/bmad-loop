@@ -21,18 +21,14 @@ fallback.
 
 from __future__ import annotations
 
-import dataclasses
 import enum
 import hashlib
 import json
-import re
 import shlex
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
-
-import regex
 
 from .. import devcontract, gates, runs
 from ..bmadconfig import ProjectPaths
@@ -44,6 +40,26 @@ from ..signals import SignalWatcher
 from ..tokens import read_usage as tally_usage
 from ..verify import read_frontmatter, status_of
 from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec, SpecSnapshot
+
+# Re-exported for importers that predate the env_fault module split (#194 landed
+# these names on this module); the definitions now live in .env_fault. The
+# redundant `X as X` form is the explicit-re-export spelling — it tells the linter
+# these are deliberate pass-throughs, without an `__all__` that would read as a
+# statement of this module's public API and understate it (callers also import
+# GenericTmuxAdapter, the *_NUDGE_TEXT constants and HEARTBEAT_INTERVAL_S).
+#
+# READ-ONLY. An import copies the object binding, so these names are aliases, not
+# a window onto env_fault's globals: reading them is exact, but REBINDING one here
+# (`monkeypatch.setattr(generic, "ENV_FAULT_MATCH_TIMEOUT_S", ...)`) is invisible to
+# the classifier, which resolves the constant from its own module at call time. That
+# is not hypothetical — it silently defused the pathological-regex test the split
+# inherited. Override at the definition site (`env_fault.<NAME>`) instead.
+from .env_fault import _ANSI_RE as _ANSI_RE
+from .env_fault import ENV_FAULT_EVIDENCE_MAX as ENV_FAULT_EVIDENCE_MAX
+from .env_fault import ENV_FAULT_MATCH_TIMEOUT_S as ENV_FAULT_MATCH_TIMEOUT_S
+from .env_fault import ENV_FAULT_STATUSES as ENV_FAULT_STATUSES
+from .env_fault import ENV_FAULT_TAIL_BYTES as ENV_FAULT_TAIL_BYTES
+from .env_fault import EnvFaultMixin
 from .multiplexer import MultiplexerError, TerminalMultiplexer, get_multiplexer
 from .profile import CLIProfile
 
@@ -100,31 +116,6 @@ class _SnapVerdict(enum.Enum):
     REFUSE = "refuse"
 
 
-# Post-mortem transport-failure classification (#194): how much of the tee'd
-# pane log's tail to scan, how long an evidence excerpt to keep, and which
-# non-completed statuses are eligible. over_budget is excluded — a budget
-# crossing proves real API traffic — and completed never reaches the scan.
-ENV_FAULT_TAIL_BYTES = 64 * 1024
-ENV_FAULT_EVIDENCE_MAX = 240
-ENV_FAULT_STATUSES = frozenset({"timeout", "stalled", "crashed"})
-# Wall-clock bound on each operator-supplied pattern match (run via the `regex`
-# module, not stdlib `re`, whose `search` has no timeout): a pathological profile
-# regex can't hang run() teardown. Huge headroom — a sane pattern over the ≤64 KiB
-# tail matches in microseconds; a runaway is capped at ~this and declines to classify.
-ENV_FAULT_MATCH_TIMEOUT_S = 2.0
-# Self-contained ANSI/terminal-control stripper for the log tail: CSI, OSC (BEL-
-# or ST-terminated), other two-char ESC sequences, and raw C1 bytes. Deliberately
-# NOT the TUI/pyte machinery — the classifier reads raw pane bytes best-effort and
-# must not pull a terminal emulator into the adapter.
-_ANSI_RE = re.compile(
-    r"""
-    \x1b\[ [0-?]* [ -/]* [@-~]        # CSI ... final byte
-    | \x1b\] .*? (?: \x07 | \x1b\\ )   # OSC ... BEL or ST
-    | \x1b [@-Z\\-_]                   # 2-char ESC sequences (incl. C1 via ESC)
-    | [\x80-\x9f]                      # raw C1 control bytes
-    """,
-    re.VERBOSE,
-)
 # min spacing between heartbeat.json overwrites in wait_for_completion; the
 # heartbeat's staleness is what makes a frozen orchestrator (#157) diagnosable.
 HEARTBEAT_INTERVAL_S = 30.0
@@ -138,7 +129,7 @@ NUDGE_TEXT = (
 # has no background-completion re-invocation, so a turn ended to await a slow
 # background process (a Unity PlayMode run, a long test) would otherwise wait
 # forever; this nudge IS that re-invocation. Skill-agnostic: it must not assume a
-# result.json (the bmad-dev-auto skill writes none — see GenericDevAdapter).
+# result.json (the bmad-build-auto skill writes none — see GenericDevAdapter).
 STALL_NUDGE_TEXT = (
     "You appear idle in bmad-loop automation mode, which cannot re-invoke you when "
     "a background process finishes. If you are waiting on one (e.g. a Unity PlayMode "
@@ -185,11 +176,12 @@ class _ResultFileMixin:
     skill-written result dict and fold it into the session's final
     ``SessionResult``. Transport-agnostic — shared by the tmux adapters and
     any adapter whose skill writes ``tasks/<task_id>/result.json``; needs
-    only ``self.tasks_dir``."""
+    only ``self.tasks_dir`` and ``self.run_dir``."""
 
-    # Set by the concrete adapter's __init__; bare annotation (no runtime effect)
-    # tells the type checker the host attribute this mixin reads.
+    # Set by the concrete adapter's __init__; bare annotations (no runtime
+    # effect) tell the type checker the host attributes this mixin reads.
     tasks_dir: Path
+    run_dir: Path
 
     # Whether `_final` applies the #261 proof-of-work gate to its read-back. False
     # here, and that is not a conservative default — it is the correct answer for
@@ -200,6 +192,38 @@ class _ResultFileMixin:
     # `_DevSynthesisMixin`, whose read-back scans a directory shared with every
     # concurrent run — the one place a result can belong to somebody else.
     _READBACK_NEEDS_PROOF_OF_WORK = False
+
+    def _hard_stop_requested(self) -> bool:
+        """Has an operator lodged a *hard* stop request that this session must
+        honor (#319)? Either this run's own, or the owning run's.
+
+        Polled twice per wait-loop iteration by both real adapters — on either
+        side of the loop's own blocking wait — so a
+        ``bmad-loop stop`` is honored mid-session on platforms where the
+        engine's SIGTERM path is unreachable. Read-only by contract: the
+        adapter never unlinks ``stop-request.json`` — the engine consumes it
+        when it raises, and must still see it to attribute the stop. A torn or
+        modeless read already leans ``"graceful"`` inside
+        ``read_stop_request_mode``, so this can never abort a session
+        spuriously.
+
+        Both dirs are read because a nested auto-sweep is a first-class run *and*
+        somebody else's child: it mints its own id and appears in ``list``, so
+        ``stop <child-id>`` must still reach it, while ``stop <parent-id>`` lodges
+        in a dir this adapter would otherwise never look at. The owner leg is
+        hard-only, like this whole predicate — a graceful request already
+        suppresses a child sweep from *starting*, and letting one already in flight
+        finish is exactly what graceful means."""
+        if runs.read_stop_request_mode(self.run_dir) == "hard":
+            return True
+        owner = runs.owner_run_dir()
+        # `!=` is a cheap dedupe for the common top-level case, not a correctness
+        # dependency: two spellings of one dir cost a redundant read, same answer.
+        return (
+            owner is not None
+            and owner != self.run_dir
+            and runs.read_stop_request_mode(owner) == "hard"
+        )
 
     def _result_json(self, handle: SessionHandle, spec: SessionSpec, *, wait: bool) -> dict | None:
         """Acquire this session's result dict. Base behavior: read the
@@ -242,6 +266,19 @@ class _ResultFileMixin:
         tees a pane log."""
         return None
 
+    def _session_vanished(self) -> bool:
+        """Whether the whole multiplexer session is gone, asked only once a
+        crash verdict has already been reached (#489). Base: False — an adapter
+        with no session to lose (opencode-http) never vanishes. Overridden by
+        `GenericAdapter`.
+
+        Same failure convention as `_window_alive`: `MultiplexerError` is the
+        seam's declared "couldn't ask" and the override swallows it to False.
+        Anything else propagates, exactly as it does from the liveness probe —
+        this is a label on a verdict already made, so it degrades rather than
+        second-guessing the verdict, but it does not swallow unknown faults."""
+        return False
+
     def _final(
         self,
         handle: SessionHandle,
@@ -283,6 +320,29 @@ class _ResultFileMixin:
             )
             result_json = None
         status = "completed" if result_json is not None else fallback
+        # Diagnose the crash verdict only (#489) — see `_session_vanished`. A
+        # read-back upgrade to `completed` is deliberately not diagnosed: a
+        # session reaped AFTER flushing its result did produce something, and the
+        # verdict it earned is the honest one. `crashed` also covers the
+        # `SessionEnd` arm of `GenericAdapter.run()`, where the CLI announced
+        # its own exit rather than the window dying — the label stays truthful
+        # there because it reports what the mux answered, not how the window
+        # ended.
+        vanished = status == "crashed" and self._session_vanished()
+        if vanished:
+            # Evidence rides along like every neighbouring crumb: which session
+            # went missing (several runs share a host) and what verdict it lands.
+            # getattr because the mixin does not declare `session_name` (opencode-
+            # http has none) and only a mux-backed adapter can reach this branch
+            # (the base `_session_vanished` is a constant False). No default — an
+            # override on an adapter without a session name must fail loud here,
+            # not write evidence-free crumbs.
+            self._note_lifecycle(
+                handle.task_id,
+                "session-vanished",
+                session=getattr(self, "session_name"),
+                status=status,
+            )
         return SessionResult(
             status=status,
             result_json=result_json,
@@ -290,6 +350,7 @@ class _ResultFileMixin:
             transcript_path=transcript,
             budget_weighted=budget_weighted,
             stop_seen=stop_seen,
+            session_vanished=vanished,
         )
 
     def _result_path(self, task_id: str) -> Path:
@@ -298,14 +359,19 @@ class _ResultFileMixin:
     def _append_diag_jsonl(self, task_id: str, filename: str, payload: dict) -> None:
         """Append ``payload`` as one JSON line to ``tasks/<task_id>/<filename>``.
         Pure observability, best-effort: an unwritable run dir must never break
-        the completion loop."""
+        the completion loop. ``ensure_ascii=False`` is why the guard names more
+        than OSError: it leaves a lone surrogate — what a POSIX filename holding
+        a non-UTF-8 byte becomes, surrogate-escaped — in the dumped str, which
+        then hits the UTF-8 encode inside ``fh.write`` as a UnicodeEncodeError.
+        That is a ValueError, not an OSError; ``UnicodeError`` covers it and the
+        decode direction both (#380)."""
         try:
             path = self.tasks_dir / task_id / filename
             path.parent.mkdir(parents=True, exist_ok=True)
             line = json.dumps(payload, ensure_ascii=False)
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
-        except OSError:
+        except (OSError, UnicodeError):
             pass
 
     def _note_resultless_stop(self, task_id: str, verdict: str, detail: str = "") -> None:
@@ -367,7 +433,7 @@ class _ResultFileMixin:
             time.sleep(RESULT_POLL_S)
 
 
-class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
+class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     injection = "tmux-initial-prompt"
     observation = "hook-signal"
     state = "local-jsonl"
@@ -382,14 +448,12 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         usage_grace_s: float | None = None,
         stop_without_result_nudges: int | None = None,
         mux: TerminalMultiplexer | None = None,
+        events_dir: Path | None = None,
     ):
         self.run_dir = run_dir
         self.policy = policy
         self.profile = profile
-        # Precompiled once per adapter (the profile validated each at parse time with
-        # the same regex engine, so regex.compile cannot raise here); matched under a
-        # per-pattern timeout in _env_fault_evidence. Empty tuple = classification inert.
-        self._env_fault_patterns = tuple(regex.compile(p) for p in profile.env_fault_patterns)
+        # env-fault patterns compile lazily off self.profile — see EnvFaultMixin.
         self.mux = mux or get_multiplexer()
         # None = use the profile's default bypass flags; a tuple replaces them
         self.extra_args = extra_args
@@ -416,7 +480,19 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         self.name = f"{profile.name}-tmux"
         self.binary = binary or profile.binary
         self.session_name = f"bmad-loop-{run_dir.name}"
-        self.watcher = SignalWatcher(run_dir / "events")
+        # The run's hook-event channel (#494): the out-of-tree directory the run
+        # bootstrap resolved, plus the legacy in-tree one kept under poll so a
+        # project whose installed relay predates the move still completes its
+        # sessions. `events_dir` is handed in rather than derived here because
+        # deriving it needs the PROJECT, and the only project this class can
+        # reach is `run_dir.parents[2]` — a shape real run dirs have and test run
+        # dirs do not, so a derivation would key the watcher off a directory that
+        # is not the project (see `_ensure_session`, which accepts exactly that
+        # weakness for a session tag but must not for the completion channel).
+        # Defaulting to the legacy dir keeps direct construction (tests, any
+        # caller outside `runsetup.make_adapters`) working unchanged; the
+        # bootstrap always passes one, pinned by a test.
+        self.watcher = SignalWatcher(events_dir or run_dir / "events", run_dir / "events")
         self.tasks_dir = run_dir / "tasks"
         self.logs_dir = run_dir / LOGS_DIR
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
@@ -449,7 +525,12 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         return argv
 
     def interactive_env(self, spec: SessionSpec) -> dict[str, str]:
-        return {**self.profile.env, **spec.env}
+        # The pin chokepoint (runs.pin_state_root): the profile's [env] table
+        # must not be able to move a session off this process's state root —
+        # including when no root derives, where there is no pin key for a mere
+        # spread ordering to protect. `start_session`'s window merge applies
+        # the same rule.
+        return runs.pin_state_root({**self.profile.env, **spec.env})
 
     def build_command(self, spec: SessionSpec) -> str:
         return " ".join(shlex.quote(a) for a in self.interactive_argv(spec))
@@ -460,9 +541,12 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         task_dir = self.tasks_dir / spec.task_id
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / "prompt.txt").write_text(spec.prompt + "\n", encoding="utf-8")
-        # A re-armed/resumed run reuses task_ids; drop any prior cycle's result
-        # so a session that writes nothing can't be read as a stale completion.
+        # Task ids are supplied by the caller, so defensively reset cycle-scoped
+        # outputs if one is reused. A silent session must not inherit a stale result.
         (task_dir / "result.json").unlink(missing_ok=True)
+        # The sweep skill also writes escalation.json here, and
+        # `resolve._gather_escalations` reads it alongside result.json.
+        (task_dir / "escalation.json").unlink(missing_ok=True)
 
         self._ensure_session(spec.cwd)
         # Stamped before launch: hook events carry wall-clock ns, and
@@ -489,7 +573,9 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
             self.session_name,
             spec.task_id[-40:],
             spec.cwd,
-            {**self.profile.env, **spec.env},
+            # Same merge as interactive_env, same pin chokepoint: the profile's
+            # [env] table must not move the window off this process's state root.
+            runs.pin_state_root({**self.profile.env, **spec.env}),
             self.build_command(spec),
         )
         # pipe_pane tolerates the window having already died (a CLI that crashes on
@@ -509,14 +595,16 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         session_id: str | None = None
         transcript_path: str | None = None
         nudges_left = self._stop_nudges
-        # set when a result-less Stop opens an idle-grace window (dev adapter
-        # only); a fresh Stop re-arms it, an elapsed window with no terminal
-        # result is a genuine stall. None = no grace pending.
-        stall_deadline: float | None = None
+        # Positive grace arms at launch for dev/review sessions, so a CLI that
+        # goes silent before its first Stop cannot burn the full wall timeout. A
+        # fresh Stop or later pane growth re-arms it; None = grace disabled.
+        stall_deadline = time.monotonic() + self._stall_grace_s if self._stall_grace_s > 0 else None
         # pane-log activity signature captured when the grace window is armed; a
         # session streaming output (a long productive turn, a streaming subagent)
         # advances it and re-arms the window, so only genuine silence stalls.
-        last_activity: tuple[int, int] | None = None
+        last_activity = (
+            self._log_activity_key(handle.task_id) if stall_deadline is not None else None
+        )
         # wake-nudges left to spend when the grace window elapses in silence: the
         # session likely ended its turn awaiting a background process, so we prod
         # it (bmad-loop has no background re-invocation) instead of stalling. A
@@ -582,6 +670,27 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                     transcript_path=transcript_path,
                     timeout_fired_at=time.time(),
                     timeout_expired_clock=expired,
+                    budget_weighted=budget_weighted,
+                    stop_seen=stop_seen,
+                )
+            # Hard-stop poll (#319), per-iteration and deliberately NOT inside
+            # the heartbeat throttle below: the loop's own wait is capped at 5s
+            # (`watcher.wait_for(..., timeout_s=min(remaining, 5.0))`), so a stop
+            # normally lands well inside `stop_run`'s 10s grace window, while riding
+            # the 30s HEARTBEAT_INTERVAL_S would be worse than the status quo. Read
+            # that as the common case, not a bound: an iteration that goes on to
+            # wait RESULT_GRACE_S for an artifact, or to block on a tmux call under
+            # TMUX_TIMEOUT_S, exceeds the grace window on its own. See the second
+            # poll after the wait below for how the interval is split, and why it
+            # still cannot be made unconditionally short. Return the verdict — never raise `RunStopped` here: that would
+            # skip `run()`'s finally-kill + `_post_kill_reconcile`. The file is
+            # left on disk for the engine to consume and attribute the stop.
+            if self._hard_stop_requested():
+                self._note_lifecycle(handle.task_id, "stop-abort-fired")
+                return SessionResult(
+                    status="aborted",
+                    session_id=session_id,
+                    transcript_path=transcript_path,
                     budget_weighted=budget_weighted,
                     stop_seen=stop_seen,
                 )
@@ -727,6 +836,27 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                 timeout_s=min(remaining, 5.0),
                 since_ns=handle.launched_ns,
             )
+            # Second poll, and the reason there are two (#319). The arm at the top of
+            # the loop is separated from its next run by everything between: the 5s
+            # wait above, plus whichever dispatch leg the event selects — a
+            # `_window_alive` or `send_text` bounded only by TMUX_TIMEOUT_S (30s), or
+            # a `_result_json(wait=True)` that waits RESULT_GRACE_S (15s) for an
+            # artifact. The last of those alone outlasts `stop_run`'s 10s grace on a
+            # perfectly healthy box, with no transport fault anywhere. Polling here
+            # splits the iteration so at most one leg sits between two checks. It
+            # cannot make the interval unconditionally short — an in-flight
+            # subprocess is not interruptible from this thread — so a leg that does
+            # outlast the window still degrades to `stop_run`'s force-kill backstop:
+            # the pre-#319 outcome, never a worse one.
+            if self._hard_stop_requested():
+                self._note_lifecycle(handle.task_id, "stop-abort-fired")
+                return SessionResult(
+                    status="aborted",
+                    session_id=session_id,
+                    transcript_path=transcript_path,
+                    budget_weighted=budget_weighted,
+                    stop_seen=stop_seen,
+                )
             if event is None:
                 try:
                     alive = self._window_alive(handle)
@@ -779,7 +909,13 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                         # agent waking; an unresponsive session keeps draining it.
                         stall_nudges_left -= 1
                         stall_nudges_sent += 1
-                        self.send_text(handle, STALL_NUDGE_TEXT)
+                        try:
+                            self.send_text(handle, STALL_NUDGE_TEXT)
+                        except MultiplexerError:
+                            # A dead/hung window cannot take the nudge. The
+                            # bounded attempt is still spent, and the next tick's
+                            # ordinary liveness probe owns the verdict.
+                            pass
                         stall_deadline = time.monotonic() + self._stall_grace_s
                         last_activity = self._log_activity_key(handle.task_id)
                         continue
@@ -854,7 +990,12 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
                     )
                 if nudges_left > 0:
                     nudges_left -= 1
-                    self.send_text(handle, NUDGE_TEXT)
+                    try:
+                        self.send_text(handle, NUDGE_TEXT)
+                    except MultiplexerError:
+                        # The next deterministic liveness probe decides whether
+                        # the un-nudgeable window is dead or merely unavailable.
+                        pass
                     continue
                 if self._stall_grace_s <= 0:
                     return self._final(
@@ -923,68 +1064,31 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
             return None
         return (st.st_mtime_ns, st.st_size)
 
-    def _classify_env_fault(
-        self, handle: SessionHandle, spec: SessionSpec, result: SessionResult
-    ) -> SessionResult:
-        """Post-mortem transport-failure classification (#194).
-
-        Runs last in ``run()`` (after ``_post_kill_reconcile``): only a
-        non-completed verdict (``result.status`` in ``ENV_FAULT_STATUSES``,
-        ``result_json is None``) with configured patterns is inspected, so a
-        reconcile upgrade to ``completed`` is never re-classified and adapters
-        without patterns stay inert. On a matching log-tail line, stamp
-        ``env_fault`` / ``env_fault_evidence`` and drop an ``env-fault-classified``
-        lifecycle breadcrumb. No match, no patterns, or an unreadable log leaves
-        the verdict untouched — best-effort, like ``_write_heartbeat``."""
-        if (
-            not self._env_fault_patterns
-            or result.status not in ENV_FAULT_STATUSES
-            or result.result_json is not None
-        ):
-            return result
-        evidence = self._env_fault_evidence(handle.task_id)
-        if evidence is None:
-            return result
-        self._note_lifecycle(
-            handle.task_id, "env-fault-classified", status=result.status, evidence=evidence
-        )
-        return dataclasses.replace(result, env_fault=True, env_fault_evidence=evidence)
-
-    def _env_fault_evidence(self, task_id: str) -> str | None:
-        """Scan the tail of the tee'd pane log for a transport-failure pattern.
-
-        Reads the last ``ENV_FAULT_TAIL_BYTES`` (binary, decoded with
-        ``errors="replace"``, ``\\r``→``\\n``), strips ANSI, and matches each line
-        against the precompiled patterns under a per-match ``ENV_FAULT_MATCH_TIMEOUT_S``
-        bound. Returns the ANSI-stripped matching line (last match winning, truncated
-        to ``ENV_FAULT_EVIDENCE_MAX``), or None when nothing matches, the log can't be
-        read (any ``OSError``), or a pattern exceeds the match timeout
-        (``TimeoutError``) — no classification, the best-effort doctrine."""
-        try:
-            with (self.logs_dir / f"{task_id}.log").open("rb") as fh:
-                fh.seek(0, 2)  # SEEK_END
-                size = fh.tell()
-                fh.seek(max(0, size - ENV_FAULT_TAIL_BYTES))
-                raw = fh.read()
-        except OSError:
-            return None
-        text = _ANSI_RE.sub("", raw.decode("utf-8", errors="replace").replace("\r", "\n"))
-        match_line: str | None = None
-        try:
-            for line in text.split("\n"):
-                if any(
-                    pat.search(line, timeout=ENV_FAULT_MATCH_TIMEOUT_S)
-                    for pat in self._env_fault_patterns
-                ):
-                    match_line = line  # last match wins
-        except TimeoutError:
-            return None  # runaway pattern → decline to classify (best-effort, like OSError)
-        if match_line is None:
-            return None
-        return match_line.strip()[:ENV_FAULT_EVIDENCE_MAX]
-
     def _window_alive(self, handle: SessionHandle) -> bool:
         return handle.native_id in self.mux.list_window_ids(self.session_name)
+
+    def _session_vanished(self) -> bool:
+        # The disambiguating probe (#489): `list_window_ids` returns [] for a
+        # dead window AND for a session that no longer exists, so a plain
+        # window-death verdict cannot tell an exited CLI from a session destroyed
+        # under the run. Only `has_session` separates them.
+        #
+        # The destroyer is NOT necessarily foreign. Candidates: an external
+        # reaper (psmux/psmux#546), a concurrent
+        # `runs.kill_session` from this tool's own prune/stop/crash paths or the
+        # TUI, an operator `kill-session`, a mux server crash, the host sleeping.
+        # The reason text stays neutral about which, because this probe cannot
+        # tell them apart — it reports that the mux no longer answers for the
+        # session, nothing more.
+        #
+        # Safe to ask this late: `run()`'s teardown kills the WINDOW, never the
+        # session, so our own kill cannot fake a vanishing, and a session once
+        # gone stays gone.
+        try:
+            return not self.mux.has_session(self.session_name)
+        except MultiplexerError:
+            # Unknown is not vanished — the same rule the liveness probe follows.
+            return False
 
     def send_text(self, handle: SessionHandle, text: str) -> None:
         self.mux.send_text(handle.native_id, text)
@@ -1165,7 +1269,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
 
 
 class _DevSynthesisMixin(_ResultFileMixin):
-    """Result synthesis for the generic ``bmad-dev-auto`` skill, shared by
+    """Result synthesis for the generic ``bmad-build-auto`` skill, shared by
     every transport that drives it (tmux today; see GenericDevAdapter for the
     skill contract). Locates the terminal spec the skill leaves on disk and
     synthesizes the legacy result dict via :mod:`devcontract`. Hosts provide
@@ -1193,7 +1297,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
     _READBACK_NEEDS_PROOF_OF_WORK = True
 
     def _configure_dev_knobs(self) -> None:
-        """Override the base result-file knobs for the bmad-dev-auto contract;
+        """Override the base result-file knobs for the bmad-build-auto contract;
         hosts call this at the end of ``__init__``."""
         # The generic skill never writes result.json, so the base "write the
         # result JSON file" nudge is meaningless — and actively misleading — for
@@ -1803,9 +1907,20 @@ class _DevSynthesisMixin(_ResultFileMixin):
         cap-exhausted injected-workflow stall whose marker landed before the
         kill is rescued by the same trust model. ``over_budget`` joins the set
         (#158): an artifact the wrap-up nudge flushed at kill-time is honored
-        the same way."""
+        the same way.
+
+        ``aborted`` joins it too (#319): an operator's hard stop kills the
+        window mid-wait, so a Stop event that had already landed — or was one
+        tick away — is never read, leaving exactly the same evidence problem.
+        The same trust model settles it: a provably dead window plus a
+        self-consistent *successful* terminal plus proof-of-work means the
+        session did finish, and discarding that work would misreport what
+        happened rather than be cautious about it. The upgrade to
+        ``completed`` does NOT resume the run — the engine re-reads the
+        hard-stop file after saving the rescued session and stops there, so a
+        rescue records the finished work and still honors the stop."""
         if (
-            result.status not in ("stalled", "timeout", "over_budget")
+            result.status not in ("stalled", "timeout", "over_budget", "aborted")
             or result.result_json is not None
         ):
             return result
@@ -1843,8 +1958,8 @@ class _DevSynthesisMixin(_ResultFileMixin):
         # this rescue exists for a session that finished but lost its Stop, not for
         # one that never ran. A session that ended no turn and whose pane log never
         # grew produced nothing, so a qualifying artifact is not its output — keep
-        # the stall/timeout verdict. This is the call path the issue's second
-        # occurrence (story i-11) took.
+        # the stall/timeout verdict. This is the call path the incident's second
+        # occurrence took.
         if not self._produced_work(handle, result.stop_seen):
             self._note_lifecycle(
                 handle.task_id,
@@ -1872,14 +1987,15 @@ class _DevSynthesisMixin(_ResultFileMixin):
 
 
 class GenericDevAdapter(_DevSynthesisMixin, GenericAdapter):
-    """Dev adapter for Alex Verhovsky's generic ``bmad-dev-auto`` skill.
+    """Dev adapter for Alex Verhovsky's generic ``bmad-build-auto`` skill.
 
     That skill writes NO ``result.json`` — its outcome lives in the spec it
     leaves on disk (frontmatter ``status:`` plus an appended ``## Auto Run
-    Result``, or, when it never created a spec, a ``bmad-dev-auto-result-*.md``
-    fallback). On the Stop event we locate that artifact and synthesize the
-    legacy result dict from it via :mod:`devcontract`, so verify/escalation and
-    the rest of the pipeline consume it unchanged. Selected by
+    Result``, or, when it never created a spec, a ``bmad-build-auto-result-*.md``
+    — ``bmad-dev-auto-result-*.md`` pre-rename — fallback). On the Stop event we
+    locate that artifact and synthesize the legacy result dict from it via
+    :mod:`devcontract`, so verify/escalation and the rest of the pipeline
+    consume it unchanged. Selected by
     ``policy.dev.skill == "bmad-dev-auto"`` (see ``cli._make_adapters``).
     """
 

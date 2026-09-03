@@ -21,7 +21,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tomllib
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import ExitStack
@@ -32,10 +31,10 @@ from typing import Any, NamedTuple
 
 from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
-from .platform_util import atomic_write_bytes, file_lock
+from .platform_util import atomic_write_bytes, atomic_write_text, file_lock
 from .policy import POLICY_TEMPLATE
 from .process_host import get_process_host
-from .verify import GitError, git_bytes
+from .verify import GitError, git_below_floor, git_bytes, git_floor_text, git_version_at_least
 
 HOOK_SCRIPT_REL = ".bmad-loop/bmad_loop_hook.py"
 # Markers for bmad-loop-managed hook commands. RELAY_MARKER is shared by
@@ -176,12 +175,18 @@ DEV_BASE_SKILLS = {
     "bmad-review-adversarial-general": (),
     "bmad-review-edge-case-hunter": (),
 }
-# The merged lens-based reviewer (BMAD-METHOD core-streamline). Current sources make
-# step-04 layer-driven off customize.toml's [[workflow.review_layers]]: four layers
-# (blind-hunter, edge-case-hunter, verification-gap — each invoking bmad-review with
-# one lens — plus intent-alignment, an inline prompt invoking no skill at all), so
-# bmad-review alone satisfies every layer that needs a skill. Named here for the
-# fallback path only; the derived path sees it named in the layers themselves.
+# The merged lens-based reviewer (BMAD-METHOD core-streamline). It satisfies the
+# layer topology of the releases that hand off to it: step-04 driven off
+# customize.toml's [[workflow.review_layers]], with the hunter layers each invoking
+# bmad-review with one lens. On 6.11 sources the same four layers (blind-hunter,
+# edge-case-hunter, verification-gap, intent-alignment) invoke no skill at all —
+# two of them read the primitive's own review-prompts/*.md, two carry their prompt
+# inline — so that tree derives an empty `required` map, which is satisfied rather
+# than unsatisfiable: _review_findings
+# falls back to the static catalog only when the resolution is None (an unreadable
+# shape), never because it resolved to requiring nothing. Both topologies stay
+# supported; this constant is named here for the fallback path only, and the derived
+# path sees it named in the layers themselves.
 MERGED_REVIEW_SKILL = "bmad-review"
 # The DEV_BASE_SKILLS entries MERGED_REVIEW_SKILL subsumes. bmad-dev-auto (the dev
 # primitive) is NOT here — the merged reviewer never substitutes for it.
@@ -1011,6 +1016,44 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
     return findings
 
 
+def hook_script_current(project: Path) -> bool | None:
+    """Does the project's installed relay match the one this wheel would write?
+
+    ``True`` yes, ``False`` stale (or otherwise divergent), ``None`` unknowable —
+    the installed copy or the packaged source could not be read as text. The
+    unknown arm is a third state and not a coerced ``False`` on purpose: the sole
+    caller (``cmd_validate``'s ``hooks.relay-stale``) reports what it knows, and
+    "I could not look" is not "your relay is out of date".
+
+    Lives here, beside :func:`install_into`'s write of the same two paths, so the
+    reader and the writer of the relay stay in one module and one reviewer's view
+    — a comparison that resolved the source differently from the writer would
+    answer a different question.
+
+    Compared as TEXT read with universal newlines, not as raw bytes. That is
+    precisely the round trip ``install_into`` performs (``read_text`` then
+    ``write_text``), and ``write_text`` translates ``\\n`` to ``os.linesep`` — so
+    on Windows every freshly-installed relay differs from the packaged source
+    byte-for-byte while being exactly what ``init`` writes. A byte compare would
+    call those installs permanently stale.
+    """
+    try:
+        installed = (project / HOOK_SCRIPT_REL).read_text(encoding="utf-8")
+        packaged = (
+            resources.files("bmad_loop.data")
+            .joinpath("bmad_loop_hook.py")
+            .read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        # ValueError covers UnicodeDecodeError (a relay overwritten with non-UTF-8
+        # bytes); OSError covers missing/unreadable on either side. Observation
+        # degrades — the missing and unreadable cases already have their own
+        # finding (`hooks.relay-present`), and a packaged source this process
+        # cannot read is a broken wheel, not a stale project.
+        return None
+    return installed == packaged
+
+
 def _hook_command(project: Path, profile: CLIProfile, canonical_event: str) -> str:
     host = get_process_host()
     interp = host.hook_interpreter()
@@ -1063,6 +1106,58 @@ def _managed_hook_in_handlers(handlers) -> bool:
     """merge_hooks' dedup: a relay OR probe-capture command is already present."""
     dumped = json.dumps(handlers)
     return RELAY_MARKER in dumped or PROBE_MARKER in dumped
+
+
+def strip_relay_hooks(config: dict, dialect: str) -> bool:
+    """Drop every relay registration from a parsed hook config. True if any went.
+
+    The inverse of :func:`merge_hooks`, for the one caller that needs its own
+    registration to be authoritative rather than additive: a worktree seeded with
+    the main repo's hook config (``provision_worktree``). That config already
+    carries a relay command written for the main repo — `$CLAUDE_PROJECT_DIR`-relative
+    for the claude dialect, which resolves inside the worktree, where no relay
+    exists. `merge_hooks` will not replace it, since `_managed_hook_in_handlers`
+    reports the event as already registered, so the stale command has to go first.
+
+    Only RELAY_MARKER commands are removed, at command granularity: a matcher
+    entry whose nested list holds a project command beside the relay keeps the
+    entry and loses only the relay command. A probe-capture hook is a deliberate,
+    temporary registration that no worktree seeding produces, and is left alone.
+    Empty event lists are dropped; an empty container is left in place for
+    `merge_hooks` to refill.
+    """
+    container = hook_event_container(config, dialect)
+    removed = False
+    for native_event in list(container):
+        handlers = container.get(native_event)
+        if not isinstance(handlers, list):
+            continue
+        kept = []
+        for handler in handlers:
+            if RELAY_MARKER not in json.dumps(handler):
+                kept.append(handler)
+                continue
+            # claude/codex/gemini wrap commands in a nested "hooks" list, and a
+            # user may have added their own command beside the relay inside ONE
+            # matcher entry — strip inside the list so theirs survives. copilot
+            # and agy store the command dict flat in the event list, so a marker
+            # match means the entry IS the relay and it drops whole.
+            nested = handler.get("hooks") if isinstance(handler, dict) else None
+            if isinstance(nested, list):
+                surviving = [c for c in nested if RELAY_MARKER not in json.dumps(c)]
+                if surviving:
+                    if len(surviving) != len(nested):
+                        handler["hooks"] = surviving
+                        removed = True
+                    kept.append(handler)
+                    continue
+            removed = True
+        if len(kept) != len(handlers):
+            if kept:
+                container[native_event] = kept
+            else:
+                del container[native_event]
+    return removed
 
 
 def relay_registered(config: dict, dialect: str, events: Iterable[str]) -> bool:
@@ -1157,7 +1252,34 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
     }
     config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
     if changed:
-        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        # atomic_write_text, never write_text (#379), the same rule
+        # `_worktree_local_exclude` states for its bytes sibling. This is a
+        # read-modify-REWRITE of a file `init` does not own: the parse above kept
+        # the operator's permission allowlist, env, MCP entries and their own
+        # hooks, and every one of them is re-serialized here. `"w"` TRUNCATES
+        # before writing, so a short write (ENOSPC, a full quota) publishes a
+        # PREFIX of that JSON — and unlike the ledgers, this failure is loud in
+        # the worst way: the next `init` reads it back, fails json.loads, and
+        # prints "is not valid JSON; fix it and re-run init" (above) at a human
+        # whose file this tool just shredded. The helper leaves the original
+        # untouched on any raise. follow_symlinks stays at the default, matching
+        # the `write_text` it replaces: `_confined_to` above resolves the path and
+        # refuses anything landing outside the project, so the only links reaching
+        # this write point back INSIDE it — an in-repo indirection the operator
+        # arranged, which a name-replacement would orphan on the first init. That
+        # rules out the confined writers too: they are no-follow by construction,
+        # so this site takes the #597 flag and nothing else.
+        # `require_writable_target=True` is that flag. `os.replace` needs write
+        # permission on the parent DIRECTORY, never on the entry it replaces, so a
+        # settings.json the operator had marked read-only was rewritten anyway and,
+        # because the mode is inherited, came back reading `0444` with nothing in
+        # the permission bits to record it. This file is the operator's own — the
+        # parse above kept their allowlist, env and MCP entries — so a read-only one
+        # is a `PermissionError`, which is what the `write_text` this replaced
+        # raised (#597).
+        atomic_write_text(
+            config_path, json.dumps(config, indent=2) + "\n", require_writable_target=True
+        )
         print(f"  hooks registered ({profile.name}): {config_path}")
     else:
         print(f"  hooks already registered ({profile.name})")
@@ -1190,7 +1312,13 @@ def _walk_traversable_files(
     an unreadable source directory never leaves an empty destination behind.
     """
     if _is_dir(src):
-        real = str(src.resolve()) if isinstance(src, Path) else None
+        try:
+            real = str(src.resolve()) if isinstance(src, Path) else None
+        except (OSError, RuntimeError):
+            if not _suppress_errors:
+                raise
+            yield rel, src
+            return
         if real is not None and real in _seen:
             return
         if _should_descend is not None and not _should_descend(rel, src):
@@ -1292,6 +1420,7 @@ def _copy_traversable(
     skip_existing: bool = False,
     worktree: Path | None = None,
     repo_root: Path | None = None,
+    copied_paths: list[Path] | None = None,
 ) -> bool:
     """Recursively copy a Traversable tree, optionally confined to a worktree.
 
@@ -1306,6 +1435,17 @@ def _copy_traversable(
     dangling links, and refused entries therefore have no copy/read path. Directory
     visits preserve main's existing empty-directory behavior and its boolean result:
     true means at least one directory or file actually landed, false means total no-op.
+
+    ``copied_paths``, when supplied, receives every destination path that actually
+    landed — each file written and each directory this call created — in walk order.
+    The boolean answers the whole call, which under ``skip_existing`` is only ever
+    "at least one descendant landed"; a caller that must know whether ONE named path
+    landed cannot recover that from the boolean, and must not infer it from the
+    entry's presence in a copied-something ledger either, because the no-clobber legs
+    above skip occupied destinations one at a time and silently. Recording per path is
+    what makes that question answerable: the returned boolean is exactly
+    ``bool(appended entries)``, and membership is exact rather than parent-scoped
+    (#592). Appends only — the caller owns the list and may share one across calls.
     """
     copied = False
     no_clobber = skip_existing or worktree is not None
@@ -1355,6 +1495,8 @@ def _copy_traversable(
             return False
         if not existed:
             copied = True
+            if copied_paths is not None:
+                copied_paths.append(target)
         return True
 
     for rel, child in _walk_traversable_files(
@@ -1379,14 +1521,33 @@ def _copy_traversable(
         except OSError:
             if worktree is None:
                 raise
-            continue
+            # `copy2` is `copyfile` FOLLOWED BY `copystat`, so a destination
+            # filesystem that refuses the utime/chmod raises with the bytes already
+            # fully written (measured). Reading that as "nothing happened"
+            # under-reports twice: the entry is journaled as a no-op seed and loses
+            # its `git add -A` shield, and the file's provenance goes missing — so an
+            # unparseable config seeding really did supply would be blamed on the
+            # branch (#592). Deleting the survivor instead would be worse: the
+            # content is correct and only its metadata was refused, and dropping it
+            # is the absent-config stall (#471). Count whatever survived — the
+            # no-clobber leg above proved this slot was empty, so anything here now
+            # is ours. A partial `write_bytes` on the zip leg counts too: the bytes
+            # came from that source, and a re-arm re-seeds them whole.
+            if not _occupied(target):
+                continue
         copied = True
+        if copied_paths is not None:
+            copied_paths.append(target)
     return copied
 
 
-# The git that introduced `extensions.worktreeConfig` and `git config --worktree`,
-# both of which the worktree-scoped shield is built out of (git-worktree(1)).
-_WORKTREE_CONFIG_GIT = (2, 20)
+# The shield's gate is the PROJECT support floor, `verify.GIT_FLOOR`, not a floor of
+# its own. `extensions.worktreeConfig` and `git config --worktree` — the two things
+# this shield is built out of — arrived in git 2.20 (git-worktree(1)), and that fact
+# is still true; it simply stopped being the threshold. Keeping a second, lower
+# number here is what used to force this module to write 2.20-era code, and it also
+# read as the project's supported range from the outside (verify.py cited it as one).
+# One floor, named once, in the module that owns the git chokepoint.
 
 # The shield's mutual exclusion, held in the repository's COMMON dir so every
 # worktree of a repo contends on one file — a per-worktree gitdir would give each
@@ -1407,7 +1568,7 @@ _SHIELD_LOCK_NAME = "bmad-loop-shield.lock"
 # unstage the tool paths in the orchestrator's own commit path — `git reset --
 # <paths>` after the `add -A` at `verify.py:1891` and `:1932`. No shadow, so no
 # seed, no `_shield_inherited_excludes`, no permanent `extensions.worktreeConfig`,
-# no 2.20 floor. It is MECHANICALLY REACHABLE: those adds are the orchestrator's
+# no version floor. It is MECHANICALLY REACHABLE: those adds are the orchestrator's
 # own, not an LLM's (no skill in `data/skills/` runs git).
 #
 # Rejected on the merits, for two reasons that are about correctness rather than
@@ -1432,23 +1593,6 @@ _SHIELD_LOCK_NAME = "bmad-loop-shield.lock"
 # at git 2.55.0, the newest release.
 
 
-def _git_version_at_least(reported: str, want: tuple[int, int]) -> bool:
-    """Is this `git version …` line at least `want`? Anything unreadable is NO.
-
-    Only `major.minor` is compared, and only from a line that actually starts
-    `git version` — the tail is vendor soup (`2.44.0.windows.1`,
-    `2.39.5 (Apple Git-154)`) and searching the whole string for the first two
-    dotted numbers would happily read a version out of a build tag.
-
-    Refusing an unparseable answer is the point rather than a fallback: the only
-    caller uses this to decide whether to make a PERMANENT repo-format change, so
-    the failure it must not have is the optimistic one — a git that will not say
-    what it is does not get that change made on its behalf.
-    """
-    match = re.match(r"git version (\d+)\.(\d+)", reported.strip())
-    return match is not None and (int(match[1]), int(match[2])) >= want
-
-
 def _shield_shared_config(worktree: Path, shared: str, key: str, *opts: str) -> bytes | None:
     """`key`'s raw value in the SHARED config, or None when it is definitely ABSENT.
 
@@ -1459,7 +1603,7 @@ def _shield_shared_config(worktree: Path, shared: str, key: str, *opts: str) -> 
     confined those keys to the main worktree, after which a genuine `core.worktree`
     starts applying to every linked worktree.
 
-    The rc mapping, stable from the 2.20 floor to current git:
+    The rc mapping, stable across the supported range, `GIT_FLOOR` to current git:
 
         absent key ......................... 1     malformed config file ..... 128
         missing file ....................... 1     --type=bool on a non-bool . 128
@@ -1553,9 +1697,10 @@ def _shield_shared_repository(worktree: Path, common_dir: Path) -> str | None:
     repository at all. That is safe here and would not be for
     `extensions.worktreeConfig`: this key is static configuration the tool never
     writes, so there is no shared mutable state to serialize. It adds no version
-    floor either — a plain `--get` with no `--type=`, so it does not reintroduce the
-    2.18 trap that keeps the version gate above the probes in
-    `_shield_enable_worktree_config`.
+    floor either — a plain `--get` with no `--type=`. `--type=` was itself a reason to
+    keep the version gate above the probes when the gate was 2.20; at `GIT_FLOOR` it
+    is far below the floor, and the gate leads for its unreadable-answer arm instead
+    (see `_shield_enable_worktree_config`).
 
     AN ALLOWLIST, NOT AN ENUMERATION OF SHARED SHAPES: git accepts keywords,
     booleans, the legacy 0/1/2 and bare octal modes, so enumerating the shared ones
@@ -1645,32 +1790,43 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> tuple[st
     the installer will not make behind an operator's back, so the shield degrades
     instead.
 
-    The version gate and both refusal probes STAY HERE, first. `git config
-    --worktree` does not exist before 2.20, so on an older git the enable buys a
-    permanent format change with nothing to show for it, and git-worktree(1) says
-    older git refuses a repository carrying the extension. `--type=` is itself git
-    2.18, so on an older git the two `--type=bool` probes below cannot answer —
-    `_shield_shared_config`'s raise on any rc but 0 or 1 is defence in depth BEHIND
-    this gate, not licence to relax the floor. The caller's `--type=path`
+    It is refused a THIRD way, which is this project's rather than git's: an
+    `extensions.worktreeConfig` already PRESENT but not `true` is an operator's
+    explicit disable, and enabling over it would rewrite that declaration
+    permanently — the same discipline as above, applied to the flag itself (#396).
+
+    The version gate and the refusal probes STAY HERE, first. The gate is the
+    PROJECT support floor (`verify.GIT_FLOOR`), not a capability threshold of this
+    shield's own: `extensions.worktreeConfig` and `git config --worktree` arrived in
+    git 2.20 and `--type=` in 2.18, all well below the floor, so on any supported git
+    every probe below can answer. Refusing an unsupported git is therefore a POLICY
+    decision, not a capability one — the enable is a permanent repo-format change,
+    and git-worktree(1) says older git refuses a repository carrying the extension,
+    so a git this project neither tests nor supports is exactly the one to withhold
+    that write from. `_shield_shared_config`'s raise on any rc but 0 or 1 is defence
+    in depth BEHIND this gate, not licence to relax it. The caller's `--type=path`
     excludesFile read rests on it too.
+
+    The run, sweep and resume entrypoints already refuse an under-floor git outright
+    (`cli._reject_under_floor_git`), so no supported path reaches this gate with one.
+    It stays because its OTHER arm still fires on a perfectly current host: a git
+    that cannot be spawned, times out, or answers unparseably reads as below the
+    floor, and none of those may authorize the write.
     """
-    # Polarity note: this gate reads `returncode != 0` as REFUSE, while the funnel
-    # below reads it as "git did not answer" and raises. Both fail closed, by
+    # Polarity note: this gate reads an unreadable answer as REFUSE, while the funnel
+    # below reads a bad rc as "git did not answer" and raises. Both fail closed, by
     # opposite-looking means, and unifying them would reverse one — an unanswerable
     # `git version` must refuse here, not degrade into a question about a key. Nor is
     # it a repo-config check: `git version` does no repository setup, so it exits 0
-    # where `rev-parse` fatals 128 on a malformed `.git/config`.
-    version = git_bytes(worktree, "version")
-    if version.returncode != 0 or not _git_version_at_least(
-        os.fsdecode(version.stdout), _WORKTREE_CONFIG_GIT
-    ):
-        want = f"{_WORKTREE_CONFIG_GIT[0]}.{_WORKTREE_CONFIG_GIT[1]}"
-        found = os.fsdecode(version.stdout).strip() or f"git exited {version.returncode}"
+    # where `rev-parse` fatals 128 on a malformed `.git/config`. `git_below_floor`
+    # folds all three unreadable shapes (bad rc, unparseable text, empty text) into
+    # the one refusal this needs.
+    if (found := git_below_floor(worktree)) is not None:
         return (
-            f"skipped the git-add shield ({worktree}): needs git {want} for "
-            f"extensions.worktreeConfig and `git config --worktree`, but git answered "
-            f"{found!r} — enabling the extension on an older git is a permanent "
-            "repo-format change that would shield nothing"
+            f"skipped the git-add shield ({worktree}): bmad-loop supports git "
+            f"{git_floor_text()} and newer, but git answered {found!r} — the shield "
+            "enables extensions.worktreeConfig, a permanent repo-format change, and "
+            "that is not made on an unsupported git"
         ), False
     # EVERY read below names the SHARED config as a file rather than going by scope
     # (`--local` resolves to it today; naming it keeps the checks honest if that
@@ -1701,11 +1857,30 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> tuple[st
     # All of that is undocumented IMPLEMENTATION DETAIL, not a compatibility
     # contract: git has converted reads to respect includes before (2.39, protected
     # config). Flag availability was never the question: `--includes` dates to git
-    # 1.7.10, far below the 2.20 floor the gate above enforces.
+    # 1.7.10, far below the floor the gate above enforces.
     shared = str(common_dir / "config")
     carried = _shield_shared_config(worktree, shared, "extensions.worktreeConfig", "--type=bool")
     if carried is not None and os.fsdecode(carried).strip() == "true":
         return None, False  # already carried: nothing for the caller to write
+    if carried is not None:
+        # Present but NOT true: enabling over an operator's explicit disable is a stronger
+        # intervention than enabling from ABSENT, and it is the SUCCESS path that does the
+        # lasting damage — rewriting that declaration to `true` forever, unjournaled. The
+        # shield degrades instead, which also puts #396's rollback deletion out of reach.
+        #
+        # `--type=bool` normalized the spelling away (`off`/`no`/`0`/`FALSE` all read back
+        # `false`, measured at 2.34.1 and 2.55.0), so re-read it RAW for the reason and
+        # neutralize it as the sharedRepository arm above does. A GitError from that read
+        # propagates — the caller's tail degrades, and still nothing is enabled. `carried`
+        # stands in only if the key stops existing between the two reads.
+        raw = _shield_shared_config(worktree, shared, "extensions.worktreeConfig")
+        value = os.fsdecode(carried if raw is None else raw).removesuffix("\n")
+        return (
+            f"skipped the git-add shield ({worktree}): the repository's shared config sets "
+            f"extensions.worktreeConfig = {value!r}, explicitly disabling it, and the shield "
+            "will not override an operator's declaration — the provisioned tool files are "
+            "not shielded from the unit's `git add -A`"
+        ), False
     bare = _shield_shared_config(worktree, shared, "core.bare", "--type=bool")
     if bare is not None and os.fsdecode(bare).strip() == "true":
         refused = "core.bare = true"
@@ -1799,16 +1974,23 @@ def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> s
         # `--unset` alone could not simply treat 5 as success, because git-config(1)
         # gives that code TWO meanings — the key did not exist, or MULTIPLE LINES
         # matched — so a doubled key that SURVIVED would report a clean rollback.
-        # Stable from the 2.20 floor to current git: `--unset` against a doubled key
+        # Stable across the supported range to current git: `--unset` against a doubled key
         # exits 5 and removes NOTHING, while `--unset-all` exits 0 and removes both
         # lines, collapsing rc 5 to the single meaning "no line matched".
         undone = git_bytes(worktree, "config", "--unset-all", "extensions.worktreeConfig")
         if undone.returncode in (0, 5):
             return ""
         detail = os.fsdecode(undone.stderr).strip() or f"git exited {undone.returncode}"
-    except GitError as e:
+    except (GitError, UnicodeError) as e:
         # the rollback's OWN git can time out or fail to spawn: a read-only `.git` or
         # a dead git fails this unset for the same reason it failed the activation.
+        #
+        # `UnicodeError` is the `fsdecode` of git's stderr one line up (#394): Windows
+        # decodes utf-8/surrogatepass, which REJECTS a lone invalid byte, so without it
+        # a codec fault escapes a function contracted never to raise (POSIX decodes
+        # with surrogateescape and never raises). `OSError`/`RuntimeError` are
+        # deliberately absent, so this is NOT a copy of the sibling scan's tuple above:
+        # nothing in this block resolves a path, which is what those two are there for.
         detail = str(e)
     # Both clauses HEDGE whether this shield set the flag, and must: reached from the
     # enable's own raise, a spawn failure can kill the enable and this unset alike,
@@ -1819,6 +2001,43 @@ def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> s
         f"rolled back ({detail}) — if this shield set the flag, the repository keeps "
         "a permanent format change that shields nothing"
     )
+
+
+# The Git for Windows FORK patches `xdg_config_home_for` (`path.c`) to prefer
+# `%APPDATA%/Git/<file>` over the `$HOME/.config/git/<file>` upstream computes,
+# from this version onward (absent at 2.45, absent upstream at every version).
+# `_shield_home_git_ignore` gates on it (#403).
+_APPDATA_IGNORE_GIT = (2, 46)
+
+
+def _shield_file_exists(candidate: Path) -> bool:
+    """git's OWN existence predicate, which is `lstat(f, &sb) == 0` (`dir.c`).
+
+    Deliberately NOT `Path.is_file()`. `lstat` succeeds on a DIRECTORY and on a BROKEN
+    SYMLINK, so `xdg_config_home_for` selects those exactly as it selects a regular
+    file, and a narrower test here would reject what the fork accepts — sending this
+    module down the `$HOME` arm git is NOT reading, which is #403's over-ignore
+    direction rather than a safe fall-through.
+
+    Selecting is not the same as being able to MIRROR, and the two non-regular shapes
+    part company right there — the caller distinguishes them:
+
+    - a BROKEN SYMLINK is dropped by git's own `access_or_warn(..., R_OK)` gate, whose
+      `ENOENT` counts as an ignorable missing file, so git loads no patterns and runs
+      on. The caller's `is_file()` seeds nothing, which mirrors that exactly.
+    - a DIRECTORY passes that same `access(R_OK)` gate, so git goes on to
+      `add_patterns_from_file_1` and `die("cannot use %s as an exclude file")`. Git
+      does not run at all, and an empty seed would model a FATAL as a permissive
+      success — see `_shield_home_git_ignore`, which refuses that shape.
+
+    Swallows `OSError` alone — a candidate this process cannot stat is one the shield
+    must treat as absent, exactly as `file_exists` reports a failed `lstat`.
+    """
+    try:
+        os.lstat(candidate)
+    except OSError:
+        return False
+    return True
 
 
 def _shield_home_git_ignore(worktree: Path) -> Path:
@@ -1845,12 +2064,25 @@ def _shield_home_git_ignore(worktree: Path) -> Path:
     operator's config. The answer comes back NUL-terminated at rc 0; with `HOME`
     unset git exits 128 and applies no fallback at all.
 
-    KNOWN GAP: this answers "where is git's `$HOME`", which is the whole of the
-    fallback UPSTREAM but not on **Git for Windows >= 2.46**, whose fork patches
-    `xdg_config_home_for` to prefer `%APPDATA%/Git/<file>` whenever that file EXISTS.
-    An operator there keeping global ignores at `%APPDATA%\\Git\\ignore` still gets
-    the wrong file seeded. Not fixed here: a downstream fork's behavior, gated well
-    above this shield's floor.
+    That `$HOME` answer is the whole of the fallback UPSTREAM, and is not on **Git
+    for Windows >= 2.46** (#403). The fork patches `xdg_config_home_for`
+    (`git-for-windows/git`, `path.c`) to prefer `%APPDATA%/Git/<file>` whenever that
+    file EXISTS, warning that it ignored the `$HOME` one when both are there. Counted
+    per tag: present at 2.46.0.windows.1 and 2.55.0.windows.3, absent at
+    2.45.0.windows.1 and 2.20.0.windows.1, absent from upstream `git/git` entirely.
+    PROVENANCE: source-read through #403, **NOT measured on a Windows machine** — no
+    runtime observation of Git for Windows was available, and Windows CI cannot supply
+    one either (the runners carry no `%APPDATA%\\Git\\ignore`, so they can show only
+    that nothing broke).
+
+    The APPDATA arm below closes a harm that ran in BOTH directions, each silent.
+    APPDATA file only: this returned a `$HOME` path that is typically not a file, the
+    seed came back empty with `reason is None`, and the caller then activated a
+    worktree-scoped `core.excludesFile` SHADOWING the file git really reads — so
+    everything the operator globally ignores became visible to `git add -A` and swept
+    into the story commit. BOTH files present: git uses the APPDATA one and says so,
+    while this seeded the `$HOME` one — copying patterns git is not applying, so the
+    worktree OVER-ignored and session-created files went silently missing instead.
 
     Raises `GitError` on any non-zero rc, INCLUDING the `HOME`-unset one. Proceeding
     would be a guess, and a guess here is silent: the caller seeds nothing and
@@ -1859,6 +2091,52 @@ def _shield_home_git_ignore(worktree: Path) -> Path:
     version-dependent. A `HOME`-less environment therefore skips the shield with a
     reported reason; only a definite absent may be silent in this caller.
     """
+    # Cheap-first, and every arm that does not MATCH falls through to the `$HOME`
+    # probe below — no APPDATA, no such file, an unanswerable `git version`, upstream
+    # git, a fork below 2.46. That fall-through is the conservative direction: it is
+    # exactly the pre-fix behavior, and a git too dead to report its version is not
+    # absolved by it, because the probe below raises its own `GitError` on the same
+    # git and the caller degrades with a reason.
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidate = Path(appdata) / "Git" / "ignore"
+        # LOAD-BEARING, and it mirrors the fork's own `file_exists` precondition
+        # EXACTLY rather than approximately — see `_shield_file_exists` for why an
+        # `is_file()` here would reject a directory and a broken symlink that git
+        # itself selects. It is also what keeps the cost at one `lstat` on every other
+        # platform: only a candidate that exists is worth the extra spawn below.
+        if _shield_file_exists(candidate):
+            # Gated on the FORK STRING, deliberately NOT `sys.platform` (#403). The
+            # preference is a patch carried by one FORK, not a property of the OS:
+            # Cygwin, MSYS2 and WSL gits run on Windows hardware without it, and a
+            # `win32` test would hand them the wrong file. This module has no
+            # `sys.platform` branch anywhere else, and asking git what it is keeps the
+            # tests honest — they fake a version string, never a platform.
+            version = git_bytes(worktree, "version")
+            if version.returncode == 0:
+                reported = os.fsdecode(version.stdout)
+                if ".windows." in reported and git_version_at_least(reported, _APPDATA_IGNORE_GIT):
+                    if candidate.is_dir():
+                        # SELECTED by git and then UNUSABLE by it: `access(R_OK)`
+                        # succeeds on a readable directory, so git reaches
+                        # `add_patterns_from_file_1` and dies ("cannot use %s as an
+                        # exclude file"). Returning it would seed nothing — and an
+                        # empty seed here is not the faithful mirror it is for a broken
+                        # symlink, it is a FATAL rendered as a permissive success:
+                        # activating a worktree-scoped `core.excludesFile` SHADOWS the
+                        # broken path, so the unit's `git add -A` would run happily
+                        # where the operator's own git refuses to run at all, and the
+                        # misconfiguration would never surface.
+                        #
+                        # `is_dir()` FOLLOWS the link deliberately: a symlink to a
+                        # directory is the same fatal. A broken one is not a directory
+                        # and falls through to be seeded as empty, which is what git
+                        # does with it.
+                        raise GitError(
+                            f"git's global ignore path is a directory ({candidate}) — "
+                            "git for Windows selects it and then cannot read it"
+                        )
+                    return candidate
     key = "bmadloop.xdghomeprobe"
     probe = git_bytes(
         worktree, "-c", f"{key}=~/.config/git/ignore", "config", "-z", "--type=path", "--get", key
@@ -1896,7 +2174,7 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
       `core.excludesFile` means "no excludes file at all", and git honors that
       literally: `-z --get` answers rc 0 with a lone NUL, git loads no patterns, and
       does NOT reach for XDG (`dir.c` guards that fallback on a NULL `excludes_file`;
-      an empty value is not NULL — unchanged from the v2.20 floor to master).
+      an empty value is not NULL — unchanged across the supported range to master).
       Reading it as unset instead seeds and activates the XDG file's patterns —
       OVER-ignoring, so files the operator deliberately stopped ignoring go silently
       missing from `git add -A`.
@@ -1914,9 +2192,9 @@ def _shield_inherited_excludes(worktree: Path) -> bytes:
     # activation shadow the file it never copied. `-z` terminates the value with NUL
     # instead.
     #
-    # The answers below hold at the 2.20 floor (the version refusal in
-    # `_shield_enable_worktree_config` has already run, so 2.20 is the oldest git that
-    # reaches this line) and at 2.55: `-z` expands `~`, gives an unset key rc 1 +
+    # The answers below hold at `GIT_FLOOR` (the version refusal in
+    # `_shield_enable_worktree_config` has already run, so the floor is the oldest git
+    # that reaches this line) and at 2.55: `-z` expands `~`, gives an unset key rc 1 +
     # empty stdout, an empty value a lone NUL at rc 0, a multi-valued key the LAST
     # value + NUL at rc 0, and a relative value verbatim.
     answer = git_bytes(worktree, "config", "-z", "--type=path", "--get", "core.excludesFile")
@@ -1998,42 +2276,90 @@ def _shield_verify_activation(worktree: Path, exclude: Path) -> str | None:
     orchestrator was launched with — outranks `worktree`. So an operator carrying an
     ambient `core.excludesFile` gets a shield that reports success and whose private
     file is never read: the provisioned tool files stay stageable by the unit's
-    `git add -A`, with no degrade reason to journal.
+    `git add -A`, with no degrade reason to journal. The check has git NAME the winning
+    scope rather than leaving it inferred from the value that came back.
 
     So the post-condition is asked of git. Detecting the ORIGIN instead —
     `GIT_CONFIG_COUNT` and friends in `os.environ` — is the enumeration this function
-    exists to avoid: `GIT_CONFIG_COUNT` does not exist at this shield's own 2.20
-    floor, `GIT_CONFIG_PARAMETERS` does but in two mutually incompatible encodings
-    across the supported range, and a `git -c` on a session's own command line never
-    appears in our environment at all. Asking git what it RESOLVED costs one call and
-    covers all of them, and whatever git adds next.
+    exists to avoid, and `--show-scope` strengthens that argument rather than retiring
+    it: nothing here reads `os.environ`, and git folds the whole channel family into
+    the single token `command` on the same single call, so every channel — and whatever
+    git adds next — arrives already LABELED, and the degrade reason names the family
+    without this code enumerating it. The evidence for why enumerating was never viable
+    stands: `GIT_CONFIG_PARAMETERS` is carried in two mutually incompatible encodings
+    across the supported range, `GIT_CONFIG_COUNT` is one more channel to remember (it
+    sits below `GIT_FLOOR`, so it is always present and always another thing to read),
+    and a `git -c` on a session's own command line never appears in our environment at
+    all. Asking git what it RESOLVED costs one call and covers all of them.
 
-    `--show-scope` would name the winning scope, and is deliberately not used: it is
-    git 2.26, above the 2.20 floor, and a probe flag with its own version floor turns
-    every rc-branch below it into a silent default.
+    `--show-scope` is git 2.26, which was above the old 2.20 gate this shield used to
+    carry; at `GIT_FLOOR` it is present on every supported git, which is what unblocked
+    it (#692). Under `-z` the answer is `scope NUL value NUL` — measured at BOTH ends of
+    the supported range, git 2.34.1 (the floor itself) and git 2.55.0, where the flag
+    also leaves the rc taxonomy alone: an absent key is still rc 1 with or without it.
+    The scope tokens git documents are `system`, `global`, `local`, `worktree` and
+    `command`. The scope refines the MESSAGE and nothing else: a byte-identical value
+    returns None whatever scope supplied it, since the post-condition is that git reads
+    the file we wrote and provenance is not a fault; every mismatch degrades; the scope
+    only decides what the reason tells the operator to go looking for.
 
     The read shape is the seed read's: `-z` because a legal POSIX path may carry edge
     whitespace, `--type=path` because that is how git itself resolves the key. Any
     non-zero rc is a fault here, not an ABSENT answer — this call asks about a key we
     have just written, so "there is no such key" is not good news about it. That is a
     DIFFERENT taxonomy from `_shield_inherited_excludes`, which reads a key the
-    operator may never have set; the two must not be unified.
+    operator may never have set; the two must not be unified. rc 0 carries a fault of
+    its own now: a well-formed `-z --show-scope` answer always holds the seam NUL
+    between scope and value, so an answer without one is not an answer and degrades
+    fail-closed rather than being parsed as a scope. Whatever shape an unmeasured git
+    might return lands there or in the unknown-token branch, and both degrade. The two
+    reads are also no longer byte-identical in ARGV — `--show-scope` is on this one
+    alone, retiring a trap the tests documented — and the seed read must NOT grow it,
+    since rc 1 there means ABSENT.
 
     The comparison is byte-exact and stays that way: `git config` round-trips a path
     verbatim through every hazard this shield has been burned by — edge whitespace,
     an embedded newline, a non-UTF-8 byte, an interior `~` — so loosening it would
     buy nothing and could only mask a real mismatch.
     """
-    resolved = git_bytes(worktree, "config", "-z", "--type=path", "--get", "core.excludesFile")
+    resolved = git_bytes(
+        worktree, "config", "-z", "--show-scope", "--type=path", "--get", "core.excludesFile"
+    )
     if resolved.returncode != 0:
         detail = os.fsdecode(resolved.stderr).strip() or f"git exited {resolved.returncode}"
         return f"git would not confirm which excludes file now applies: {detail}"
-    effective = resolved.stdout.split(b"\0", 1)[0]
+    scope, sep, rest = resolved.stdout.partition(b"\0")
+    if not sep:
+        return (
+            "git answered the activation check without naming a scope "
+            f"({resolved.stdout!r}), so which excludes file applies is unconfirmed"
+        )
+    effective = rest.split(b"\0", 1)[0]
     if effective == os.fsencode(str(exclude)):
         return None
+    shown = os.fsdecode(effective)
+    if scope == b"command":
+        return (
+            "the write succeeded but an ambient command-scope override — a `git -c` "
+            "this process was launched inside of, GIT_CONFIG_PARAMETERS, or "
+            f"GIT_CONFIG_COUNT — outranks it, so git reads {shown!r} instead and the "
+            "shield's patterns never apply"
+        )
+    if scope == b"worktree":
+        return (
+            "the write succeeded but worktree scope answers a different value, so git "
+            f"reads {shown!r} instead of the path just written and the shield's "
+            "patterns never apply"
+        )
+    if scope in (b"local", b"global", b"system"):
+        return (
+            "the write succeeded but git still resolves core.excludesFile from "
+            f"{os.fsdecode(scope)} scope — the worktree-scoped write is not in force "
+            f"at all, so git reads {shown!r} and the shield's patterns never apply"
+        )
     return (
-        "the write succeeded but another configuration scope outranks it, so git "
-        f"reads {os.fsdecode(effective)!r} instead and the shield's patterns never apply"
+        f"the write succeeded but a scope this code does not know, {os.fsdecode(scope)!r}, "
+        f"outranks it, so git reads {shown!r} instead and the shield's patterns never apply"
     )
 
 
@@ -2095,7 +2421,7 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         if answered.returncode != 0:
             # Not a repo (rc 128), the expected skip — NOT "a git too old for
             # `--absolute-git-dir`": rev-parse ECHOES an option it does not know and
-            # exits 0, so a git predating the flag lands in the git 2.20 refusal in
+            # exits 0, so a git predating the flag lands in the version refusal in
             # `_shield_enable_worktree_config` — a degrade, not this silent skip.
             return None
     except GitError:
@@ -2111,7 +2437,8 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         # `except` of its own: a non-zero rc returns the reason below, a raise lands in
         # this try's tail — which also catches the `UnicodeError` the `fsdecode` of
         # git's stderr can raise on Windows, hence that read sits inside the guard.
-        # #394 records that same decode escaping at a sibling block that lacks it.
+        # The sibling decode in `_shield_undo_extension`'s rollback carries that same
+        # guard, for the same reason (#394).
         shared_answer = git_bytes(worktree, "rev-parse", "--git-common-dir")
         if shared_answer.returncode != 0:
             detail = (
@@ -2185,8 +2512,10 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         # The span cannot be narrowed to those writes: the enable must stay immediately
         # above the activation, the private exclude must exist before it, and the
         # version + `core.bare`/`core.worktree` gates inside the probe must stay above
-        # the seed read, which shares the same `--type=` floor. So the file write sits
-        # inside the locked span.
+        # the seed read — the version gate for its unreadable-answer arm (see
+        # `_shield_enable_worktree_config`), the other two because the seed read must
+        # not run against a repo they would refuse. So the file write sits inside the
+        # locked span.
         #
         # The acquisition's own `OSError` is caught HERE only so the operator is told
         # which step failed: POSIX `flock` blocks indefinitely, but `msvcrt.locking`
@@ -2227,12 +2556,28 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
             #
             # BYTES, never decoded text: an exclude holds path patterns, POSIX paths
             # are arbitrary bytes, and an operator's own file may be in any legacy
-            # 8-bit encoding. `bytes.splitlines()` is also the git-CORRECT split —
-            # `str.splitlines()` breaks on \x0b, \x0c, \x1c, \x1d, \x1e and \x85, none
-            # of which git treats as a line boundary, so a legitimate pattern carrying
-            # one fragments into wrong dedupe keys.
+            # 8-bit encoding. `str.splitlines()` would also break on \x0b, \x0c, \x1c,
+            # \x1d, \x1e and \x85, none of which git treats as a line boundary, so a
+            # legitimate pattern carrying one fragments into wrong dedupe keys.
+            #
+            # SPLIT THE WAY GIT DOES (#472): \n boundaries, with exactly ONE trailing
+            # \r trimmed per line. `bytes.splitlines()` is CLOSE but not identical —
+            # it also breaks on a LONE \r, which git treats as ordinary content
+            # (measured, 2.55.0: `/hidden\rjunk` ignores nothing, while `/hidden\r\n`
+            # ignores `hidden` and `/hidden\r\r\n` does not). That difference is not
+            # cosmetic here: an operator line carrying an embedded \r fragments, and a
+            # fragment byte-equal to a wanted pattern reads as ALREADY PRESENT. Where
+            # that fragment sits after the last negation the settled rule below skips
+            # the append — the shield then writes a file that does not shield, with no
+            # degrade reason, because nothing failed. The mirror direction is benign
+            # (a fragmented key only ever costs a duplicate append; last match wins),
+            # so this split is chosen for the SKIP direction alone.
+            #
+            # A trailing b"" (the file ended in \n) rides along unfiltered: no wanted
+            # pattern is empty and b"" does not start with b"!", so it is inert in both
+            # consumers below.
             existing = exclude.read_bytes() if existed else _shield_inherited_excludes(worktree)
-            lines = existing.splitlines()
+            lines = [ln.removesuffix(b"\r") for ln in existing.split(b"\n")]
             # PRESENT IS NOT THE SAME AS EFFECTIVE (#384). gitignore is LAST MATCH
             # WINS, so a pattern this file already contains can be cancelled by a `!`
             # line below it, and a plain set-membership dedupe then declined to append
@@ -2455,33 +2800,45 @@ def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
     return skipped_any
 
 
-def seed_base_skills(project: Path, dest_tree: str) -> tuple[list[str], list[str]]:
-    """Copy installed upstream dev skills into a kind-only skill tree.
+def _provision_kinds(names: Sequence[str]) -> int:
+    """Run each named adapter kind's runtime installer, printing its notes.
 
-    bmm installs the primitive in a host CLI's tree; a headless provider still
-    dispatches that same primitive on dev/review legs.  This is copy-when-absent
-    so a Cursor-specific local customization is never overwritten.
+    Deliberately project-independent: a provisioner installs a machine-scoped
+    runtime a kind cannot express as a Python dependency (``@cursor/sdk`` is a
+    Node package), so there is nothing project-shaped to hand it. Which kinds
+    offer one is asked of the live registry, never a hardcoded set, so an
+    out-of-tree family with a runtime of its own is provisionable too.
+
+    Returns an rc, like ``install_into`` itself: an unknown or non-provisionable
+    name and a failed install are both a ``FAIL:`` line and 1, never a
+    traceback — this is a first-run command an operator is reading the output of.
     """
-    try:
-        source_trees = [profile.skill_tree for profile in load_profiles(project).values()]
-    except ProfileError:
-        source_trees = []
-    copied: list[str] = []
-    missing: list[str] = []
-    for skill in BASE_SKILLS:
-        destination = project / dest_tree / skill
-        if destination.exists():
-            continue
-        source = next(
-            (project / tree / skill for tree in source_trees if (project / tree / skill).is_dir()),
-            None,
-        )
-        if source is None:
-            missing.append(skill)
-            continue
-        _copy_traversable(source, destination)
-        copied.append(skill)
-    return copied, missing
+    from .adapters.registry import (
+        AdapterError,
+        ProvisionError,
+        get_adapter_kind,
+        provisionable_adapter_kinds,
+    )
+
+    for name in dict.fromkeys(names):
+        offered = ", ".join(provisionable_adapter_kinds()) or "(none)"
+        try:
+            kind = get_adapter_kind(name)
+        except AdapterError as error:
+            print(f"FAIL: --provision {name!r}: {error} (provisionable: {offered})")
+            return 1
+        if kind.provision is None:
+            print(f"FAIL: --provision {name!r}: that kind has no runtime to install")
+            print(f"  provisionable kinds: {offered}")
+            return 1
+        try:
+            notes = kind.provision()
+        except ProvisionError as error:
+            print(f"FAIL: could not provision {name!r}: {error}")
+            return 1
+        for note in notes:
+            print(f"  provision: {note}")
+    return 0
 
 
 def _warn_if_policy_tracked(project: Path) -> None:
@@ -2492,15 +2849,16 @@ def _warn_if_policy_tracked(project: Path) -> None:
     means nothing to warn about."""
     try:
         tracked = (
-            subprocess.run(  # fixed argv, no shell
-                ["git", "ls-files", "--error-unmatch", ".bmad-loop/policy.toml"],
-                cwd=project,
-                capture_output=True,
-                timeout=10,
+            git_bytes(
+                project,
+                "ls-files",
+                "--error-unmatch",
+                ".bmad-loop/policy.toml",
+                timeout_s=10,  # the pre-#390 bound: a hint must not stall init
             ).returncode
             == 0
         )
-    except (OSError, subprocess.SubprocessError):
+    except GitError:
         return
     if tracked:
         print(
@@ -2518,19 +2876,11 @@ def install_into(
     force_skills: bool = False,
     provision: Sequence[str] = (),
 ) -> int:
-    from .adapters import adapter_kinds
-    from .adapters.adapter_kinds import ProvisionError
-
     project = project.resolve()
     try:
         available = load_profiles(project)
         profiles = []
-        kind_profiles = []
         for name in clis:
-            kind = adapter_kinds.get_adapter_kind(name)
-            if kind is not None:
-                kind_profiles.append(kind.profile)
-                continue
             key = ALIASES.get(name, name)
             if key not in available:
                 raise ProfileError(
@@ -2544,12 +2894,11 @@ def install_into(
     bmad_loop_dir = project / ".bmad-loop"
     bmad_loop_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. hook relay script (only hook-driven profiles need it).
-    if profiles:
-        script_target = project / HOOK_SCRIPT_REL
-        script_source = resources.files("bmad_loop.data").joinpath("bmad_loop_hook.py")
-        script_target.write_text(script_source.read_text(encoding="utf-8"), encoding="utf-8")
-        print(f"  hook script: {script_target}")
+    # 1. hook relay script (shared by all CLIs)
+    script_target = project / HOOK_SCRIPT_REL
+    script_source = resources.files("bmad_loop.data").joinpath("bmad_loop_hook.py")
+    script_target.write_text(script_source.read_text(encoding="utf-8"), encoding="utf-8")
+    print(f"  hook script: {script_target}")
 
     # 2. per-CLI hook registration
     for profile in profiles:
@@ -2560,7 +2909,7 @@ def install_into(
     #    .agents/skills)
     skills_skipped = False
     if skills:
-        trees = list(dict.fromkeys([p.skill_tree for p in profiles + kind_profiles]))
+        trees = list(dict.fromkeys(p.skill_tree for p in profiles))
         try:
             skills_skipped = _copy_skills(project, trees, force_skills)
         except ProfileError as e:
@@ -2605,32 +2954,20 @@ def install_into(
     if skills_skipped:
         print("  some skills already present; re-run with --force-skills to overwrite")
 
-    # Runtime installation is explicitly opt-in: it may access the network.
-    for name in dict.fromkeys(provision):
-        kind = adapter_kinds.get_adapter_kind(name)
-        if kind is None or kind.provision is None:
-            print(f"FAIL: --provision {name!r} is not a provisionable adapter kind")
-            return 1
-        copied, missing = seed_base_skills(project, kind.profile.skill_tree)
-        if copied:
-            print(
-                f"  provision: seeded base skills into {kind.profile.skill_tree}/: {', '.join(copied)}"
-            )
-        if missing:
-            print(f"  provision: base skills not found to seed: {', '.join(missing)}")
-        try:
-            for note in kind.provision():
-                print(f"  provision: {note}")
-        except ProvisionError as error:
-            print(f"FAIL: could not provision {name!r}: {error}")
-            return 1
+    # 6. adapter-kind runtimes (`--provision`). Explicitly opt-in and never part
+    # of a plain `init`: a provisioner installs software over the network. Kept
+    # last so a failure here leaves a fully-initialized project behind — the hook
+    # relay, skills, policy and gitignore above are all already written, and the
+    # operator only has to re-run the provisioning step.
+    if provision and _provision_kinds(provision) != 0:
+        return 1
 
     print(
         "init complete. One-time setup before `bmad-loop run` — spawned "
         "sessions cannot answer first-run dialogs, and a pending dialog reads "
         "as a session timeout:"
     )
-    for profile in profiles + kind_profiles:
+    for profile in profiles:
         if profile.first_run_note:
             print(f"  {profile.name}: {profile.first_run_note}")
     return 0

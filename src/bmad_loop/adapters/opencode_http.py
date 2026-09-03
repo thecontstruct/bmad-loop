@@ -151,6 +151,7 @@ from ..model import TokenUsage
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
 from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec
+from .env_fault import EnvFaultMixin
 from .generic import (
     BUDGET_NUDGE_TEXT,
     HEARTBEAT_INTERVAL_S,
@@ -366,7 +367,16 @@ class _ServerSession:
     floor_ms: int = 0
 
 
-class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
+class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
+    # Env-fault classification scans the SERVER's own stdout/stderr, not
+    # <task_id>.log — that file is the curated `[bmad]` conversation transcript
+    # written by the SSE reader, so it carries the model's own words. Two reasons
+    # this must be .server.out: the provider's AI_APICallError logfmt lines only
+    # ever land there, and the profile's patterns are anchored on the assumption
+    # that a story quoting a provider error verbatim cannot reach the scanned
+    # bytes. Point this at the transcript and both properties break at once.
+    ENV_FAULT_LOG_SUFFIX = ".server.out"
+
     injection = "http"
     observation = "sse"
     state = "remote"
@@ -380,7 +390,14 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         extra_args: tuple[str, ...] | None = None,
         usage_grace_s: float | None = None,
         stop_without_result_nudges: int | None = None,
+        events_dir: Path | None = None,
     ):
+        # `events_dir` is accepted and unused: this family observes over SSE and
+        # fires no hooks, so it has no event channel to point at. It is part of
+        # the run description `runsetup.make_adapters` hands every family (#494),
+        # and refusing the kwarg here would make the bootstrap branch per family
+        # on a value that costs nothing to carry.
+        del events_dir
         self._httpx = _require_httpx()
         self.run_dir = run_dir
         self.policy = policy
@@ -605,9 +622,24 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         task_dir = self.tasks_dir / spec.task_id
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / "prompt.txt").write_text(spec.prompt + "\n", encoding="utf-8")
-        # A re-armed/resumed run reuses task_ids; drop any prior cycle's result
-        # so a session that writes nothing can't be read as a stale completion.
+        # Task ids are supplied by the caller, so defensively reset cycle-scoped
+        # outputs if one is reused. A silent session must not inherit a stale result.
         (task_dir / "result.json").unlink(missing_ok=True)
+        # The sweep skill also writes escalation.json here, and
+        # `resolve._gather_escalations` reads it alongside result.json.
+        (task_dir / "escalation.json").unlink(missing_ok=True)
+        # Same hazard, same reason, for the file the #194 tail scan reads (mirrors
+        # GenericAdapter.start_session, which unlinks its pane tee here). This one
+        # bites hardest on the path the classifier exists to serve: an env fault
+        # PAUSEs the run, the operator re-arms and resumes, and the next session
+        # reusing this task_id would scan the PREVIOUS cycle's provider error and
+        # pause again — however healthy the new session's own log. A pause loop
+        # that survives every re-arm, off one stale line.
+        #
+        # Unlinked HERE and not in _spawn_server, which deliberately opens the file
+        # "ab" so a spawn retry (free-port collision) keeps its predecessor's
+        # diagnostics inside the SAME session.
+        self._env_fault_log_path(spec.task_id).unlink(missing_ok=True)
 
         launched_ns = time.time_ns()
         sess = self._spawn_server(spec)
@@ -991,11 +1023,11 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         wall_deadline = time.time() + spec.timeout_s
         session_id = sess.session_id
         nudges_left = self._stop_nudges
-        # Mirrors generic.wait_for_completion: stall-grace window armed by a
-        # result-less Stop (idle), re-armed by activity, spent via wake-nudges
-        # bounded by the monotonic spec.stall_nudges_cap (#149).
-        stall_deadline: float | None = None
-        last_activity: int | None = None
+        # Mirrors generic.wait_for_completion: stall grace starts at launch,
+        # re-arms on activity or a result-less Stop (idle), and is spent via
+        # wake-nudges bounded by the monotonic spec.stall_nudges_cap (#149).
+        stall_deadline = time.monotonic() + self._stall_grace_s if self._stall_grace_s > 0 else None
+        last_activity = sess.activity
         stall_nudges_left = self._stall_nudges
         stall_nudges_sent = 0
         # Loop-owned silence clock: updated on every dequeue, so a dead reader
@@ -1043,6 +1075,37 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
                     transcript_path=transcript,
                     timeout_fired_at=time.time(),
                     timeout_expired_clock=expired,
+                    budget_weighted=budget_weighted,
+                )
+            # Hard-stop poll (#319), per-iteration and deliberately NOT inside the
+            # heartbeat throttle below: the loop blocks up to `POLL_TICK_S` (5s) per
+            # tick, so *detection* normally lands well inside `stop_run`'s 10s
+            # grace window — the common case, not a bound: the dispatch legs below
+            # the wait are bounded only by the client's own timeouts, and the
+            # generic adapter is no better off (its `_await_result` waits
+            # RESULT_GRACE_S on a healthy box). Beyond detection, this arm then
+            # makes two
+            # HTTP round-trips against a server that may itself be wedged, and the
+            # client's 10s per-phase timeout applies to each. So the arm is NOT
+            # bounded by the grace window, by design: it gives the engine its best
+            # chance to tear itself down cleanly, and when the server will not answer
+            # it degrades to `stop_run`'s force-kill backstop — the same outcome
+            # every native-Windows stop had before #319, never a worse one. Don't
+            # "fix" this by trimming the timeouts: the same two calls serve the
+            # timeout arm, where the transcript is the whole diagnostic payload.
+            #
+            # Mirror the timeout arm exactly — without `_abort` the in-flight HTTP
+            # turn keeps running until teardown. Return the verdict; never raise
+            # `RunStopped` here, and never unlink the request file: the engine
+            # consumes it and attributes the stop.
+            if self._hard_stop_requested():
+                self._note_lifecycle(handle.task_id, "stop-abort-fired")
+                self._abort(sess)
+                transcript = self._capture_usage(handle, sess)
+                return SessionResult(
+                    status="aborted",
+                    session_id=session_id,
+                    transcript_path=transcript,
                     budget_weighted=budget_weighted,
                 )
             now = time.monotonic()
@@ -1180,6 +1243,25 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
             if event is not None:
                 last_seen = time.monotonic()
 
+            # Second poll (#319) — see the arm at the top of the loop. What follows
+            # here is the dispatch: `_probe_completion`'s two GETs, which are NOT
+            # throttled (once a turn goes quiet past SILENCE_THRESHOLD_S they run on
+            # every tick), a `_session_status` GET, or `_result_json(wait=True)`'s
+            # RESULT_GRACE_S wait. Each is bounded only by the client's own timeouts,
+            # so a single iteration can outlast `stop_run`'s 10s grace. Polling here
+            # keeps at most one leg between two checks. It cannot bound an in-flight
+            # socket read, so when one does outlast the window the stop degrades to
+            # the force-kill backstop exactly as it did before #319.
+            if self._hard_stop_requested():
+                self._note_lifecycle(handle.task_id, "stop-abort-fired")
+                self._abort(sess)
+                transcript = self._capture_usage(handle, sess)
+                return SessionResult(
+                    status="aborted",
+                    session_id=session_id,
+                    transcript_path=transcript,
+                    budget_weighted=budget_weighted,
+                )
             if event == "error":
                 # session.error may precede a retry, not a turn-end (status
                 # "retry" exists); only a PROVABLY settled session reads as a
@@ -1234,20 +1316,21 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
                             stall_deadline = time.monotonic() + self._stall_grace_s
                             continue
                         if time.monotonic() >= stall_deadline:
+                            if self._session_status(sess):
+                                # Provably mid-turn (a busy child/parent the
+                                # SSE missed): re-arm rather than injecting a
+                                # prompt into a working session or declaring
+                                # it stalled after the nudge budget is spent.
+                                stall_deadline = time.monotonic() + self._stall_grace_s
+                                continue
                             if stall_nudges_left > 0 and (
                                 spec.stall_nudges_cap is None
                                 or stall_nudges_sent < spec.stall_nudges_cap
                             ):
-                                if self._session_status(sess):
-                                    # Provably mid-turn (a busy child/parent the
-                                    # SSE missed): re-arm rather than injecting a
-                                    # prompt into a working session. Unknown
-                                    # (None) proceeds to the nudge — a transport
-                                    # too broken to answer the probe would fail
-                                    # the nudge too, and burning the bounded
-                                    # budget converges to an honest stall.
-                                    stall_deadline = time.monotonic() + self._stall_grace_s
-                                    continue
+                                # Unknown status (None) proceeds to the nudge —
+                                # a transport too broken to answer the probe
+                                # would fail the nudge too, and burning the
+                                # bounded budget converges to an honest stall.
                                 stall_nudges_left -= 1
                                 stall_nudges_sent += 1
                                 self.send_text(handle, STALL_NUDGE_TEXT)
@@ -1549,7 +1632,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
 
 
 class OpencodeDevAdapter(_DevSynthesisMixin, OpencodeHttpAdapter):
-    """Dev/review adapter for the generic ``bmad-dev-auto`` skill over HTTP.
+    """Dev/review adapter for the generic ``bmad-build-auto`` skill over HTTP.
 
     That skill writes NO ``result.json`` — its outcome lives in the terminal
     spec it leaves on disk, which :class:`_DevSynthesisMixin` locates and

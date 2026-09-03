@@ -1,8 +1,10 @@
 import json
+import re
+import sys
 
 import pytest
 
-from bmad_loop import policy
+from bmad_loop import platform_util, policy
 
 
 def test_defaults_when_file_missing(tmp_path):
@@ -361,6 +363,63 @@ def test_zero_budget_rejected(tmp_path):
         policy.load(p)
 
 
+@pytest.mark.parametrize(
+    ("key", "minimum"),
+    [
+        pytest.param("session_timeout_min", 1, id="timeout-minimum"),
+        pytest.param("stop_without_result_nudges", 0, id="nudges-minimum"),
+    ],
+)
+def test_limits_schema_minimum_boundaries(key, minimum):
+    loaded = policy.loads(f"[limits]\n{key} = {minimum}\n")
+    assert getattr(loaded.limits, key) == minimum
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    [
+        pytest.param(
+            "session_timeout_min",
+            0,
+            "limits.session_timeout_min must be >= 1: got 0",
+            id="timeout-zero",
+        ),
+        pytest.param(
+            "session_timeout_min",
+            -1,
+            "limits.session_timeout_min must be >= 1: got -1",
+            id="timeout-negative-one",
+        ),
+        pytest.param(
+            "session_timeout_min",
+            -9,
+            "limits.session_timeout_min must be >= 1: got -9",
+            id="timeout-negative-nine",
+        ),
+        pytest.param(
+            "stop_without_result_nudges",
+            -1,
+            "limits.stop_without_result_nudges must be >= 0: got -1",
+            id="nudges-negative-one",
+        ),
+        pytest.param(
+            "stop_without_result_nudges",
+            -9,
+            "limits.stop_without_result_nudges must be >= 0: got -9",
+            id="nudges-negative-nine",
+        ),
+    ],
+)
+def test_limits_schema_minima_reject_below_minimum(key, value, expected):
+    """ABLATION A1: Delete only the `session_timeout_min` gate; the timeout rows
+    fail because invalid values load.
+    ABLATION A2: Delete only the `stop_without_result_nudges` gate; the nudge
+    rows fail because invalid values load."""
+    with pytest.raises(policy.PolicyError) as exc:
+        policy.loads(f"[limits]\n{key} = {value}\n")
+    assert str(exc.value) == expected
+
+
 def test_git_timeout_default_parse_and_template():
     import tomllib
 
@@ -434,6 +493,276 @@ def test_dev_contract_nudge_default_parse_and_template():
     assert doc["limits"]["dev_contract_nudge"] == policy.LimitsPolicy.dev_contract_nudge
 
 
+def test_dev_contract_nudge_rejects_non_boolean():
+    """Ablation: delete `_typed_bool`'s conditional and raise, retaining
+    `return value`; this test fails because the string is returned unchanged."""
+    with pytest.raises(policy.PolicyError, match=r"limits\.dev_contract_nudge must be a boolean"):
+        policy.loads('[limits]\ndev_contract_nudge = "false"\n')
+
+
+@pytest.mark.parametrize("bad", ["true", "1.5", '"1"'])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "max_review_cycles",
+        "max_dev_attempts",
+        "max_followup_reviews",
+        "session_timeout_min",
+        "git_timeout_s",
+        "teardown_grace_s",
+        "stop_without_result_nudges",
+        "dev_stall_grace_s",
+        "dev_stall_nudges",
+        "dev_stall_nudges_cap",
+        "workflow_stall_nudges_cap",
+        "max_tokens_per_story",
+        "max_tokens_per_session",
+        "session_budget_grace_s",
+    ],
+)
+def test_limits_integer_fields_reject_non_integer(key, bad):
+    """Ablation: delete `_typed_int`'s conditional and raise, retaining
+    `return value`; all rows fail because bad scalars are accepted or reach
+    downstream validation without the required integer `PolicyError`."""
+    with pytest.raises(policy.PolicyError, match=rf"limits\.{key} must be an integer"):
+        policy.loads(f"[limits]\n{key} = {bad}\n")
+
+
+@pytest.mark.parametrize("bad", ["true", "1.5", '"1"'])
+@pytest.mark.parametrize(
+    ("section", "key"),
+    [
+        ("verify", "stream_capture_kb"),
+        ("sweep", "max_bundles"),
+        ("sweep", "max_triage_attempts"),
+        ("sweep", "max_migration_attempts"),
+        ("sweep", "max_cycles"),
+        ("scm", "max_parallel"),
+        ("scm", "failed_diff_max_mb"),
+        ("cleanup", "run_retention"),
+        ("cleanup", "retention_days"),
+    ],
+)
+def test_numeric_policy_fields_reject_non_integer(section, key, bad):
+    """The [limits] grid above, for the sections #587 did not reach. Every one of
+    these was a bare `int()`: `"1"` and `1.5` came back as a raw ValueError and
+    `true` came back as 1, none of them a PolicyError, so all three walked past the
+    `except (PolicyError, OSError)` handlers that exist to degrade to defaults.
+
+    Ablation: delete `_typed_int`'s conditional and raise, retaining `return value`;
+    every row fails — the quoted and float rows raise ValueError instead of
+    PolicyError, and `true` is accepted outright."""
+    with pytest.raises(policy.PolicyError, match=rf"{section}\.{key} must be an integer"):
+        policy.loads(f"[{section}]\n{key} = {bad}\n")
+
+
+@pytest.mark.parametrize("table", ["adapter", "adapter.review"])
+@pytest.mark.parametrize(
+    ("key", "kind", "bad"),
+    [
+        ("usage_grace_s", "a number", "true"),
+        ("usage_grace_s", "a number", '"3"'),
+        ("stop_without_result_nudges", "an integer", "true"),
+        ("stop_without_result_nudges", "an integer", "2.5"),
+        ("stop_without_result_nudges", "an integer", '"1"'),
+    ],
+)
+def test_adapter_timing_knobs_reject_non_numeric(table, key, kind, bad):
+    """`_opt_grace`/`_opt_nudges` return None for "inherit from the profile", so they
+    cannot take `_typed_*`'s default — they carry the same guard inline. Before it,
+    `usage_grace_s = true` resolved to a 1.0-second grace and the quoted rows raised
+    a raw ValueError past every degrade handler.
+
+    Ablation: delete the isinstance conditional in the named helper (singly),
+    retaining the coercion below it; that helper's rows fail on both tables."""
+    with pytest.raises(policy.PolicyError, match=rf"{re.escape(table)}\.{key} must be {kind}"):
+        policy.loads(f"[{table}]\n{key} = {bad}\n")
+
+
+@pytest.mark.parametrize("table", ["adapter", "adapter.review"])
+def test_usage_grace_s_accepts_a_toml_integer(table):
+    """A grace in whole seconds is the natural spelling and stays legal — the guard
+    rejects wrong TYPES, not int-shaped numbers (`limits.cache_read_weight` above
+    makes the same promise)."""
+    pol = policy.loads(f"[{table}]\nusage_grace_s = 30\n")
+    stage = pol.adapter if table == "adapter" else pol.adapter.review
+    assert stage.usage_grace_s == 30.0
+    assert isinstance(stage.usage_grace_s, float)
+
+
+@pytest.mark.parametrize("bad", ['"pytest"', "5", "[1]"])
+@pytest.mark.parametrize(
+    ("table", "key"),
+    [
+        ("verify", "commands"),
+        ("adapter", "extra_args"),
+        ("adapter.dev", "extra_args"),
+    ],
+)
+def test_array_policy_fields_reject_scalars(table, key, bad):
+    """The `scm.worktree_seed` trap, in the three argv-shaped fields that still had
+    it. `tuple(str(a) for a in raw)` accepts anything iterable, so a bare TOML string
+    exploded CHARACTER-WISE — `commands = "pytest"` became six one-character commands
+    while reading as applied configuration — and a scalar int raised a bare TypeError
+    out of `loads`, untyped, where every other malformed value here raises
+    PolicyError. `[1]` is the third shape: right container, wrong entries, silently
+    stringified.
+
+    Ablation: delete `_typed_str_tuple`'s two conditionals (singly); the shape check
+    fails the string and int rows, the entry check fails the `[1]` rows."""
+    with pytest.raises(
+        policy.PolicyError, match=rf"{re.escape(table)}\.{key} must be an array of strings"
+    ):
+        policy.loads(f"[{table}]\n{key} = {bad}\n")
+
+
+def test_array_policy_fields_keep_unset_distinct_from_empty():
+    """`extra_args` is a tri-state: unset (None) inherits the profile's arguments,
+    `[]` is an explicit "no arguments". The shape guard must not fold one into the
+    other — `verify.commands` is not optional and normalizes both to ()."""
+    assert policy.loads("").adapter.extra_args is None
+    assert policy.loads("").adapter.dev.extra_args is None
+    assert policy.loads("[adapter]\nextra_args = []\n").adapter.extra_args == ()
+    assert policy.loads('[adapter]\nextra_args = ["-p"]\n').adapter.extra_args == ("-p",)
+    assert policy.loads("").verify.commands == ()
+    assert policy.loads('[verify]\ncommands = ["pytest -q"]\n').verify.commands == ("pytest -q",)
+
+
+# The two silent-coercion grids below share their field lists with their positive
+# twin, so the "still parses" claim is made about the same keys the rejection grid
+# names rather than a hand-picked subset of them.
+_BOOLEAN_POLICY_FIELDS = [
+    ("notify", "desktop"),
+    ("notify", "file"),
+    ("review", "enabled"),
+    ("adapter", "cleanup_session_on_finish"),
+    ("sweep", "repeat"),
+    ("scm", "delete_branch"),
+    ("scm", "keep_failed"),
+    ("scm", "rollback_on_failure"),
+    ("scm", "failed_diff_unlimited"),
+    ("scm", "seed_adapter_defaults"),
+    ("cleanup", "trim_artifacts"),
+    ("cleanup", "archive_old"),
+    ("cleanup", "auto_clean_on_finish"),
+    ("cleanup", "clean_tmp"),
+    ("tui", "low_frame_rate"),
+    ("operator", "enabled"),
+]
+
+
+@pytest.mark.parametrize("bad", ['"false"', "1", "[true]"])
+@pytest.mark.parametrize(("section", "key"), _BOOLEAN_POLICY_FIELDS)
+def test_boolean_policy_fields_reject_non_boolean(section, key, bad):
+    """The silent half of #440: unlike the raw `int()` fields, a bare `bool()` never
+    raised at all — it accepted every one of these and rewrote the knob. `"false"` is
+    the hazard #278 was filed for, because a non-empty string is truthy, so the one
+    spelling a user reaches for to turn a feature OFF turned it ON; `1` and `[true]`
+    are the other two truthy shapes TOML can produce here. No degrade handler ever
+    saw a fault, because there was no fault to see — the run just behaved differently
+    from its configuration.
+
+    Ablation: delete `_typed_bool`'s conditional and raise, retaining `return value`;
+    every row fails because each bad value is returned unchanged and truthy."""
+    with pytest.raises(policy.PolicyError, match=rf"{section}\.{key} must be a boolean"):
+        policy.loads(f"[{section}]\n{key} = {bad}\n")
+
+
+@pytest.mark.parametrize(("section", "key"), _BOOLEAN_POLICY_FIELDS)
+def test_boolean_policy_fields_accept_a_real_toml_false(section, key):
+    """The guard rejects wrong TYPES, not falsy values — a real TOML `false` is how
+    every one of these knobs is legitimately turned off, and it must still parse to
+    `False` rather than tripping the new check."""
+    pol = policy.loads(f"[{section}]\n{key} = false\n")
+    assert getattr(getattr(pol, section), key) is False
+
+
+@pytest.mark.parametrize("bad", ["5", "true"])
+@pytest.mark.parametrize(
+    ("section", "key"),
+    [
+        ("gates", "mode"),
+        ("gates", "on_escalation"),
+        ("gates", "retrospective"),
+        ("review", "trigger"),
+        ("review", "on_timeout"),
+        ("review", "on_status_contradiction"),
+        ("stories", "source"),
+        ("stories", "spec_folder"),
+        ("dev", "skill"),
+        ("adapter", "name"),
+        ("adapter", "model"),
+        ("adapter.dev", "name"),
+        ("adapter.dev", "model"),
+        ("adapter.review", "name"),
+        ("adapter.review", "model"),
+        ("sweep", "auto"),
+        ("scm", "isolation"),
+        ("scm", "branch_per"),
+        ("scm", "target_branch"),
+        ("scm", "merge_strategy"),
+        ("scm", "commit_message_template"),
+        ("mux", "backend"),
+    ],
+)
+def test_string_policy_fields_reject_non_string(section, key, bad):
+    """`str()` never raises either, so a wrong-typed value became its `repr` and was
+    then judged as a string. Two outcomes, both wrong: the fields with a downstream
+    allowlist blamed the VALUE for a TYPE fault ("gates.mode must be one of [...]: got
+    '5'", naming a quoted 5 the file does not contain), and the free-form ones
+    (`scm.target_branch`, `scm.commit_message_template`, `adapter.model`) took the
+    stringified value silently. The allowlist and regex checks still run — they just
+    run second now.
+
+    Ablation: two disjoint conditionals. Delete `_typed_str`'s and raise, retaining
+    `return value`; every row fails except the four `adapter.dev`/`adapter.review`
+    ones, which are the per-stage overrides and go through `_opt_typed_str` — delete
+    that one instead and exactly those four fail."""
+    with pytest.raises(policy.PolicyError, match=rf"{re.escape(section)}\.{key} must be a string"):
+        policy.loads(f"[{section}]\n{key} = {bad}\n")
+
+
+@pytest.mark.parametrize("bad", ["5", "true", "[]"])
+def test_plugins_enabled_entries_reject_non_strings(bad):
+    """The list SHAPE was already typed; its entries were not, so `[str(n) for n in
+    raw_enabled]` turned any scalar into a plugin name that no loader can resolve —
+    `enabled = [5]` asked for a plugin literally named "5". The sibling entry guard on
+    `scm.worktree_seed` is the precedent this matches.
+
+    Ablation: delete the isinstance conditional and its raise, retaining the append;
+    all rows fail because every entry is collected whatever its type."""
+    with pytest.raises(policy.PolicyError, match=r"plugins\.enabled entries must be strings"):
+        policy.loads(f"[plugins]\nenabled = [{bad}]\n")
+
+
+@pytest.mark.parametrize("bad", ["5", "true"])
+def test_deprecated_engine_name_rejects_non_string(bad):
+    """The deprecated `[engine]` fold reads `name` to decide which plugin to enable,
+    so a wrong-typed one stringified into a bogus plugin name on the way out of a
+    block that is already warning the user it is going away. The DeprecationWarning
+    still fires: the type check runs after it, not instead of it.
+
+    Ablation: delete `_typed_str`'s conditional and raise; both rows fail because the
+    name is stringified and enables a plugin named "5"/"True"."""
+    with pytest.warns(DeprecationWarning):
+        with pytest.raises(policy.PolicyError, match=r"engine\.name must be a string"):
+            policy.loads(f"[engine]\nname = {bad}\n")
+
+
+@pytest.mark.parametrize("bad", ["true", '"0.5"'])
+def test_cache_read_weight_rejects_non_number(bad):
+    """Ablation: delete `_typed_float`'s conditional and raise; both rows fail
+    because `float` accepts the boolean and quoted-number values."""
+    with pytest.raises(policy.PolicyError, match=r"limits\.cache_read_weight must be a number"):
+        policy.loads(f"[limits]\ncache_read_weight = {bad}\n")
+
+
+def test_cache_read_weight_accepts_integer_as_float():
+    value = policy.loads("[limits]\ncache_read_weight = 1\n").limits.cache_read_weight
+    assert value == 1.0
+    assert isinstance(value, float)
+
+
 def test_session_budget_mode_default_parse_and_template():
     import tomllib
 
@@ -449,6 +778,13 @@ def test_session_budget_mode_default_parse_and_template():
 def test_invalid_session_budget_mode():
     with pytest.raises(policy.PolicyError, match=r"limits\.session_budget_mode"):
         policy.loads('[limits]\nsession_budget_mode = "sometimes"\n')
+
+
+def test_session_budget_mode_rejects_non_string():
+    """Ablation: delete `_typed_str`'s conditional and raise; this test fails
+    because the downstream options check raises a different `PolicyError`."""
+    with pytest.raises(policy.PolicyError, match=r"limits\.session_budget_mode must be a string"):
+        policy.loads("[limits]\nsession_budget_mode = 1\n")
 
 
 def test_max_tokens_per_story_default_and_parse():
@@ -674,6 +1010,45 @@ def test_scm_worktree_seed_rejects_non_project_relative_entries(tmp_path, entry)
 
 
 @pytest.mark.parametrize(
+    "entry",
+    [
+        "NUL",  # a device rather than a directory, and project-relative by every other measure
+        "sub/NUL",  # non-final component — `_is_reserved_basename` alone answers False here
+        "aux.json",  # lowercase with an extension: the shape a seed entry actually takes
+        "PRN  ",  # trailing spaces are trimmed away before the device name is compared
+        ".claude/skills.",  # the trim rule one component up from the leaf
+        "cfg ",  # …and at the leaf, on a name that is otherwise entirely ordinary
+    ],
+)
+def test_scm_worktree_seed_rejects_win32_alias_entries(tmp_path, entry):
+    """The second refusal at this site, and the one the first cannot make: every row
+    here IS project-relative, so `names_tree_root`, `is_absolute_path` and
+    `has_parent_ref` all pass it. What it is not is the same path on both platforms,
+    which is why it carries its own message instead of a fourth spelling of "must be
+    project-relative".
+
+    The harm is a seed entry that quietly means something else on Windows. A reserved
+    name resolves to a device rather than to the file it spells, and a component
+    ending in a period or space is created trimmed — so the entry the shield later
+    renders as an exclude pattern names a path that does not exist, the line is inert,
+    and the surplus it fails to shield is staged by the unit's `git add -A`. Both
+    halves of that are cited (Microsoft, Wine, Project Zero) rather than measured:
+    this suite runs on POSIX, where every row here is an ordinary name.
+
+    Ablation: delete the `names_win32_alias(seed)` arm and all six rows fail while
+    `test_scm_worktree_seed_rejects_non_project_relative_entries` stays green — the
+    two arms reject disjoint sets, which is what keeps each separately ablatable."""
+    p = tmp_path / "policy.toml"
+    p.write_text(f"[scm]\nworktree_seed = [{entry!r}]\n".replace("'", '"'))
+
+    with pytest.raises(
+        policy.PolicyError,
+        match="must not name a Windows device or end a component in a period or space",
+    ):
+        policy.load(p)
+
+
+@pytest.mark.parametrize(
     ("value", "match"),
     [
         ('""', "must be a list of paths"),  # iterates to an EMPTY tuple: silently inert
@@ -702,13 +1077,21 @@ def test_scm_worktree_seed_rejects_value_shapes_that_are_not_a_list_of_paths(
         policy.load(p)
 
 
-def test_scm_worktree_seed_rejects_a_bad_entry_beside_good_ones(tmp_path):
+@pytest.mark.parametrize(
+    ("entry", "match"),
+    [
+        ("", "got ''"),  # root-naming: caught by the project-relative arm
+        ("NUL", "got 'NUL'"),  # …and by the win32-alias arm that follows it in the same loop
+    ],
+)
+def test_scm_worktree_seed_rejects_a_bad_entry_beside_good_ones(tmp_path, entry, match):
     """Every entry is checked, not just the first: a valid leading entry must not
-    let a later empty one through."""
+    let a later empty one through. The win32-alias arm sits inside that same loop, so
+    the row for it pins that it inherits the property rather than re-earning it."""
     p = tmp_path / "policy.toml"
-    p.write_text('[scm]\nworktree_seed = [".mcp.json", "", ".envrc"]\n')
+    p.write_text(f'[scm]\nworktree_seed = [".mcp.json", "{entry}", ".envrc"]\n')
 
-    with pytest.raises(policy.PolicyError, match="got ''"):
+    with pytest.raises(policy.PolicyError, match=match):
         policy.load(p)
 
 
@@ -775,6 +1158,22 @@ def test_scm_failed_diff_settings(tmp_path):
     # the cap must be a positive size
     p.write_text("[scm]\nfailed_diff_max_mb = 0\n")
     with pytest.raises(policy.PolicyError, match="scm.failed_diff_max_mb"):
+        policy.load(p)
+
+
+def test_verify_stream_capture_kb(tmp_path):
+    """The retain cap parses, defaults, and admits 0 as "capture nothing" —
+    unlike scm.failed_diff_max_mb, whose 0 is rejected. The opt-out is the whole
+    point of the knob, so the floor is 0 and only a negative is refused."""
+    p = tmp_path / "policy.toml"
+    p.write_text("[verify]\nstream_capture_kb = 8\n")
+    assert policy.load(p).verify.stream_capture_kb == 8
+    p.write_text('[verify]\ncommands = ["pytest -q"]\n')
+    assert policy.load(p).verify.stream_capture_kb == 256  # default survives a partial table
+    p.write_text("[verify]\nstream_capture_kb = 0\n")
+    assert policy.load(p).verify.stream_capture_kb == 0  # opting out is legal
+    p.write_text("[verify]\nstream_capture_kb = -1\n")
+    with pytest.raises(policy.PolicyError, match=r"verify\.stream_capture_kb"):
         policy.load(p)
 
 
@@ -917,7 +1316,7 @@ def test_template_mux_block_parses_to_defaults():
 
 def test_write_mux_backend_uncomments_template_anchor(tmp_path):
     p = tmp_path / "policy.toml"
-    policy.write_mux_backend(p, "psmux")
+    policy.write_mux_backend(p, "psmux", confine_root=tmp_path)
     text = p.read_text(encoding="utf-8")
     assert 'backend = "psmux"' in text
     assert policy.load(p).mux.backend == "psmux"
@@ -927,9 +1326,9 @@ def test_write_mux_backend_uncomments_template_anchor(tmp_path):
 
 def test_write_mux_backend_replaces_existing_value(tmp_path):
     p = tmp_path / "policy.toml"
-    policy.write_mux_backend(p, "psmux")
+    policy.write_mux_backend(p, "psmux", confine_root=tmp_path)
     before = p.read_text(encoding="utf-8")
-    policy.write_mux_backend(p, "tmux")
+    policy.write_mux_backend(p, "tmux", confine_root=tmp_path)
     after = p.read_text(encoding="utf-8")
     assert policy.load(p).mux.backend == "tmux"
     # a targeted line replace: everything but the anchor line is byte-identical
@@ -939,8 +1338,8 @@ def test_write_mux_backend_replaces_existing_value(tmp_path):
 
 def test_write_mux_backend_clear_recomments(tmp_path):
     p = tmp_path / "policy.toml"
-    policy.write_mux_backend(p, "psmux")
-    policy.write_mux_backend(p, None)
+    policy.write_mux_backend(p, "psmux", confine_root=tmp_path)
+    policy.write_mux_backend(p, None, confine_root=tmp_path)
     assert policy.load(p).mux.backend == ""
     assert '# backend = "tmux"' in p.read_text(encoding="utf-8")
 
@@ -949,7 +1348,7 @@ def test_write_mux_backend_appends_table_to_legacy_file(tmp_path):
     p = tmp_path / "policy.toml"
     legacy = '# my notes\n[gates]\nmode = "none"\n'
     p.write_text(legacy, encoding="utf-8")
-    policy.write_mux_backend(p, "psmux")
+    policy.write_mux_backend(p, "psmux", confine_root=tmp_path)
     text = p.read_text(encoding="utf-8")
     assert text.startswith(legacy)  # untouched prefix, table appended at EOF
     pol = policy.load(p)
@@ -960,7 +1359,7 @@ def test_write_mux_backend_appends_table_to_legacy_file(tmp_path):
 def test_write_mux_backend_reinserts_deleted_key_line(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text("[mux]\n# hand-trimmed file: no key line\n", encoding="utf-8")
-    policy.write_mux_backend(p, "tmux")
+    policy.write_mux_backend(p, "tmux", confine_root=tmp_path)
     assert policy.load(p).mux.backend == "tmux"
 
 
@@ -968,7 +1367,7 @@ def test_write_mux_backend_preserves_hand_edits(tmp_path):
     p = tmp_path / "policy.toml"
     hand = '[limits]\nmax_dev_attempts = 7  # keep my comment\n\n[mux]\nbackend = "old"\n'
     p.write_text(hand, encoding="utf-8")
-    policy.write_mux_backend(p, "new")
+    policy.write_mux_backend(p, "new", confine_root=tmp_path)
     pol = policy.load(p)
     assert pol.mux.backend == "new"
     assert pol.limits.max_dev_attempts == 7
@@ -980,7 +1379,7 @@ def test_write_mux_backend_preserves_trailing_comment_on_anchor_line(tmp_path):
     'preserving every other byte' includes the anchor line's own comment."""
     p = tmp_path / "policy.toml"
     p.write_text('[mux]\nbackend = "old"  # pinned per teammate X\n', encoding="utf-8")
-    policy.write_mux_backend(p, "new")
+    policy.write_mux_backend(p, "new", confine_root=tmp_path)
     text = p.read_text(encoding="utf-8")
     assert 'backend = "new"  # pinned per teammate X\n' in text
     assert policy.load(p).mux.backend == "new"
@@ -990,7 +1389,7 @@ def test_write_mux_backend_clear_preserves_trailing_comment(tmp_path):
     """Clearing re-comments the line but keeps the hand-added trailing comment."""
     p = tmp_path / "policy.toml"
     p.write_text('[mux]\nbackend = "old"  # pinned per teammate X\n', encoding="utf-8")
-    policy.write_mux_backend(p, None)
+    policy.write_mux_backend(p, None, confine_root=tmp_path)
     text = p.read_text(encoding="utf-8")
     assert '# backend = "tmux"  # pinned per teammate X\n' in text
     assert policy.load(p).mux.backend == ""
@@ -999,14 +1398,114 @@ def test_write_mux_backend_clear_preserves_trailing_comment(tmp_path):
 def test_write_mux_backend_preserves_crlf_line_ending(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_bytes(b'[mux]\r\nbackend = "old"\r\n')
-    policy.write_mux_backend(p, "new")
+    policy.write_mux_backend(p, "new", confine_root=tmp_path)
     assert b'backend = "new"\r\n' in p.read_bytes()
+
+
+def test_write_mux_backend_hands_the_helper_bytes(tmp_path, monkeypatch):
+    """#363. The CRLF pin above does NOT grade the bytes-vs-text choice on Linux:
+    `atomic_write_text` passes `newline=None`, whose translation is a no-op wherever
+    `os.linesep == "\\n"`, so swapping the text helper in reddens that row on WINDOWS
+    ONLY and CI's Linux leg would call the swap green.
+
+    This grades it platform-independently by inspecting the payload the helper is
+    handed, upstream of any newline translation: bytes, carrying CRLF verbatim. The
+    binding is WRAPPED rather than replaced so the real write still happens and the
+    surrounding round-trip behaviour is unchanged.
+
+    Ablation: swap `atomic_write_bytes_confined` for `atomic_write_text_confined` in
+    `write_mux_backend` (dropping the `.encode`) and this reddens on every platform,
+    on the `isinstance(..., bytes)` row. The exact-length assertion also pins
+    "exactly one write", so a retry loop cannot creep in unnoticed."""
+    seen: list[bytes] = []
+    real = policy.atomic_write_bytes_confined
+
+    def record(path, data, *, confine_root, require_writable_target=False):
+        seen.append(data)
+        real(path, data, confine_root=confine_root, require_writable_target=require_writable_target)
+
+    monkeypatch.setattr(policy, "atomic_write_bytes_confined", record)
+    p = tmp_path / "policy.toml"
+    p.write_bytes(b'[mux]\r\nbackend = "old"\r\n')
+
+    policy.write_mux_backend(p, "new", confine_root=tmp_path)
+
+    assert len(seen) == 1
+    assert isinstance(seen[0], bytes)
+    assert b'backend = "new"\r\n' in seen[0]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_write_mux_backend_replaces_a_planted_symlink(tmp_path):
+    """#363. The one row that grades this SITE's choice of a writer that replaces
+    the NAME rather than the helper's implementation of it — everything else about
+    no-follow is pinned in test_platform_util.py, where the helper is called
+    directly. The site no longer spells that choice as `follow_symlinks=False`:
+    since #593 it calls `atomic_write_bytes_confined`, which is no-follow by
+    construction — the anchored arm publishes with a dir_fd-relative `os.replace`
+    that does not dereference its destination, and the win32 arm passes the
+    no-follow itself.
+
+    Behaviour-preserving first: `os.replace` never dereferenced this destination
+    either, so a follow-the-link writer here would have CHANGED what the function
+    does, not merely relaxed it. It is also the security choice — `runsetup`
+    states a driven session can write `.bmad-loop/policy.toml`, so writing
+    THROUGH a link planted at that name would hand the session a host-side write
+    to any operator-writable path.
+
+    Ablation: swap `write_mux_backend`'s writer for `atomic_write_bytes(path, ...)`
+    at its follow-the-link default and this reddens on the link surviving and the
+    planted target rewritten (the confined-parent and binding-pin rows redden with
+    it — the swap removes the call they patch and the guard they raise on). This
+    is still the one row that reddens on the LINK: no other consumer test plants a
+    symlink at the paths these five sites write."""
+    real = tmp_path / "someone-elses-file"
+    real.write_bytes(b'[mux]\nbackend = "old"\n')
+    link = tmp_path / "policy.toml"
+    link.symlink_to(real)
+
+    policy.write_mux_backend(link, "new", confine_root=tmp_path)
+
+    assert not link.is_symlink()  # the NAME was replaced
+    assert policy.load(link).mux.backend == "new"
+    assert real.read_bytes() == b'[mux]\nbackend = "old"\n'  # not written through
+
+
+def test_write_mux_backend_write_failure_raises_and_keeps_the_file(tmp_path, monkeypatch):
+    """#363. The hand-rolled temp this replaced was the fixed name
+    `.bmad-loop/policy.toml.tmp`, which nothing gitignores — the init line is the
+    anchored literal `.bmad-loop/policy.toml`, which does not cover a `.tmp` suffix —
+    so a failed replace stranded an untracked file that held `worktree_clean` False.
+    The helper removes its own temp on any raise, and the raise still propagates.
+
+    Patched at policy's OWN binding: the helper writes through an `mkstemp` fd via
+    `os.fdopen`, so a `Path.write_bytes` patch never fires and passes vacuously.
+
+    Ablation A5: revert `write_mux_backend` to `tmp.write_bytes(...)` +
+    `atomic_replace` and this reddens together with the bytes pin above — both as
+    an AttributeError from `monkeypatch.setattr`, since the
+    `atomic_write_bytes_confined` binding they share disappears with the revert. The
+    pre-existing CRLF row stays green, which is the point of the bytes pin: CRLF
+    alone does not grade this."""
+    p = tmp_path / "policy.toml"
+    p.write_bytes(b'[mux]\nbackend = "old"\n')
+    before = p.read_bytes()
+
+    def boom(path, data, *, confine_root, require_writable_target=False):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(policy, "atomic_write_bytes_confined", boom)
+    with pytest.raises(OSError, match="disk full"):
+        policy.write_mux_backend(p, "new", confine_root=tmp_path)
+
+    assert p.read_bytes() == before
+    assert b'backend = "new"' not in p.read_bytes()  # the mutation that must not land
 
 
 def test_write_mux_backend_rejects_bad_name(tmp_path):
     p = tmp_path / "policy.toml"
     with pytest.raises(policy.PolicyError, match="mux.backend"):
-        policy.write_mux_backend(p, "bad name!")
+        policy.write_mux_backend(p, "bad name!", confine_root=tmp_path)
     assert not p.exists()  # rejected before any write
 
 
@@ -1014,5 +1513,85 @@ def test_write_mux_backend_refuses_broken_file(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text("[gates\nmode = ", encoding="utf-8")
     with pytest.raises(policy.PolicyError):
-        policy.write_mux_backend(p, "tmux")
+        policy.write_mux_backend(p, "tmux", confine_root=tmp_path)
     assert p.read_text(encoding="utf-8") == "[gates\nmode = "  # never half-writes
+
+
+# ------------------------------------- the confined policy write (#593, #597)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_write_mux_backend_refuses_a_symlinked_policy_parent(tmp_path):
+    """The escape #593 names, at this site. `follow_symlinks=False` refused a link
+    planted at `policy.toml` itself and nothing above it, so a link at `.bmad-loop/`
+    left every directory component resolved by NAME: `mkstemp(dir=...)` and
+    `os.replace`'s destination both walked it, and the temp and the published
+    policy.toml landed wherever the link pointed. `write_mux_backend`'s own
+    `mkdir(parents=True, exist_ok=True)` ACCEPTS a symlink-to-a-directory, so the
+    planted parent survives the setup step rather than being replaced by it.
+
+    That matters here because `runsetup` states a driven session can write
+    `.bmad-loop/policy.toml` — so the redirect is a session's choice, and honouring
+    it turns `bmad-loop mux set` into a host-side write to any operator-writable
+    path outside the project.
+
+    The second assertion is the load-bearing one: raising is worth nothing if the
+    bytes already landed outside the project.
+
+    Ablation: revert the call to
+    `atomic_write_bytes(path, result.encode("utf-8"), follow_symlinks=False)` and
+    this fails `DID NOT RAISE`, with a full policy.toml sitting in `outside/`."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+    p = tmp_path / ".bmad-loop" / "policy.toml"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        policy.write_mux_backend(p, "psmux", confine_root=tmp_path)
+
+    assert list(outside.iterdir()) == []  # nothing escaped the project
+
+
+def test_write_mux_backend_creates_a_real_policy_parent(tmp_path):
+    """The positive control for the refusal above, in the same `.bmad-loop/`
+    shape. Without it that test passes for a `write_mux_backend` wired to refuse
+    every write, which is one of the reasons a file could be absent from
+    `outside/` — and for one that refuses whenever the parent does not exist yet,
+    which is `bmad-loop mux set` on a project that has never been configured.
+
+    The parent is deliberately NOT pre-created: the confined helper requires an
+    existing parent, so this also grades the site's own `mkdir` running first."""
+    p = tmp_path / ".bmad-loop" / "policy.toml"
+
+    policy.write_mux_backend(p, "psmux", confine_root=tmp_path)
+
+    assert p.parent.is_dir() and not p.parent.is_symlink()  # a real dir, freshly made
+    assert policy.load(p).mux.backend == "psmux"
+
+
+def test_write_mux_backend_refuses_a_read_only_policy_file(tmp_path):
+    """#597 at this site. policy.toml is the operator's own orchestration config,
+    hand-edited and sometimes deliberately chmod'ed read-only; a bare
+    `Path.write_bytes` refused that write as a side effect of opening the file.
+    Going atomic dropped the refusal silently — a temp-and-replace never opens the
+    target, and `os.replace` needs write permission on the DIRECTORY, so 0444 was
+    routed around and the file came back rewritten and still reading 0444.
+
+    The mode is restored in a `finally` because Windows rmtree refuses a READONLY
+    file at cleanup; 0444 sets that attribute there too, which is why this row has
+    no `skipif` — `O_WRONLY` is denied on both platforms.
+
+    Ablation: drop `require_writable_target=True` from the `write_mux_backend`
+    call and this fails `DID NOT RAISE`, with `backend = "new"` on disk."""
+    p = tmp_path / "policy.toml"
+    before = b'[mux]\nbackend = "old"\n'
+    p.write_bytes(before)
+    p.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            policy.write_mux_backend(p, "new", confine_root=tmp_path)
+    finally:
+        p.chmod(0o644)
+
+    assert p.read_bytes() == before  # the rewrite never landed
+    assert list(tmp_path.glob("*.tmp")) == []  # and a refusal stages nothing

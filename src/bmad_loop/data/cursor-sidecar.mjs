@@ -16,7 +16,14 @@ function parseArgs(argv) {
 }
 const emit = (event) => process.stdout.write(JSON.stringify(event) + '\n');
 const options = parseArgs(process.argv.slice(2));
-if (!process.env.CURSOR_API_KEY || !options.prompt) process.exit(1);
+// Every exit path emits a sentinel, including this one: the adapter reads the
+// sentinel as the turn-end signal, and a silent exit is indistinguishable from
+// a sidecar the OS killed.
+if (!process.env.CURSOR_API_KEY || !options.prompt) {
+  const missing = !process.env.CURSOR_API_KEY ? 'CURSOR_API_KEY is not set' : 'no prompt supplied';
+  emit({ type: SENTINEL, status: 'error', error: { message: missing } });
+  process.exit(1);
+}
 let agent; let timer;
 try {
   const { Agent } = await import('@cursor/sdk');

@@ -20,8 +20,9 @@ it lazily for its own tests.
 
 from __future__ import annotations
 
+import copy
 import json
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, NoReturn
@@ -56,8 +57,10 @@ from .install import (
     missing_stories_support,
     renderer_stub_resolved,
     resolve_review_layers,
+    strip_relay_hooks,
 )
 from .model import Phase
+from .platform_util import atomic_write_text
 from .process_host import get_process_host
 from .workspace import (
     UnitWorkspace,
@@ -68,6 +71,8 @@ from .workspace import (
 )
 
 if TYPE_CHECKING:
+    from importlib.resources.abc import Traversable
+
     from .adapters.base import CodingCLIAdapter
     from .adapters.profile import CLIProfile
     from .bmadconfig import ProjectPaths
@@ -113,41 +118,141 @@ def _required_worktree_skills(repo_root: Path, tree: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys((dev_primitive_or_default(repo_root, tree), *review_skills)))
 
 
-def _drop_inert_tracked_file_patterns(
-    worktree: Path, patterns: set[str]
-) -> tuple[set[str], str | None]:
-    """Drop shield patterns that name a TRACKED REGULAR FILE, keeping the rest.
+def _escape_exclude_pattern(pattern: str) -> str:
+    """Render one shield pattern so it names the literal path it spells (#476).
 
-    Such a pattern shields nothing and costs something (#392, reported from production
-    by an external user whose repo-hygiene gate then blocked the story's commit).
-    Measured on git 2.55.0 with the shield's own private-exclude + worktree-scoped
-    `core.excludesFile` shape, a tracked `.codex/hooks.json`, and its pattern present:
+    Patterns are built as ``f"/{rel}"`` from real on-disk rels, but git reads them
+    as gitignore(5) patterns, so a rel carrying pattern syntax names something
+    else entirely — and it goes wrong in both directions at once. Measured on git
+    2.55.0, identical at 2.20.4 (the shield's floor):
+
+    * ``/cfg[env]`` leaves ``cfg[env]/conf.json`` STAGEABLE. The path we seeded is
+      never shielded, which is the one job the shield has (#476).
+    * The same line hides ``cfge/`` and ``cfgn/``, because ``[env]`` is a class
+      over ``e``/``n``/``v``. A broken pattern silently hides an UNRELATED file
+      that the unit meant to commit (#401, consolidated into #476).
+
+    An unescaped trailing space does both in one line: git drops it, so ``/kept``
+    plus a space shields ``kept/`` and leaves ``kept /`` visible.
+
+    gitignore(5)'s own escape rule is the fix — a backslash before a wildmatch
+    special (``*``, ``?``, ``[``, and the backslash itself) or before a trailing
+    space makes git match that character literally. ``]`` is deliberately left
+    alone: it is not special without an opening ``[``, which this escapes. ``!``
+    and ``#`` matter only at line start, and every pattern starts with ``/``.
+
+    One trailing ``/`` is split off and re-appended unescaped: it is the MUSTBEDIR
+    marker (``RENDER_DIR_REL``), not part of the name.
+
+    Ordinary rels come back byte-identical, which is what makes this inert for
+    every path the shield has ever written.
+    """
+    body, suffix = (pattern[:-1], "/") if pattern.endswith("/") else (pattern, "")
+    for special in ("\\", "*", "?", "["):
+        body = body.replace(special, "\\" + special)
+    stripped = body.rstrip(" ")
+    return stripped + "\\ " * (len(body) - len(stripped)) + suffix
+
+
+def _fits_one_exclude_line(pattern: str) -> bool:
+    """True when ``pattern`` survives a round trip through the exclude file.
+
+    The exclude is a line-oriented format with NO escape for its own line
+    boundary, so two characters in a real filename cannot be written as a pattern
+    at all — unlike the wildmatch specials, which :func:`_escape_exclude_pattern`
+    can quote. `_worktree_local_exclude` writes each pattern `\n`-terminated
+    (`install.py`), and git reads lines back the way #472 measured them at 2.55.0:
+    `\n` boundaries with exactly ONE trailing `\r` trimmed.
+
+    * An embedded ``\n`` SPLITS the pattern into two. Neither half names the file,
+      so it is not shielded — and the orphaned second half is a live, unanchored
+      pattern that can hide an UNRELATED file, which is #401's harm direction
+      arriving through the one character #476's escaping cannot quote.
+    * A TRAILING ``\r`` is eaten as the line terminator's other half, so the
+      pattern names the path WITHOUT it — #476's harm direction, same cause.
+
+    An embedded ``\r`` is content to git (`/hidden\rjunk` ignores nothing but a
+    file spelled that way), so it needs no exclusion here.
+    """
+    return "\n" not in pattern and not pattern.endswith("\r")
+
+
+def _reconcile_tracked_patterns(
+    worktree: Path, patterns: set[str], written: Collection[str]
+) -> tuple[set[str], str | None]:
+    """Reshape the shield patterns that name a TRACKED path; keep the rest as written.
+
+    Git consults ignore rules only for UNTRACKED paths, so what a pattern is worth
+    depends on what it names — and the two tracked shapes need opposite answers.
+
+    A pattern naming a tracked REGULAR FILE shields nothing and costs something
+    (#392, reported from production by an external user whose repo-hygiene gate then
+    blocked the story's commit). Measured on git 2.55.0 with the shield's own
+    private-exclude + worktree-scoped `core.excludesFile` shape, a tracked
+    `.codex/hooks.json`, and its pattern present:
 
     * `git add -A` STAGES a modification to it anyway — ignore rules are consulted only
       for untracked paths, so the pattern never did the job it is here for;
     * `git ls-files -ci --exclude-standard` inside the worktree REPORTS it, which is the
       tracked-and-ignored state hygiene gates reject.
 
-    So the pattern is pure cost and dropping it is free. This is the second half of #384
+    So the pattern is pure cost and it is DROPPED. This is the second half of #384
     — its reporter proposed it as their option 3 ("skip any pattern whose path already
     contains tracked files … costs nothing and removes the surprising case entirely");
     PR #385 landed option 1 (scope + lifetime) and this half was dropped rather than
     rejected, which is how a second reporter hit it.
 
-    A tracked DIRECTORY keeps its pattern: measured, that one really does hide new
-    children, which is the shield working. Its tracked children still answer `-ci`, and
-    no pattern shape avoids that — `dir/*`, `dir/**` and a trailing negation all
-    measured identical to `dir`, since gitignore cannot re-include under an excluded
-    parent, while the one shape that cleared the report leaked a new file into the
-    commit. Not a case this function can fix; the tradeoff favors the shield.
+    A pattern naming a tracked DIRECTORY is that reporter's shape one step out (#484),
+    and its answer is SUBSTITUTION. The measurement that used to justify keeping it
+    still stands and is kept here: a dir pattern really does hide new children, and no
+    pattern SHAPE both hides them and keeps the report clean — `dir/*`, `dir/**` and
+    `dir` plus a trailing negation all measured identical to `dir`, because gitignore
+    cannot re-include anything under an excluded parent, while the one shape that did
+    clear the report (`dir/*` with per-child negations) leaked a new file into the
+    commit. What reverses is the VERDICT, on the #392 physics: over a tracked tree the
+    pattern's protection is already mostly inert — every modification to a tracked
+    child stages regardless — so it was buying new-child coverage alone at the price of
+    a false tracked-and-ignored report for the whole tree.
+
+    The fix is therefore a different set of PATHS rather than a different shape: drop
+    the dir pattern and substitute one pattern per file THIS provisioning run actually
+    wrote below it (``written``). Those files are untracked by construction —
+    copy-when-absent cannot land on top of a tracked child — which is why they are
+    exactly the case an ignore rule works for, and why none of them is re-probed here:
+    the spawn count stays one per pattern the caller built. A tracked directory that
+    received nothing at all drops to no pattern, which is the same answer for the same
+    reason: there is nothing of ours below it to shield.
+
+    ACCEPTED RESIDUAL (maintainer decision on #484, 2026-08-08, which is this
+    function's design authority): a file the SESSION creates under a tracked tool
+    directory can be staged, where the dir pattern would have hidden it. That is the
+    trade, deliberately taken — it matches the project's own decision to TRACK that
+    tree, and everything the orchestrator put there keeps a pattern of its own. It is
+    not a defect to fix by widening back to a dir pattern.
+
+    APPEND-ONLY RESIDUE: `_worktree_local_exclude` never removes a line, by design —
+    operator lines ride in its rewrite prefix and its last-match-wins reasoning depends
+    on nothing being deleted, with no marker separating our stale line from theirs. So
+    a `/dir` line an OLDER provisioning of the SAME worktree wrote survives a
+    re-provision that would no longer write it. Accepted rather than fixed: the residue
+    can only be too wide, never too narrow, and the private exclude dies with the
+    worktree.
 
     Patterns ending in `/` are directory-shaped by construction (`RENDER_DIR_REL`) and
     are never probed.
 
-    Degrades by KEEPING every pattern when git cannot answer: the shield staying too
-    wide is cosmetic, while dropping a pattern on a guess can leak the orchestrator's
-    own seeded files into a story commit. Returns the surviving patterns and a reason
-    for the caller to journal, or None when nothing went wrong.
+    A substituted rel that cannot be spelled as ONE exclude line
+    (:func:`_fits_one_exclude_line`) sends the WHOLE directory back to its dir
+    pattern, journaled. That is the same trade as the degrade below and for the same
+    reason: no per-file pattern exists for such a name, so substituting would leave
+    the file stageable and — for a newline — write an orphan half-pattern that hides
+    unrelated files.
+
+    Degrades by KEEPING every pattern it could not resolve, in its ORIGINAL shape —
+    the dir shape included, never the substitution. A shield staying too wide is
+    cosmetic, while dropping or narrowing a pattern on a guess can leak the
+    orchestrator's own seeded files into a story commit. Returns the surviving patterns
+    and a reason for the caller to journal, or None when nothing went wrong.
 
     NOT-A-REPO IS SILENT, and it is the ordinary case rather than an edge one: many
     callers provision plain non-repo directories, where there is no index, no shield and
@@ -162,27 +267,110 @@ def _drop_inert_tracked_file_patterns(
         return patterns, None
     kept: set[str] = set()
     unprobed: list[str] = []
+    unwritable: list[str] = []
     for pattern in patterns:
         rel = pattern.lstrip("/")
         if not rel or pattern.endswith("/"):
             kept.add(pattern)
             continue
         try:
-            if not verify.path_tracked_file(worktree, rel):
-                kept.add(pattern)
+            kind = verify.path_tracked_kind(worktree, rel)
         except (verify.GitError, OSError) as e:
             kept.add(pattern)
             unprobed.append(f"{rel} ({e})")
+            continue
+        if kind == "untracked":
+            kept.add(pattern)
+        elif kind == "dir":
+            subs = {f"/{w}" for w in written if w.startswith(rel + "/")}
+            unrepresentable = sorted(s for s in subs if not _fits_one_exclude_line(s))
+            if unrepresentable:
+                # Substituting here would write a pattern the exclude cannot carry,
+                # leaving that file stageable AND (for a `\n`) loosing an unanchored
+                # orphan pattern on unrelated files. The dir pattern is the only shape
+                # that still covers it, so this degrades the way every other
+                # unanswerable case does: KEEP the original, journal the reason. Too
+                # wide is cosmetic — this tree keeps its tracked-and-ignored report —
+                # while dropping or half-substituting leaks provisioned work into the
+                # unit's commit.
+                kept.add(pattern)
+                unwritable.extend(unrepresentable)
+            else:
+                kept |= subs
+        # "file": dropped. The pattern is measurably inert over a tracked file and
+        # only feeds it to repo-hygiene gates as tracked-and-ignored (#392).
+    reasons: list[str] = []
     if unprobed:
-        return kept, (
+        reasons.append(
             "worktree git-add shield could not check whether these paths are tracked, "
-            "so their patterns were kept; a tracked file among them will read as "
-            f"ignored to repo-hygiene checks (#392): {'; '.join(sorted(unprobed))}"
+            "so their patterns were kept as built; a tracked path among them will read "
+            f"as ignored to repo-hygiene checks (#392, #484): {'; '.join(sorted(unprobed))}"
         )
-    return kept, None
+    if unwritable:
+        reasons.append(
+            "worktree git-add shield kept a tracked directory's whole-dir pattern "
+            "because a file provisioning wrote below it cannot be spelled as one "
+            "exclude line (a newline, or a trailing carriage return); that directory "
+            "will read as ignored to repo-hygiene checks (#484): "
+            f"{'; '.join(sorted(unwritable))}"
+        )
+    return kept, (" ".join(reasons) if reasons else None)
 
 
-def _seed_bmad_tree(worktree: Path, repo_root: Path) -> list[str]:
+def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
+    """Keep a rewritten TRACKED hook config out of the unit's story commits.
+
+    The worktree-local exclude cannot: git consults ignore rules only for
+    untracked paths (#392). When a project tracks its hook config, the relay
+    rewrite — a machine-specific absolute command — would ride every
+    `git add -A` (the skill's own commits and finalize_commit alike) into the
+    story commit and merge back to the target branch, handing every other
+    checkout a relay path that does not exist there. The worktree's own index
+    carries a skip-worktree bit that `add -A`, `status` and checkout all honor
+    (it is the sparse-checkout mechanism) and that dies with the worktree, so
+    the rewrite stays session-local.
+
+    While the pin holds, the config is orchestrator-owned: a story's own edit to
+    the pinned file stays session-local and is discarded with the worktree. That
+    is deliberate — before this pin the tracked case stalled outright (#352), so
+    there is no prior working behavior to preserve, and any file-level hiding
+    that keeps OUR rewrite out of `add -A` hides a story's edit with it.
+
+    NOT-A-REPO IS SILENT for the same reason the shield's tracked-probe is:
+    provisioning a plain directory is ordinary, and there is no index and no
+    `git add -A` to be wrong about. An untracked config needs nothing — the
+    exclude shield owns it. A tracked-probe that cannot answer is returned for
+    the caller to journal (observation degrades; the rewrite stands, since a
+    stalled session is the worse outcome, #352). But a failed update-index on a
+    KNOWN-tracked config raises: the pin is a repair write, and continuing
+    without it knowingly leaves `git add -A` free to commit the machine-specific
+    command and merge it back.
+    """
+    try:
+        if verify.git_bytes(worktree, "rev-parse", "--absolute-git-dir").returncode != 0:
+            return None
+    except (verify.GitError, OSError):
+        return None
+    try:
+        if not verify.path_tracked_file(worktree, rel):
+            return None
+    except (verify.GitError, OSError) as e:
+        return (
+            f"could not check whether the rewritten hook config {rel} is tracked "
+            f"({e}); if the project tracks it, the worktree's machine-specific relay "
+            "command may be committed and merged back (#352)"
+        )
+    pinned = verify.git_bytes(worktree, "update-index", "--skip-worktree", "--", rel)
+    if pinned.returncode != 0:
+        raise verify.GitError(
+            f"git update-index --skip-worktree {rel} failed in the worktree; the hook "
+            "config is tracked, so without the pin its machine-specific relay rewrite "
+            "would reach story commits and merge back (#352)"
+        )
+    return None
+
+
+def _seed_bmad_tree(worktree: Path, repo_root: Path) -> tuple[list[str], list[str]]:
     """Merge the repo's project-local BMAD surface into an isolated worktree.
 
     Renderer-backed skills receive the worktree as their project root and do not
@@ -191,18 +379,30 @@ def _seed_bmad_tree(worktree: Path, repo_root: Path) -> list[str]:
     intentional: unlike ``rglob``, it descends a symlinked child directory, allowing
     the result-side completeness predicates to see every file the copier considered.
 
-    Returns the paths that need the worktree-local git-add shield: the root when it
-    was absent before seeding, otherwise each file that actually landed.
+    Returns ``(shield_rels, written)``, two readings of the same copy:
+
+    * ``shield_rels`` — what the caller turns into git-add shield patterns: ``[]``
+      when nothing landed, ``[BMAD_DIR]`` when the root was absent before seeding
+      (one pattern covers a tree that is wholly ours), otherwise each file that
+      actually landed. A fresh worktree checkout materializes every tracked path, so
+      "root absent AND tracked" cannot arise and this collapse is already correct for
+      the tracked-directory rule (#484): the collapsed shape only ever names an
+      untracked root.
+    * ``written`` — always the per-file landed rels, never the collapse. This is the
+      substitution ledger the shield reads when a tool directory turns out to be
+      TRACKED (#484): the dir pattern is dropped and these files get patterns of
+      their own, so the answer has to stay per-file even when ``shield_rels``
+      collapsed.
     """
     src_root = repo_root / BMAD_DIR
     if not _is_dir(src_root):
-        return []
+        return [], []
     dst_root = worktree / BMAD_DIR
     had_bmad = _is_dir(dst_root)
     try:
         tops = sorted(src_root.iterdir(), key=lambda entry: entry.name)
     except OSError:
-        return []
+        return [], []
 
     seeded: list[str] = []
     for top in tops:
@@ -221,8 +421,49 @@ def _seed_bmad_tree(worktree: Path, repo_root: Path) -> list[str]:
             ):
                 seeded.append(f"{BMAD_DIR}/{rel}")
     if not seeded:
-        return []
-    return [BMAD_DIR] if not had_bmad else seeded
+        return [], []
+    return ([BMAD_DIR] if not had_bmad else seeded), seeded
+
+
+def _record_seeded(
+    seeded_from: dict[Path, Path],
+    landed: Sequence[Path],
+    src: Path,
+    dst: Path,
+) -> None:
+    """Record where each path a seed entry just wrote was copied FROM.
+
+    `_copy_traversable` reproduces the source tree's shape under ``dst``, so a landed
+    path's rel against ``dst`` is also its source's rel against ``src``; the root of a
+    file entry gives ``Path(".")``, which pathlib drops, mapping ``dst`` to ``src``.
+
+    ``src`` is the RESOLVED source, so a seed entry reached through a symlink names
+    the file that really holds the bytes rather than the link the operator listed.
+    First writer wins: nothing overwrites an earlier entry, because a path is only
+    ever written once — copy-when-absent makes the second entry naming it a skip, and
+    a skip lands nothing to record (#592).
+    """
+    for path in landed:
+        seeded_from.setdefault(path, src / path.relative_to(dst))
+
+
+def _written_rels(worktree: Path, landed: Sequence[Path]) -> list[str]:
+    """Worktree-relative rels of the FILES a copy call just wrote.
+
+    Feeds the shield's tracked-directory substitution (#484): over a tracked tool
+    dir the whole-dir pattern is replaced by one pattern per file provisioning
+    actually landed there, so this is the ledger of what there is to shield.
+
+    The :func:`_is_file` filter is load-bearing rather than defensive.
+    ``_copy_traversable``'s ``copied_paths`` records every destination that landed —
+    each file written AND each directory the call created (``install.py:1427-1436``).
+    A directory rel reaching the substitution would render as another whole-dir
+    pattern, reintroducing the exact shape #484 removes, one level down.
+
+    ``as_posix`` so a substituted pattern anchors on Windows too; ``os.sep`` would
+    not, and the exclude is read by git, not by the platform.
+    """
+    return [p.relative_to(worktree).as_posix() for p in landed if _is_file(p)]
 
 
 def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
@@ -315,8 +556,21 @@ def worktree_seed_undelivered(
     source escape, a symlinked destination, or destination escape proves the seed was
     refused. This report is informational and is never an escalation gate.
     """
-    worktree = worktree.resolve()
-    repo_root = repo_root.resolve()
+    unresolved_repo_root = repo_root
+    try:
+        worktree = worktree.resolve()
+        repo_root = repo_root.resolve()
+    except (OSError, RuntimeError):
+        # Observation only: root uncertainty cannot prove delivery, but it must
+        # not turn an informational journal probe into a run-wide failure.
+        rels = [str(rel) for rel in seed_files]
+        for pattern in seed_globs:
+            try:
+                matches = sorted(unresolved_repo_root.glob(pattern))
+            except (OSError, RuntimeError):
+                continue
+            rels.extend(match.relative_to(unresolved_repo_root).as_posix() for match in matches)
+        return list(dict.fromkeys(rels))
     rels = [str(rel) for rel in seed_files]
     for pattern in seed_globs:
         rels.extend(
@@ -387,6 +641,83 @@ def worktree_seed_undelivered(
     return undelivered
 
 
+def module_skills_seed_undelivered(
+    worktree: Path,
+    trees: Sequence[str],
+    skills_root: Traversable | None = None,
+) -> list[str]:
+    """Wheel-bundled ``MODULE_SKILLS`` whose content never reached the worktree.
+
+    Re-probes DISK, never the copier's bookkeeping: a user-authored
+    ``scm.worktree_seed`` entry that happens to spell a skill rel can therefore
+    neither forge nor mask a report. The source is the wheel's own skills tree, which
+    may be a zip Traversable rather than a real directory, so enumeration goes through
+    the shared :func:`install._walk_traversable_files` walk instead of ``rglob``.
+
+    Presence is the whole contract; content is NEVER compared. Seeding is per-FILE
+    no-clobber, so a checkout carrying its own divergent fork of a bundled skill keeps
+    those bytes while its absent siblings are filled in — comparing content would
+    report that healthy shape as undelivered. A skill the wheel itself lacks is
+    skipped: a broken wheel is the module-skills sync test's concern, not a run's.
+
+    Informational, and NEVER an escalation gate. No ``MODULE_SKILLS`` entry has a
+    worktree-resident consumer — sweep triage dispatches ``/bmad-loop-sweep`` at the
+    MAIN checkout, ``bmad-loop-resolve`` runs at the main checkout too, and
+    ``bmad-loop-setup`` has no session consumer at all — so an absence here cannot
+    prove a stall, and a CRITICAL gate would refuse healthy runs. Extension point: if
+    a consumer ever becomes worktree-resident (e.g. sweep triage moving into unit
+    worktrees), arm the gate by routing this predicate's result into
+    :meth:`WorktreeFlow.escalate_unit` for that consumer's required subset.
+
+    Returns coarse ``"{tree}/{skill}"`` posix rels in iteration order.
+    """
+    if skills_root is None:
+        skills_root = resources.files("bmad_loop.data").joinpath("skills")
+    try:
+        worktree = worktree.resolve()
+    except (OSError, RuntimeError):
+        # This is a journal-only observation. Root uncertainty means every
+        # bundled skill the wheel actually carries is coarsely undelivered.
+        return [
+            f"{tree}/{skill}"
+            for tree in dict.fromkeys(trees)
+            for skill in MODULE_SKILLS
+            if _is_file(skills_root.joinpath(skill)) or _is_dir(skills_root.joinpath(skill))
+        ]
+
+    def contained(target: Path) -> bool:
+        try:
+            return target.resolve().is_relative_to(worktree)
+        except (OSError, RuntimeError):
+            return False
+
+    def delivered(src: Traversable, dst: Path) -> bool:
+        """Whether every usable wheel entry has a matching worktree destination."""
+        for rel, entry in _walk_traversable_files(src):
+            target = dst.joinpath(*rel.split("/")) if rel else dst
+            if _is_file(entry):
+                if contained(target) and _is_file(target):
+                    continue
+                return False
+            if _is_dir(entry):
+                # Directories are yielded only when enumeration was refused, so
+                # their unknown descendants cannot be claimed as delivered.
+                return False
+            # Neither a readable file nor a directory: the copier has no path for
+            # such an entry either, so its absence is not a delivery failure.
+        return True
+
+    undelivered: list[str] = []
+    for tree in dict.fromkeys(trees):
+        for skill in MODULE_SKILLS:
+            src = skills_root.joinpath(skill)
+            if not (_is_file(src) or _is_dir(src)):
+                continue
+            if not delivered(src, worktree / tree / skill):
+                undelivered.append(f"{tree}/{skill}")
+    return undelivered
+
+
 def provision_worktree(
     worktree: Path,
     profiles: Sequence[CLIProfile],
@@ -404,7 +735,7 @@ def provision_worktree(
     the Stop-signal hook never fires, and isolated sessions can't reach their MCP
     server. Lay the bundled skills + signal hook into the worktree for the active
     CLI profiles, and copy the `seed_files` configs in from the main repo. The
-    upstream skills the orchestrator drives (BASE_SKILLS: bmad-dev-auto + the review
+    upstream skills the orchestrator drives (BASE_SKILLS: bmad-build-auto + the review
     hunters, plus whatever review layers this project's own config names) are not
     bundled in the wheel, so they are copied from the MAIN REPO's installed tree
     instead — together with `_bmad/custom/`, the customization those layers resolve
@@ -428,8 +759,12 @@ def provision_worktree(
       project that commits its own skill tree (e.g. .agents/) or config keeps it
       untouched (no diff merged back);
     - the hook points at the MAIN repo's already-installed relay via an absolute
-      path (the relay locates the run dir from $BMAD_LOOP_RUN_DIR, not its own
-      location), so nothing is written into the worktree's .bmad-loop/;
+      path (the relay locates its events directory from $BMAD_LOOP_EVENTS_DIR,
+      falling back to $BMAD_LOOP_RUN_DIR/events — never from its own location),
+      so nothing is written into the worktree's .bmad-loop/. Since #494 the
+      primary channel is out of the project tree entirely, so a worktree cannot
+      carry a run's control plane at all — but the fallback still resolves under
+      the MAIN run dir, so the guarantee holds for an older installed relay too;
     - everything we wrote is excluded from git, in a file private to THIS worktree
       (`.git/worktrees/<id>/info/exclude`, activated per-worktree) that dies with it
       when the worktree is removed. It is never the repository-wide
@@ -447,7 +782,17 @@ def provision_worktree(
 
     seed_files are copied BEFORE the hook step so a seeded settings file that is
     also a hook config_path (.claude/settings.json, .gemini/settings.json) keeps its
-    real content and just gets the Stop hook merged in, rather than being created empty.
+    real content rather than being created empty. Its relay entry is replaced, not
+    kept: the seeded copy carries the main repo's $CLAUDE_PROJECT_DIR-relative relay
+    command, which resolves to the worktree, so the hook step strips it and registers
+    its own absolute command in its place (#352). A config that is already there but
+    cannot be parsed refuses provisioning outright — `verify.GitError`, which the
+    caller escalates as CRITICAL and pauses the run — rather than being replaced by
+    a hooks-only file: an unparseable config is evidence of an earlier fault, and the
+    operator's bytes are left intact for inspection. The refusal sends the repair to
+    whichever source supplied those bytes — read from the per-path record of what
+    seeding actually wrote, never inferred from the seed entry that covers the path
+    (#592).
 
     The repo's `_bmad/` surface is also merge-seeded, excluding generated render
     output. Renderer and upstream-skill completeness failures share the return
@@ -460,14 +805,38 @@ def provision_worktree(
     """
     if not profiles and not seed_files and not seed_globs and not _is_dir(repo_root / BMAD_DIR):
         return []
-    worktree = worktree.resolve()
-    repo_root = repo_root.resolve()
+    unresolved_worktree = worktree
+    unresolved_repo_root = repo_root
+    try:
+        worktree = worktree.resolve()
+        repo_root = repo_root.resolve()
+    except (OSError, RuntimeError) as e:
+        raise verify.GitError(
+            "cannot resolve worktree provisioning roots safely "
+            f"(worktree={unresolved_worktree}, repo_root={unresolved_repo_root}): {e}"
+        ) from e
     relay = repo_root / HOOK_SCRIPT_REL
     skills_root = resources.files("bmad_loop.data").joinpath("skills")
 
     # project gitignored MCP/CLI configs: copy from the main repo when absent.
     # Resolve-and-contain guards against an `..`/absolute entry escaping either tree.
     seeded: list[str] = []
+    # Every FILE provisioning actually wrote, worktree-relative. `seeded` answers per
+    # ENTRY and collapses a directory to its root; this stays per-file, because over a
+    # TRACKED tool directory the shield drops the dir pattern and substitutes one
+    # pattern per file we landed under it (#484). A path is here only if this run
+    # wrote it, which is what makes the substituted patterns untracked by construction
+    # — copy-when-absent cannot land on top of a tracked child.
+    written: set[str] = set()
+    # Which source supplied each path seeding actually WROTE, keyed by where it
+    # landed. `seeded` answers per ENTRY and cannot be read per FILE: a directory
+    # entry records only its own rel below, and copy-when-absent skips occupied
+    # children one at a time, so a dir rel here means "at least one child landed",
+    # never "this child did". The hook step reads this map to name the real source of
+    # an unparseable config, where guessing sends the operator to repair the wrong
+    # file (#592). `_copy_traversable` mirrors the source layout under `dst`, so each
+    # landed path's rel is its source's rel too.
+    seeded_from: dict[Path, Path] = {}
     # Entries that named a real source but copied nothing, because every path they
     # name already exists. Reported to the caller (this function is quiet by
     # contract — it runs under a TUI) because the no-op is otherwise silent: an
@@ -477,9 +846,12 @@ def provision_worktree(
     # misconfiguration, exactly like the glob-expanded matches below.
     skipped: list[str] = []
     for rel in seed_files:
-        src = (repo_root / rel).resolve()
         raw = worktree / rel
-        dst = raw.resolve()
+        try:
+            src = (repo_root / rel).resolve()
+            dst = raw.resolve()
+        except (OSError, RuntimeError):
+            continue
         if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
             continue
         if not (_is_file(src) or _is_dir(src)):
@@ -502,12 +874,14 @@ def provision_worktree(
             # checkout carries some tracked child, so the whole entry used to be a
             # no-op — including the gitignored children that are absent and would
             # clobber nothing. Recurse instead, copying only what is missing.
+            landed: list[Path] = []
             if not _copy_traversable(
                 src,
                 raw,
                 skip_existing=True,
                 worktree=worktree,
                 repo_root=repo_root,
+                copied_paths=landed,
             ):
                 # every child was already present: still a total no-op, still
                 # reported. Only a PARTIAL seed stops being reported.
@@ -518,20 +892,26 @@ def provision_worktree(
             # `git add -A`. Excluding the whole dir is safe — an exclude does not
             # untrack the tracked children that were already there.
             seeded.append(rel)
+            _record_seeded(seeded_from, landed, src, raw)
+            written.update(_written_rels(worktree, landed))
             continue
         # `resolve()` is non-strict, so a dangling leaf or parent link answers for
         # its target. Never mkdir/copy through it. Existing live links were handled
         # by the skip arm above, preserving copy-when-absent reporting.
         if dst != raw:
             continue
+        landed = []
         if _copy_traversable(
             src,
             raw,
             skip_existing=True,
             worktree=worktree,
             repo_root=repo_root,
+            copied_paths=landed,
         ):
             seeded.append(rel)
+            _record_seeded(seeded_from, landed, src, raw)
+            written.update(_written_rels(worktree, landed))
 
     # glob-seeded trees (e.g. an engine plugin's MCP skill dirs): expand each
     # pattern against the main repo and copy matches in, same contain guard +
@@ -540,30 +920,38 @@ def provision_worktree(
     for pattern in seed_globs:
         for match in sorted(repo_root.glob(pattern)):
             rel = match.relative_to(repo_root)
-            src = match.resolve()
             raw = worktree / rel
-            dst = raw.resolve()
+            try:
+                src = match.resolve()
+                dst = raw.resolve()
+            except (OSError, RuntimeError):
+                continue
             if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
                 continue
             if not (_is_file(src) or _is_dir(src)) or _occupied(dst):
                 continue
             if dst != raw:
                 continue
+            landed = []
             if not _copy_traversable(
                 src,
                 raw,
                 skip_existing=True,
                 worktree=worktree,
                 repo_root=repo_root,
+                copied_paths=landed,
             ):
                 continue
             # as_posix so the exclude pattern anchors on Windows too (os.sep would not)
             seeded.append(rel.as_posix())
+            _record_seeded(seeded_from, landed, src, raw)
+            written.update(_written_rels(worktree, landed))
 
     # Renderer-backed skills are handed the worktree as their project root. Merge
     # the repo's project-local BMAD surface after explicit seeds (operator intent wins
     # on collisions) and reserve the two renderer sentinels for result-side checks.
-    seeded_bmad = _seed_bmad_tree(worktree, repo_root)
+    seeded_bmad, bmad_written = _seed_bmad_tree(worktree, repo_root)
+    written.update(bmad_written)
     skipped = [rel for rel in skipped if rel not in RENDERER_SEED_SENTINELS]
     if _bmad_scripts_seed_incomplete(worktree, repo_root):
         skipped.append(BMAD_SCRIPTS_SEED_REL)
@@ -576,18 +964,28 @@ def provision_worktree(
         tree_dir = worktree / tree
         for skill in MODULE_SKILLS:
             dst = tree_dir / skill
+            # `copied_paths` is read only by the shield: when this tree turns out to
+            # be TRACKED, these files are what gets a pattern in place of the dropped
+            # dir pattern (#484). Completeness is still re-probed on disk below —
+            # copy bookkeeping never arms a gate.
+            landed = []
             _copy_traversable(
                 skills_root.joinpath(skill),
                 dst,
                 skip_existing=True,
                 worktree=worktree,
+                copied_paths=landed,
             )
-        # Known gap, deliberately restated rather than folded into the CRITICAL gate
-        # below: wheel MODULE_SKILLS have no result-side completeness predicate. Story
-        # worktrees deterministically dispatch the upstream dev/review skills, while
-        # these bundled operator/triage skills are a different invocation surface; a
-        # partial wheel copy therefore cannot honestly reuse the guaranteed-stall gate.
-        # Closing that observability gap needs its own required-consumer contract.
+            written.update(_written_rels(worktree, landed))
+        # Wheel MODULE_SKILLS get the same result-side completeness re-probe as every
+        # other seeded surface (`module_skills_seed_undelivered`, journaled by the
+        # caller as `worktree-module-skills-dropped`) — but journal-only, never the
+        # CRITICAL gate below: no MODULE_SKILLS entry has a worktree-resident consumer
+        # (sweep triage and bmad-loop-resolve dispatch at the MAIN checkout;
+        # bmad-loop-setup has no session consumer), so a partial wheel copy cannot
+        # prove a stall the way a missing upstream dev/review skill does. A future
+        # worktree-resident consumer arms the gate via escalate_unit over that
+        # predicate's result.
         # The orchestrator-driven upstream skills are not in the wheel; copy them
         # from the MAIN REPO's installed tree (same tree path) so an isolated
         # worktree can still resolve the dev primitive and the review layers. Skip
@@ -610,16 +1008,22 @@ def provision_worktree(
         # never there.
         for skill in _worktree_skill_copy_candidates(repo_root, tree):
             dst = tree_dir / skill
-            src = (repo_root / tree / skill).resolve()
+            try:
+                src = (repo_root / tree / skill).resolve()
+            except (OSError, RuntimeError):
+                continue
             if not src.is_relative_to(repo_root) or not _is_dir(src):
                 continue
+            landed = []
             _copy_traversable(
                 src,
                 dst,
                 skip_existing=True,
                 worktree=worktree,
                 repo_root=repo_root,
+                copied_paths=landed,
             )
+            written.update(_written_rels(worktree, landed))
 
     # Re-ask the result rather than trusting copy bookkeeping. A user-authored seed
     # can happen to spell a skill rel, so only this disk predicate may arm the gate.
@@ -631,6 +1035,7 @@ def provision_worktree(
 
     # per-CLI signal-hook registration, baked to the main repo's relay (absolute).
     # Hookless profiles (HTTP/SSE transport) have no config to merge.
+    stripped_paths: set[Path] = set()
     for profile in profiles:
         if profile.hookless:
             continue
@@ -660,23 +1065,138 @@ def provision_worktree(
         if _is_file(config_path):
             try:
                 config = json.loads(config_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                config = {}
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                # Refuse, exactly as `_register_hooks` does at init
+                # (install.py:1244-1248): same file, same merge, one policy (#592).
+                # JSON has no partial read, so a config that will not parse is
+                # evidence of an earlier fault rather than a blank slate — and
+                # swallowing it to `{}` is not a degrade but a destructive write:
+                # `baseline_config` below deep-copies that `{}`, so the change gate
+                # always fires and publishes a hooks-only file over the operator's
+                # allowlist, env and MCP entries, erasing the very evidence.
+                # UnicodeDecodeError rides along because `read_text` raises it on
+                # invalid UTF-8 — the same "operator file unreadable as content"
+                # family, and uncaught it crashes the engine instead of escalating.
+                # Raising mid-loop, after earlier profiles were provisioned, is
+                # safe: the escalation pauses the run, and provisioning re-runs on
+                # resume without duplicating its work (pinned by
+                # test_shield_reprovision_does_not_duplicate_patterns).
+                #
+                # Send the repair to whatever SUPPLIES these bytes, which is never
+                # this file: the worktree is disposable, an escalated story re-enters
+                # the run only through a re-arm, and that discards the worktree
+                # (`engine._finish_inflight` -> `discard_worktree`) and provisions a
+                # fresh one. `seeded_from` answers which source that is POSITIVELY —
+                # keyed on THIS path, and populated only where a copy actually landed.
+                # Both halves are load-bearing. Existence of a main-checkout
+                # counterpart proves nothing: seeding is copy-when-absent, so a config
+                # the project TRACKS is skipped as an occupied destination and arrives
+                # with the branch checkout instead (the call site says so at the
+                # `config_path` seed), and repairing the counterpart would not take —
+                # the fresh worktree checks the committed version out again and the
+                # refusal recurs, so that lane is told to commit. Nor can provenance
+                # come from the seed ENTRY that covers this path: a directory entry is
+                # recorded once, for the parent, while its children are skipped
+                # individually, so a config landing under a seeded `.claude/` and one
+                # merely sitting there beside a seeded sibling are indistinguishable
+                # at that granularity — and misreading the second as seeded advises
+                # committing a gitignored file that may carry credentials.
+                # ESCALATED is terminal with no transition out (`statemachine.py`),
+                # and `resolve` takes a required `run_id` (`cli.py:4232`), so the
+                # remedy names the re-arm in a form that actually runs.
+                seed_rel = profile.hooks.config_path
+                seeded_source = seeded_from.get(config_path)
+                if seeded_source is not None:
+                    src_note = (
+                        f"this copy was seeded from {seeded_source}, which a "
+                        "re-arm seeds in again, so"
+                    )
+                    remedy = f"repair or remove {seeded_source} in the main checkout"
+                else:
+                    src_note = (
+                        "nothing seeded this copy — it arrived with the branch "
+                        "checkout, which a re-arm checks out again, so"
+                    )
+                    remedy = f"commit a repaired {seed_rel} on the target branch"
+                raise verify.GitError(
+                    f"hook config {config_path} cannot be parsed ({e}); an "
+                    "unparseable config is evidence of an earlier fault, not a blank "
+                    "slate — provisioning refuses rather than replace the operator's "
+                    "allowlist, env, and MCP settings with a hooks-only file. "
+                    f"{src_note} {remedy}, then re-arm this escalation with "
+                    "`bmad-loop resolve <run-id> --no-interactive`: ESCALATED is "
+                    "terminal, so repairing the file alone does not put the story "
+                    "back in the run (#592)"
+                ) from e
         host = get_process_host()
         interp = host.hook_interpreter()
         registrations = {
             native: f"{interp} {host.shell_quote(str(relay))} {canonical}"
             for native, canonical in profile.hooks.events.items()
         }
-        config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
-        if changed:
-            config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        # A seeded config_path (.claude/settings.json is both a seeded file and the
+        # hook config) arrives carrying the MAIN repo's relay command, which for the
+        # claude dialect is $CLAUDE_PROJECT_DIR-relative and resolves to a path that
+        # does not exist inside the worktree. merge_hooks will not replace an
+        # already-registered relay, so strip it first and let this registration —
+        # baked to the main repo's relay, absolute — be authoritative. Strip only on
+        # FIRST encounter per config file: profiles can share a config_path
+        # (user-overlay aliases of one CLI), and a later profile's pass must not
+        # tear out the relay events an earlier one just registered — merge_hooks
+        # unions its events in, the first registration winning a shared event.
+        baseline_config = copy.deepcopy(config)
+        if config_path not in stripped_paths:
+            strip_relay_hooks(config, profile.hooks.dialect)
+            stripped_paths.add(config_path)
+        config, _ = merge_hooks(config, registrations, profile.hooks.dialect)
+        # Write — and pin — only when the strip+merge actually changed the parsed
+        # config. Non-claude dialects bake the absolute main-repo relay at init
+        # (_hook_command), so a tracked codex/gemini config often arrives already
+        # carrying exactly the command registered here: strip-then-merge nets to
+        # zero, and a pin would claim orchestrator ownership of a file this run
+        # never modified, hiding a story's own edit to it for no benefit.
+        if config != baseline_config:
+            # atomic_write_text, never write_text (#379). `_register_hooks` states
+            # the rule at length; the stakes are higher here. This config is the
+            # SEEDED copy of the operator's own — allowlist, env, MCP entries and
+            # their hooks all round-trip through the parse above — and a truncating
+            # `"w"` publishes a prefix of it on a short write. Nothing downstream
+            # re-reads it to complain, either: the session starts against a settings
+            # file whose JSON no longer parses, so the CLI falls back to its defaults
+            # and the Stop hook never registers. That is #363's stall with no
+            # diagnostic. follow_symlinks stays at the default, matching the
+            # `write_text` it replaces — and the symlink question is already settled
+            # above this line, by the component-wise refusal walk that skips the
+            # profile entirely when any component of the path is a link — a walk
+            # stricter than the confined writers' (it refuses a link anywhere on the
+            # path, in the worktree as well as out), so a confined write would
+            # relax this site rather than harden it. The #597 flag is the whole
+            # change here: `os.replace` needs write permission on the parent
+            # DIRECTORY, never on the entry it replaces, so a seeded config the
+            # operator had marked read-only was rewritten anyway and came back
+            # reading `0444`. This is the operator's own settings file, round-tripped
+            # through the parse above, so a read-only one earns the `PermissionError`
+            # the `write_text` this replaced raised.
+            atomic_write_text(
+                config_path,
+                json.dumps(config, indent=2) + "\n",
+                require_writable_target=True,
+            )
+            pin_degrade = _pin_tracked_config_rewrite(worktree, profile.hooks.config_path)
+            if pin_degrade is not None and on_degraded is not None:
+                on_degraded(pin_degrade)
 
     # Shield exactly the paths we wrote (skill trees + hook configs + seeded
     # configs) from the unit's `git add -A`, in case a project doesn't gitignore
     # its tool dirs. Scoped to this worktree and expiring with it — these are
     # paths projects legitimately TRACK, so a repo-wide exclude here went on
     # hiding their new files from the operator's own checkout (#384).
+    #
+    # Built here at ENTRY granularity, which is only provisional: the reconcile step
+    # below re-asks git what each one names, drops a pattern over a tracked file as
+    # inert (#392), and over a tracked DIRECTORY swaps the entry for one pattern per
+    # file `written` recorded under it (#484). `written` is therefore not an
+    # alternative source of patterns but the substitution ledger that step reads.
     patterns = {f"/{p.skill_tree}" for p in profiles}
     # hookless profiles have no config_path, so there is nothing to shield: their
     # empty string would render as a bare "/", which git strips to a zero-length
@@ -694,10 +1214,14 @@ def provision_worktree(
         # be consulted. Avoiding that inert sibling keeps the worktree-local exclude
         # precise; the file and its lines disappear with this worktree.
         patterns.add(f"/{RENDER_DIR_REL}/")
-    patterns, tracked_degrade = _drop_inert_tracked_file_patterns(worktree, patterns)
+    patterns, tracked_degrade = _reconcile_tracked_patterns(worktree, patterns, written)
     if tracked_degrade is not None and on_degraded is not None:
         on_degraded(tracked_degrade)
-    reason = _worktree_local_exclude(worktree, sorted(patterns))
+    # Escaping is the LAST transform: `_reconcile_tracked_patterns` strips the leading
+    # "/" and probes git with the LITERAL rel, and the per-file patterns it substitutes
+    # come back RAW too, so it has to keep seeing and emitting unescaped patterns —
+    # escaping must stay downstream of the tracked-pattern transform.
+    reason = _worktree_local_exclude(worktree, sorted(_escape_exclude_pattern(p) for p in patterns))
     if reason is not None and on_degraded is not None:
         on_degraded(reason)
     return skipped
@@ -892,6 +1416,72 @@ class WorktreeFlow:
             return ()
         return (rel,)
 
+    def _board_seed(self, worktree: Path) -> tuple[str, ...]:
+        """The sprint board, when a worktree checkout cannot deliver it (#350).
+
+        The structural sibling of :meth:`_ledger_seed`, for the other
+        orchestrator-owned artifact in the BMAD artifacts dir, and the same shape
+        for the same reason: `git worktree add` checks out TRACKED files only, so a
+        project that gitignores its board gets a unit worktree with none, while the
+        orchestrator writes the board through ``self.workspace.paths`` — i.e. that
+        missing copy.
+
+        What the ledger's absence costs is a livelock; the board's is a CRASH.
+        ``Engine._post_dev_state_sync``'s ``advance`` returns None on a file that is
+        not there (a silent no-op), and ``verify_dev`` then reads the SAME absent
+        file through ``story_status``, where ``sprintstatus.load`` raises
+        ``SprintStatusError`` — a class cli, operatoractions and the TUI all catch
+        and neither engine.py nor verify.py does, so the story dies and takes the
+        run with it. Seeding removes that structurally: the gate reads the
+        orchestrator's own write instead of a hole.
+
+        Per the maintainer decision on #350 the worktree copy is CANONICAL for the
+        duration of the story. As with the ledger, the copy is not what delivers the
+        advance back: every seeded rel is shielded from the unit's ``git add -A``,
+        so the worktree's flip never rides the merge, and a post-merge carry is the
+        delivery path.
+
+        Excluded, arm for arm as the ledger's: a board already in the checkout
+        (tracked, hence delivered — seeding it would copy nothing and journal
+        ``worktree-seed-skipped`` on every isolated unit of every project that
+        tracks its board, which is the common shape for this file); one absent from
+        the main checkout, which the seed loop drops SILENTLY — neither
+        ``worktree-seed-skipped`` nor ``worktree-seed-dropped`` — so naming it would
+        be invisible rather than merely inert (a story run cannot reach here without
+        a board, since ``_pick_next`` reads it first, but a sweep or stories run
+        needs no board at all); and one resolving outside the project tree, which
+        for an out-of-tree artifacts dir ``ProjectPaths.rebased`` leaves unmoved, so
+        the worktree already reads this very file. Presence is asked of the
+        WORKTREE, not of git, for the ledger's reason: it is the predicate the seed
+        loop itself decides on, it costs no subprocess and it cannot raise.
+
+        A board that is itself a symlink inherits ``_ledger_seed``'s caveat verbatim
+        (#462); it is derived there and not repeated here.
+
+        INHERITED LIMITATION — parity, not a regression, and NOT fixed here: a
+        non-fixable rollback does not restore a seeded board. Rollback resets
+        TRACKED paths and removes untracked NON-IGNORED ones
+        (``verify.untracked_files``); an ignored board is in neither set, so nothing
+        puts back the pre-attempt status. An attempt that advanced the worktree
+        board to ``done`` therefore PINS it there — ``advance`` never regresses — and
+        a later attempt that parks instead cannot satisfy ``verify_dev``'s
+        ``awaiting-operator`` expectation. That is exactly what an in-place
+        gitignored board already does under ``isolation = "none"``; only a TRACKED
+        board escapes, via the rollback's ``reset --hard``. Seeding neither
+        introduces the trap nor widens it.
+
+        Deduped against ``scm.worktree_seed`` by the caller.
+        """
+        board = self.paths.sprint_status
+        repo = self.paths.repo_root
+        try:
+            rel = board.resolve().relative_to(repo.resolve()).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return ()
+        if not _is_file(board) or _is_file(worktree / rel):
+            return ()
+        return (rel,)
+
     def run_isolated(self, task: StoryTask, drive: Callable[[StoryTask], None]) -> None:
         """Run one unit's `drive` body in a fresh per-unit worktree, then merge
         it back into the target branch. `drive` either returns (DONE/DEFERRED →
@@ -971,7 +1561,10 @@ class WorktreeFlow:
                 if not profile.hookless and profile.hooks.config_path:
                     seeds.append(profile.hooks.config_path)
         seeds.extend(scm.worktree_seed)
+        # the two orchestrator-owned artifacts a tracked-only checkout can leave
+        # behind — each decides its own exclusions; see the methods.
         seeds.extend(self._ledger_seed(unit.path))
+        seeds.extend(self._board_seed(unit.path))
         # plugins (e.g. the Unity engine) may prime an isolated checkout with
         # gitignored paths they need — e.g. an MCP-generated skill tree + client
         # config so the worktree's Editor MCP is reachable. Aggregate every loaded
@@ -979,14 +1572,22 @@ class WorktreeFlow:
         seeds.extend(self._registry.seed_files())
         seed_files = list(dict.fromkeys(seeds))  # dedupe, preserve order
         seed_globs = self._registry.seed_globs()
-        skipped_seeds = provision_worktree(
-            unit.path,
-            profiles,
-            self.paths.repo_root,
-            seed_files=seed_files,
-            seed_globs=seed_globs,
-            on_degraded=lambda msg: self._exclude_degraded(task.story_key, msg),
-        )
+        try:
+            skipped_seeds = provision_worktree(
+                unit.path,
+                profiles,
+                self.paths.repo_root,
+                seed_files=seed_files,
+                seed_globs=seed_globs,
+                on_degraded=lambda msg: self._exclude_degraded(task.story_key, msg),
+            )
+        except verify.GitError as e:
+            # Every provisioning refusal carries its own cause — an unresolvable
+            # root, a config pin that could not be recorded, an unparseable seeded
+            # hook config (#592) — so the wrapper names the unit and defers the
+            # "why" to the inner message rather than asserting one of the three.
+            reason = f"cannot safely provision the worktree for {task.story_key}: {e}"
+            self.escalate_unit(task, reason)  # always raises RunPaused
         if skipped_seeds:
             # A seed entry whose destination already exists is a no-op. Harmless for
             # a file the checkout legitimately carries, but a directory entry is
@@ -1014,11 +1615,23 @@ class WorktreeFlow:
                 "worktree-seed-dropped", story_key=task.story_key, entries=undelivered_seeds
             )
 
+        trees = [p.skill_tree for p in profiles]
+        # The wheel's own bundled skills, journal-only like worktree-seed-dropped but
+        # under their own kind so a user seed that spells a skill rel can neither forge
+        # nor mask an entry. No MODULE_SKILLS entry has a worktree-resident consumer,
+        # so an absence here cannot prove a stall and must never escalate.
+        undelivered_module_skills = module_skills_seed_undelivered(unit.path, trees)
+        if undelivered_module_skills:
+            self.journal.append(
+                "worktree-module-skills-dropped",
+                story_key=task.story_key,
+                entries=undelivered_module_skills,
+            )
+
         # Missing upstream skill content is a determinate stall for both inline and
         # renderer-era primitives. Re-probe disk rather than trusting skipped_seeds,
         # which a user-authored seed rel could otherwise forge. Check this first so a
         # wholly absent primitive is not misdiagnosed as a renderer-surface problem.
-        trees = [p.skill_tree for p in profiles]
         absent_skills = base_skills_seed_incomplete(unit.path, self.paths.repo_root, trees)
         if absent_skills:
             reason = (
@@ -1165,6 +1778,77 @@ class WorktreeFlow:
                 patch=str(patch) if patch else None,
             )
 
+    def _carried_artifact_rels(self, repo: Path) -> tuple[str, ...]:
+        """The repo-relative posix paths the RUN commits for itself after the merge —
+        ``clean_incoming_collisions``' ``protected`` operand (#618).
+
+        The sprint board and the deferred-work ledger, because those are the two
+        files the four post-merge carries name: ``_carry_harvested_deferrals``,
+        ``_carry_review_budget_followups`` and ``_carry_story_deferred_closes`` pass
+        ``paths.deferred_work`` and ``_carry_board_advance`` passes
+        ``paths.sprint_status``, all four to ``verify.commit_paths`` against this same
+        ``repo``. That call stages by PATHSPEC — `git add -- :(literal)<path>` — so
+        whatever the working tree holds at that path is committed no matter who wrote
+        it, and a merge that walked past an operator's edit there hands the run its
+        own bytes to commit under a `chore(...)` message. The blast radius is strictly
+        same-path (`git commit -- <pathspec>` is implicitly `--only`), which is why
+        this is an exact path set and not a policy.
+
+        ``self.paths``, not ``self.workspace.paths``: the carries read the MAIN
+        checkout's copies (their docstrings say so explicitly), and this is the
+        checkout the merge lands in.
+
+        Relativized exactly as ``commit_paths`` relativizes its own operands
+        (``resolve().relative_to(repo.resolve()).as_posix()``) — that is what makes
+        each entry the same string the carry will later hand ``git add``, and the same
+        key shape ``verify.dirty_paths`` returns, so the guard's membership test is an
+        equality it cannot get subtly wrong. Resolving is load-bearing rather than
+        defensive: through a symlinked artifacts dir the unresolved rel names the LINK
+        while both git and ``commit_paths`` name the target.
+
+        A path that cannot be expressed relative to ``repo`` is dropped, not raised
+        on: it cannot be dirty in this checkout, and ``commit_paths`` filters the same
+        ``ValueError`` and so would never commit it either. ``_ledger_seed``'s
+        three-way catch for the same reason — an unresolvable path (the WSL UNC
+        provider fault, a symlink loop) omits only itself.
+
+        TRACKED ONLY, and that is the whole boundary of the hazard rather than a
+        precaution. What makes the carry dangerous is committing a DIVERGENCE from a
+        baseline somebody else authored: on a tracked board, an operator's local
+        reopen of a story row rides out under `chore(sprint-status): carry ...` with
+        the tree left clean and nothing to read it back from. An UNTRACKED artifact
+        has no such baseline — git reports the whole file as dirt because git has
+        never seen it, the orchestrator has been reading that exact file as its own
+        all along, and committing it is how a non-ignored board first reaches git at
+        all (#350's carry). Protecting it would refuse the merge on EVERY isolated run
+        of any project that has yet to commit its board — measured: an untracked,
+        non-ignored board with no operator dirt anywhere ends the run
+        `done=0 paused=True escalated=1` — which is the unattended-halt class #460 and
+        #618 exist to remove, in exchange for a "hazard" that loses nothing (the bytes
+        are committed, not overwritten). A gitignored artifact never reaches the
+        question: ``dirty_paths`` does not report ignored files and ``git add`` refuses
+        an ignored pathspec, so the carry degrades instead of committing.
+
+        A trackedness probe that cannot answer keeps the path, the direction
+        ``path_tracked``'s own callers degrade in: uncertainty must not be what
+        authorizes writing an operator's bytes into the run's commit. The cost of
+        being wrong that way is a refusal the operator can act on; the other way it is
+        silent.
+        """
+        rels: list[str] = []
+        for artifact in (self.paths.sprint_status, self.paths.deferred_work):
+            try:
+                rel = artifact.resolve().relative_to(repo.resolve()).as_posix()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            try:
+                tracked = verify.path_tracked(repo, rel)
+            except verify.GitError:
+                tracked = True
+            if tracked:
+                rels.append(rel)
+        return tuple(rels)
+
     def merge_local(
         self,
         task: StoryTask,
@@ -1200,16 +1884,51 @@ class WorktreeFlow:
         # A per_worktree Unity Editor can leak asset writes into the *main*
         # checkout (see the unity plugin's worktree setup), dirtying the target with the very
         # files this branch already committed. Reconcile that first: clean only
-        # the leaked copies of incoming files; refuse (escalate) if anything dirty
-        # falls outside this branch's path set — that may be real operator work.
+        # the leaked copies of incoming files; nothing outside this branch's path set is
+        # ever touched. Outside it two questions decide whether the merge proceeds. What
+        # the MERGE can commit is what git has staged (#618), so an unstaged stray is
+        # inert and is tolerated and journaled while a staged one escalates. What the RUN
+        # can commit is the second question, and `protected` is what asks it: the
+        # post-merge carry stages the board and the ledger BY PATHSPEC, so any dirt on
+        # them — staged or not, whoever wrote it — would ride the run's own bookkeeping
+        # commit. Inert-under-merge and safe-to-proceed are not the same predicate.
+        tolerated: list[str] = []
+
+        def note_tolerated(paths: list[str]) -> None:
+            """Journal the guard's decision AND keep the paths for the arms below.
+
+            The event stays here, before the merge, because it records what the
+            GUARD decided; emitting it only on success would lose the trace in
+            exactly the run worth debugging. But "tolerated" is a claim about the
+            path SET, and a stray outside that set by path can still clash with it
+            structurally — a file where the merge needs a directory, or the reverse
+            — so git may refuse the merge over a path this event just called
+            harmless. Holding the list lets the pre-flight arm correct the record
+            instead of leaving it asserting the run merged past a path that in fact
+            stopped it (#623).
+            """
+            tolerated.extend(paths)
+            self.journal.append(
+                "merge-target-tolerated",
+                story_key=task.story_key,
+                branch=unit.branch,
+                paths=paths,
+            )
+
         try:
-            cleaned = verify.clean_incoming_collisions(repo, target, merge_ref)
-        except (verify.GitError, OSError) as e:
-            # OSError joins GitError because clean_incoming_collisions mutates the
-            # checkout directly (unlink/iterdir/rmdir) — a non-spawn FS fault the
-            # #343 chokepoint cannot translate. Crashing here would strand a DONE
-            # unit mid-merge; the keep-branch escalation is the point of this guard.
-            if isinstance(e, (verify.GitSpawnError, OSError)):
+            cleaned = verify.clean_incoming_collisions(
+                repo,
+                target,
+                merge_ref,
+                protected=self._carried_artifact_rels(repo),
+                on_tolerated=note_tolerated,
+            )
+        except (verify.GitError, OSError, RuntimeError) as e:
+            # OSError/RuntimeError join GitError because clean_incoming_collisions
+            # mutates the checkout directly (resolve/unlink/iterdir/rmdir) — non-spawn
+            # FS faults the #343 chokepoint cannot translate. Crashing here would
+            # strand a DONE unit mid-merge; keep-branch escalation is this boundary.
+            if isinstance(e, (verify.GitSpawnError, OSError, RuntimeError)):
                 # environment fault (spawn failure or direct-FS error) — there may
                 # be no stray files at all, so no "clean them" guidance: the inner
                 # error is the diagnosis.
@@ -1219,11 +1938,19 @@ class WorktreeFlow:
                     f"fault, then `bmad-loop resume {self.state.run_id}`"
                 )
             else:
+                # The outer sentence names the HAZARD, never the mechanism: since #618
+                # there are two, and only the inner clause knows which applies to which
+                # path. Saying "a merge or squash would fold them" out here attributed
+                # every refusal to the merge, including one raised because the run's own
+                # post-merge carry would sweep a path it commits for itself.
                 reason = (
                     f"merge of {unit.branch} into {target} blocked: the target checkout has "
-                    f"uncommitted changes that are not part of this branch (likely a Unity "
-                    f"Editor wrote into the main project) — clean them, then "
-                    f"`bmad-loop resume {self.state.run_id}`. {e}"
+                    f"uncommitted changes to tracked files outside this branch that this run "
+                    f"could commit under the story's name — the clause below names the paths, "
+                    f"the mechanism, and what each one needs. Commit, stash or revert them, "
+                    f"then `bmad-loop resume {self.state.run_id}`. One cause is a "
+                    f"per_worktree engine Editor writing into the main checkout; another is "
+                    f"ordinary local work. {e}"
                 )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return
@@ -1255,13 +1982,211 @@ class WorktreeFlow:
                 message=self.merge_message(task),
                 allow_empty_squash=replay,
             )
-        except verify.GitError as e:
-            # genuine content conflict against the target: keep the branch for
-            # manual merge. The unit committed cleanly (phase is already DONE,
-            # which has no legal transition), so escalate directly.
+        except verify.MergePreflightError as e:
+            # Subclass arm, so it must precede the GitError one below. git declined
+            # before the merge began: nothing was merged and the target checkout is
+            # exactly as it was. Describe that STATE rather than prescribing one
+            # remedy — the same refusal covers an untracked file the merge would
+            # overwrite, a staged change on an incoming path, a file/directory shape
+            # clash, and a target that cannot fast-forward — and let the appended raw
+            # git error name the cause and the paths (#619).
+            reason = (
+                f"merge of {unit.branch} into {target} was refused by git before it "
+                f"started: nothing was merged, the target checkout is unchanged, and "
+                f"there is no conflict to resolve. The target's state clashes with the "
+                f"incoming commit; git's own message below names the cause and the "
+                f"paths. Clear that clash, then `bmad-loop resume {self.state.run_id}`. "
+                f"{e}"
+            )
+            if tolerated:
+                # Corrective, not duplicative: only this arm knows the merge died at
+                # git's pre-flight, and only the callback above knows which paths the
+                # guard waved through. One of them may be the cause — git's text names
+                # it — so pair the two rather than making either infer the other. Rides
+                # phase 1's typed error: one discriminator, two consumers (#623).
+                self.journal.append(
+                    "merge-preflight-refused",
+                    story_key=task.story_key,
+                    branch=unit.branch,
+                    tolerated=tolerated,
+                    error=str(e),
+                )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+            return  # defensive: never fall through to the success teardown below
+        except verify.MergeHalfAppliedError as e:
+            # Sibling of the pre-flight arm above, not a subclass of it, so it is a
+            # separate arm rather than a branch inside one — and like its neighbours it
+            # must precede the bare `GitError` arm. git died PART-WAY through the
+            # checkout: the pre-flight sentence above is false in its load-bearing
+            # clause ("the target checkout is unchanged"), because the incoming files
+            # git had already written are still there, untracked. Naming them is the
+            # whole point — they are what makes the next attempt fail, as an
+            # untracked-overwrite refusal over paths no earlier message mentioned.
+            #
+            # No `merge-preflight-refused` companion here even when `tolerated` is set:
+            # that event is the #623 corrective for a guard that called a path harmless
+            # and then watched git refuse over that same path. This failure is not about
+            # the tolerated paths at all — it is incoming content failing to check out —
+            # so pairing it with the guard's decision would assert a link that is not there.
+            # Two residue axes, two different asks, and the operator needs whichever
+            # ones actually apply — so the middle of this message is composed rather
+            # than picked from a fixed set. An incoming path the target did not track
+            # lands untracked and no restore reaches it, so it is theirs to clear; one
+            # it DID track was modified in place and `merge_branch` has already
+            # restored it path-scoped, unless that restore failed too.
+            # The restore clause LEADS when both apply: it says "before anything
+            # else" and means it — a resume dies on the tracked residue first —
+            # so the untracked clause defers to it ("then") rather than both
+            # claiming first place in one message.
+            # The prescription is path-scoped for the reason the restore itself is:
+            # only the named paths are proven git's, and a repo-wide
+            # `git reset --hard HEAD` would flatten the operator's own uncommitted
+            # work alongside them — the destruction the per-path attribution exists
+            # to prevent.
+            steps: list[str] = []
+            if not e.restored:
+                rewritten = (
+                    " ".join(e.rewritten) if e.rewritten else "<the paths git's message names>"
+                )
+                steps.append(
+                    f"The tracked files git had already rewritten could NOT be rolled "
+                    f"back — that failure is in the message below too — so {target} is "
+                    f"still holding incoming content on those paths. Restore exactly "
+                    f"those paths (`git checkout HEAD -- {rewritten}` in {target}, "
+                    f"never a repo-wide `git reset --hard`, which would flatten your "
+                    f"own uncommitted work too) before anything else."
+                )
+            if e.paths:
+                steps.append(
+                    f"Some incoming files are left UNTRACKED in the checkout and no "
+                    f"restore removes them — not `git merge --abort`, not "
+                    f"`git reset --hard`: {', '.join(e.paths)}. "
+                    + ("Clear those first, " if e.restored else "Then clear those, ")
+                    + "checking the contents before you delete: the run can prove git "
+                    "wrote each path, not that the bytes now there are git's."
+                )
+            if e.restored and not e.paths:
+                steps.append(
+                    "The tracked files git had already rewritten have been rolled "
+                    "back, so the checkout itself needs nothing from you."
+                )
+            reason = (
+                f"merge of {unit.branch} into {target} failed PART-WAY THROUGH: git got "
+                f"far enough to start writing the incoming files into {target}'s "
+                f"checkout before it stopped, so nothing was committed and this is not a "
+                f"clash between the target and the incoming commit. "
+                + " ".join(steps)
+                + f" Whatever residue is left refuses the NEXT attempt over those same "
+                f"paths rather than with the error below, which is why a resume before "
+                f"clearing it fails on the tree instead of on the cause. Then fix what "
+                f"stopped the checkout — git's own message below names it, and a "
+                f"required clean/smudge filter that cannot run is the measured cause — "
+                f"and `bmad-loop resume {self.state.run_id}`. {e}"
+            )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+            return  # defensive: never fall through to the success teardown below
+        except verify.MergeResidueUnreadError as e:
+            # The terminal arm's caller-side half, and another sibling that must
+            # precede the bare `GitError` arm. Neither neighbour's sentence can be
+            # borrowed: the pre-flight arm's "the target checkout is unchanged" is
+            # exactly the claim the dead probe can no longer back, and the
+            # half-applied arm names residue this run never read. Say what IS known
+            # — the merge failed, git's text below names why — and send the operator
+            # to the one reading the run could not take, which their own `git
+            # status` still can.
+            reason = (
+                f"merge of {unit.branch} into {target} failed, AND the after-the-fact "
+                f"probe that verifies the checkout failed too, so whether {target}'s "
+                f"checkout still holds incoming residue is UNVERIFIED. Run `git "
+                f"status` in {target}: clear any residue it names that is not yours "
+                f"(files from {unit.branch} left untracked or rewritten), fix what "
+                f"stopped the merge — git's message below names it — then "
+                f"`bmad-loop resume {self.state.run_id}`. {e}"
+            )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+            return  # defensive: never fall through to the success teardown below
+        except verify.MergeCommitRefusedError as e:
+            # Sibling of the arm above and equally a GitError subclass, so it too must
+            # precede the last arm. Neither neighbour's remedy applies here: the merge
+            # RAN and resolved, so there is no target-state clash to clear, and it
+            # resolved cleanly, so there is no conflict to resolve either. `merge_branch`
+            # rolled it back — `merge --abort` on the `--no-ff` leg, `reset --hard` on
+            # the squash leg's own commit — so the checkout is back where it started and
+            # the operator is sent to the policy that declined the commit (#619). The
+            # unrestored wording branches on WHERE the checkout stands, because the two
+            # legs strand differently and the first step differs with them.
+            if e.restored:
+                reason = (
+                    f"merge of {unit.branch} into {target} resolved cleanly, but git "
+                    f"refused to COMMIT it, so the merge was rolled back and the target "
+                    f"checkout is back as it was. There is no conflict to resolve and "
+                    f"nothing to clear from the tree: a `pre-merge-commit` or "
+                    f"`commit-msg` hook, or commit signing, declined it — git's own "
+                    f"message below names which. Fix that, then "
+                    f"`bmad-loop resume {self.state.run_id}`. {e}"
+                )
+            elif e.staged:
+                # The squash leg's strand: no MERGE_HEAD exists, so "recover the
+                # merge" would be fiction — the squash result is sitting STAGED,
+                # either because the rollback failed or because the checkout also
+                # carries the operator's own uncommitted work, which the rollback
+                # refuses to flatten. The exception's text says which.
+                reason = (
+                    f"merge of {unit.branch} into {target} resolved cleanly, git "
+                    f"refused to COMMIT it, and the squash result is left STAGED in "
+                    f"{target}'s checkout — the message below says why it was not "
+                    f"rolled back for you. Stash or commit anything in {target} that "
+                    f"is yours, then clear the staged result "
+                    f"(`git reset --hard HEAD` in {target}). Only then fix whatever "
+                    f"declined the commit: a `pre-merge-commit` or `commit-msg` hook, "
+                    f"or commit signing. Then `bmad-loop resume {self.state.run_id}`. "
+                    f"{e}"
+                )
+            else:
+                # The abort failed too, so the restored sentence would be a lie about
+                # the one thing the operator has to act on FIRST: a resume attempted
+                # over a mid-merge checkout dies on the merge state, not on the
+                # policy, and keeps doing so however well they fix the hook.
+                reason = (
+                    f"merge of {unit.branch} into {target} resolved cleanly, git refused "
+                    f"to COMMIT it, and the abort meant to undo that failed as well — so "
+                    f"the target checkout is left MID-MERGE and has to be recovered "
+                    f"first (`git merge --abort`, or reset it to the pre-merge commit). "
+                    f"Only then fix whatever declined the commit: a `pre-merge-commit` "
+                    f"or `commit-msg` hook, or commit signing. git's own message below "
+                    f"names both failures. Then `bmad-loop resume {self.state.run_id}`. "
+                    f"{e}"
+                )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+            return  # defensive: never fall through to the success teardown below
+        except verify.MergeConflictError as e:
+            # genuine content conflict against the target, measured (unmerged index
+            # stages): keep the branch for manual merge. The unit committed cleanly
+            # (phase is already DONE, which has no legal transition), so escalate
+            # directly.
             reason = (
                 f"merge of {unit.branch} into {target} failed "
-                f"(content conflict against the target): {e}"
+                f"(content conflict against the target): resolve it by hand, then "
+                f"`bmad-loop resume {self.state.run_id}`. {e}"
+            )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+            return  # defensive: never fall through to the success teardown below
+        except verify.GitError as e:
+            # Every state the classification MEASURED has a typed arm above, so a
+            # bare GitError is a state nothing measured. This arm used to claim the
+            # most specific diagnosis — "content conflict, resolve it by hand" — for
+            # exactly the failures it knew least about, which is how six mislabeled
+            # git states in a row reached the operator wearing a fictional remedy
+            # (#619). It now claims only what it knows: the merge failed, the run
+            # cannot say what state the checkout is in, and git's text names the
+            # cause. An unforeseen shape lands here as a vague-but-true message
+            # rather than a precise fiction.
+            reason = (
+                f"merge of {unit.branch} into {target} failed, and the failure was "
+                f"not classified: the run cannot say what state {target}'s checkout "
+                f"is in. Run `git status` in {target} and put the checkout right — "
+                f"git's own message below names the cause — then "
+                f"`bmad-loop resume {self.state.run_id}`. {e}"
             )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
@@ -1288,8 +2213,10 @@ class WorktreeFlow:
 
     def keep_branch_and_escalate(self, task: StoryTask, unit: UnitWorkspace, reason: str) -> None:
         """Preserve a DONE unit's branch (no delete, kept for manual merge) and
-        escalate. Shared by the two merge-back failure paths: a target dirtied
-        with stray work, and a genuine content conflict."""
+        escalate. Shared by every merge-back failure path: a target dirtied with
+        stray work, a merge git refused at pre-flight, a merge that died part-way
+        through its checkout, a merge whose COMMIT git refused, a genuine content
+        conflict, and a failure nothing classified."""
         close_unit_workspace(
             unit,
             success=False,
@@ -1358,10 +2285,13 @@ class WorktreeFlow:
                 task,
                 f"worktree for {task.story_key} is gone ({wt}); cannot resume in place",
             )
-        # spec_file is persisted relative to the worktree (model.to_dict) so the
-        # state stays portable; re-absolutize it against the reopened worktree.
-        if task.spec_file and not Path(task.spec_file).is_absolute():
-            task.spec_file = str(wt / task.spec_file)
+        # Spec paths are persisted relative to the worktree (model.to_dict) so
+        # state stays portable; re-absolutize both accepted/result ownership and
+        # the current/last attempt's dispatch ownership against the reopened tree.
+        # Absolute outside-worktree paths pass through unchanged. The rule itself
+        # lives on the class that creates the relative spelling, so this and
+        # `Engine._finish_inflight`'s pre-discard re-anchor cannot drift apart.
+        task.rebase_spec_paths_on(wt)
         return UnitWorkspace(
             workspace=Workspace(root=wt, paths=self.paths.rebased(wt)),
             repo_root=self.paths.repo_root,

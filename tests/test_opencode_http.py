@@ -24,8 +24,9 @@ from pathlib import Path
 import pytest
 from conftest import write_script_launcher
 
+from bmad_loop import runs
 from bmad_loop.adapters import generic, opencode_http
-from bmad_loop.adapters.base import SessionHandle, SessionSpec
+from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec
 from bmad_loop.adapters.generic import BUDGET_NUDGE_TEXT, NUDGE_TEXT, STALL_NUDGE_TEXT
 from bmad_loop.adapters.opencode_http import (
     _RESET,
@@ -74,6 +75,10 @@ PINNED_EPOCH_MS = 1_784_218_739_410
 #                      reconnect); the turn completes result+messages only —
 #                      completion is reachable only via the HTTP poll fallback
 # FAKE_OPENCODE_START_FAILURES=N makes the first N spawns exit(1) pre-bind.
+# FAKE_OPENCODE_LOG_LINE: written to the server's own stdout at the top of every
+# turn — i.e. into logs/<task_id>.server.out, which is the channel the env-fault
+# post-mortem reads (NOT <task_id>.log, the curated conversation transcript).
+# Unset = silent, so every other scenario is unaffected.
 # FAKE_OPENCODE_SPEC_PATH/_SPEC_TEXT: a bmad-dev-auto-style terminal spec the
 # turn writes wherever a scenario writes its result (and at the start of
 # busy-forever, for the post-kill rescue). Unset = no-op, like RESULT_PATH.
@@ -88,6 +93,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 SCENARIO = os.environ.get("FAKE_OPENCODE_SCENARIO", "completed")
 REC_DIR = os.environ["FAKE_OPENCODE_DIR"]
 RESULT_PATH = os.environ.get("FAKE_OPENCODE_RESULT_PATH", "")
+LOG_LINE = os.environ.get("FAKE_OPENCODE_LOG_LINE", "")
 SPEC_PATH = os.environ.get("FAKE_OPENCODE_SPEC_PATH", "")
 SPEC_TEXT = os.environ.get("FAKE_OPENCODE_SPEC_TEXT", "")
 START_FAILURES = int(os.environ.get("FAKE_OPENCODE_START_FAILURES", "0"))
@@ -163,6 +169,8 @@ def run_turn():
     with LOCK:
         STATE["busy"] = True
         n = STATE["prompts"]
+    if LOG_LINE:
+        print(LOG_LINE, flush=True)  # stdout is the adapter's tee'd session log
     # let the 204 flush before any scripted death tears the connection down
     time.sleep(0.15)
     if SCENARIO == "completed":
@@ -1282,6 +1290,32 @@ def test_missing_binary_is_a_clean_error(tmp_path):
         adapter.start_session(spec)
 
 
+def test_start_session_drops_a_reused_task_dirs_escalation(tmp_path):
+    """Parity with GenericAdapter: both adapters own a tasks/<id>/ dir, so both must
+    drop a prior cycle's `escalation.json` — the file the sweep skill writes and
+    `resolve._gather_escalations` reads beside result.json — before a re-armed run
+    reusing the id lands there. No fake server needed: the unlink runs BEFORE
+    _spawn_server's PATH check raises, so a missing binary still exercises it."""
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    spec = SessionSpec(task_id="t-1", role="triage", prompt="p", cwd=tmp_path)
+    task_dir = adapter.tasks_dir / "t-1"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    stale = task_dir / "escalation.json"
+    stale.write_text(
+        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "last cycle"}]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OpencodeServerError, match="not found on PATH"):
+        adapter.start_session(spec)
+    assert not stale.exists()
+
+    # ...and the ordinary case — no prior escalation — reaches the same spawn error,
+    # i.e. the unlink is missing_ok and did not become the failure itself
+    with pytest.raises(OpencodeServerError, match="not found on PATH"):
+        adapter.start_session(spec)
+
+
 def test_kill_unknown_handle_is_a_noop(tmp_path):
     adapter = make_adapter(tmp_path)
     adapter.kill(SessionHandle(task_id="never-started", native_id="ses_x"))
@@ -2027,6 +2061,327 @@ def test_timeout_wall_clock_step_back_cannot_extend_deadline(tmp_path, monkeypat
     assert ticks["n"] == 3  # same tick count as an untouched wall clock
 
 
+# ---------------------------- in-session hard-stop poll (#319)
+#
+# Contract parity: tests/test_generic_tmux.py carries the identically named pair
+# over the tmux transport. `bmad-loop stop` lodges a mode-aware stop-request.json
+# before it signals; the wait loop reads it twice per iteration and returns the
+# non-completion `aborted` verdict, cancelling the in-flight HTTP turn exactly as
+# the timeout arm does. The adapter never unlinks the file — the engine consumes
+# it, and must still see it to attribute the stop.
+
+
+class _AbortRecordingClient:
+    """Minimal opencode HTTP client stand-in: records every POST path so a test
+    can prove the abort really went out, and answers the usage GET
+    `_capture_usage` makes on the way out."""
+
+    def __init__(self):
+        self.posts: list[str] = []
+
+    def get(self, path):
+        class _Resp:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return [{"info": {"role": "assistant", "tokens": {"input": 10, "output": 5}}}]
+
+        return _Resp()
+
+    def post(self, path):
+        self.posts.append(path)
+
+        class _Resp:
+            status_code = 200
+
+        return _Resp()
+
+    def close(self):
+        pass
+
+
+def _lodge_stop_request(adapter, mode: str) -> Path:
+    """Lodge a stop request of ``mode`` on this run's control-file channel, as
+    ``bmad-loop stop`` does."""
+    adapter.run_dir.mkdir(parents=True, exist_ok=True)
+    path = adapter.run_dir / runs.STOP_REQUEST_FILE
+    path.write_text(
+        json.dumps({"requested_at": "2026-08-22T00:00:00", "mode": mode}), encoding="utf-8"
+    )
+    return path
+
+
+def test_wait_aborts_on_hard_stop_request(tmp_path, monkeypatch):
+    """A hard stop pending on the channel ends the wait on its very next
+    iteration with the non-completion `aborted` verdict, and takes the timeout
+    arm's exit shape: `_abort` cancels the in-flight turn, then `_capture_usage`
+    reads usage back before teardown. Without the abort the HTTP turn would keep
+    running server-side until the session is torn down.
+
+    The verdict fires before the loop ever polls its event queue, so the
+    steerable clock never advances: the pass is deterministic, not a race.
+
+    Ablation: delete the `_hard_stop_requested()` arm from `wait_for_completion`
+    and the clock runs the session to its scripted `timeout` verdict instead —
+    proven red once, then restored.
+    """
+    adapter = make_adapter(tmp_path)
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+    request = _lodge_stop_request(adapter, "hard")
+
+    ticks = {"n": 0}
+
+    def advance():
+        ticks["n"] += 1
+        clock["mono"] += 11.0  # only reached if the abort arm is gone
+
+    sess = _timeout_driven_session(adapter, advance)
+    sess.client = _AbortRecordingClient()
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"), _timeout_spec(tmp_path)
+    )
+
+    assert result.status == "aborted"
+    assert result.result_json is None  # an abort is never a completion path
+    assert ticks["n"] == 0  # aborted before the first event-queue poll
+    assert sess.client.posts == ["/session/ses_1/abort"]
+    assert result.transcript_path == str(adapter.tasks_dir / "t-1" / "messages.json")
+    fired = [ln for ln in _lifecycle_lines(adapter) if ln["event"] == "stop-abort-fired"]
+    assert len(fired) == 1
+    # The engine consumes the request when it raises; an adapter that unlinked it
+    # would leave the engine unable to attribute the stop.
+    assert request.is_file()
+
+
+def test_wait_polls_the_hard_stop_channel_after_the_event_queue_too(tmp_path, monkeypatch):
+    """The arm at the top of the loop is not enough by itself. Below the event-queue
+    wait sit the dispatch legs — `_probe_completion`'s two GETs (not throttled: once
+    a turn goes quiet past SILENCE_THRESHOLD_S they run every tick), a
+    `_session_status` GET, or `_result_json(wait=True)`'s grace wait — each bounded
+    only by the client's own timeouts. One iteration can outlast `stop_run`'s 10s
+    grace window, and on native Windows that is the force-kill this issue exists to
+    avoid. A second poll straight after the queue wait leaves at most one leg between
+    two checks.
+
+    The request is lodged *inside* the queue poll, so it is absent at the top-of-loop
+    check and present immediately after — the interval the second poll covers.
+
+    This does not make the interval unconditionally short, and the prose no longer
+    claims it does: an in-flight socket read cannot be interrupted from this thread.
+
+    Ablation: delete the second `_hard_stop_requested()` arm (below the queue wait)
+    -> `_probe_completion` is called, because the loop enters the silent-turn
+    dispatch leg and only notices the request on its next iteration. The verdict
+    stays `aborted` either way, which is why the probe spy carries the proof and the
+    status does not."""
+    adapter = make_adapter(tmp_path)
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+    adapter.silence_threshold_s = 0.0  # the quiet-turn leg fires on every tick
+
+    probes: list[int] = []
+    monkeypatch.setattr(
+        type(adapter), "_probe_completion", lambda self, sess: (probes.append(1), False)[1]
+    )
+
+    lodged: list[str] = []
+
+    def advance():
+        if not lodged:  # absent at the top-of-loop check, present right after
+            lodged.append("hard")
+            _lodge_stop_request(adapter, "hard")
+        clock["mono"] += 11.0  # makes the turn read as silent below the wait
+
+    sess = _timeout_driven_session(adapter, advance)
+    sess.client = _AbortRecordingClient()
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"), _timeout_spec(tmp_path)
+    )
+
+    assert lodged == ["hard"]  # the interleave really happened
+    assert result.status == "aborted"
+    assert sess.client.posts == ["/session/ses_1/abort"]  # took the abort exit shape
+    assert probes == []  # never entered the dispatch leg below the wait
+
+
+def test_wait_ignores_graceful_stop_request(tmp_path, monkeypatch):
+    """Graceful means *finish the in-flight item*, so a graceful request pending
+    on the same channel must not touch a running session — only `hard` aborts.
+    Every pre-#319 (modeless) body reads graceful, so this pins the back-compat
+    case for the HTTP transport too.
+
+    Ablation: widen the adapter's check to any pending request (drop the
+    ``== "hard"`` comparison in `_hard_stop_requested`) and this test reddens
+    with an `aborted` verdict.
+    """
+    adapter = make_adapter(tmp_path)
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+    _lodge_stop_request(adapter, "graceful")
+
+    def advance():
+        clock["mono"] += 11.0
+
+    sess = _timeout_driven_session(adapter, advance)
+    sess.client = _AbortRecordingClient()
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"), _timeout_spec(tmp_path)
+    )
+
+    # the loop ran on to its scripted verdict rather than aborting
+    assert result.status == "timeout"
+    events = [ln["event"] for ln in _lifecycle_lines(adapter)]
+    assert "stop-abort-fired" not in events
+    assert events.count("timeout-fired") == 1
+
+
+# -------------------------- launch-stall transport parity (#411/#470)
+#
+# Two-way contract-parity link: tests/test_generic_tmux.py carries identically
+# named T1/T2 tests under its matching launch-stall header. Changes to the
+# shared completion-loop behavior must update both transports or record the
+# deliberate divergence; T3 pins OpenCode's HTTP busy/retry safety branch.
+
+
+def test_dev_stall_arms_at_launch_without_stop(tmp_path, monkeypatch):
+    """A silent dev/review turn is bounded even if no idle event ever arrives.
+
+    INVERSE ablation: restore launch initialization of ``stall_deadline`` and
+    ``last_activity`` to ``None`` and this test times out with zero stall nudges.
+    """
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 2
+    adapter.silence_threshold_s = float("inf")
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+
+    def advance():
+        clock["mono"] += 11.0
+
+    sess = _timeout_driven_session(adapter, advance)
+    assert sess.activity == 0
+    monkeypatch.setattr(adapter, "_session_status", lambda _sess: False)
+    sent: list[str] = []
+    monkeypatch.setattr(adapter, "send_text", lambda _handle, text: sent.append(text))
+    heartbeats: list[dict] = []
+    monkeypatch.setattr(
+        adapter, "_write_heartbeat", lambda _task_id, payload: heartbeats.append(payload)
+    )
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"),
+        _timeout_spec(tmp_path, timeout_s=100.0),
+    )
+
+    assert (result.status, sent) == ("stalled", [STALL_NUDGE_TEXT] * 2)
+    assert heartbeats[0]["stall_armed"] is True
+
+
+def test_dev_activity_rearms_launch_stall_grace(tmp_path, monkeypatch):
+    """Two productive launch ticks re-arm grace; one full silent grace stalls.
+
+    ``test_sse_dispatch_filters_child_sessions`` proves that the manually
+    incremented counter is shared parent/child SSE activity, not an invented
+    test seam. Ablation target: delete the activity-change re-arm branch and
+    this test stalls at the first productive grace crossing instead of tick 3.
+    """
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 0
+    adapter.silence_threshold_s = float("inf")
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+    ticks = {"n": 0}
+    sess: _ServerSession
+
+    def advance_and_stream():
+        ticks["n"] += 1
+        clock["mono"] += 11.0
+        if ticks["n"] <= 2:
+            sess.activity += 1
+
+    sess = _timeout_driven_session(adapter, advance_and_stream)
+    monkeypatch.setattr(adapter, "_session_status", lambda _sess: False)
+    sent: list[str] = []
+    monkeypatch.setattr(adapter, "send_text", lambda _handle, text: sent.append(text))
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"),
+        _timeout_spec(tmp_path, timeout_s=100.0),
+    )
+
+    assert result.status == "stalled"
+    assert (ticks["n"], sess.activity, sent) == (3, 2, [])
+
+
+def test_dev_busy_status_rearms_launch_stall_grace_without_nudging(tmp_path, monkeypatch):
+    """OpenCode busy/retry proof protects work after the nudge budget is spent.
+
+    Ablation target: move the busy-status guard back under the positive nudge-
+    budget branch and this test stalls instead of reaching the timeout.
+    """
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 0
+    adapter.silence_threshold_s = float("inf")
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+    ticks = {"n": 0}
+
+    def advance():
+        ticks["n"] += 1
+        clock["mono"] += 11.0
+
+    sess = _timeout_driven_session(adapter, advance)
+    statuses = iter(("busy", "retry", "busy", "retry"))
+    observed: list[str] = []
+
+    class _StatusClient:
+        def get(self, path):
+            if path == "/session/status":
+                status = next(statuses)
+                observed.append(status)
+                payload = {sess.session_id: {"type": status}}
+            else:
+                payload = []
+
+            class _Resp:
+                status_code = 200
+
+                @staticmethod
+                def json():
+                    return payload
+
+            return _Resp()
+
+        def post(self, path):
+            class _Resp:
+                status_code = 200
+
+            return _Resp()
+
+        def close(self):
+            pass
+
+    sess.client = _StatusClient()
+    sent: list[str] = []
+    monkeypatch.setattr(adapter, "send_text", lambda _handle, text: sent.append(text))
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"),
+        _timeout_spec(tmp_path, timeout_s=35.0),
+    )
+
+    assert result.status == "timeout"
+    assert (observed, sent, ticks["n"]) == (["busy", "retry", "busy", "retry"], [], 4)
+
+
 def test_e2e_server_death_with_artifact_completes(tmp_path, fake_opencode):
     """Server death ≙ window death: the crash path vouches for a landed
     result.json (accept_result=True), so finished-then-died reads completed."""
@@ -2383,3 +2738,180 @@ def test_e2e_dev_wait_loop_drives_observe_tick(tmp_path, fake_opencode, monkeypa
     assert result.status == "completed"
     assert seen and all(tid == "3-1-dev-1" and same for tid, same in seen)
     assert_server_gone(rec)
+
+
+# --------------------------------------------------------------- env fault (#194)
+# The HTTP adapter went without env-fault classification entirely while the tmux
+# adapter had it, because the hook was implemented on GenericAdapter rather than
+# shared — so a 5-hour provider quota outage read as three healthy stories timing
+# out and burned their retry budgets. The classifier now lives in EnvFaultMixin;
+# these tests assert this adapter actually inherits it, which is the regression
+# that matters (the mechanics themselves are covered in test_generic_tmux.py).
+#
+# This adapter's log is the `opencode serve` process's own stdout/stderr, not a
+# tmux pane capture, so the lines below keep the server's logfmt SHAPE and the
+# provider's verbatim AI_APICallError text (that text is what the patterns key
+# on) — but every session/run identifier is a synthetic stand-in, not the real
+# one from the outage, which came from a private client project's run.
+_EF_TASK = "17-1b-dev-1"
+
+_QUOTA_LINE = (
+    'timestamp=2026-07-26T13:12:53.262Z level=ERROR run=fake0001 message="stream error" '
+    "providerID=zai-coding-plan modelID=glm-5.2 session.id=ses_fake0000000000000000000001 "
+    'small=false agent=general mode=subagent error.error="AI_APICallError: Usage limit '
+    'reached for 5 hour. Your limit will reset at 2026-07-26 22:49:46"'
+)
+_SOCKET_LINE = (
+    'timestamp=2026-07-26T22:52:57.193Z level=ERROR run=fake0002 message="stream error" '
+    'providerID=zai-coding-plan modelID=glm-5.2 error.error="AI_APICallError: Cannot '
+    'connect to API: The socket connection was closed unexpectedly."'
+)
+
+
+def _ef_classify(adapter, status, *, result_json=None, task_id=_EF_TASK):
+    handle = SessionHandle(task_id=task_id, native_id=task_id)
+    spec = SessionSpec(task_id=task_id, role="dev", prompt="/x", cwd=adapter.run_dir)
+    return adapter._classify_env_fault(
+        handle, spec, SessionResult(status=status, result_json=result_json)
+    )
+
+
+def _write_ef_log(adapter, text: str, task_id: str = _EF_TASK) -> None:
+    """Writes to whatever file the adapter actually scans, not a hardcoded name.
+
+    These unit tests are deliberately blind to WHICH file that is — asserting the
+    suffix here would just restate the implementation. Pinning the wiring is
+    test_e2e_env_fault_classified_through_run's job, and it is the only thing that
+    caught the scan pointing at the wrong file after <task_id>.log became the
+    conversation transcript."""
+    adapter._env_fault_log_path(task_id).write_text(text, encoding="utf-8")
+
+
+@pytest.mark.parametrize("line", [_QUOTA_LINE, _SOCKET_LINE])
+def test_opencode_classifies_provider_quota_as_env_fault(tmp_path, line):
+    """The headline regression: a timed-out session whose server log carries the
+    provider's refusal is an environment fault, not a failed story attempt."""
+    adapter = make_adapter(tmp_path)
+    _write_ef_log(adapter, f"listening on 127.0.0.1\n{line}\ncleanup prune=7.days\n")
+    result = _ef_classify(adapter, "timeout")
+    assert result.env_fault is True
+    assert result.status == "timeout"  # the verdict string is unchanged
+    assert "AI_APICallError" in result.env_fault_evidence
+
+
+def test_opencode_env_fault_writes_lifecycle_breadcrumb(tmp_path):
+    adapter = make_adapter(tmp_path)
+    _write_ef_log(adapter, _QUOTA_LINE + "\n")
+    _ef_classify(adapter, "timeout")
+    events = [
+        json.loads(line)
+        for line in (adapter.tasks_dir / _EF_TASK / "session-lifecycle.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [e["event"] for e in events] == ["env-fault-classified"]
+    assert events[0]["status"] == "timeout"
+    assert "Usage limit reached" in events[0]["evidence"]
+
+
+def test_opencode_healthy_timeout_is_not_an_env_fault(tmp_path):
+    """The other half: an ordinary timeout whose log holds only normal server
+    chatter stays a real dev attempt. Classifying this would let a genuinely
+    stuck story pause the run forever instead of retrying."""
+    adapter = make_adapter(tmp_path)
+    _write_ef_log(
+        adapter,
+        "timestamp=2026-07-26T15:45:39.732Z level=INFO message=stream "
+        "providerID=zai-coding-plan modelID=glm-5.2\ncleanup prune=7.days\n",
+    )
+    result = _ef_classify(adapter, "timeout")
+    assert result.env_fault is False
+    assert result.env_fault_evidence is None
+
+
+def test_opencode_env_fault_skips_completed_and_result_bearing(tmp_path):
+    """`completed` never reaches the scan, and a result-bearing verdict is a
+    session that did real work — a reconcile upgrade must not be re-classified."""
+    adapter = make_adapter(tmp_path)
+    _write_ef_log(adapter, _QUOTA_LINE + "\n")
+    assert _ef_classify(adapter, "completed").env_fault is False
+    assert _ef_classify(adapter, "timeout", result_json={"status": "done"}).env_fault is False
+    assert not (adapter.tasks_dir / _EF_TASK / "session-lifecycle.jsonl").exists()
+
+
+def test_opencode_env_fault_missing_log_degrades_silently(tmp_path):
+    """Best-effort doctrine: an unreadable log leaves the verdict untouched."""
+    adapter = make_adapter(tmp_path)
+    result = _ef_classify(adapter, "timeout", task_id="never-ran")
+    assert result.env_fault is False
+
+
+def test_e2e_env_fault_classified_through_run(tmp_path, fake_opencode):
+    """The wiring, not just the inheritance: every test above calls
+    _classify_env_fault directly, and all of them would still pass if
+    CodingCLIAdapter.run() never invoked the hook for this adapter — which is
+    exactly the regression (#194 went unclassified here for that reason).
+
+    So drive a real session end to end: the fake server logs the provider's
+    refusal to its own stdout (logs/<task_id>.server.out — NOT <task_id>.log, the
+    curated conversation transcript) at the top of a turn that then never
+    finishes, the session idles out its clock, and the SessionResult that comes
+    back out of run() must carry the classification."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(
+        tmp_path,
+        rec,
+        "busy-forever",
+        timeout_s=1.5,
+        extra_env={"FAKE_OPENCODE_LOG_LINE": _QUOTA_LINE},
+    )
+
+    result = adapter.run(spec)
+
+    assert result.status == "timeout"  # the verdict string is unchanged
+    assert result.result_json is None
+    assert result.env_fault is True
+    assert "Usage limit reached" in result.env_fault_evidence
+    # The signal came off the SERVER log specifically. Named literally rather than
+    # via adapter._env_fault_log_path, because this assertion exists to catch the
+    # scan being pointed at the wrong file — resolving the path through the code
+    # under test would make it agree with any answer. <task_id>.log is the curated
+    # conversation transcript and must NOT be the source here.
+    logs = tmp_path / "run" / "logs"
+    assert "AI_APICallError" in (logs / "t-1.server.out").read_text(encoding="utf-8")
+    assert "AI_APICallError" not in (logs / "t-1.log").read_text(encoding="utf-8")
+    events = read_jsonl(tmp_path / "run" / "tasks" / "t-1" / "session-lifecycle.jsonl")
+    assert [e["event"] for e in events][-1:] == ["env-fault-classified"]
+    assert_server_gone(rec)
+
+
+def test_env_fault_log_is_dropped_at_session_start(tmp_path, fake_opencode):
+    """A re-armed run reusing a task_id must not classify off the PREVIOUS cycle's
+    provider error.
+
+    This is the pause loop the classifier would otherwise create for itself: an
+    env fault PAUSEs the run, the operator re-arms and resumes, and the next
+    session — however healthy its own log — rescans the stale refusal and pauses
+    again, forever. GenericAdapter.start_session unlinks its pane tee for exactly
+    this reason; the server sink needs the same treatment.
+
+    Drives a real session so the unlink is exercised through the actual spawn
+    path, not asserted against a hand-placed file."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    stale = adapter._env_fault_log_path("t-1")
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text(_QUOTA_LINE + "\n", encoding="utf-8")
+
+    # This cycle times out with the provider saying NOTHING (no FAKE_OPENCODE_LOG_LINE),
+    # so it is eligible for classification and the only quota line anywhere is the
+    # stale one. Deliberately a non-completed verdict: `completed` short-circuits
+    # the classifier before it reads a byte, so it would pass with or without the
+    # unlink and prove nothing.
+    spec = make_spec(tmp_path, rec, "busy-forever", timeout_s=1.5)
+    result = adapter.run(spec)
+
+    assert result.status == "timeout"
+    assert result.env_fault is False, f"classified off a stale log: {result.env_fault_evidence}"
+    assert "Usage limit reached" not in stale.read_text(encoding="utf-8", errors="replace")

@@ -3,7 +3,7 @@
 This module is two things: the bundled `bmad-loop-*` skills and the `bmad-loop`
 orchestrator tool (the Python program that actually drives the loop). The skills do
 nothing on their own — the orchestrator is what spawns the fresh coding-CLI sessions
-that invoke the upstream `bmad-dev-auto` skill (which implements and, re-invoked on
+that invoke the upstream `bmad-build-auto` skill (which implements and, re-invoked on
 the done spec, runs the follow-up review) plus `bmad-loop-sweep` and
 `bmad-loop-resolve`, watches their hook signals, and verifies
 their artifacts. Installing the tool is part of setup, not
@@ -20,6 +20,13 @@ of the README.
 ## Platform prerequisites
 
 - **Python 3.11+** and a supported coding CLI (`claude` by default).
+- **git 2.34 or newer** — every unit of work moves through git, so this one is enforced
+  rather than advised: `bmad-loop run`, `sweep` and `resume` refuse to start below it, and
+  `bmad-loop validate` reports it as a problem (`git.version`, exit 1). It is a **support**
+  floor rather than a capability one — no git command bmad-loop issues needs 2.34 — set so
+  the project stops carrying accommodations for releases it does not test against. 2.34 is
+  Ubuntu 22.04 LTS's stock git; Ubuntu 20.04 (2.25) and Debian 11 (2.30) are below it.
+  `git --version` reports what is on your `PATH`.
 - **A terminal multiplexer** — the orchestrator drives agent sessions through a terminal
   multiplexer: **tmux** (POSIX) and the experimental **psmux** (native Windows) ship
   bundled, and further backends install as separate packages that register themselves
@@ -37,12 +44,23 @@ of the README.
   every POSIX path work unchanged there, so no special setup is needed. **Native Windows is
   experimental** — the bundled `psmux` backend (a ConPTY tmux re-implementation) drives runs
   there and is selected automatically as the win32 default when its prerequisites are present:
-  the `psmux` and `pwsh` (PowerShell) binaries on `PATH`, with `psmux` newer than 3.3.6 (older
-  releases can force-kill a recycled PID during teardown and so read as unavailable). It is
+  the `psmux` and `pwsh` (PowerShell) binaries on `PATH`, with `psmux` 3.3.8 or newer (older
+  releases read as unavailable — see
+  [multiplexer backends](multiplexer-backends.md#psmux-native-windows-experimental) for why). It is
   not yet at the Linux/macOS/WSL support tier — the remaining native-Windows work (window
   hosting, attach/detach, Unity cache paths) is tracked in
   [the roadmap](ROADMAP.md#native-windows-multiplexer-backend); the port path is in
-  [Porting bmad-loop to a new OS](porting-to-a-new-os.md).
+  [Porting bmad-loop to a new OS](porting-to-a-new-os.md). Stopping a run is not part of
+  that gap: `bmad-loop stop` lodges its request in a control file the engine reads itself,
+  at item boundaries and mid-session, so it no longer depends on Windows signal delivery
+  (#319). Inside WSL, install with the
+  **Linux** interpreter — a Windows-installed bmad-loop is reachable from the bash prompt
+  and silently behaves as Windows
+  ([why](multiplexer-backends.md#psmux-native-windows-experimental)). To check:
+  `bmad-loop mux` should read `platform default for linux`; if it names `win32` you are
+  running the Windows build, and `bmad-loop validate` says so too. (A forced choice —
+  `BMAD_LOOP_MUX_BACKEND` or `[mux] backend` — is reported as the reason _instead_ of the
+  platform, so clear it before reading that line as a platform check.)
 
 ## Installed via the BMAD-method installer? (recommended)
 
@@ -94,30 +112,35 @@ claude "/bmad-loop-setup accept all defaults"                   # install the to
 Add `--cli codex --cli gemini` to also populate `.agents/skills/`. `init` always
 installs all the bundled skills together (`bmad-loop-resolve`, `bmad-loop-sweep`,
 `bmad-loop-setup`); `bmad-loop-sweep` owns the canonical `deferred-work-format.md`
-the orchestrator normalizes the ledger to. The dev primitive `bmad-dev-auto` is
+the orchestrator normalizes the ledger to. The dev primitive `bmad-build-auto`
+(spelled `bmad-dev-auto` before the 6.10.1 rename — the orchestrator resolves
+whichever name is on disk and invokes that one) is
 **not** bundled: it is the upstream skill the orchestrator drives (for both
 implementation and the follow-up review), installed by the BMad Method (bmm)
-module. `bmad-loop validate` checks it — plus the review layers it invokes
-inline — are present before a run starts.
+module. `bmad-loop validate` checks it — plus any review skills its layers
+invoke — are present before a run starts.
 
-**Minimum BMAD-METHOD: v6.10.0** for sprint mode. Beyond `bmad-dev-auto` itself (with
+**Minimum BMAD-METHOD: v6.10.0** for sprint mode. Beyond the primitive itself (with
 its `customize.toml`), `bmad-loop validate` holds you to no fixed list of review
-skills: it reads the `bmad-dev-auto` you actually have installed and requires the
-reviewers that copy will actually invoke.
+skills: it reads the primitive you actually have installed and requires the
+reviewers that copy will actually invoke — which on current sources is none at all.
 
 - **Layer-driven (post-6.10.0)** — `customize.toml` defines
-  `[[workflow.review_layers]]`, and each layer's `instruction` names the skill it hands
-  off to. Current sources define four layers: `blind-hunter`, `edge-case-hunter`, and
-  `verification-gap`, each invoking the merged `bmad-review` skill with one lens, plus
-  `intent-alignment`, a self-contained prompt that invokes no skill at all. Such a tree
-  needs `bmad-review` and none of the standalone hunters. An intermediate release whose
-  layers name the standalone hunters needs exactly those instead.
+  `[[workflow.review_layers]]`, and a layer's `instruction` may name a skill to hand
+  off to. Current (6.11) sources define four layers — `blind-hunter`,
+  `edge-case-hunter`, `verification-gap` and `intent-alignment` — and none of them
+  invokes a skill: each is a self-contained prompt — `edge-case-hunter` and
+  `verification-gap` read the primitive's own `review-prompts/*.md`, `blind-hunter`
+  and `intent-alignment` carry their prompt inline. Such a tree requires no review
+  skill at all. An intermediate release whose layers invoke the merged `bmad-review`
+  with one lens each needs `bmad-review`; an earlier one naming the standalone hunters
+  needs exactly those instead.
 - **v6.10.0** — no `review_layers` section at all; `step-04-review.md` names
   `bmad-review-adversarial-general` and `bmad-review-edge-case-hunter` inline, so those
   two are what is required.
 
 A layer disabled with an empty `instruction`, or replaced in
-`_bmad/custom/bmad-dev-auto.toml` by a recipe that runs something else, requires
+`_bmad/custom/bmad-build-auto.toml` by a recipe that runs something else, requires
 nothing. If the shape cannot be read at all, `validate` falls back to requiring the two
 v6.10.0 hunters — which a tree carrying `bmad-review` satisfies.
 
@@ -127,10 +150,13 @@ forwarder to `bmad-review`. It is required exactly when your installed layers na
 
 ### Customizing the review layers
 
-Your project overrides in `_bmad/custom/bmad-dev-auto.toml` (team) and
-`_bmad/custom/bmad-dev-auto.user.toml` (personal, gitignored by the bmm installer) are
-applied before the requirement is computed, using the same merge rules BMAD's own
-resolver uses: an array of tables merges by key only when _every_ entry — default and
+Your project overrides in `_bmad/custom/bmad-build-auto.toml` (team) and
+`_bmad/custom/bmad-build-auto.user.toml` (personal, gitignored by the bmm installer) are
+applied before the requirement is computed. (Overrides are keyed by skill directory
+name, so a pre-6.10.1 install spells both files `bmad-dev-auto*.toml`; the deprecated
+shim offers to rename them when you first invoke the old name.) The merge follows the
+same rules BMAD's own resolver uses: an array of tables merges by key only when
+_every_ entry — default and
 override alike — carries the same `code` or `id`; otherwise the override appends. So
 adding a layer with a new `id` adds a requirement, and replacing one by `id` moves it.
 
@@ -143,7 +169,7 @@ without running the review:
 
 Both come back as `skills.review-layer-unresolved` warnings, so a customized layer can
 never block a run the way the old fixed catalog did. What _is_ a problem: every layer
-disabled at once (`skills.review-layers-empty`), which makes `bmad-dev-auto` HALT
+disabled at once (`skills.review-layers-empty`), which makes the primitive HALT
 blocked with `no active review layers`.
 
 Under `isolation = "worktree"` the skills your layers name are copied into each unit's
@@ -157,9 +183,10 @@ The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`,
 `antigravity` (Google's `agy`, experimental — `isolation = "none"` only), `opencode`
 (OpenCode ≥ 1.18 over HTTP/SSE, profile `opencode-http` — no tmux window; needs the
 `bmad-loop[opencode]` extra and `model` set as `provider/model`), and `cursor-sdk`
-(Cursor's headless local SDK agent; Node ≥ 22.13 and `CURSOR_API_KEY`; provision it with
-`bmad-loop init --provision cursor-sdk`). You can pick more than one — register every CLI
-you intend to use for dev, review, or sweep triage.
+(Cursor's headless agent over `@cursor/sdk`, experimental — no tmux window; needs Node
+≥ 22.13, a `CURSOR_API_KEY`, and a one-off `bmad-loop init --provision cursor-sdk` to
+install the SDK runtime). You can pick more than one — register every CLI you intend to
+use for dev, review, or sweep triage.
 
 There are **two layers** here, and confusing them is the usual stumbling block:
 
@@ -326,7 +353,9 @@ bmad-loop cleanup --project <project-root>         # kill leftover tmux sessions
 ```
 
 `clean --hard` permanently deletes runs instead of archiving them (we're removing the tool, so
-there's nothing to keep). See the disk-reclamation coverage in
+there's nothing to keep). Running it **first** also matters for the out-of-tree half: each run's
+control-plane directory lives under the user-scoped state root, and `clean` is what collects it
+(step 2 covers what is left over). See the disk-reclamation coverage in
 [docs/FEATURES.md](FEATURES.md) and the [command reference](../README.md#command-reference) for
 what each command touches. Make sure no run is still live (Editor open, session attached) first.
 
@@ -338,6 +367,19 @@ Delete the `.bmad-loop/` directory. This removes the hook relay script
 
 ```bash
 rm -rf .bmad-loop/
+```
+
+One piece is **not** under `.bmad-loop/`: each run's hook-event channel lives in a user-scoped
+state root outside the project (#494) — `$XDG_STATE_HOME/bmad-loop`, else
+`~/.local/state/bmad-loop`; `%LOCALAPPDATA%\bmad-loop\state` on Windows; or whatever
+`BMAD_LOOP_STATE_DIR` names. Step 1 collected this project's runs from it, leaving an empty
+per-project directory whose name is a digest of the project path — not something to pick out by
+hand. That root is shared by **every** project on this machine, so delete the whole thing only if
+you are removing bmad-loop everywhere:
+
+```bash
+# all projects on this machine — same cascade the orchestrator resolves
+rm -rf "${BMAD_LOOP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/bmad-loop}"
 ```
 
 ### 3. Remove the bundled skills

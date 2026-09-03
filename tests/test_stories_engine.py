@@ -8,8 +8,16 @@ from pathlib import Path
 
 import pytest
 import yaml
-from conftest import attach_profile, git, install_build_auto_skill, write_spec
+from conftest import (
+    _OK,
+    attach_profile,
+    git,
+    install_build_auto_skill,
+    write_gated_ledger,
+    write_spec,
+)
 
+from bmad_loop import stories
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
@@ -25,6 +33,7 @@ from bmad_loop.model import (
     PAUSE_PLAN_CHECKPOINT,
     PAUSE_SPEC_APPROVAL,
     PAUSE_STORY_CHECKPOINT,
+    PAUSE_STORY_GATE,
     Phase,
     RunState,
     StoryTask,
@@ -38,6 +47,7 @@ from bmad_loop.policy import (
     Policy,
     ReviewPolicy,
     ScmPolicy,
+    VerifyPolicy,
 )
 from bmad_loop.runs import STOP_REQUEST_FILE, graceful_stop_requested
 from bmad_loop.stories_engine import StoriesEngine
@@ -244,6 +254,34 @@ def test_two_story_happy_path(project):
     assert engine.state.tasks["2"].phase == Phase.DONE
 
 
+def test_story_review_gate_journals_its_verify_commands(project):
+    """`StoriesEngine._verify_review` threads the base engine's review sink, so a
+    stories-mode review-leg verifier pass lands the same `verify-command-result`
+    records the base engine's does.
+
+    Its own row rather than a claim carried by `test_engine.py`: the sink is
+    passed at each override, so dropping it here would leave every stories run
+    silently unrecorded while the base engine's tests stayed green — the shape the
+    #695 root bug already took across these same three gates.
+
+    Ablation: remove `on_results=` from `StoriesEngine._verify_review` and the
+    record assertion fails at zero entries."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(
+        project, [], policy=_stories_policy(verify=VerifyPolicy(commands=(_OK,)))
+    )
+    sp = story_spec(project, "1")
+    write_spec(sp, "done", rev_parse_head(project.project))
+    task = StoryTask(story_key="1", epic=1)
+    task.spec_file = str(sp)
+
+    assert engine._verify_review(task).ok
+
+    (record,) = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    assert record["verification_stage"] == "review"
+    assert record["command"] == _OK and record["story_key"] == "1"
+
+
 def test_run_state_pins_stories_mode(project):
     setup_stories(project, [entry("1")])
     engine, _ = make_engine(project, [stories_dev_effect()])
@@ -269,6 +307,155 @@ def test_stories_validated_journaled_once(project):
     validated = [e for e in engine.journal.entries() if e.get("kind") == "stories-validated"]
     assert len(validated) == 1
     assert validated[0]["count"] == 2
+
+
+# ----------------------------------------------- dispatched spec ownership
+
+
+def test_dispatched_spec_binding_uses_exact_present_id_keyed_file(project):
+    folder = setup_stories(project, [entry("1")])
+    present = story_spec(project, "1")
+    write_spec(present, "ready-for-dev", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "present story spec")
+    engine, _ = make_engine(project, [])
+
+    assert engine._dispatched_spec_for_attempt(StoryTask("1", 0)) == str(present)
+    assert present.parent == folder / "stories"
+
+
+def test_bound_folder_id_dispatch_aborts_when_final_snapshot_fails(project, monkeypatch):
+    """A Stories prompt stays fail-safe even though it names only folder + id.
+
+    Ablation: require the final snapshot only for prompts containing ``spec_file``
+    and this bound attempt launches despite its failed final observation.
+    """
+    setup_stories(project, [entry("1")])
+    present = story_spec(project, "1")
+    write_spec(present, "ready-for-dev", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "present story spec")
+    engine, adapter = make_engine(project, [stories_dev_effect()])
+    task = StoryTask("1", 0, spec_file=str(present))
+    engine.state.tasks[task.story_key] = task
+    real_refresh = engine._refresh_dispatched_spec_snapshot
+    calls = 0
+
+    def fail_final_snapshot(bound_task, **kwargs):
+        nonlocal calls
+        calls += 1
+        refreshed = real_refresh(bound_task, **kwargs)
+        if calls == 2:
+            return False
+        return refreshed
+
+    monkeypatch.setattr(engine, "_refresh_dispatched_spec_snapshot", fail_final_snapshot)
+
+    with pytest.raises(RuntimeError, match="pre-launch snapshot"):
+        engine._dev_phase(task)
+
+    assert calls == 2
+    assert adapter.sessions == []
+
+
+def test_present_folder_id_dispatch_aborts_when_initial_binding_fails(project, monkeypatch):
+    """An existing Stories target cannot launch unbound after a read fault."""
+    setup_stories(project, [entry("1")])
+    present = story_spec(project, "1")
+    write_spec(present, "ready-for-dev", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "present story spec")
+    engine, adapter = make_engine(project, [stories_dev_effect()])
+    task = StoryTask("1", 0, spec_file=str(present))
+    engine.state.tasks[task.story_key] = task
+    monkeypatch.setattr(engine, "_dispatched_spec_for_attempt", lambda _task: None)
+
+    with pytest.raises(RuntimeError, match="pre-launch snapshot"):
+        engine._dev_phase(task)
+
+    assert task.phase == Phase.DEV_RUNNING
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+    assert adapter.sessions == []
+    persisted = load_state(engine.run_dir).tasks[task.story_key]
+    assert persisted.phase == Phase.DEV_RUNNING
+    assert persisted.attempt == task.attempt
+
+
+def test_present_folder_id_dispatch_fails_closed_when_requirement_observation_faults(
+    project, monkeypatch
+):
+    """Two failed resolver observations cannot turn an existing target unbound."""
+    setup_stories(project, [entry("1")])
+    present = story_spec(project, "1")
+    write_spec(present, "ready-for-dev", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "present story spec")
+    engine, adapter = make_engine(project, [stories_dev_effect()])
+    task = StoryTask("1", 0, spec_file=str(present))
+    engine.state.tasks[task.story_key] = task
+    real_resolve = stories.resolve_story_spec
+    calls = 0
+
+    def fail_authority_observations(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls in {1, 3}:
+            raise OSError("transient Stories resolver fault")
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "bmad_loop.stories_engine.stories.resolve_story_spec", fail_authority_observations
+    )
+
+    with pytest.raises(RuntimeError, match="pre-launch snapshot"):
+        engine._dev_phase(task)
+
+    assert adapter.sessions == []
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+    assert calls == 3
+    persisted = load_state(engine.run_dir).tasks[task.story_key]
+    assert persisted.phase == Phase.DEV_RUNNING
+    assert persisted.attempt == task.attempt
+
+
+def test_dispatched_spec_binding_refuses_pending_story(project):
+    """Ablation: delete the StoriesEngine override and the inherited sprint seam
+    binds the valid decoy ``task.spec_file``, failing this PENDING refusal alone."""
+    folder = setup_stories(project, [entry("1")])
+    task = StoryTask("1", 0, spec_file=str(folder / "SPEC.md"))
+    engine, _ = make_engine(project, [])
+
+    assert engine._dispatched_spec_for_attempt(task) is None
+
+
+def test_dispatched_spec_binding_refuses_ambiguous_story(project):
+    """Ablation: delete the StoriesEngine override and the inherited sprint seam
+    binds the valid decoy ``task.spec_file``, failing this AMBIGUOUS refusal alone."""
+    folder = setup_stories(project, [entry("1")])
+    write_spec(story_spec(project, "1"), "ready-for-dev", rev_parse_head(project.project))
+    write_spec(folder / "stories" / "1-other.md", "ready-for-dev", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ambiguous story specs")
+    task = StoryTask("1", 0, spec_file=str(folder / "SPEC.md"))
+    engine, _ = make_engine(project, [])
+
+    assert engine._dispatched_spec_for_attempt(task) is None
+
+
+def test_dispatched_spec_binding_refuses_sentinel_story(project):
+    """Ablation: delete the StoriesEngine override and the inherited sprint seam
+    binds the valid decoy ``task.spec_file``, failing this SENTINEL refusal alone."""
+    folder = setup_stories(project, [entry("1")])
+    sentinel = folder / "stories" / "1-unresolved.md"
+    write_spec(sentinel, "blocked", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "sentinel story spec")
+    task = StoryTask("1", 0, spec_file=str(folder / "SPEC.md"))
+    engine, _ = make_engine(project, [])
+
+    assert engine._dispatched_spec_for_attempt(task) is None
 
 
 # ------------------------------------------------------------- scheduling
@@ -426,6 +613,11 @@ def test_story_selector_filters_to_one_id(project):
 
 
 def test_dev_prompt_fresh_dispatch_shape(project):
+    """Stories keeps its folder+id route instead of inheriting sprint routing.
+
+    Ablation: route ``StoriesEngine._dev_prompt`` through its superclass and this
+    exact assertion fails on the inherited bare sprint-key prompt.
+    """
     setup_stories(project, [entry("1")])
     engine, _ = make_engine(project, [])
     task = StoryTask(story_key="1", epic=0)
@@ -531,6 +723,12 @@ def test_review_prompt_carries_no_sprint_board_clause(project):
 
 
 def test_dev_prompt_repair_leg_is_explicit_spec_resume(project, tmp_path):
+    """A Stories repair remains its pre-sprint-routing explicit-spec invocation.
+
+    Green ablation: routing ``StoriesEngine._dev_prompt`` through its superclass
+    leaves this test green because the two repair legs are intentionally
+    byte-identical; ``test_dev_prompt_fresh_dispatch_shape`` grades the override.
+    """
     setup_stories(project, [entry("1")])
     engine, _ = make_engine(project, [])
     task = StoryTask(story_key="1", epic=0)
@@ -541,8 +739,13 @@ def test_dev_prompt_repair_leg_is_explicit_spec_resume(project, tmp_path):
     feedback = tmp_path / "fb.md"
     feedback.write_text("boom")
     prompt = engine._dev_prompt(task, feedback)
-    assert prompt.startswith("/bmad-dev-auto Resume the autonomous dev session on the in-progress")
-    assert "Story id:" not in prompt  # repair is an explicit-spec-file invocation
+    assert prompt == (
+        f"/bmad-dev-auto Resume the autonomous dev session on the in-progress spec at "
+        f"`{task.spec_file}`. The previous session's work failed deterministic "
+        f"verification; repair the working tree so verification passes without "
+        f"changing the spec's frozen intent contract. Verification evidence is "
+        f"in `{feedback}`."
+    )
 
 
 def test_dev_prompt_spells_the_post_rename_primitive(project, tmp_path, monkeypatch):
@@ -795,6 +998,82 @@ def test_plan_checkpoint_pause_then_resume_implements(project):
     leg2 = next(s for s in radapter.sessions if s.role == "dev")
     assert "Halt after planning" not in leg2.prompt
     assert "BMAD_LOOP_PLAN_HALT" not in leg2.env
+
+
+def test_operator_spec_path_anchors_an_isolated_units_spec(project):
+    """The pause notice is the FIRST surface an operator meets — before any dashboard.
+
+    Every pause here hands a human a path and says "review it, then resume", and the
+    `checkpoint-pause` journal records the same string. `task.spec_file` is persisted
+    RELATIVE to the mounted worktree (`model._serialized_worktree_path`), so the raw
+    value resolved against whatever directory the operator happened to be in — the main
+    checkout, which carries the same `epic-1/stories/...` layout and answers with the
+    wrong tree's copy. The TUI's `_paused_spec` carries a docstring about exactly this;
+    the notification reaches the operator earlier and had none.
+
+    NOT applied to the dev-session prompt at `spec_ref`: that session's cwd IS the
+    mount, so the relative spelling is the correct one there. The anchor belongs to the
+    consumer, not to the field.
+
+    Ablation: change the helper's body to return `task.spec_file` and this reddens.
+    NOTE this row grades the HELPER only — reverting a CALL SITE to a bare
+    `task.spec_file` leaves it green, which is why
+    `test_plan_checkpoint_pause_journals_the_mount_anchored_spec` below pins the
+    journalled value that an actual pause emits.
+    """
+    engine, _adapter = make_engine(project, [])
+    wt = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1"
+    rel = "epic-1/stories/1-slug.md"
+    task = StoryTask("1", 0, spec_file=rel)
+    task.worktree_path = str(wt)
+
+    assert engine._operator_spec_path(task) == str(wt / rel)
+    # a spec-less task falls back to the story key rather than raising out of a notice
+    assert engine._operator_spec_path(StoryTask("1", 0)) == "1"
+
+
+def test_plan_checkpoint_pause_journals_the_mount_anchored_spec(project):
+    """The CALL SITE, not the helper — the two can regress independently.
+
+    `test_operator_spec_path_anchors_an_isolated_units_spec` calls the helper directly,
+    so every one of the five notification/journal sites could be reverted to a bare
+    `task.spec_file` with the whole suite still green: the stories engine builds its
+    policy with `notify=QUIET`, so no row observes a notification body, and every other
+    `checkpoint-pause` assertion reads `checkpoint` and never `spec`.
+
+    This pins the value an actual pause emits, which is also the premise
+    `diagnostics.py` now records for the `spec` alias field.
+
+    Ablation: revert `_pause_plan_checkpoint`'s `spec=` to `task.spec_file` and this
+    reddens on the bare relative spelling.
+    """
+    from bmad_loop.engine import RunPaused
+
+    engine, _adapter = make_engine(project, [])
+    wt = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1"
+    rel = "epic-1/stories/1-slug.md"
+    task = StoryTask("1", 0, spec_file=rel)
+    task.worktree_path = str(wt)
+    engine.state.tasks["1"] = task
+
+    with pytest.raises(RunPaused):
+        engine._pause_plan_checkpoint(task)
+
+    record = _kinds(engine.journal, "checkpoint-pause")[-1]
+    assert record["spec"] == str(wt / rel)
+    assert record["checkpoint"] == "plan"
+
+    # The NOTIFY body, not only the journal: they are separate call sites that regress
+    # independently, and this one is the surface the operator actually reads. `QUIET` is
+    # `NotifyPolicy(desktop=False, file=True)`, so the ATTENTION file is written. Before
+    # this assertion no row in the repo observed ANY `gates.notify` body, so every
+    # notification site could be reverted to a bare `task.spec_file` with the suite green.
+    #
+    # Ablation: revert `_pause_plan_checkpoint`'s notify to `task.spec_file` and this
+    # reddens — the bare relpath appears and the anchored path does not.
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert str(wt / rel) in attention
+    assert f"review {rel}," not in attention  # not the un-anchored spelling
 
 
 # -------- MAJOR-B: a spec_checkpoint story can never commit without a plan review
@@ -1086,7 +1365,7 @@ def test_blocked_resolve_rearm_then_redispatch_to_done(project):
     assert not any(s.role == "dev" for s in adapter.sessions)  # story 2 not leapfrogged
 
     # human fixed the frozen spec → re-arm (must run while still escalation-paused)
-    runs.rearm_escalation(engine.run_dir, "1")
+    runs.rearm_escalation(engine.run_dir, "1", isolated_redrive=False)
     assert status_of(read_frontmatter(story_spec(project, "1"))) == "ready-for-dev"
 
     # resume re-drives the re-armed story, then continues the schedule to story 2
@@ -1100,6 +1379,45 @@ def test_blocked_resolve_rearm_then_redispatch_to_done(project):
         "/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 1.",
         "/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 2.",
     ]
+
+
+def test_resolved_wedge_is_still_gated_on_redispatch(project):
+    """The state that makes a "has this story ever run?" test unbuildable, and so
+    the reason `_finish_inflight`'s restart arm asks the gate unconditionally.
+
+    `_pause_wedged` records an ESCALATED task *before any session runs this pick*:
+    `attempt == 0`, no session records, and after `resolve` also `rearmed`. Every
+    signal that would exempt a re-drive is therefore set on a story whose first
+    dispatch has not happened — so exempting re-drives would wave a wedged story
+    straight past a gate that landed while the run was down. Story 1's re-dispatch
+    is a start like any other, and story 2 must not be leapfrogged either: the gate
+    pauses the run rather than skipping the story, exactly as `validate` fails the
+    whole preflight."""
+    from bmad_loop import runs
+
+    folder = setup_stories(project, [entry("1"), entry("2")])
+    write_spec(folder / "stories" / "1-slug.md", "blocked", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story 1 blocked")
+
+    engine, _ = make_engine(project, [])
+    assert engine.run().paused
+    wedged = load_state(engine.run_dir).tasks["1"]
+    assert wedged.phase == Phase.ESCALATED and wedged.attempt == 0 and not wedged.sessions
+
+    runs.rearm_escalation(
+        engine.run_dir, "1", isolated_redrive=False
+    )  # human fixed the frozen spec
+    assert load_state(engine.run_dir).tasks["1"].rearmed  # ...and the re-drive is armed
+    # a gate on story 1 lands while the run is down
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])})
+
+    resumed, radapter = resume_engine(project, engine, [stories_dev_effect(), stories_dev_effect()])
+    summary = resumed.run()
+
+    assert summary.paused and summary.done == 0
+    assert radapter.sessions == []
+    assert load_state(resumed.run_dir).paused_stage == PAUSE_STORY_GATE
 
 
 def test_sentinel_rearm_deletes_by_recorded_verdict_e2e(project):
@@ -1123,7 +1441,7 @@ def test_sentinel_rearm_deletes_by_recorded_verdict_e2e(project):
     assert engine.run().paused
     assert load_state(engine.run_dir).tasks["1"].sentinel_kind == "unresolved"  # recorded
 
-    runs.rearm_escalation(engine.run_dir, "1")
+    runs.rearm_escalation(engine.run_dir, "1", isolated_redrive=False)
     assert not sentinel.exists()  # cleared by the recorded verdict
     assert (engine.run_dir / "sentinels" / "1-unresolved.md").is_file()  # copy preserved
     reloaded = load_state(engine.run_dir)
