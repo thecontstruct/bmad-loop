@@ -687,7 +687,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         if profile.hookless:
             report.ok(
                 "adapter.hookless",
-                f"{profile.name}: hookless (HTTP/SSE transport) — no hook registration needed",
+                f"{profile.name}: hookless transport — no hook registration needed",
                 {"profile": profile.name},
             )
             continue
@@ -2066,10 +2066,25 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
+    from .adapters import registry
     from .adapters.profile import get_profile
 
     cfg = pol.adapter.resolved(role)
     profile = get_profile(cfg.name, project)
+    if profile.adapter == registry.CURSOR_CLI_HEADLESS:
+        # Rendered from the adapter's own argv builder, so the preview cannot
+        # drift from what a real run executes. `<worktree>` stands in for the
+        # per-session cwd a preview has not resolved yet.
+        from .adapters.cursor_cli_headless import build_argv
+
+        argv = build_argv(
+            prompt=profile.render_prompt(prompt),
+            cwd=Path("<worktree>"),
+            model=cfg.model,
+            binary=profile.binary,
+            bypass=tuple(cfg.extra_args if cfg.extra_args is not None else profile.bypass_args),
+        )
+        return " ".join(argv[:-1] + [f'"{argv[-1]}"'])
     if profile.hookless:
         # HTTP/SSE transport — there is no shell invocation to print. Render
         # the real sequence (per-session server spawn + API prompt) instead of
@@ -4647,7 +4662,7 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         metavar="PROFILE",
         help="CLI profile(s) to register hooks for (claude | codex | gemini | copilot | "
-        "antigravity | opencode-http (alias: opencode) | custom; "
+        "antigravity | opencode-http (alias: opencode) | cursor-cli-headless | custom; "
         "repeatable; default: profiles referenced by .bmad-loop/policy.toml, or claude)",
     )
     init_p.add_argument(

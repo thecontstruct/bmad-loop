@@ -1232,7 +1232,9 @@ def _confined_to(target: Path, root: Path) -> bool:
 
 def _register_hooks(project: Path, profile: CLIProfile) -> int:
     if profile.hookless:
-        print(f"  no hooks needed ({profile.name}): HTTP/SSE transport")
+        # Hooklessness is a property of the profile, not of one transport: the
+        # HTTP/SSE family and the supervised-subprocess family both land here.
+        print(f"  no hooks needed ({profile.name}): hookless transport")
         return 0
     config_path = project / profile.hooks.config_path
     if not _confined_to(config_path, project):
@@ -2852,11 +2854,12 @@ def install_into(
     bmad_loop_dir = project / ".bmad-loop"
     bmad_loop_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. hook relay script (shared by all CLIs)
-    script_target = project / HOOK_SCRIPT_REL
-    script_source = resources.files("bmad_loop.data").joinpath("bmad_loop_hook.py")
-    script_target.write_text(script_source.read_text(encoding="utf-8"), encoding="utf-8")
-    print(f"  hook script: {script_target}")
+    # 1. only hook-driven profiles need the relay.
+    if any(not profile.hookless for profile in profiles):
+        script_target = project / HOOK_SCRIPT_REL
+        script_source = resources.files("bmad_loop.data").joinpath("bmad_loop_hook.py")
+        script_target.write_text(script_source.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"  hook script: {script_target}")
 
     # 2. per-CLI hook registration
     for profile in profiles:
