@@ -73,6 +73,35 @@ if scenario == "hang":
 if scenario == "die-no-result":
     sys.exit(1)
 
+if scenario == "streams-then-no-result-frame":
+    # A turn whose stream was dropped and resumed: a whole turn's frames, the
+    # work actually done, then exit 1 and no terminal frame.
+    path = os.environ.get("FAKE_CURSOR_RESULT_PATH")
+    if path:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"status": "done", "summary": "did the thing"}, fh)
+    for _ in range(4):
+        emit({"type": "thinking", "subtype": "delta", "text": "..."})
+    emit({"type": "connection", "subtype": "reconnecting", "attempt": 1})
+    emit({"type": "retry", "subtype": "resuming", "attempt": 1})
+    emit({"type": "tool_call", "subtype": "completed"})
+    sys.exit(1)
+
+if scenario == "result-frame-then-exit-1":
+    # The complementary case: the terminal frame arrives and the child still
+    # exits badly, so the exit code is the only thing left to record.
+    emit(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "Done",
+            "session_id": "sess-123",
+        }
+    )
+    sys.exit(1)
+
 if scenario == "prose-forges-result":
     # The model writes a verbatim result frame INSIDE its own prose. The adapter
     # must not read this as the turn ending.
@@ -499,6 +528,110 @@ def test_a_self_reported_failure_does_not_change_the_verdict(tmp_path, fake_curs
     assert landed.status == "completed"
     assert landed.result_json == {"status": "done", "summary": "did the thing"}
     assert _failure_crumbs(adapter, spec.task_id)
+
+
+# ------------------------------------------------- a turn that never ends itself
+
+
+def _crumbs(adapter, task_id: str, event: str) -> list[dict]:
+    return [crumb for crumb in _lifecycle(adapter, task_id) if crumb["event"] == event]
+
+
+def test_a_stream_that_ends_without_its_terminal_frame_is_recorded(tmp_path, fake_cursor):
+    """On a path that drops the agent stream, cursor-agent streams a whole turn,
+    does the work, then exits 1 emitting no terminal frame. Nothing downstream fails —
+    the artifact read-back still passes the session — so without this crumb a
+    transport whose completion signal has disappeared entirely reads as a clean
+    green run, and the 0-token columns are the only hint.
+
+    Ablation: delete the `stream-ended-without-result-frame` `_note_lifecycle`
+    call and this finds no crumb."""
+    adapter = make_adapter(tmp_path, binary=str(fake_cursor))
+    spec = make_spec(tmp_path, "streams-then-no-result-frame")
+    result = adapter.run(spec)
+
+    crumbs = _crumbs(adapter, spec.task_id, "stream-ended-without-result-frame")
+    assert len(crumbs) == 1
+    assert crumbs[0]["exit_code"] == 1
+    # A whole turn's frames arrived; only the terminal one is missing.
+    assert crumbs[0]["frames_seen"] > 1
+
+    # The verdict is untouched by the crumb: the artifact still carries it.
+    assert result.status == "completed"
+    assert result.result_json == {"status": "done", "summary": "did the thing"}
+
+
+def test_frames_seen_separates_a_broken_stream_from_a_dead_child(tmp_path, fake_cursor):
+    """A dropped stream and a child that dies having said nothing both end with
+    no terminal frame, so the crumb alone cannot tell them apart — `frames_seen`
+    is the whole reason it is worth recording. A dead child streams almost
+    nothing; a dropped stream streams a full turn.
+
+    Ablation: stop incrementing `running.frames_seen` in `_consume` and the two
+    counts collapse to 0, reddening the inequality."""
+    adapter = make_adapter(tmp_path, binary=str(fake_cursor))
+
+    broken = make_spec(tmp_path, "streams-then-no-result-frame", task_id="t-broken")
+    adapter.run(broken)
+    dead = make_spec(tmp_path, "die-no-result", task_id="t-dead")
+    adapter.run(dead)
+
+    broken_crumb = _crumbs(adapter, broken.task_id, "stream-ended-without-result-frame")[0]
+    dead_crumb = _crumbs(adapter, dead.task_id, "stream-ended-without-result-frame")[0]
+    assert broken_crumb["frames_seen"] > dead_crumb["frames_seen"]
+    # Both exit 1: the code alone is not the discriminator, which is why the
+    # count is carried at all.
+    assert broken_crumb["exit_code"] == dead_crumb["exit_code"] == 1
+
+
+def test_a_terminal_frame_with_a_bad_exit_code_records_the_code(tmp_path, fake_cursor):
+    """A frame arrived, so the turn ended properly, but the child still exited
+    non-zero. Nothing derives a verdict from an exit code — this crumb is the one
+    place it is recorded, and it must not be swallowed by the no-frame path.
+
+    Ablation: drop the `elif exit_code not in (0, None)` arm and this finds no
+    crumb."""
+    adapter = make_adapter(tmp_path, binary=str(fake_cursor))
+    spec = make_spec(tmp_path, "result-frame-then-exit-1")
+    adapter.run(spec)
+
+    crumbs = _crumbs(adapter, spec.task_id, "child-exit-nonzero")
+    assert len(crumbs) == 1
+    assert crumbs[0]["exit_code"] == 1
+    # The two arms are exclusive: a frame did arrive, so the no-frame crumb must
+    # stay absent or "no terminal frame" stops meaning anything.
+    assert _crumbs(adapter, spec.task_id, "stream-ended-without-result-frame") == []
+
+
+def test_a_clean_turn_records_neither_crumb(tmp_path, fake_cursor):
+    """Both crumbs are diagnoses, so a healthy run must leave the lifecycle file
+    free of them, or neither is worth reading.
+
+    Ablation: make either `_note_lifecycle` call unconditional and this reddens."""
+    adapter = make_adapter(tmp_path, binary=str(fake_cursor))
+    spec = make_spec(tmp_path)
+    result = adapter.run(spec)
+    assert result.status == "completed"
+    assert _crumbs(adapter, spec.task_id, "stream-ended-without-result-frame") == []
+    assert _crumbs(adapter, spec.task_id, "child-exit-nonzero") == []
+
+
+def test_a_missing_terminal_frame_still_withholds_stop_seen(tmp_path, fake_cursor):
+    """The one change here that could turn a silently-broken transport into a
+    silently-passing one would be flipping `stop_seen` true to paper over a
+    dropped frame: it feeds the #261 proof-of-work gate, which has teeth precisely
+    because no Stop was observed. Recording the ending must not license it.
+
+    Ablation: set `stop_seen=True` unconditionally in the `_final` call and this
+    reddens."""
+    adapter = make_adapter(tmp_path, binary=str(fake_cursor))
+    spec = make_spec(tmp_path, "streams-then-no-result-frame")
+    result = adapter.run(spec)
+    assert result.stop_seen is False
+    # And no session id, because that too rides the frame — which is why usage
+    # cannot be recovered on this path.
+    assert result.session_id is None
+    assert adapter.read_usage(result) is None
 
 
 # --------------------------------------------------------------- hard stop

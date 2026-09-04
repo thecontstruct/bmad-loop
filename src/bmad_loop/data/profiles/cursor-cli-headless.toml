@@ -3,6 +3,53 @@
 # off the terminal `result` frame, so no hook script or config is ever written.
 # Flags pinned against cursor-agent 2026.08.04: `-p/--print`, `--output-format
 # stream-json`, `-f/--force`, `--trust`, `--workspace`, `--model`.
+#
+# THE TERMINAL FRAME IS NOT GUARANTEED, and what makes it go missing is the
+# network path, not the CLI build. When the connection to the agent endpoint
+# drops mid-turn the CLI emits `connection`/`retry` frames, resumes, and can then
+# end the turn WITHOUT its terminal `result` frame, exiting non-zero — while
+# still having done the work correctly.
+#   Measured, 12 runs on one trivial prompt, the two builds INTERLEAVED so that
+# drifting network conditions could not be read as a version effect:
+# 2026.08.04-aaa8809 produced the frame in 0/6 and 2026.09.02-c22c1a3 in 0/7.
+# Every one of the twelve carried 6 `retry` + 6 `connection` frames, exited 1
+# with `RetriableError: WritableIterable is closed` on stderr, and edited the
+# file correctly. Output format does not save it either: `--output-format json`
+# produced the frame in only 1/4 under the same conditions. Do not record this as
+# a regression in any particular build — an earlier, uninterleaved comparison
+# read that way and was wrong, because it varied reconnect pressure and version
+# together.
+#   THE CAUSE IS NOT LOCAL, and it is not the network path. The A/B above was
+# repeated in full on a mobile hotspot — different gateway, carrier, egress IP
+# and resolver, nothing shared with the first path but the machine — and it
+# reproduced: 1/8 frames there against 0/13 on the LAN, 1/21 overall. Both paths
+# passed every local check (no TLS interception, HTTP/2 streaming to Cursor
+# trickling normally over 5s, third-party HTTP/1.1 streaming trickling normally,
+# long-idle streams surviving 68s with ~22s gaps, unary requests to the agent
+# host at 200 in ~100ms). An HTTP/1.1-only buffering oddity against
+# api2.cursor.sh is NOT evidence of a local fault and was ruled out: the CLI
+# speaks HTTP/2, over which the same endpoint is healthy.
+#   The tell is the regularity. Every one of the 21 runs across BOTH paths
+# carried exactly 6 `retry` + 6 `connection` frames. A property of the network
+# would vary between a home LAN and a cellular carrier; an identical count on
+# both does not. Together with `RetriableError: WritableIterable is closed` —
+# which Cursor has publicly acknowledged as an internal transient stream error
+# (forum 169334) — this points at their side, and the lone success (exit 0, frame
+# and usage intact) is what "transient" looks like from here.
+#   Nothing about the CLI predicts it, no network fix addresses it, and it may
+# clear server-side without warning. So it must not be coded around; it can only
+# be recorded, which is what the crumb does. Version is NOT the variable: 1/10 on
+# 2026.08.04 against 0/11 on 2026.09.02 is nowhere near a difference.
+#   What it costs THIS profile: the frame is the completion signal, the sole
+# token source (usage_parser = "none", below) and the only failure signal. With
+# it gone every session takes the adapter's window-death path — verdict
+# `crashed`, upgraded to `completed` by the artifact read-back — so a one-story
+# run still passes, silently, with 0 tokens and no health signal at all. The
+# fallback is load-bearing whenever the path is bad, not a safety net, and that
+# is exactly why such a run reads as green. The `stream-ended-without-result-
+# frame` crumb exists to make that state legible rather than invisible; it is
+# also why no recovery is hardcoded here, since there is no CLI-side setting that
+# fixes a buffering middlebox.
 name = "cursor-cli-headless"
 binary = "cursor-agent"
 # Driven by the bundled headless adapter class (adapters/registry.py), not the
@@ -21,7 +68,9 @@ prompt_template = "Use the {skill} skill now: {args}"
 # without the trust dialog. Policy `[adapter] extra_args` replaces this list.
 bypass_args = ["--force", "--trust"]
 # cursor-agent exposes no transcript a parser can reach; token counts ride the
-# terminal `result` frame instead and the adapter reads them from there.
+# terminal `result` frame instead and the adapter reads them from there. Whenever
+# the path drops that frame this reports 0 tokens for every session, on any build
+# — see the note at the top of this file.
 usage_parser = "none"
 first_run_note = "run `cursor-agent login` once (or set CURSOR_API_KEY) before starting a headless run"
 
