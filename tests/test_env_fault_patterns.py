@@ -64,7 +64,11 @@ PANE_CAPTURE_PROFILES = ("claude",)
 # An unverified pattern is not a neutral bet — one that fires on a healthy session
 # pauses the whole run, which is worse than the fault it was meant to catch.
 # Seeding nothing costs only the status quo. See test_unseeded_profiles_stay_inert.
-UNSEEDED_PROFILES = ("codex", "gemini", "copilot", "antigravity")
+# cursor-sdk is here for a slightly different reason from the four CLIs: the file
+# it scans (logs/<task_id>.sidecar.err) is model-free, so it could carry the
+# looser anchor-plus-cause form — but no captured Cursor SDK provider-outage line
+# exists yet, and the evidentiary bar is the same either way.
+UNSEEDED_PROFILES = ("codex", "gemini", "copilot", "antigravity", "cursor-sdk")
 ALL_PROFILES = SEEDED_PROFILES + UNSEEDED_PROFILES
 
 # The two logfmt shapes `opencode serve` emitted during a real 5-hour provider

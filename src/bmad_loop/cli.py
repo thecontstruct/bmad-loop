@@ -684,10 +684,30 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"run `pip install 'bmad-loop[opencode]'`",
                     {"profile": profile.name},
                 )
+        if profile.adapter == adapter_registry.CURSOR_SDK:
+            # The cursor-sdk family's three preconditions — a new-enough Node,
+            # a provisioned @cursor/sdk, an API key — are the same kind of fact
+            # as the httpx check above: they belong to ONE bundled family, not
+            # to hooklessness. None of them can be expressed as a Python
+            # dependency, and each fails a run at launch with no symptom beyond
+            # a session that dies before doing anything, so surface them here.
+            from .adapters.cursor_sdk import validate_environment
+
+            notes, problems = validate_environment(profile.binary)
+            for note in notes:
+                report.ok("adapter.cursor-sdk", f"{profile.name}: {note}", {"profile": profile.name})
+            for problem in problems:
+                report.fail(
+                    "adapter.cursor-sdk", f"{profile.name}: {problem}", {"profile": profile.name}
+                )
         if profile.hookless:
             report.ok(
                 "adapter.hookless",
-                f"{profile.name}: hookless (HTTP/SSE transport) — no hook registration needed",
+                # Transport-neutral wording: `hookless` says the adapter observes
+                # completion itself, and which transport that is differs per
+                # family (opencode-http's SSE stream, cursor-sdk's Node sidecar).
+                f"{profile.name}: hookless (the adapter observes completion itself) — "
+                "no hook registration needed",
                 {"profile": profile.name},
             )
             continue
@@ -2066,10 +2086,23 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
+    from .adapters import registry as adapter_registry
     from .adapters.profile import get_profile
 
     cfg = pol.adapter.resolved(role)
     profile = get_profile(cfg.name, project)
+    if profile.adapter == adapter_registry.CURSOR_SDK:
+        # A Node sidecar, not a coding CLI: the launched argv is `node
+        # cursor-sidecar.mjs …`, and the prompt reaches the agent through a file
+        # rather than the command line. Keyed on the adapter KIND, not on
+        # `hookless`: what is being described is this family's launch sequence,
+        # and the opencode text below would be a fiction for it.
+        model = f" model={cfg.model}" if cfg.model else ""
+        return (
+            f"{profile.binary} <bmad-loop>/cursor-sidecar.mjs --cwd <worktree> "
+            f'--prompt-file <task>/prompt.txt (@cursor/sdk Agent.create → send "'
+            f'{profile.render_prompt(prompt)}"){model}'
+        )
     if profile.hookless:
         # HTTP/SSE transport — there is no shell invocation to print. Render
         # the real sequence (per-session server spawn + API prompt) instead of
@@ -4587,7 +4620,16 @@ def cmd_init(args: argparse.Namespace) -> int:
         # missing policy file yields defaults -> ("claude",)
         pol = policy_mod.load(_policy_path(project))
         clis = tuple(dict.fromkeys(pol.adapter.resolved(role).name for role in ROLES))
-    return install_into(project, clis=clis, skills=args.skills, force_skills=args.force_skills)
+    # `--provision` names an adapter KIND, `--cli` a profile — two axes, so the
+    # two lists stay separate. A kind's runtime is machine-scoped and installed
+    # once; which profiles a project registers is a per-project answer.
+    return install_into(
+        project,
+        clis=clis,
+        skills=args.skills,
+        force_skills=args.force_skills,
+        provision=tuple(dict.fromkeys(args.provision or ())),
+    )
 
 
 def cmd_relay(args: argparse.Namespace) -> int:
@@ -4647,8 +4689,15 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         metavar="PROFILE",
         help="CLI profile(s) to register hooks for (claude | codex | gemini | copilot | "
-        "antigravity | opencode-http (alias: opencode) | custom; "
+        "antigravity | opencode-http (alias: opencode) | cursor-sdk | custom; "
         "repeatable; default: profiles referenced by .bmad-loop/policy.toml, or claude)",
+    )
+    init_p.add_argument(
+        "--provision",
+        action="append",
+        metavar="KIND",
+        help="install an adapter kind's out-of-band runtime, e.g. cursor-sdk "
+        "(downloads over the network; repeatable; run `bmad-loop adapters` to list kinds)",
     )
     init_p.add_argument(
         "--no-skills",

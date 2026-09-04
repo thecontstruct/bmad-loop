@@ -2800,6 +2800,47 @@ def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
     return skipped_any
 
 
+def _provision_kinds(names: Sequence[str]) -> int:
+    """Run each named adapter kind's runtime installer, printing its notes.
+
+    Deliberately project-independent: a provisioner installs a machine-scoped
+    runtime a kind cannot express as a Python dependency (``@cursor/sdk`` is a
+    Node package), so there is nothing project-shaped to hand it. Which kinds
+    offer one is asked of the live registry, never a hardcoded set, so an
+    out-of-tree family with a runtime of its own is provisionable too.
+
+    Returns an rc, like ``install_into`` itself: an unknown or non-provisionable
+    name and a failed install are both a ``FAIL:`` line and 1, never a
+    traceback — this is a first-run command an operator is reading the output of.
+    """
+    from .adapters.registry import (
+        AdapterError,
+        ProvisionError,
+        get_adapter_kind,
+        provisionable_adapter_kinds,
+    )
+
+    for name in dict.fromkeys(names):
+        offered = ", ".join(provisionable_adapter_kinds()) or "(none)"
+        try:
+            kind = get_adapter_kind(name)
+        except AdapterError as error:
+            print(f"FAIL: --provision {name!r}: {error} (provisionable: {offered})")
+            return 1
+        if kind.provision is None:
+            print(f"FAIL: --provision {name!r}: that kind has no runtime to install")
+            print(f"  provisionable kinds: {offered}")
+            return 1
+        try:
+            notes = kind.provision()
+        except ProvisionError as error:
+            print(f"FAIL: could not provision {name!r}: {error}")
+            return 1
+        for note in notes:
+            print(f"  provision: {note}")
+    return 0
+
+
 def _warn_if_policy_tracked(project: Path) -> None:
     """One-time migration hint: a .gitignore entry does not untrack an
     already-committed policy.toml, so repos initialized before the file was
@@ -2833,6 +2874,7 @@ def install_into(
     *,
     skills: bool = True,
     force_skills: bool = False,
+    provision: Sequence[str] = (),
 ) -> int:
     project = project.resolve()
     try:
@@ -2911,6 +2953,14 @@ def install_into(
 
     if skills_skipped:
         print("  some skills already present; re-run with --force-skills to overwrite")
+
+    # 6. adapter-kind runtimes (`--provision`). Explicitly opt-in and never part
+    # of a plain `init`: a provisioner installs software over the network. Kept
+    # last so a failure here leaves a fully-initialized project behind — the hook
+    # relay, skills, policy and gitignore above are all already written, and the
+    # operator only has to re-run the provisioning step.
+    if provision and _provision_kinds(provision) != 0:
+        return 1
 
     print(
         "init complete. One-time setup before `bmad-loop run` — spawned "

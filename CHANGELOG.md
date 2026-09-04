@@ -9,6 +9,22 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **`cursor-sdk` provider (experimental).** Drives Cursor's headless agent through a bundled
+  Node sidecar over `@cursor/sdk` — no tmux window and no hooks. Ships as a packaged
+  `cursor-sdk` profile selecting a new bundled adapter kind (`needs_mux = false`); the
+  sidecar's NDJSON completion sentinel is the turn-end signal and carries token usage.
+  Supports dev, review and triage. Skills read from `.claude/skills/`, which Cursor loads for
+  compatibility. Env-fault classification scans the sidecar's own stderr
+  (`logs/<task-id>.sidecar.err`), never its model-written event stream; no patterns are seeded.
+
+- **`bmad-loop init --provision <kind>`** installs an adapter kind's out-of-band runtime —
+  today `cursor-sdk`, whose `@cursor/sdk` dependency is an npm package and cannot be a Python
+  extra. Opt-in and never called from a run path; the runtime lands in `~/.bmad-loop/cursor-sdk`
+  (`BMAD_LOOP_CURSOR_SDK_DIR` overrides). Backed by a new optional `provision` thunk on
+  `register_adapter`, so an out-of-tree family can offer one too. `bmad-loop validate` reports
+  the cursor-sdk preconditions — Node ≥ 22.13, the provisioned runtime, `CURSOR_API_KEY` — as
+  `adapter.cursor-sdk` findings.
+
 - **Review-gate verify commands are journalled** (#656, partial). The three review gates
   (`verify_review`, `verify_review_stories`, `verify_review_bundle`) now emit one
   `verify-command-result` per command, `verification_stage: "review"`, sharing the story's
@@ -57,6 +73,11 @@ breaking changes may land in a minor release.
   failing on a lock it never needed.
 
 ### Changed
+
+- **`validate`'s `adapter.hookless` line no longer names a transport.** It read "hookless
+  (HTTP/SSE transport)", which was only ever true of the opencode family; it now reads
+  "hookless (the adapter observes completion itself)". Hooklessness and the driving class have
+  been separate axes since the adapter registry landed.
 
 - **A story's `verification_sequence` now numbers its review passes too**, so the ordinals a
   `post_dev_verify` handler receives shift: for an unchanged run whose review gate sits between

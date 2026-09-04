@@ -5367,7 +5367,7 @@ def test_validate_hookless_profile_notes_no_hook_registration(project, capsys):
 
     cli.cmd_validate(args)
     text = _validate_output(capsys)
-    assert "opencode-http: hookless (http/sse transport)" in text
+    assert "opencode-http: hookless (the adapter observes completion itself)" in text
     assert "hooks not registered for opencode-http" not in text
     # httpx ships in the dev group, so the extra-dependency gate passes here
     assert "httpx available for opencode-http" in text
@@ -5386,7 +5386,7 @@ def test_validate_hookless_dev_review_is_runnable(project, capsys):
 
     cli.cmd_validate(args)
     text = _validate_output(capsys)
-    assert "opencode-http: hookless (http/sse transport)" in text
+    assert "opencode-http: hookless (the adapter observes completion itself)" in text
     assert "cannot drive the dev/review roles" not in text
     assert "phase 4" not in text
 

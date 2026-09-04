@@ -53,6 +53,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "adapter.binary-unrunnable",
         "adapter.hookless",
         "adapter.httpx",
+        "adapter.cursor-sdk",
         "adapter.kind",
         "adapter.external",
         "adapter.external-profile",
