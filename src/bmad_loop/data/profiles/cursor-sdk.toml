@@ -3,6 +3,27 @@
 # stdout and its terminal sentinel, so no hook scripts or config merges are
 # ever written and no tmux window is opened.
 # Transport facts live in the adapters/cursor_sdk.py docstring.
+#
+# Verified end to end on @cursor/sdk with node 24.14.1, macOS: a one-story dev
+# loop completed `1 done, 0 deferred, 0 escalated` with a real commit, and the
+# sidecar sentinel carried real token counts through to the run summary
+# (409,382 weighted / 720,019 raw) — the only one of the three Cursor providers
+# that reports usage at all today. The CLI binary's version is irrelevant here:
+# this transport never parses `cursor-agent` stdout, so the missing terminal
+# `result` frame documented in the cursor-cli-headless profile cannot reach it.
+#   That is NOT a claim of immunity to the underlying fault, and the difference
+# matters. What takes that frame away is the long-lived agent stream dropping
+# mid-turn, and the SDK rides a long-lived stream to the same service, so the
+# reason it escapes is only that it does not depend on that particular CLI's
+# stdout. The verified run above happened while those drops were not occurring;
+# this transport has NOT been measured while they were. Expect the sentinel to be
+# at risk too until someone does that run.
+#
+# MODEL: unlike a CLI there is no server default — the SDK requires an explicit
+# model id, so the adapter carries DEFAULT_MODEL. Leaving `[adapter] model`
+# unset therefore does NOT mean "same model as the cursor CLI profiles": they
+# fall through to the server's `auto` and this one does not. Pin `model`
+# explicitly in policy when comparing transports.
 name = "cursor-sdk"
 # `node`, not a Cursor binary: the SDK is a Node library and the sidecar is the
 # program that is launched. Override here (or in .bmad-loop/profiles/) to pin a
