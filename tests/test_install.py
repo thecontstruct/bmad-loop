@@ -55,6 +55,7 @@ from bmad_loop.install import (
     missing_base_skills,
     missing_stories_support,
     provision_worktree,
+    relay_registered,
     renderer_stub_resolved,
     resolve_dev_primitive,
     resolve_review_layers,
@@ -145,6 +146,71 @@ def test_merge_hooks_adds_all_events():
     settings, changed = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
     assert changed
     assert set(profile.hooks.events) <= set(settings["hooks"])
+
+
+def test_merge_hooks_cursor_writes_versioned_bare_entries():
+    """Cursor's project hook file is versioned and its entries are bare commands.
+
+    The `version` key is the load-bearing half: Cursor 3.x refuses a project-level
+    .cursor/hooks.json carrying no numeric top-level `version` and then loads NONE
+    of its hooks, so omitting it registers a relay that never fires and reads as a
+    session timeout rather than as an error anyone can see.
+
+    The equality is exact, not a subset, because the claim IS the absence: Cursor's
+    entries carry no matcher wrapper, no nested "hooks" list, no "type" and no
+    timeout field, all of which the shared handler in `_hook_entry` would add.
+
+    Ablation (both run): dropping "cursor-hooks-json" from the version arm of
+    `merge_hooks` fails the version assertion, and returning `_hook_entry`'s shared
+    `handler` instead of the bare dict fails the equality on the extra "type" key.
+    """
+    profile = get_profile("cursor")
+    config, changed = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
+    assert changed is True
+    assert config["version"] == 1
+    assert config["hooks"] == {
+        "sessionStart": [{"command": "python3 /x/.bmad-loop/bmad_loop_hook.py SessionStart"}],
+        "stop": [{"command": "python3 /x/.bmad-loop/bmad_loop_hook.py Stop"}],
+    }
+
+
+def test_cursor_relay_strips_whole_and_spares_a_project_hook():
+    """`provision_worktree` seeds the main repo's hook file into the worktree and
+    then re-registers, so the relay has to survive a strip/re-add round trip.
+
+    Cursor stores the command dict FLAT in the event list, like copilot and agy and
+    unlike claude/codex/gemini, so `strip_relay_hooks` must drop a matching entry
+    WHOLE — there is no nested "hooks" list to reach into. The project's own `stop`
+    hook sitting beside the relay is the control: it must still be there afterwards,
+    which is what separates "removed the relay" from "cleared the event".
+
+    Ablation: make the strip loop keep any entry lacking a nested "hooks" list and
+    the relay survives, failing the `relay_registered` check below.
+    """
+    profile = get_profile("cursor")
+    mine = {"command": "./hooks/my-own-audit.sh"}
+    config, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
+    config["hooks"]["stop"].append(mine)
+
+    assert strip_relay_hooks(config, profile.hooks.dialect) is True
+    assert relay_registered(config, profile.hooks.dialect, profile.hooks.events) is False
+    assert config["hooks"]["stop"] == [mine]  # the project's own hook is untouched
+    assert "sessionStart" not in config["hooks"]  # emptied events are dropped
+
+    # and re-registering restores the relay without duplicating the project's hook
+    config, changed = merge_hooks(config, _registrations(profile), profile.hooks.dialect)
+    assert changed is True
+    assert relay_registered(config, profile.hooks.dialect, profile.hooks.events) is True
+    assert config["hooks"]["stop"].count(mine) == 1
+
+
+def test_merge_hooks_cursor_is_idempotent():
+    """A second `init` must not stack a duplicate relay in the flat event list."""
+    profile = get_profile("cursor")
+    config, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
+    again, changed = merge_hooks(config, _registrations(profile), profile.hooks.dialect)
+    assert changed is False
+    assert again["hooks"]["stop"] == [{"command": "python3 /x/.bmad-loop/bmad_loop_hook.py Stop"}]
 
 
 def test_merge_hooks_idempotent():

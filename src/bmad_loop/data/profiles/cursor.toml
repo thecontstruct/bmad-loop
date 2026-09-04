@@ -1,0 +1,84 @@
+# Cursor CLI (`cursor-agent`), driven interactively in a mux pane. Verified
+# against cursor-agent 2026.08.04 and re-verified on 2026.09.02-c22c1a3, macOS.
+# No longer experimental: `probe-adapter cursor --probe` was run (0 warnings,
+# both events captured live) and a one-story dev loop then completed end to end
+# — `1 done, 0 deferred, 0 escalated`, with a real commit — so the hook dialect,
+# trust gate and skill tree below are all measured through a full run, not just
+# against a live binary.
+#   Completion here comes from the hooks, not from parsed stdout, so this profile
+# does not depend on the terminal `result` frame that a dropped agent stream
+# takes away from the print/stream-json transports (see the cursor-cli-headless
+# profile for that measurement). Untested claim, stated as one: the dev loop
+# above ran on a healthy network path, so how these hooks behave when the stream
+# drops mid-turn has NOT been measured.
+#
+# TRUST (measured, 4-cell matrix, each in a fresh untrusted git dir launched
+# interactively under tmux — the shape bmad-loop actually spawns):
+#   bare                     -> blocks on a "Workspace Trust Required" dialog
+#   --force                  -> STILL blocks (the flag covers tool permissions only)
+#   --force --trust          -> passes straight through to the session
+#   seeded trust marker      -> STILL blocks
+# So `--trust` is the only thing that clears the gate for an unattended launch,
+# and it is in bypass_args for that reason, not merely for tidiness. The marker
+# row is the one worth writing down: `~/.cursor/projects/<path-slug>/
+# .workspace-trusted` is real and is what Cursor writes when a human answers the
+# dialog, but replaying a byte-correct copy of one does NOT satisfy the gate, so
+# seeding it is not a substitute. NOTE: `extra_args` in policy.toml REPLACES
+# bypass_args — set it and you drop `--trust`, and every session hangs on the
+# dialog until session_timeout_min. Unlike antigravity's exact-path trust (#169),
+# a per-launch flag costs nothing per worktree, so `isolation = "worktree"` works.
+#
+# HOOKS: project-level .cursor/hooks.json. The top-level `version` is REQUIRED —
+# Cursor 3.x refuses a project hook file without a numeric one and loads none of
+# its hooks, which would read as a session timeout rather than an error (see
+# merge_hooks). Event entries are bare {"command": ...} objects: no matcher
+# wrapper, no nested "hooks" list, no "type" key, and no timeout field.
+# `stop` fires when the agent loop ends and is the turn-end signal; `sessionStart`
+# marks liveness. Cursor also documents `sessionEnd` and `preCompact`, and they
+# are deliberately NOT registered: nothing derives completion from them, and
+# whether cursor-agent (as opposed to the IDE) fires them is unverified here.
+# Payload keys are snake_case (conversation_id, transcript_path), which the
+# shared relay already reads. Cursor sends no `cwd` — it sends `workspace_roots`,
+# a list the relay does not unpack, so the event's cwd is empty. Nothing consumes
+# that field, so this is recorded, not deferred work.
+#
+# PROMPT: the prompt is handed over as an argv positional, never typed into the
+# pane, so a leading "/" never reaches Cursor's slash menu and must not be relied
+# on to expand. The explicit LOAD form is used for the same reason codex and
+# copilot use it — it names the file and cannot depend on command expansion.
+#
+# usage_parser is "none", and the probe has now settled why it must stay that
+# way. Cursor puts the token counts on the Stop hook payload itself —
+# `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`,
+# plus `loop_count` and `status` — and puts NO token fields in the transcript at
+# all, so a `usage_parser` (which is handed a transcript path) has nothing to
+# read no matter what it is set to. The counts do reach this machine and are then
+# dropped: the shared relay narrows every payload to ts/event/task_id/session_id/
+# transcript_path/cwd. Wiring them up therefore means widening the relay contract
+# that all providers share, not editing this profile, so the token columns stay
+# empty for cursor by design and `session_budget_mode` is inert here.
+name = "cursor"
+binary = "cursor-agent"
+skill_tree = ".cursor/skills"
+prompt_template = "LOAD the FULL .cursor/skills/{skill}/SKILL.md, read its entire contents and follow its directions exactly, using subagents as needed: {args}"
+bypass_args = ["--force", "--trust"]
+model_flag = "--model"
+usage_parser = "none"
+first_run_note = "run `cursor-agent login` once (or set CURSOR_API_KEY). Requires Cursor CLI with a `--trust` flag (verified on 2026.08.04). Do not set [adapter] extra_args unless it also carries `--trust`: it replaces bypass_args, and without that flag every unattended session hangs on the workspace-trust dialog."
+# Gitignored configs a worktree checkout omits: project MCP servers
+# (.cursor/mcp.json) and the hook file itself. .cursor/hooks.json is also the
+# hook config_path — it is seeded first, then the relay is merged into it, so a
+# worktree keeps any hooks the project already had (see provision_worktree).
+seed_files = [
+  ".cursor/mcp.json",
+  ".cursor/hooks.json",
+]
+
+# No env_fault_patterns: no cursor-agent transport-failure line has been
+# captured, and on a pane capture that vocabulary is what a story implementing
+# error handling prints. Seed one only from a captured line, citing its run.
+
+[hooks]
+dialect = "cursor-hooks-json"
+config_path = ".cursor/hooks.json"
+events = { sessionStart = "SessionStart", stop = "Stop" }

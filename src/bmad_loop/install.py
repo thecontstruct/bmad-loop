@@ -1072,6 +1072,12 @@ def _hook_entry(dialect: str, command: str) -> dict:
     if dialect == "copilot-settings-json":
         handler["timeoutSec"] = COPILOT_HOOK_TIMEOUT_SEC  # Copilot timeouts are seconds
         return handler  # Copilot stores the handler directly in the event list
+    if dialect == "cursor-hooks-json":
+        # Cursor's event entries are BARE command objects: no matcher wrapper, no
+        # nested "hooks" list, and no "type" key either — the shape read off a
+        # live ~/.cursor/hooks.json and matching Cursor's published example. It
+        # takes no timeout key, so the handler built above is discarded whole.
+        return {"command": command}
     if dialect == "antigravity-hooks-json":
         handler["timeout"] = ANTIGRAVITY_HOOK_TIMEOUT_SEC  # agy timeouts are seconds
         # agy's Stop event value is a flat list of handler objects — the handler
@@ -1139,9 +1145,9 @@ def strip_relay_hooks(config: dict, dialect: str) -> bool:
                 continue
             # claude/codex/gemini wrap commands in a nested "hooks" list, and a
             # user may have added their own command beside the relay inside ONE
-            # matcher entry — strip inside the list so theirs survives. copilot
-            # and agy store the command dict flat in the event list, so a marker
-            # match means the entry IS the relay and it drops whole.
+            # matcher entry — strip inside the list so theirs survives. copilot,
+            # cursor and agy store the command dict flat in the event list, so a
+            # marker match means the entry IS the relay and it drops whole.
             nested = handler.get("hooks") if isinstance(handler, dict) else None
             if isinstance(nested, list):
                 surviving = [c for c in nested if RELAY_MARKER not in json.dumps(c)]
@@ -1190,13 +1196,17 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
                 handlers.append(_hook_entry(dialect, command))
                 changed = True
         return config, changed
-    if dialect == "copilot-settings-json":
-        config.setdefault("version", 1)  # Copilot hook configs are versioned
+    if dialect in ("copilot-settings-json", "cursor-hooks-json"):
+        # Both are versioned. For cursor this is REQUIRED, not cosmetic: Cursor 3.x
+        # refuses a project-level .cursor/hooks.json with no numeric top-level
+        # `version` and loads NONE of its hooks, so omitting it would register a
+        # relay that never fires and read as a session timeout.
+        config.setdefault("version", 1)
     hooks = config.setdefault("hooks", {})
     for native_event, command in registrations.items():
         matchers = hooks.setdefault(native_event, [])
-        # claude/codex/gemini nest handlers under "hooks"; copilot stores the
-        # handler dict directly in the event list — the serialized scan covers
+        # claude/codex/gemini nest handlers under "hooks"; copilot and cursor store
+        # the handler dict directly in the event list — the serialized scan covers
         # both shapes so a re-run stays idempotent for every dialect.
         if not _managed_hook_in_handlers(matchers):
             matchers.append(_hook_entry(dialect, command))
