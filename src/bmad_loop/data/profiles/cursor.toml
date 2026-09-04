@@ -1,8 +1,16 @@
 # Cursor CLI (`cursor-agent`), driven interactively in a mux pane. Verified
-# against cursor-agent 2026.08.04 on macOS. EXPERIMENTAL: the hook dialect,
-# trust gate and skill tree below were each checked against a live binary, but no
-# full dev/review loop has been run end to end — finalize with
-# `bmad-loop probe-adapter cursor --probe` before trusting it unattended.
+# against cursor-agent 2026.08.04 and re-verified on 2026.09.02-c22c1a3, macOS.
+# No longer experimental: `probe-adapter cursor --probe` was run (0 warnings,
+# both events captured live) and a one-story dev loop then completed end to end
+# — `1 done, 0 deferred, 0 escalated`, with a real commit — so the hook dialect,
+# trust gate and skill tree below are all measured through a full run, not just
+# against a live binary.
+#   Completion here comes from the hooks, not from parsed stdout, so this profile
+# does not depend on the terminal `result` frame that a dropped agent stream
+# takes away from the print/stream-json transports (see the cursor-cli-headless
+# profile for that measurement). Untested claim, stated as one: the dev loop
+# above ran on a healthy network path, so how these hooks behave when the stream
+# drops mid-turn has NOT been measured.
 #
 # TRUST (measured, 4-cell matrix, each in a fresh untrusted git dir launched
 # interactively under tmux — the shape bmad-loop actually spawns):
@@ -39,9 +47,16 @@
 # on to expand. The explicit LOAD form is used for the same reason codex and
 # copilot use it — it names the file and cannot depend on command expansion.
 #
-# usage_parser is "none": the Stop payload carries a `transcript_path`, but its
-# token schema has not been read, so nothing is claimed about it. Runs work; the
-# token columns stay empty until a probe supplies the schema.
+# usage_parser is "none", and the probe has now settled why it must stay that
+# way. Cursor puts the token counts on the Stop hook payload itself —
+# `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`,
+# plus `loop_count` and `status` — and puts NO token fields in the transcript at
+# all, so a `usage_parser` (which is handed a transcript path) has nothing to
+# read no matter what it is set to. The counts do reach this machine and are then
+# dropped: the shared relay narrows every payload to ts/event/task_id/session_id/
+# transcript_path/cwd. Wiring them up therefore means widening the relay contract
+# that all providers share, not editing this profile, so the token columns stay
+# empty for cursor by design and `session_budget_mode` is inert here.
 name = "cursor"
 binary = "cursor-agent"
 skill_tree = ".cursor/skills"
