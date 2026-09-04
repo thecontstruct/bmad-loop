@@ -219,6 +219,20 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **`cursor-cli-headless` no longer adds `reasoningTokens` to output tokens.** Cursor documents
+  the field as a subset of `outputTokens` — its own SDK types state that `totalTokens` excludes
+  it — so adding the two double-counted output. Latent, not observed: no real `cursor-agent` or
+  `@cursor/sdk` run has yet emitted the field, and the parser coerces a missing key to 0, so no
+  shipped token figure was wrong. The mapping deliberately diverges from the copilot and gemini
+  parsers in `tokens.py`, which fold their vendors' identically-spelled fields in.
+
+- **A `cursor-cli-headless` turn that reports its own failure now leaves a breadcrumb.** The
+  terminal `result` frame carries `subtype`, `is_error` and a short `result` string, and the
+  adapter read none of them, so a failed turn looked exactly like a successful one in the run
+  directory. A self-reported failure now appends a `result-frame-reported-error` line to
+  `tasks/<task-id>/session-lifecycle.jsonl`. Diagnostics only — the verdict stays deterministic
+  and artifact-derived, and `stop_seen` still records that the turn ended.
+
 - Emit `diagnose --json` v2, replacing journal `patch` / `stashed_to` paths with
   `patch_present` / `stashed_to_present`, and silently degrade Git stale-commit probe
   failures while propagating non-Git faults.

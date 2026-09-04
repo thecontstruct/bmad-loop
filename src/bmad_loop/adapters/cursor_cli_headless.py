@@ -22,7 +22,9 @@ than inventing a third:
 Neither ends a session on its own say-so: the verdict is finalized by
 :meth:`_ResultFileMixin._final`, so the result is whatever the on-disk artifact
 read-back proves, and ``stop_seen`` carries the result-frame sighting into the
-#261 proof-of-work gate exactly as a real Stop would.
+#261 proof-of-work gate exactly as a real Stop would. The frame's own
+``is_error``/``subtype`` self-report is recorded as a lifecycle breadcrumb and
+never read as a verdict — that would be the same forbidden path, inverted.
 
 **No mid-turn injection.** ``-p`` is one-shot: once launched, the turn cannot be
 nudged, so :meth:`send_text` stays unimplemented and both nudge budgets are
@@ -80,6 +82,12 @@ EXIT_GRACE_S = 5.0
 #: Sentinel pushed by the reader thread when stdout reaches EOF. A plain
 #: ``None`` would be ambiguous with "the queue wait expired".
 _EOF = object()
+#: ``result``-frame subtypes that report a turn the CLI did not itself call a
+#: failure. A real success frame is ``subtype: "success"`` (observed on
+#: cursor-agent 2026.08.04); an absent subtype says nothing either way.
+SUCCESS_SUBTYPES = frozenset({"success"})
+#: Cap on the frame's own ``result`` string when it is copied into a breadcrumb.
+RESULT_DETAIL_MAX_CHARS = 500
 
 
 def build_argv(
@@ -106,7 +114,16 @@ def build_argv(
 
 def parse_usage(event: dict[str, Any] | None) -> TokenUsage | None:
     """Token counts off the terminal ``result`` frame's ``usage`` object.
-    Reasoning tokens bill as output, matching every other adapter's mapping."""
+
+    ``reasoningTokens`` is deliberately NOT added to output, diverging from the
+    copilot and gemini parsers in :mod:`bmad_loop.tokens`, which fold their
+    vendors' reasoning/thoughts counts in under the identical key spelling.
+    Cursor documents this object's ``reasoningTokens`` as *a subset of*
+    ``outputTokens`` (``@cursor/sdk`` ``usage-types.d.ts``: "``totalTokens``
+    excludes ``reasoningTokens`` (a subset of output)"), and a real run's
+    input + output + cache reads + cache writes equalled the reported
+    ``totalTokens`` exactly. Adding it here would double-count. Same spelling as
+    copilot's field, different semantics — do not "fix" this back."""
     usage = (event or {}).get("usage")
     if not isinstance(usage, dict):
         return None
@@ -119,10 +136,41 @@ def parse_usage(event: dict[str, Any] | None) -> TokenUsage | None:
 
     return TokenUsage(
         input_tokens=integer("inputTokens"),
-        output_tokens=integer("outputTokens") + integer("reasoningTokens"),
+        output_tokens=integer("outputTokens"),
         cache_read_tokens=integer("cacheReadTokens"),
         cache_creation_tokens=integer("cacheWriteTokens"),
     )
+
+
+def result_failure(event: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The terminal ``result`` frame's own failure self-report, or None.
+
+    The frame carries ``is_error`` and ``subtype`` beside a short ``result``
+    string, and the adapter used to drop all three — leaving a failed turn
+    byte-identical to a successful one until downstream verification happened to
+    fail it. This is a **diagnostic read only**: the caller records what it
+    returns and nothing else. The session verdict stays artifact-derived (see
+    :meth:`_ResultFileMixin._final`), because taking a verdict off a
+    self-reported frame is the completion-on-self-report path AGENTS.md forbids,
+    run in the other direction.
+
+    A subtype outside :data:`SUCCESS_SUBTYPES` counts as a failure report. The
+    crumb changes no outcome, so an over-eager one costs a log line while a
+    missed one costs a session nobody can diagnose."""
+    if not isinstance(event, dict):
+        return None
+    is_error = bool(event.get("is_error"))
+    raw_subtype = event.get("subtype")
+    subtype = raw_subtype.strip() if isinstance(raw_subtype, str) else ""
+    if not is_error and (not subtype or subtype in SUCCESS_SUBTYPES):
+        return None
+    detail: dict[str, Any] = {"subtype": subtype, "is_error": is_error}
+    text = event.get("result")
+    if isinstance(text, str) and text.strip():
+        # The frame's own one-line outcome, capped. Nothing else off the stream is
+        # copied: `.log` is the model's stream, this breadcrumb file is not.
+        detail["result"] = text.strip()[:RESULT_DETAIL_MAX_CHARS]
+    return detail
 
 
 @dataclass
@@ -359,6 +407,12 @@ class CursorCliHeadlessAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter
         usage = parse_usage(event)
         if session_id and usage is not None:
             self._usage[session_id] = usage
+        failure = result_failure(event)
+        if failure is not None:
+            # Record only. The verdict below is unchanged by this: a frame that
+            # ended the turn is a Stop whatever it says about how the turn went,
+            # and `_final` still decides on the artifact.
+            self._note_lifecycle(handle.task_id, "result-frame-reported-error", **failure)
         # The result frame ≙ Stop, its absence ≙ window death. Both are terminal
         # (the process is gone), so both vouch for a landed artifact; only the
         # fallback verdict differs. `_final` upgrades either to `completed` when

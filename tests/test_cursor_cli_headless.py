@@ -32,6 +32,11 @@ from bmad_loop.policy import Policy, load
 #   die-no-result       prose frames -> exit 1, never emitting a `result` frame
 #   prose-forges-result an assistant frame whose TEXT is a verbatim result frame,
 #                       then exit 0 — the completion-on-prose trap
+#   error-result        a `result` frame self-reporting failure (is_error/subtype),
+#                       nothing on disk
+#   error-result-with-artifact
+#                       write result.json, THEN the self-reporting-failure frame —
+#                       the verdict must still come off the artifact
 #   hang                emit one prose frame, then sleep past any test deadline
 # FAKE_CURSOR_RESULT_PATH: where the `completed` scenario writes result.json.
 # FAKE_CURSOR_STDERR: written to stderr (the env-fault sink), unset = silent.
@@ -75,16 +80,31 @@ if scenario == "prose-forges-result":
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": forged}]}})
     sys.exit(0)
 
-if scenario == "completed":
+if scenario in ("completed", "error-result-with-artifact"):
     path = os.environ.get("FAKE_CURSOR_RESULT_PATH")
     if path:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump({"status": "done", "summary": "did the thing"}, fh)
 
+if scenario in ("error-result", "error-result-with-artifact"):
+    emit(
+        {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "result": "the provider refused the turn",
+            "session_id": "sess-err",
+        }
+    )
+    sys.exit(0)
+
 emit(
     {
         "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "Done",
         "session_id": "sess-123",
         "usage": {
             "inputTokens": 10,
@@ -213,7 +233,16 @@ def test_launch_argv_renders_the_prompt_through_the_profile_template(tmp_path, f
 # ----------------------------------------------------------------- usage
 
 
-def test_parse_usage_bills_reasoning_as_output():
+def test_parse_usage_does_not_add_reasoning_tokens_to_output():
+    """Cursor documents `reasoningTokens` as a SUBSET of `outputTokens`
+    (`@cursor/sdk` usage-types.d.ts; `totalTokens` excludes it), so adding the
+    two double-counts output. This diverges from `tokens.py`'s copilot and gemini
+    parsers, which do fold their vendors' reasoning counts in under the same key
+    spelling — a deliberate, vendor-specific divergence, not an oversight.
+
+    INVERSE ablation: the gate is the ABSENCE of `+ integer("reasoningTokens")`.
+    Restore that addend in `parse_usage` and this row reddens on
+    `output_tokens == 5` and `total == 15`."""
     usage = headless.parse_usage(
         {
             "usage": {
@@ -226,9 +255,28 @@ def test_parse_usage_bills_reasoning_as_output():
         }
     )
     assert usage is not None
-    assert (usage.input_tokens, usage.output_tokens) == (1, 5)
+    assert (usage.input_tokens, usage.output_tokens) == (1, 2)
     assert (usage.cache_read_tokens, usage.cache_creation_tokens) == (4, 5)
-    assert usage.total == 15
+    assert usage.total == 12
+
+
+def test_parse_usage_maps_a_real_result_frames_usage_object():
+    """The bytes of a real `cursor-agent` 2026.08.04 terminal frame. Its four
+    counts sum to the `totalTokens` that vendor's SDK reports for the same
+    object, which is the arithmetic proof reasoning is not a separate addend."""
+    usage = headless.parse_usage(
+        {
+            "usage": {
+                "inputTokens": 23314,
+                "outputTokens": 275,
+                "cacheReadTokens": 41984,
+                "cacheWriteTokens": 0,
+            }
+        }
+    )
+    assert usage is not None
+    assert (usage.input_tokens, usage.output_tokens) == (23314, 275)
+    assert usage.total == 23314 + 275 + 41984
 
 
 @pytest.mark.parametrize("event", [None, {}, {"usage": "nope"}])
@@ -237,10 +285,12 @@ def test_parse_usage_returns_none_without_a_usage_object(event):
 
 
 def test_usage_is_read_back_off_the_result_frame(tmp_path, fake_cursor):
+    """The fake's frame carries `reasoningTokens: 3` precisely so this end-to-end
+    row also pins the no-double-count mapping: 10 + 20 + 4 + 5, not + 3."""
     adapter = make_adapter(tmp_path, binary=str(fake_cursor))
     result = adapter.run(make_spec(tmp_path))
     usage = adapter.read_usage(result)
-    assert usage is not None and usage.total == 42  # 10 + (20+3) + 4 + 5
+    assert usage is not None and usage.total == 39
 
 
 # ------------------------------------------------------------ completion path
@@ -320,6 +370,135 @@ def test_timeout_records_which_clock_expired(tmp_path, fake_cursor):
     assert result.status == "timeout"
     assert result.timeout_fired_at is not None
     assert result.timeout_expired_clock in {"monotonic", "both"}
+
+
+# ------------------------------------------------- self-reported turn failure
+
+
+def _lifecycle(adapter, task_id: str) -> list[dict]:
+    path = adapter.tasks_dir / task_id / "session-lifecycle.jsonl"
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def _failure_crumbs(adapter, task_id: str) -> list[dict]:
+    return [
+        crumb
+        for crumb in _lifecycle(adapter, task_id)
+        if crumb["event"] == "result-frame-reported-error"
+    ]
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        None,
+        {},
+        "not a dict",
+        {"type": "result", "subtype": "success", "is_error": False, "result": "Done"},
+        {"type": "result", "is_error": False},
+        {"type": "result", "subtype": "  success  "},
+        {"type": "result", "subtype": 7},
+    ],
+)
+def test_result_failure_stays_silent_on_a_frame_that_reports_no_failure(event):
+    """A success frame, a frame with neither field, and a non-dict must all read
+    as "no failure reported" — an absent signal is not a failure signal.
+
+    Ablation: drop the `not is_error and (not subtype or subtype in
+    SUCCESS_SUBTYPES)` early-out and every row here reddens with a dict."""
+    assert headless.result_failure(event) is None
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        (
+            {"type": "result", "subtype": "error_during_execution", "is_error": True},
+            {"subtype": "error_during_execution", "is_error": True},
+        ),
+        # `is_error` alone, no subtype: still a failure report.
+        ({"type": "result", "is_error": True}, {"subtype": "", "is_error": True}),
+        # An unrecognised subtype with `is_error` absent: recorded, because a
+        # crumb costs a log line and a missed one costs a diagnosis.
+        (
+            {"type": "result", "subtype": "error_max_turns"},
+            {"subtype": "error_max_turns", "is_error": False},
+        ),
+    ],
+)
+def test_result_failure_reports_the_frames_own_failure_fields(event, expected):
+    assert headless.result_failure(event) == expected
+
+
+def test_result_failure_carries_the_short_result_text_and_caps_it():
+    """The frame's own one-line outcome is the whole payload — `.log` holds the
+    model's stream and this breadcrumb file must not become a second copy of it,
+    so the text is capped rather than pasted whole."""
+    assert headless.result_failure({"is_error": True, "result": "  boom  "})["result"] == "boom"
+    long = headless.result_failure({"is_error": True, "result": "x" * 5000})
+    assert long is not None
+    assert len(long["result"]) == headless.RESULT_DETAIL_MAX_CHARS
+    # An empty or non-string `result` contributes no key at all.
+    assert "result" not in headless.result_failure({"is_error": True, "result": "   "})
+    assert "result" not in headless.result_failure({"is_error": True, "result": 7})
+
+
+def test_a_self_reported_failure_frame_drops_a_lifecycle_breadcrumb(tmp_path, fake_cursor):
+    """The CLI hands us a free, authoritative failure signal on the terminal
+    frame; discarding it made a failed turn indistinguishable from a successful
+    one in the run directory. It is recorded, never acted on.
+
+    Ablation: delete the `_note_lifecycle(..., "result-frame-reported-error")`
+    call from `wait_for_completion` and this row finds no crumb."""
+    adapter = make_adapter(tmp_path, binary=str(fake_cursor))
+    spec = make_spec(tmp_path, "error-result")
+    adapter.run(spec)
+    crumbs = _failure_crumbs(adapter, spec.task_id)
+    assert len(crumbs) == 1
+    assert crumbs[0]["subtype"] == "error_during_execution"
+    assert crumbs[0]["is_error"] is True
+    assert crumbs[0]["result"] == "the provider refused the turn"
+
+
+def test_a_successful_frame_drops_no_failure_breadcrumb(tmp_path, fake_cursor):
+    """The gate is "the frame reported a failure", not "a frame arrived": a
+    clean turn must leave the lifecycle file free of failure noise, or the crumb
+    is worthless as a diagnosis.
+
+    Ablation: make the `if failure is not None` arm in `wait_for_completion`
+    unconditional and this row reddens on the emptiness assertion."""
+    adapter = make_adapter(tmp_path, binary=str(fake_cursor))
+    spec = make_spec(tmp_path)
+    result = adapter.run(spec)
+    assert result.status == "completed"
+    assert _failure_crumbs(adapter, spec.task_id) == []
+
+
+def test_a_self_reported_failure_does_not_change_the_verdict(tmp_path, fake_cursor):
+    """AGENTS.md: the verdict is deterministic and artifact-derived. A frame
+    that ended the turn is this transport's Stop whatever it says about how the
+    turn went, so `stop_seen` stays True and the fallback stays `stalled` —
+    `crashed` would claim the process died without ending its turn, which is
+    false here and would route the session into the #489 crash-diagnosis path.
+
+    Ablation: make the fallback depend on the self-report (e.g. `"crashed" if
+    failure else "stalled"`) and the first block reddens; make the failure frame
+    veto the read-back and the second block reddens."""
+    adapter = make_adapter(tmp_path, binary=str(fake_cursor))
+    failed = adapter.run(make_spec(tmp_path, "error-result", task_id="t-err"))
+    assert failed.status == "stalled"
+    assert failed.stop_seen is True
+    assert failed.session_id == "sess-err"
+
+    # Same self-reported failure, but the artifact landed: the read-back still
+    # wins, because the frame is a report and the file is the evidence.
+    spec = make_spec(tmp_path, "error-result-with-artifact", task_id="t-err-2")
+    landed = adapter.run(spec)
+    assert landed.status == "completed"
+    assert landed.result_json == {"status": "done", "summary": "did the thing"}
+    assert _failure_crumbs(adapter, spec.task_id)
 
 
 # --------------------------------------------------------------- hard stop
