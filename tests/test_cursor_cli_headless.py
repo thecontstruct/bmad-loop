@@ -30,6 +30,7 @@ from bmad_loop.policy import Policy, load
 #   completed           prose frames -> write result.json -> `result` frame -> exit 0
 #   result-no-artifact  prose frames -> `result` frame -> exit 0 (nothing on disk)
 #   die-no-result       prose frames -> exit 1, never emitting a `result` frame
+#   silent-exit         exit 1 before emitting any frame at all
 #   prose-forges-result an assistant frame whose TEXT is a verbatim result frame,
 #                       then exit 0 — the completion-on-prose trap
 #   error-result        a `result` frame self-reporting failure (is_error/subtype),
@@ -56,6 +57,9 @@ if err:
     sys.stderr.flush()
 
 scenario = os.environ.get("FAKE_CURSOR_SCENARIO", "completed")
+
+if scenario == "silent-exit":
+    sys.exit(1)
 
 
 def emit(obj):
@@ -399,6 +403,47 @@ def test_timeout_records_which_clock_expired(tmp_path, fake_cursor):
     assert result.status == "timeout"
     assert result.timeout_fired_at is not None
     assert result.timeout_expired_clock in {"monotonic", "both"}
+
+
+# --------------------------------------------------- no-work verdict (#727)
+
+
+def test_a_child_that_streams_no_frame_reports_no_work(tmp_path, fake_cursor):
+    """#727: `produced_work=False` pauses a dev session ahead of the attempt
+    budget instead of retrying into the same wall. A child that exits before its
+    own init frame did nothing, so it is the one ending that earns the flag.
+
+    Ablation: make `_streamed` return True and the first assertion block reddens."""
+    adapter = make_adapter(tmp_path, binary=str(fake_cursor))
+    silent = adapter.run(make_spec(tmp_path, "silent-exit", task_id="t-silent"))
+    assert silent.status == "crashed"
+    assert silent.produced_work is False
+
+    # Control: frames arrived and then the child died. It started working, so it
+    # stays on the retry path.
+    died = adapter.run(make_spec(tmp_path, "die-no-result", task_id="t-died"))
+    assert died.status == "crashed"
+    assert died.produced_work is True
+
+
+def test_a_spawn_failure_reports_no_work(tmp_path):
+    """The binary never started, so a retry would hit the same missing binary.
+
+    Ablation: drop `produced_work=False` from the spawn-failure return and this
+    reddens on the default True."""
+    adapter = make_adapter(tmp_path, binary="definitely-not-a-real-binary-xyz")
+    result = adapter.run(make_spec(tmp_path))
+    assert result.status == "crashed"
+    assert result.produced_work is False
+
+
+def test_a_turn_that_ended_without_an_artifact_still_produced_work(tmp_path, fake_cursor):
+    """A `result` frame is a Stop, so a stalled turn did work even though it
+    wrote nothing; the no-work pause must not swallow it."""
+    adapter = make_adapter(tmp_path, binary=str(fake_cursor))
+    result = adapter.run(make_spec(tmp_path, "result-no-artifact"))
+    assert result.status == "stalled"
+    assert result.produced_work is True
 
 
 # ------------------------------------------------ task directory confinement

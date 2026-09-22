@@ -358,8 +358,9 @@ class CursorCliHeadlessAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter
     def wait_for_completion(self, handle: SessionHandle, spec: SessionSpec) -> SessionResult:
         running = self._running.get(handle.task_id)
         if running is None or running.spawn_error is not None:
-            # The binary never started: nothing ran, so nothing may be read back.
-            return SessionResult(status="crashed")
+            # The binary never started: nothing ran, so nothing may be read back,
+            # and a retry would hit the same missing binary (#727).
+            return SessionResult(status="crashed", produced_work=False)
         # Wall-clock co-bound (#157): a host suspend freezes time.monotonic() and
         # would silently extend the deadline. The wall clock may EXPIRE it, never
         # extend it — every sub-wait below stays monotonic.
@@ -393,6 +394,7 @@ class CursorCliHeadlessAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter
                     timeout_fired_at=time.time(),
                     timeout_expired_clock=expired,
                     stop_seen=running.result_event is not None,
+                    produced_work=self._streamed(running),
                 )
             # Hard-stop poll (#319), on both sides of the blocking wait below so
             # at most one leg sits between two checks. Return the verdict — never
@@ -405,6 +407,7 @@ class CursorCliHeadlessAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter
                     status="aborted",
                     session_id=self._session_id(running),
                     stop_seen=running.result_event is not None,
+                    produced_work=self._streamed(running),
                 )
             now = time.monotonic()
             if last_heartbeat is None or now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
@@ -426,6 +429,7 @@ class CursorCliHeadlessAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter
                     status="aborted",
                     session_id=self._session_id(running),
                     stop_seen=running.result_event is not None,
+                    produced_work=self._streamed(running),
                 )
             if item is _EOF:
                 break
@@ -506,7 +510,19 @@ class CursorCliHeadlessAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter
             session_id,
             str(self.logs_dir / f"{handle.task_id}.log"),
             stop_seen=event is not None,
+            produced_work=self._streamed(running),
         )
+
+    @staticmethod
+    def _streamed(running: _Running) -> bool:
+        """``SessionResult.produced_work`` (#727) for this transport.
+
+        False only when the child emitted not one well-formed frame: it never got
+        as far as its own init frame, so it did no work and a retry launches into
+        the same wall (a missing login, a broken install). Any frame at all keeps
+        the default True, so a child that started and then failed stays on the
+        retry path. A terminal frame always carries ``frames_seen >= 1``."""
+        return running.frames_seen > 0
 
     def _consume(self, running: _Running, line: str) -> None:
         """Record the terminal control frame; only count every other frame.

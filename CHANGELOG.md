@@ -22,7 +22,9 @@ breaking changes may land in a minor release.
   `reasoningTokens` is not added to output, because Cursor documents it as a subset of
   `outputTokens`. A frame that reports its own failure (`is_error` / `subtype`), a stream that
   ends without its `result` frame, and a non-zero exit each append a line to
-  `tasks/<task-id>/session-lifecycle.jsonl`; none of them changes the verdict.
+  `tasks/<task-id>/session-lifecycle.jsonl`; none of them changes the verdict. A child that
+  never starts, or exits before its first stream-json frame, reports `produced_work = false`,
+  so a dev session pauses instead of retrying into the same failure (#727).
 - Add a free-form `effort` key to `[adapter]` and every `[adapter.<stage>]` table,
   inherited like `model`; `opencode-http` sends it as the per-prompt `variant` on
   every turn, and `validate` warns (`policy.effort-unsupported`) when a tmux stage
