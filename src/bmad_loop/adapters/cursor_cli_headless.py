@@ -57,11 +57,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..journal import LOGS_DIR
+from ..journal import LOGS_DIR, TASK_CYCLE_ARTIFACTS
 from ..model import TokenUsage
-from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec
+from .base import (
+    CodingCLIAdapter,
+    SessionHandle,
+    SessionResult,
+    SessionSpec,
+    reset_task_prompt,
+    validate_adapter_artifact_paths,
+    validated_task_directory,
+)
 from .env_fault import EnvFaultMixin
-from .generic import HEARTBEAT_INTERVAL_S, _DevSynthesisMixin, _ResultFileMixin
+from .generic import (
+    HEARTBEAT_INTERVAL_S,
+    RESULT_FILE_ARTIFACTS,
+    _DevSynthesisMixin,
+    _ResultFileMixin,
+)
 from .profile import CLIProfile
 
 if TYPE_CHECKING:
@@ -88,6 +101,11 @@ _EOF = object()
 SUCCESS_SUBTYPES = frozenset({"success"})
 #: Cap on the frame's own ``result`` string when it is copied into a breadcrumb.
 RESULT_DETAIL_MAX_CHARS = 500
+#: Capacity bound for the ``_usage`` stash, for the reason ``opencode_http``'s
+#: ``USAGE_STASH_CAP`` gives (DW-117): it is keyed by ``session_id`` and read by
+#: the engine after ``run()`` returns, so it cannot ride per-task eviction and is
+#: bounded oldest-first at its write site instead.
+USAGE_STASH_CAP = 256
 
 
 def build_argv(
@@ -248,17 +266,33 @@ class CursorCliHeadlessAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter
     # ------------------------------------------------------------- lifecycle
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
-        task_dir = self.tasks_dir / spec.task_id
+        task_dir = validated_task_directory(self.tasks_dir, spec.task_id)
+        # Every leaf this session writes, validated before the first write for the
+        # reason GenericAdapter and OpencodeHttpAdapter validate theirs — see
+        # `RESULT_FILE_ARTIFACTS`.
+        validate_adapter_artifact_paths(
+            task_dir, tuple(task_dir / name for name in RESULT_FILE_ARTIFACTS)
+        )
+        validate_adapter_artifact_paths(
+            self.logs_dir,
+            (self.logs_dir / f"{spec.task_id}.log", self._env_fault_log_path(spec.task_id)),
+        )
         task_dir.mkdir(parents=True, exist_ok=True)
         # The engine hands every adapter the canonical "/skill args" prompt; it is
         # the adapter's job to run it through the profile template (see
         # GenericAdapter.build_command / OpencodeHttpAdapter.start_session).
         rendered = self.profile.render_prompt(spec.prompt)
-        (task_dir / "prompt.txt").write_text(rendered + "\n", encoding="utf-8")
+        reset_task_prompt(task_dir, rendered)
         # Unlink before launch so a stale result.json from a previous attempt can
         # never be read back as this session's work (the property `_ResultFileMixin`
-        # relies on to skip the proof-of-work gate on its own read-back).
-        (task_dir / "result.json").unlink(missing_ok=True)
+        # relies on to skip the proof-of-work gate on its own read-back). The list
+        # is shared with the other adapters and `resolve._gather_escalations`.
+        for artifact in TASK_CYCLE_ARTIFACTS:
+            (task_dir / artifact).unlink(missing_ok=True)
+        # The env-fault scan reads `.err`, which the spawn below opens for append,
+        # so a reused task id must not scan the previous cycle's provider error
+        # (the pause loop OpencodeHttpAdapter.start_session describes).
+        self._env_fault_log_path(spec.task_id).unlink(missing_ok=True)
         lines: queue.Queue[str | object] = queue.Queue()
         launched_ns = time.time_ns()
         argv = build_argv(
@@ -269,7 +303,7 @@ class CursorCliHeadlessAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter
             bypass=self.bypass_args,
         )
         try:
-            err_sink = (self.logs_dir / f"{spec.task_id}.err").open("a", encoding="utf-8")
+            err_sink = self._env_fault_log_path(spec.task_id).open("a", encoding="utf-8")
         except OSError:
             err_sink = None
         try:
@@ -416,7 +450,7 @@ class CursorCliHeadlessAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter
         exit_code = running.proc.returncode if running.proc is not None else None
         usage = parse_usage(event)
         if session_id and usage is not None:
-            self._usage[session_id] = usage
+            self._stash_usage(session_id, usage)
         failure = result_failure(event)
         if failure is not None:
             # Record only. The verdict below is unchanged by this: a frame that
@@ -525,6 +559,21 @@ class CursorCliHeadlessAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter
         running = self._running.get(handle.task_id)
         if running is not None:
             self._terminate(running)
+
+    def run(self, spec: SessionSpec) -> SessionResult:
+        # `_running` holds one Popen per session. Evicted here rather than in
+        # `kill`, because the dev variant's `_post_kill_reconcile` still reads it
+        # through `_probe_alive` after the kill (DW-106).
+        try:
+            return super().run(spec)
+        finally:
+            self._running.pop(spec.task_id, None)
+
+    def _stash_usage(self, session_id: str, usage: TokenUsage) -> None:
+        if session_id not in self._usage:
+            while len(self._usage) >= USAGE_STASH_CAP:
+                del self._usage[next(iter(self._usage))]
+        self._usage[session_id] = usage
 
     def read_usage(self, result: SessionResult) -> TokenUsage | None:
         return self._usage.get(result.session_id) if result.session_id else None

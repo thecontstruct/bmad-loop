@@ -401,6 +401,75 @@ def test_timeout_records_which_clock_expired(tmp_path, fake_cursor):
     assert result.timeout_expired_clock in {"monotonic", "both"}
 
 
+# ------------------------------------------------ task directory confinement
+
+
+def test_an_unsafe_task_id_is_refused_before_any_write(tmp_path, fake_cursor):
+    """The task id names files under `tasks/` and `logs/`, so one that is not a
+    single clean path segment must be refused before the adapter writes or
+    spawns anything (the shared `validated_task_directory` boundary).
+
+    Ablation: build `task_dir` as `self.tasks_dir / spec.task_id` again and the
+    escaping directory is created, reddening the `exists` assertion."""
+    from bmad_loop.adapters.base import AdapterTaskDirectoryError
+
+    adapter = make_adapter(tmp_path, binary=str(fake_cursor))
+    with pytest.raises(AdapterTaskDirectoryError):
+        adapter.start_session(make_spec(tmp_path, task_id="../escape"))
+    assert not (tmp_path / "run" / "escape").exists()
+
+
+def test_a_reused_task_id_resets_every_cycle_artifact_and_the_err_sink(tmp_path, fake_cursor):
+    """A reused task id must not inherit the previous cycle's `escalation.json`
+    (which `resolve._gather_escalations` reads beside `result.json`) or its
+    `.err`, which the env-fault scan reads.
+
+    Ablation: unlink only `result.json` (the pre-merge behavior) and the
+    `escalation.json` assertion reddens; drop the `.err` unlink and the stale
+    line survives into the new session's sink."""
+    adapter = make_adapter(tmp_path, binary=str(fake_cursor))
+    spec = make_spec(tmp_path, "result-no-artifact")
+    task_dir = tmp_path / "run" / "tasks" / spec.task_id
+    task_dir.mkdir(parents=True)
+    (task_dir / "escalation.json").write_text("{}", encoding="utf-8")
+    err = tmp_path / "run" / "logs" / f"{spec.task_id}.err"
+    err.write_text("stale provider outage\n", encoding="utf-8")
+
+    adapter.run(spec)
+
+    assert not (task_dir / "escalation.json").exists()
+    assert "stale provider outage" not in err.read_text(encoding="utf-8")
+
+
+# ------------------------------------------------------- per-session stores
+
+
+def test_the_child_process_is_evicted_once_the_session_ends(tmp_path, fake_cursor):
+    """`_running` holds one Popen per session; without eviction it grows for the
+    adapter's lifetime (DW-106). Usage is read after `run()` returns, so it must
+    survive the eviction.
+
+    Ablation: drop the `finally` pop in `run` and `_running` keeps the entry."""
+    adapter = make_adapter(tmp_path, binary=str(fake_cursor))
+    result = adapter.run(make_spec(tmp_path))
+    assert adapter._running == {}
+    assert adapter.read_usage(result) is not None
+
+
+def test_the_usage_stash_is_capped_oldest_first():
+    """Keyed by session id and read after `run()`, so it is bounded at its write
+    site (DW-117) rather than evicted with the per-task state.
+
+    Ablation: make `_stash_usage` a plain assignment and the length reddens."""
+    adapter = CursorCliHeadlessAdapter.__new__(CursorCliHeadlessAdapter)
+    adapter._usage = {}
+    for i in range(headless.USAGE_STASH_CAP + 2):
+        adapter._stash_usage(f"s-{i}", headless.TokenUsage(input_tokens=i))
+    assert len(adapter._usage) == headless.USAGE_STASH_CAP
+    assert "s-0" not in adapter._usage and "s-1" not in adapter._usage
+    assert f"s-{headless.USAGE_STASH_CAP + 1}" in adapter._usage
+
+
 # ------------------------------------------------- self-reported turn failure
 
 
