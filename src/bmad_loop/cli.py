@@ -716,7 +716,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
             notes, problems = validate_environment(profile.binary)
             for note in notes:
-                report.ok("adapter.cursor-sdk", f"{profile.name}: {note}", {"profile": profile.name})
+                report.ok(
+                    "adapter.cursor-sdk", f"{profile.name}: {note}", {"profile": profile.name}
+                )
             for problem in problems:
                 report.fail(
                     "adapter.cursor-sdk", f"{profile.name}: {problem}", {"profile": profile.name}

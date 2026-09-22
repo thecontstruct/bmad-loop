@@ -81,17 +81,14 @@ def _fake_sidecar(tmp_path: Path, body: str) -> Path:
     scope, so a test writes only what its case is about."""
     script = tmp_path / "fake_sidecar.py"
     script.write_text(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             import json, sys
             argv = sys.argv[1:]
             opts = {argv[i].lstrip("-"): argv[i + 1] for i in range(0, len(argv) - 1, 2)}
             def emit(obj):
                 sys.stdout.write(json.dumps(obj) + "\\n")
                 sys.stdout.flush()
-            """
-        )
-        + textwrap.dedent(body),
+            """) + textwrap.dedent(body),
         encoding="utf-8",
     )
     return script
@@ -192,9 +189,7 @@ def test_packaged_profile_spells_the_skill_out_as_an_instruction():
 # Dispatch through the registry seam
 
 
-def test_make_adapters_builds_the_sdk_family_without_resolving_a_multiplexer(
-    project, monkeypatch
-):
+def test_make_adapters_builds_the_sdk_family_without_resolving_a_multiplexer(project, monkeypatch):
     """The cursor-sdk profile routes to the Node-sidecar classes, and the shared
     multiplexer is never even resolved — the kind registers ``needs_mux=False``.
     Dev and review share the synthesizing variant; triage gets the plain one.
@@ -212,7 +207,9 @@ def test_make_adapters_builds_the_sdk_family_without_resolving_a_multiplexer(
     _write_policy(project.project, CURSOR_POLICY)
 
     adapters = runsetup.make_adapters(
-        project.project, _run_dir(project.project), policy_mod.load(cli._policy_path(project.project))
+        project.project,
+        _run_dir(project.project),
+        policy_mod.load(cli._policy_path(project.project)),
     )
 
     assert isinstance(adapters["dev"], CursorSdkDevAdapter)
@@ -236,7 +233,9 @@ def test_dev_variant_empties_the_nudge_budgets_it_cannot_spend(project, monkeypa
     install_bmad_config(project)
     _write_policy(project.project, CURSOR_POLICY)
     dev = runsetup.make_adapters(
-        project.project, _run_dir(project.project), policy_mod.load(cli._policy_path(project.project))
+        project.project,
+        _run_dir(project.project),
+        policy_mod.load(cli._policy_path(project.project)),
     )["dev"]
     assert dev._stall_grace_s == 0.0
     assert dev._stall_nudges == 0
@@ -548,9 +547,7 @@ def test_stdout_is_tee_d_to_the_session_log_and_stderr_to_the_env_fault_log(
     assert "node: boom" in (adapter.logs_dir / "t1.sidecar.err").read_text(encoding="utf-8")
 
 
-def test_a_sidecar_that_never_finishes_times_out_and_is_torn_down(
-    project, tmp_path, monkeypatch
-):
+def test_a_sidecar_that_never_finishes_times_out_and_is_torn_down(project, tmp_path, monkeypatch):
     """The session clock is the backstop when no sentinel ever lands. The verdict
     carries which clock expired (#157), and the process is terminated rather than
     left running past the run."""

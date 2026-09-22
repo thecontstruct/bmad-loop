@@ -181,9 +181,13 @@ def validate_environment(binary: str) -> tuple[list[str], list[str]]:
     if node is None:
         problems.append(f"{binary!r} not found on PATH — {PROVIDER} needs Node >= {floor}")
     elif (version := _node_version(node)) is None:
-        problems.append(f"`{binary} --version` did not report a version — {PROVIDER} needs Node >= {floor}")
+        problems.append(
+            f"`{binary} --version` did not report a version — {PROVIDER} needs Node >= {floor}"
+        )
     elif version < MIN_NODE:
-        problems.append(f"node {'.'.join(map(str, version))} is below the {floor} floor for {PROVIDER}")
+        problems.append(
+            f"node {'.'.join(map(str, version))} is below the {floor} floor for {PROVIDER}"
+        )
     else:
         notes.append(f"node {'.'.join(map(str, version))} found ({node})")
     home = sdk_home()
