@@ -49,7 +49,6 @@ from __future__ import annotations
 import json
 import os
 import queue
-import shutil
 import subprocess
 import threading
 import time
@@ -624,18 +623,3 @@ class CursorCliHeadlessDevAdapter(_DevSynthesisMixin, CursorCliHeadlessAdapter):
         if running is None or running.proc is None:
             return False  # never spawned: nothing we own is alive
         return running.proc.poll() is None
-
-
-def validate_environment(project: Path) -> tuple[list[str], list[str]]:
-    """Preflight notes/errors for ``bmad-loop validate``."""
-    del project
-    binary = shutil.which(BINARY)
-    if binary is None:
-        return [], [f"{BINARY} not found on PATH — install Cursor CLI headless support and re-run"]
-    notes = [f"{BINARY} found ({binary})"]
-    notes.append(
-        "CURSOR_API_KEY is set"
-        if os.environ.get("CURSOR_API_KEY")
-        else "CURSOR_API_KEY unset — run `cursor-agent login` or export it"
-    )
-    return notes, []
