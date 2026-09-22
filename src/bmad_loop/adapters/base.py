@@ -7,7 +7,7 @@ treating every CLI as a dumb terminal:
 - injection:   how a prompt reaches the CLI
                "tmux-initial-prompt" | "launch-flag" | "http"
 - observation: how turn/session completion is detected
-               "hook-signal" | "sse" | "transcript-poll"
+               "hook-signal" | "sse" | "stream-json" | "transcript-poll"
 - state:       where session state is readable
                "local-jsonl" | "local-json-tree" | "remote"
 """
@@ -208,8 +208,8 @@ class SessionSpec:
     # model-specific; "" = provider default. Resolved per stage by
     # `AdapterPolicy.resolved()` with the same client-specific inheritance as
     # `model`. Only the opencode-http adapter has a channel for it — it rides every
-    # `prompt_async` body as `variant` — and the tmux generic family ignores it
-    # (`bmad-loop validate` warns). Never reaches argv, so `config_digest` is
+    # `prompt_async` body as `variant` — and the tmux generic family and
+    # cursor-cli-headless ignore it (`bmad-loop validate` warns). Never reaches argv, so `config_digest` is
     # untouched. Kept LAST so positional SessionSpec constructions stay valid.
     effort: str = ""
 

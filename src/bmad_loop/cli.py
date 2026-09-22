@@ -708,7 +708,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         if profile.hookless:
             report.ok(
                 "adapter.hookless",
-                f"{profile.name}: hookless (HTTP/SSE transport) — no hook registration needed",
+                f"{profile.name}: hookless transport — no hook registration needed",
                 {"profile": profile.name},
             )
             continue
@@ -916,12 +916,18 @@ def cmd_validate(args: argparse.Namespace) -> int:
             # kind sends it as the per-prompt `variant`. The tmux generic family
             # has no channel for it — no profile flag, no hook field — so a stage
             # that sets it there runs at the provider default with nothing to show
-            # for it. Keyed on the bundled GENERIC kind, like the two checks above,
-            # because "cannot carry effort" is a fact about that family; an
-            # out-of-tree kind's capability is not knowable here, so it stays
-            # silent rather than assert one. Advisory: severity `problem` is
-            # validate's exit code, and an ignored knob does not make a run unrunnable.
-            if prof is not None and prof.adapter == adapter_registry.GENERIC and cfg.effort:
+            # for it, and neither does the bundled cursor-cli-headless kind, whose
+            # `cursor-agent -p` argv has no effort flag. Keyed on those two bundled
+            # kinds, like the two checks above, because "cannot carry effort" is a
+            # fact about each family; an out-of-tree kind's capability is not
+            # knowable here, so it stays silent rather than assert one. Advisory:
+            # severity `problem` is validate's exit code, and an ignored knob does
+            # not make a run unrunnable.
+            if (
+                prof is not None
+                and prof.adapter in (adapter_registry.GENERIC, adapter_registry.CURSOR_CLI_HEADLESS)
+                and cfg.effort
+            ):
                 report.warn(
                     "policy.effort-unsupported",
                     f"{role} effort {cfg.effort!r} is ignored by {prof.name}: "
@@ -2148,6 +2154,20 @@ def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
 
     cfg = pol.adapter.resolved(role)
     profile = get_profile(cfg.name, project)
+    if profile.adapter == adapter_registry.CURSOR_CLI_HEADLESS:
+        # Rendered from the adapter's own argv builder, so the preview cannot
+        # drift from what a real run executes. `<worktree>` stands in for the
+        # per-session cwd a preview has not resolved yet.
+        from .adapters.cursor_cli_headless import build_argv
+
+        argv = build_argv(
+            prompt=profile.render_prompt(prompt),
+            cwd=Path("<worktree>"),
+            model=cfg.model,
+            binary=profile.binary,
+            bypass=tuple(cfg.extra_args if cfg.extra_args is not None else profile.bypass_args),
+        )
+        return " ".join(argv[:-1] + [f'"{argv[-1]}"'])
     # Keyed on the adapter KIND, not on `hookless`: the registry decoupled the two
     # axes, so an `opencode-http` profile carrying a hook dialect still launches
     # the HTTP adapter (and sends effort), while a hookless profile of another
@@ -5339,7 +5359,7 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         metavar="PROFILE",
         help="CLI profile(s) to register hooks for (claude | codex | gemini | copilot | "
-        "antigravity | opencode-http (alias: opencode) | custom; "
+        "antigravity | opencode-http (alias: opencode) | cursor-cli-headless | custom; "
         "repeatable; default: profiles referenced by .bmad-loop/policy.toml, or claude)",
     )
     init_p.add_argument(

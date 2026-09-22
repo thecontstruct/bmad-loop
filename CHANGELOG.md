@@ -9,6 +9,24 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **`cursor-cli-headless` provider.** Drives Cursor's `cursor-agent` as a supervised child
+  process in one-shot print mode (`-p --output-format stream-json`) — no terminal multiplexer
+  and no hooks. Registered as an adapter class through the adapter registry
+  (`needs_mux = False`) and selected by the profile's `adapter` field. The terminal `result`
+  frame maps onto the Stop hook and process exit onto window death, so completion still comes
+  from the deterministic artifact read-back; dev/review sessions reuse the shared
+  `_DevSynthesisMixin` rather than a forked synthesis path. Experimental: the flags are pinned
+  against `cursor-agent` 2026.08.04, but no live end-to-end turn has been run. `-p` accepts no
+  mid-turn input, so stall and contract nudges are disabled for this family and a stalled
+  session runs out its timeout. Token counts come off the `result` frame's `usage` object;
+  `reasoningTokens` is not added to output, because Cursor documents it as a subset of
+  `outputTokens`. A frame that reports its own failure (`is_error` / `subtype`), a stream that
+  ends without its `result` frame, and a non-zero exit each append a line to
+  `tasks/<task-id>/session-lifecycle.jsonl`; none of them changes the verdict. A child that
+  never starts, or exits before its first stream-json frame, reports `produced_work = false`,
+  so a dev session pauses instead of retrying into the same failure (#727). `cursor-agent -p`
+  has no effort flag, so `validate` warns (`policy.effort-unsupported`) when a stage sets
+  `effort` on this kind.
 - Add a free-form `effort` key to `[adapter]` and every `[adapter.<stage>]` table,
   inherited like `model`; `opencode-http` sends it as the per-prompt `variant` on
   every turn, and `validate` warns (`policy.effort-unsupported`) when a tmux stage
