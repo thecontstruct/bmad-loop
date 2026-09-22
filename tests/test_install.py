@@ -157,6 +157,9 @@ def test_merge_hooks_adds_all_events():
     assert set(profile.hooks.events) <= set(settings["hooks"])
 
 
+_CURSOR_RELAY = "/opt/bmad/bin/bmad-loop relay {event}"
+
+
 def test_merge_hooks_cursor_writes_versioned_bare_entries():
     """Cursor's project hook file is versioned and its entries are bare commands.
 
@@ -174,12 +177,12 @@ def test_merge_hooks_cursor_writes_versioned_bare_entries():
     `handler` instead of the bare dict fails the equality on the extra "type" key.
     """
     profile = get_profile("cursor")
-    config, changed = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
+    config, changed = merge_hooks({}, _registrations(profile, _CURSOR_RELAY), profile.hooks.dialect)
     assert changed is True
     assert config["version"] == 1
     assert config["hooks"] == {
-        "sessionStart": [{"command": "python3 /x/.bmad-loop/bmad_loop_hook.py SessionStart"}],
-        "stop": [{"command": "python3 /x/.bmad-loop/bmad_loop_hook.py Stop"}],
+        "sessionStart": [{"command": "/opt/bmad/bin/bmad-loop relay SessionStart"}],
+        "stop": [{"command": "/opt/bmad/bin/bmad-loop relay Stop"}],
     }
 
 
@@ -198,7 +201,7 @@ def test_cursor_relay_strips_whole_and_spares_a_project_hook():
     """
     profile = get_profile("cursor")
     mine = {"command": "./hooks/my-own-audit.sh"}
-    config, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
+    config, _ = merge_hooks({}, _registrations(profile, _CURSOR_RELAY), profile.hooks.dialect)
     config["hooks"]["stop"].append(mine)
 
     assert strip_relay_hooks(config, profile.hooks.dialect) is True
@@ -207,7 +210,9 @@ def test_cursor_relay_strips_whole_and_spares_a_project_hook():
     assert "sessionStart" not in config["hooks"]  # emptied events are dropped
 
     # and re-registering restores the relay without duplicating the project's hook
-    config, changed = merge_hooks(config, _registrations(profile), profile.hooks.dialect)
+    config, changed = merge_hooks(
+        config, _registrations(profile, _CURSOR_RELAY), profile.hooks.dialect
+    )
     assert changed is True
     assert relay_registered(config, profile.hooks.dialect, profile.hooks.events) is True
     assert config["hooks"]["stop"].count(mine) == 1
@@ -216,10 +221,11 @@ def test_cursor_relay_strips_whole_and_spares_a_project_hook():
 def test_merge_hooks_cursor_is_idempotent():
     """A second `init` must not stack a duplicate relay in the flat event list."""
     profile = get_profile("cursor")
-    config, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
-    again, changed = merge_hooks(config, _registrations(profile), profile.hooks.dialect)
+    registrations = _registrations(profile, _CURSOR_RELAY)
+    config, _ = merge_hooks({}, registrations, profile.hooks.dialect)
+    again, changed = merge_hooks(config, registrations, profile.hooks.dialect)
     assert changed is False
-    assert again["hooks"]["stop"] == [{"command": "python3 /x/.bmad-loop/bmad_loop_hook.py Stop"}]
+    assert again["hooks"]["stop"] == [{"command": "/opt/bmad/bin/bmad-loop relay Stop"}]
 
 
 def test_merge_hooks_idempotent():
@@ -410,7 +416,9 @@ def test_init_preserves_different_script_with_same_basename(tmp_path):
     assert any(command.endswith(_installed_relay_suffix("Stop")) for command in commands)
 
 
-@pytest.mark.parametrize("name,container", [("copilot", "hooks"), ("antigravity", "bmad-loop")])
+@pytest.mark.parametrize(
+    "name,container", [("copilot", "hooks"), ("cursor", "hooks"), ("antigravity", "bmad-loop")]
+)
 def test_init_migrates_flat_legacy_hook_and_preserves_user(tmp_path, name, container):
     profile = get_profile(name)
     config = tmp_path / profile.hooks.config_path
@@ -671,6 +679,30 @@ def test_install_into_copilot(tmp_path):
     assert len(settings["hooks"]["agentStop"]) == 1
 
 
+def test_install_into_cursor(tmp_path):
+    """`init --cli cursor` writes the installed relay as bare, versioned entries.
+
+    The merge-level tests pin the shape with a synthetic command; this pins it with
+    the command `_hook_command` really builds, so the bare-entry arm and the
+    installed-relay form are checked together.
+    """
+    assert install_into(tmp_path, clis=("cursor",)) == 0
+    config = json.loads((tmp_path / ".cursor" / "hooks.json").read_text())
+    assert config["version"] == 1
+    assert set(config["hooks"]) == {"sessionStart", "stop"}
+    for native, canonical in (("sessionStart", "SessionStart"), ("stop", "Stop")):
+        [entry] = config["hooks"][native]
+        assert set(entry) == {"command"}
+        assert entry["command"].endswith(_installed_relay_suffix(canonical))
+        assert relay_executable(entry["command"]) is not None
+    for skill in MODULE_SKILLS:
+        assert (tmp_path / ".cursor" / "skills" / skill / "SKILL.md").is_file()
+
+    assert install_into(tmp_path, clis=("cursor",)) == 0
+    config = json.loads((tmp_path / ".cursor" / "hooks.json").read_text())
+    assert len(config["hooks"]["stop"]) == 1
+
+
 def test_install_into_full(tmp_path):
     assert install_into(tmp_path) == 0
     assert not (tmp_path / ".bmad-loop" / "bmad_loop_hook.py").exists()
@@ -701,7 +733,7 @@ def test_install_into_full(tmp_path):
     assert final_gitignore.count(f"{RENDER_DIR_REL}/") == 1
 
 
-@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "antigravity"])
+@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "cursor", "antigravity"])
 def test_fresh_init_registers_installed_command_for_each_dialect(tmp_path, name):
     profile = get_profile(name)
     assert install_into(tmp_path, clis=(name,), skills=False) == 0
@@ -713,7 +745,8 @@ def test_fresh_init_registers_installed_command_for_each_dialect(tmp_path, name)
         handlers = container[native]
         command = (
             handlers[0]["command"]
-            if profile.hooks.dialect in {"copilot-settings-json", "antigravity-hooks-json"}
+            if profile.hooks.dialect
+            in {"copilot-settings-json", "cursor-hooks-json", "antigravity-hooks-json"}
             else handlers[0]["hooks"][0]["command"]
         )
         assert command.endswith(_installed_relay_suffix(canonical))
