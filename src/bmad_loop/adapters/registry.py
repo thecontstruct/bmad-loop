@@ -15,11 +15,11 @@ An adapter *kind* is selected by **data**: ``profile.adapter`` names the kind, a
 family:
 
 - :class:`AdapterKind` — ``name`` + ``needs_mux`` (does the family drive a
-  terminal multiplexer?) + ``load``, a lazy thunk returning the builder. The thunk
-  is why registration, validation (``known_adapter_kinds``) and listing
-  (``detect_adapters``) never import a heavy adapter module — nor an optional
-  dependency like ``httpx``, which only the opencode family pulls in at
-  construction.
+  terminal multiplexer?) + ``load``, a lazy thunk returning the builder, and an
+  optional ``provision`` thunk (see below). The thunks are why registration,
+  validation (``known_adapter_kinds``) and listing (``detect_adapters``) never
+  import a heavy adapter module — nor an optional dependency like ``httpx``,
+  which only the opencode family pulls in at construction.
 - :class:`AdapterBuilder` — the ``plain`` class, the ``_DevSynthesisMixin``-composed
   ``dev`` class (both share the ``(*args, paths, **kwargs)`` dev ``__init__``), and
   the family's construction-failure exception type(s) (``()`` = none;
@@ -27,8 +27,15 @@ family:
   can't spawn). ``runsetup.make_adapters`` converts a raised ``construct_error``
   into a ``SystemExit``.
 
+A kind may also carry a **runtime it installs itself**. ``@cursor/sdk`` is a Node
+package, so the ``cursor-sdk`` family cannot express its dependency in
+``pyproject.toml`` the way the opencode family expresses ``httpx`` as an extra.
+:attr:`AdapterKind.provision` is that seam: a thunk ``bmad-loop init --provision
+<kind>`` calls, and nothing else ever does — provisioning may touch the network,
+so it stays human-triggered and out of every run path.
+
 Bundled kinds register from :func:`_load_builtin_adapters` (:data:`GENERIC`,
-:data:`OPENCODE_HTTP`); out-of-tree kinds arrive at import time, triggered by the
+:data:`OPENCODE_HTTP`, :data:`CURSOR_SDK`); out-of-tree kinds arrive at import time, triggered by the
 ``bmad_loop.adapters`` entry-point scan in :func:`_load_external_adapters` — so a
 pip/uv co-installed adapter package is selectable with no config step. Builtins
 are seeded by :func:`register_adapter` itself, so an external can never shadow a
@@ -68,6 +75,10 @@ from .entrypoints import record_load_error
 # never a literal). GENERIC is the `profile.adapter` default.
 GENERIC = "generic"
 OPENCODE_HTTP = "opencode-http"
+# `validate`'s Node/API-key/runtime preflight keys on CURSOR_SDK for the same
+# reason the httpx check keys on OPENCODE_HTTP: those preconditions are facts
+# about ONE bundled family, not about hooklessness and not about the valid set.
+CURSOR_SDK = "cursor-sdk"
 
 
 class AdapterError(Exception):
@@ -76,6 +87,15 @@ class AdapterError(Exception):
     Construction failures a *known* family raises during ``__init__`` are its own
     types (e.g. ``OpencodeServerError``), carried by
     :attr:`AdapterBuilder.construct_error`, not this seam-level type."""
+
+
+class ProvisionError(Exception):
+    """A kind's optional runtime could not be installed (:attr:`AdapterKind.provision`).
+
+    Seam-level, so ``install_into`` can report *any* family's provisioning
+    failure as one ``FAIL:`` line without importing that family — which is why
+    a family raises THIS type (re-exported from its own module for readability)
+    rather than one of its own that the installer could not name."""
 
 
 @dataclass(frozen=True)
@@ -107,6 +127,14 @@ class AdapterKind:
     name: str
     needs_mux: bool
     load: Callable[[], AdapterBuilder]
+    #: Installs this family's out-of-band runtime, returning progress notes;
+    #: ``None`` for a family with nothing to install (the common case). Called
+    #: ONLY from ``bmad-loop init --provision <kind>``, never from a run: it may
+    #: touch the network, so it is human-triggered and opt-in. Must raise
+    #: :class:`ProvisionError` on failure. Like ``load`` this is a thunk the
+    #: registration hands over without importing the family, so listing and
+    #: validating kinds stay free of heavy imports.
+    provision: Callable[[], list[str]] | None = None
 
 
 # ---------------------------------------------------------------- builtins
@@ -132,15 +160,40 @@ def _opencode_http_builder() -> AdapterBuilder:
     )
 
 
-# The bundled kinds, as (name, needs_mux, load-thunk). A module constant, not
-# mutable registry state, so detect_adapters can label a row builtin-vs-external
-# without the fixtures having to snapshot it. `generic` drives tmux + hooks and
-# needs the multiplexer; `opencode-http` is hookless HTTP/SSE and does not.
-_BUILTIN_ADAPTERS: tuple[tuple[str, bool, Callable[[], AdapterBuilder]], ...] = (
-    (GENERIC, True, _generic_builder),
-    (OPENCODE_HTTP, False, _opencode_http_builder),
+def _cursor_sdk_builder() -> AdapterBuilder:
+    from .cursor_sdk import CursorSdkAdapter, CursorSdkDevAdapter, CursorSdkError
+
+    return AdapterBuilder(
+        plain=CursorSdkAdapter,
+        dev=CursorSdkDevAdapter,
+        construct_error=(CursorSdkError,),
+    )
+
+
+def _cursor_sdk_provision() -> list[str]:
+    # A module-level function rather than `cursor_sdk.provision_sdk` itself, so
+    # registration keeps the lazy-import property the `load` thunks have: naming
+    # the family's provisioner directly would import it at registration time.
+    from .cursor_sdk import provision_sdk
+
+    return provision_sdk()
+
+
+# The bundled kinds, as (name, needs_mux, load-thunk, provision-thunk). A module
+# constant, not mutable registry state, so detect_adapters can label a row
+# builtin-vs-external without the fixtures having to snapshot it. `generic`
+# drives tmux + hooks and needs the multiplexer; `opencode-http` (HTTP/SSE) and
+# `cursor-sdk` (a Node sidecar) are hookless and do not. Only `cursor-sdk` has a
+# runtime to install: its `@cursor/sdk` dependency is a Node package, so it
+# cannot ride uv.lock the way opencode's httpx extra does.
+_BUILTIN_ADAPTERS: tuple[
+    tuple[str, bool, Callable[[], AdapterBuilder], Callable[[], list[str]] | None], ...
+] = (
+    (GENERIC, True, _generic_builder, None),
+    (OPENCODE_HTTP, False, _opencode_http_builder, None),
+    (CURSOR_SDK, False, _cursor_sdk_builder, _cursor_sdk_provision),
 )
-_BUILTIN_NAMES = frozenset(name for name, _, _ in _BUILTIN_ADAPTERS)
+_BUILTIN_NAMES = frozenset(name for name, _, _, _ in _BUILTIN_ADAPTERS)
 
 # The live registry: name -> AdapterKind. Unlike the multiplexer's ordered list
 # (registration order breaks selection ties), adapter selection is a pure by-name
@@ -149,10 +202,17 @@ _ADAPTERS: dict[str, AdapterKind] = {}
 _BUILTINS_LOADED = False
 
 
-def register_adapter(name: str, needs_mux: bool, load: Callable[[], AdapterBuilder]) -> None:
+def register_adapter(
+    name: str,
+    needs_mux: bool,
+    load: Callable[[], AdapterBuilder],
+    provision: Callable[[], list[str]] | None = None,
+) -> None:
     """Register an adapter kind. ``name`` is the ``profile.adapter`` key that
     selects it; ``needs_mux`` declares whether the family drives a terminal
-    multiplexer; ``load`` is the lazy builder thunk. First registration of a name
+    multiplexer; ``load`` is the lazy builder thunk; ``provision`` is the
+    optional runtime installer ``bmad-loop init --provision`` calls (see
+    :attr:`AdapterKind.provision`). First registration of a name
     wins, and the builtins are seeded here rather than only by the resolution
     entry points, so an out-of-tree package can never shadow a bundled name. An
     out-of-tree kind calls this at import time — no core edit required. There is
@@ -168,7 +228,9 @@ def register_adapter(name: str, needs_mux: bool, load: Callable[[], AdapterBuild
     ``setdefault`` keep the external under a bundled name and silently redirect
     every default profile to it."""
     _load_builtin_adapters()
-    _ADAPTERS.setdefault(name, AdapterKind(name=name, needs_mux=needs_mux, load=load))
+    _ADAPTERS.setdefault(
+        name, AdapterKind(name=name, needs_mux=needs_mux, load=load, provision=provision)
+    )
 
 
 def _load_builtin_adapters() -> None:
@@ -184,8 +246,8 @@ def _load_builtin_adapters() -> None:
     if _BUILTINS_LOADED:
         return
     _BUILTINS_LOADED = True
-    for name, needs_mux, load in _BUILTIN_ADAPTERS:
-        register_adapter(name, needs_mux, load)
+    for name, needs_mux, load, provision in _BUILTIN_ADAPTERS:
+        register_adapter(name, needs_mux, load, provision)
 
 
 # The entry-point group an out-of-tree adapter package advertises its module
@@ -283,6 +345,16 @@ def get_adapter_kind(name: str) -> AdapterKind:
     if kind is None:
         raise AdapterError(f"unknown adapter kind {name!r}; known: {_known()}")
     return kind
+
+
+def provisionable_adapter_kinds() -> list[str]:
+    """Sorted names of the registered kinds that declare a ``provision`` thunk —
+    the valid arguments to ``bmad-loop init --provision``. Derived from the live
+    registry like :func:`known_adapter_kinds`, never a hardcoded set, so an
+    out-of-tree family with a runtime of its own is offered too."""
+    _load_builtin_adapters()
+    _load_external_adapters()
+    return sorted(name for name, kind in _ADAPTERS.items() if kind.provision is not None)
 
 
 def known_adapter_kinds() -> list[str]:

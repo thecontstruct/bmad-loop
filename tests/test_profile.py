@@ -95,7 +95,7 @@ def test_builtin_profiles_load():
     # tests/test_env_fault_patterns.py; here we only pin which profiles are seeded.
     for name in ("claude", "opencode-http"):
         assert profiles[name].env_fault_patterns, f"{name} ships no env_fault_patterns"
-    for name in ("codex", "gemini", "copilot", "antigravity"):
+    for name in ("codex", "gemini", "copilot", "antigravity", "cursor-sdk"):
         assert profiles[name].env_fault_patterns == ()
     # opencode-http is hookless (HTTP/SSE transport): no hook dialect surfaces,
     # skills read from the claude tree, usage comes over HTTP (no transcript parser)
@@ -107,8 +107,20 @@ def test_builtin_profiles_load():
     assert opencode.skill_tree == ".claude/skills"
     assert opencode.usage_parser == "none"
     assert opencode.binary == "opencode"
+    # cursor-sdk is the other hookless built-in: a Node sidecar over @cursor/sdk,
+    # so the binary is the interpreter, usage rides the sidecar's completion
+    # sentinel, and skills read from the claude tree — Cursor loads that tree for
+    # compatibility, and it is the one the BMAD installer puts the dev primitive in.
+    cursor = profiles["cursor-sdk"]
+    assert cursor.hookless is True
+    assert cursor.hooks.dialect == "none"
+    assert cursor.hooks.config_path == ""
+    assert cursor.hooks.events == {}
+    assert cursor.skill_tree == ".claude/skills"
+    assert cursor.usage_parser == "none"
+    assert cursor.binary == "node"
     # every hook-driven built-in stays non-hookless
-    for name in sorted(set(profiles) - {"opencode-http"}):
+    for name in sorted(set(profiles) - {"opencode-http", "cursor-sdk"}):
         assert profiles[name].hookless is False
 
 
@@ -189,13 +201,14 @@ def test_unknown_profile_raises():
 
 def test_adapter_field_defaults_to_generic_and_parses():
     """The adapter kind is read at parse time: unset defaults to the bundled tmux
-    generic; opencode-http declares its HTTP adapter kind. Asserted across ALL
+    generic; the two non-tmux profiles declare their own kind. Asserted across ALL
     built-ins, not two spot checks — a profile silently defaulting to `generic`
     would dispatch to the tmux adapter, which cannot host it."""
     profiles = load_profiles()
     assert profiles["opencode-http"].adapter == "opencode-http"
+    assert profiles["cursor-sdk"].adapter == "cursor-sdk"
     assert {name for name, p in profiles.items() if p.adapter == "generic"} == (
-        set(profiles) - {"opencode-http"}
+        set(profiles) - {"opencode-http", "cursor-sdk"}
     )
 
 

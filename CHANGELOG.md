@@ -9,6 +9,19 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add the experimental `cursor-sdk` provider: Cursor's local agent driven through a bundled
+  Node sidecar over `@cursor/sdk`, with no tmux window and no hooks. A packaged profile selects
+  a new bundled adapter kind (`needs_mux = false`). The sidecar's NDJSON sentinel is the
+  turn-end signal and carries token usage. Covers dev, review and triage; skills load from
+  `.claude/skills/`. Env-fault scans read the sidecar's stderr (`logs/<task-id>.sidecar.err`),
+  never its event stream; no patterns are seeded. `effort` is ignored (the SDK encodes it in
+  the model id), so `validate` warns `policy.effort-unsupported` for a cursor-sdk stage.
+- Add `bmad-loop init --provision <kind>` to install an adapter kind's out-of-band runtime —
+  today `cursor-sdk`'s npm-only `@cursor/sdk`, into `~/.bmad-loop/cursor-sdk`
+  (`BMAD_LOOP_CURSOR_SDK_DIR` overrides). Opt-in, never called from a run. Backed by an
+  optional `provision` thunk on `register_adapter`, so out-of-tree kinds can offer one.
+  `validate` reports Node ≥ 22.13, the provisioned runtime and `CURSOR_API_KEY` as
+  `adapter.cursor-sdk` findings.
 - Add a free-form `effort` key to `[adapter]` and every `[adapter.<stage>]` table,
   inherited like `model`; `opencode-http` sends it as the per-prompt `variant` on
   every turn, and `validate` warns (`policy.effort-unsupported`) when a tmux stage
@@ -301,6 +314,9 @@ breaking changes may land in a minor release.
   failing on a lock it never needed.
 
 ### Changed
+
+- Word `validate`'s `adapter.hookless` line without naming a transport: "hookless (the
+  adapter observes completion itself)". It said "HTTP/SSE transport", true only of opencode.
 
 - Organize decision-answer and publication documentation into navigable operator sections
   for stale answers, store validation, publication refusals and recovery (DW-240).

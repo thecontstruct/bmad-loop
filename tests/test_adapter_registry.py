@@ -181,25 +181,78 @@ def _run_dir(project):
 
 
 def test_builtin_kinds_registered_with_needs_mux(fresh_adapter_registry):
-    """The two bundled kinds register with the correct transport requirement:
-    generic drives tmux (needs_mux), opencode-http is hookless HTTP/SSE (does not)."""
+    """The three bundled kinds register with the correct transport requirement:
+    generic drives tmux (needs_mux); opencode-http (HTTP/SSE) and cursor-sdk (a
+    Node sidecar) are hookless and drive no multiplexer."""
     generic = fresh_adapter_registry.get_adapter_kind("generic")
     http = fresh_adapter_registry.get_adapter_kind("opencode-http")
+    sdk = fresh_adapter_registry.get_adapter_kind("cursor-sdk")
     assert generic.needs_mux is True
     assert http.needs_mux is False
-    assert fresh_adapter_registry.known_adapter_kinds() == ["generic", "opencode-http"]
+    assert sdk.needs_mux is False
+    assert fresh_adapter_registry.known_adapter_kinds() == [
+        "cursor-sdk",
+        "generic",
+        "opencode-http",
+    ]
 
 
 def test_builtin_name_constants_match_the_registered_names(fresh_adapter_registry):
-    """`validate`'s httpx check keys on the GENERIC/OPENCODE_HTTP constants rather
-    than on literals. Pin them to what actually registers, so a rename cannot make
-    that check silently stop firing — an absent finding reads as a pass."""
+    """`validate`'s httpx and Node/API-key checks key on the GENERIC /
+    OPENCODE_HTTP / CURSOR_SDK constants rather than on literals. Pin them to what
+    actually registers, so a rename cannot make either check silently stop firing
+    — an absent finding reads as a pass."""
     assert fresh_adapter_registry.GENERIC == "generic"
     assert fresh_adapter_registry.OPENCODE_HTTP == "opencode-http"
+    assert fresh_adapter_registry.CURSOR_SDK == "cursor-sdk"
     assert set(fresh_adapter_registry.known_adapter_kinds()) == {
         fresh_adapter_registry.GENERIC,
         fresh_adapter_registry.OPENCODE_HTTP,
+        fresh_adapter_registry.CURSOR_SDK,
     }
+
+
+def test_only_cursor_sdk_declares_a_provisionable_runtime(fresh_adapter_registry):
+    """`provision` is the seam `bmad-loop init --provision` resolves against, and
+    it is opt-in per family: only cursor-sdk has a runtime bmad-loop can install
+    (``@cursor/sdk`` is a Node package, so it cannot be a Python extra the way
+    opencode's httpx is). The thunk is NOT invoked here — listing provisionable
+    kinds must stay free of the family import, like every other registry read.
+
+    ABLATION: drop the `provision` argument from the cursor-sdk row in
+    `_BUILTIN_ADAPTERS` and both halves redden — the list empties and the kind's
+    `provision` goes None."""
+    registry = fresh_adapter_registry
+    assert registry.provisionable_adapter_kinds() == ["cursor-sdk"]
+    assert registry.get_adapter_kind("cursor-sdk").provision is not None
+    assert registry.get_adapter_kind("generic").provision is None
+    assert registry.get_adapter_kind("opencode-http").provision is None
+
+
+def test_registered_provision_thunk_calls_the_family_provisioner(
+    fresh_adapter_registry, monkeypatch
+):
+    """The registration-side thunk resolves to the family's own provisioner, and
+    only on CALL — so the lazy-import property survives the indirection."""
+    from bmad_loop.adapters import cursor_sdk
+
+    monkeypatch.setattr(cursor_sdk, "provision_sdk", lambda: ["installed"])
+    assert fresh_adapter_registry.get_adapter_kind("cursor-sdk").provision() == ["installed"]
+
+
+def test_cursor_sdk_load_thunk_returns_the_real_builder(fresh_adapter_registry):
+    """The lazy thunk resolves to the real Node-sidecar classes, and declares the
+    construction-failure type `make_adapters` turns into a clean SystemExit."""
+    from bmad_loop.adapters.cursor_sdk import (
+        CursorSdkAdapter,
+        CursorSdkDevAdapter,
+        CursorSdkError,
+    )
+
+    builder = fresh_adapter_registry.get_adapter_kind("cursor-sdk").load()
+    assert builder.plain is CursorSdkAdapter
+    assert builder.dev is CursorSdkDevAdapter
+    assert builder.construct_error == (CursorSdkError,)
 
 
 def test_load_thunk_returns_real_builder(fresh_adapter_registry):
@@ -216,7 +269,7 @@ def test_load_thunk_returns_real_builder(fresh_adapter_registry):
 def test_unknown_kind_fails_loud_naming_known(fresh_adapter_registry):
     """An explicit but unregistered kind is a misconfiguration: fail loud, listing
     the registered kinds — never silently fall back."""
-    with pytest.raises(AdapterError, match=r"nonesuch.*generic.*opencode-http"):
+    with pytest.raises(AdapterError, match=r"nonesuch.*cursor-sdk.*generic.*opencode-http"):
         fresh_adapter_registry.get_adapter_kind("nonesuch")
 
 
@@ -235,9 +288,10 @@ def test_detect_adapters_labels_builtin(fresh_adapter_registry):
     registry = fresh_adapter_registry
     registry.register_adapter("extra", needs_mux=False, load=lambda: _stub_builder())
     rows = {r.name: r for r in registry.detect_adapters()}
-    assert set(rows) == {"generic", "opencode-http", "extra"}
+    assert set(rows) == {"generic", "opencode-http", "cursor-sdk", "extra"}
     assert rows["generic"].builtin is True and rows["generic"].needs_mux is True
     assert rows["opencode-http"].builtin is True and rows["opencode-http"].needs_mux is False
+    assert rows["cursor-sdk"].builtin is True and rows["cursor-sdk"].needs_mux is False
     assert rows["extra"].builtin is False
     assert [r.name for r in registry.detect_adapters()] == sorted(rows)
 

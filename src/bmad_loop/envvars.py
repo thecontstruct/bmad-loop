@@ -38,6 +38,9 @@ PROCESS_HOST = "BMAD_LOOP_PROCESS_HOST"
 #: Overrides the user-scoped state root that per-run control-plane state lives
 #: under (see :func:`runs.state_root`), replacing the whole platform cascade.
 STATE_DIR = "BMAD_LOOP_STATE_DIR"
+#: Overrides where the cursor-sdk adapter's ``@cursor/sdk`` Node runtime is
+#: installed and loaded from (see :func:`adapters.cursor_sdk.sdk_home`).
+CURSOR_SDK_DIR = "BMAD_LOOP_CURSOR_SDK_DIR"
 
 
 def session_timeout_s() -> float | None:
@@ -109,3 +112,18 @@ def state_dir() -> str | None:
     whatever cwd the loop happened to be launched from.
     """
     return os.environ.get(STATE_DIR) or None
+
+
+def cursor_sdk_dir() -> str | None:
+    """The overriding ``@cursor/sdk`` install directory, or ``None`` when unset.
+
+    Verbatim, and empty reads as unset, for the same two reasons
+    :func:`state_dir` gives: an operator who names a directory gets that
+    directory, and ``export BMAD_LOOP_CURSOR_SDK_DIR=`` would otherwise install a
+    ``node_modules`` tree into whatever cwd the loop was launched from.
+
+    Unlike the state root a relative value is usable here — one process resolves
+    it, and :func:`~.adapters.cursor_sdk.sdk_home` expands ``~`` — so nothing
+    downstream refuses it.
+    """
+    return os.environ.get(CURSOR_SDK_DIR) or None
