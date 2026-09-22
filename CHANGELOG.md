@@ -24,7 +24,9 @@ breaking changes may land in a minor release.
   ends without its `result` frame, and a non-zero exit each append a line to
   `tasks/<task-id>/session-lifecycle.jsonl`; none of them changes the verdict. A child that
   never starts, or exits before its first stream-json frame, reports `produced_work = false`,
-  so a dev session pauses instead of retrying into the same failure (#727).
+  so a dev session pauses instead of retrying into the same failure (#727). `cursor-agent -p`
+  has no effort flag, so `validate` warns (`policy.effort-unsupported`) when a stage sets
+  `effort` on this kind.
 - Add a free-form `effort` key to `[adapter]` and every `[adapter.<stage>]` table,
   inherited like `model`; `opencode-http` sends it as the per-prompt `variant` on
   every turn, and `validate` warns (`policy.effort-unsupported`) when a tmux stage

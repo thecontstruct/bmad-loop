@@ -9637,6 +9637,26 @@ def test_validate_effort_silent_on_the_opencode_kind(project, capsys):
     assert policy_mod.load(project.project / ".bmad-loop" / "policy.toml").adapter.effort == "max"
 
 
+def test_validate_warns_when_effort_is_set_on_the_cursor_headless_kind(project, capsys):
+    """`cursor-agent -p` has no effort flag, so a cursor-cli-headless stage that
+    sets `effort` runs at the provider default, the same silent drop the tmux
+    family has.
+
+    ABLATION: key the predicate on `GENERIC` alone and this reddens."""
+    install_bmad_config(project)
+    _write_policy(
+        project.project,
+        '[adapter]\nname = "cursor-cli-headless"\n[adapter.review]\neffort = "high"\n',
+    )
+    write_sprint(project, {"epic-1": "backlog"})
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    findings = [f for f in doc["findings"] if f["check"] == "policy.effort-unsupported"]
+    assert [f["detail"] for f in findings] == [
+        {"role": "review", "effort": "high", "profile": "cursor-cli-headless"}
+    ]
+
+
 def test_validate_effort_silent_when_unset(project, capsys):
     """No effort anywhere → no finding, on the very profile that would warn."""
     install_bmad_config(project)
