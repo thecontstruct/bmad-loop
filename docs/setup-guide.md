@@ -422,6 +422,7 @@ that hook event):
 - **codex** — `.codex/hooks.json`
 - **gemini** — `.gemini/settings.json`
 - **copilot** — `.github/copilot/settings.json`
+- **cursor** — `.cursor/hooks.json`
 - **antigravity** — `.agents/hooks.json` (the `bmad-loop` hook group)
 
 Edit only the registered CLIs. Match the full relay command and event; leave every
