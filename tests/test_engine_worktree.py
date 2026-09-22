@@ -10,21 +10,30 @@ from __future__ import annotations
 
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from conftest import (
     _OK,
+    NUL_PATH_RESOLVE_FAULTS,
+    UNDECODABLE_LEDGER,
     _exists_run,
+    _file_exists_cmd,
     _seeded_then_touch,
     _spec_baseline,
     _touch_run,
     attach_profile,
     crash_at_merge_back,
+    fault_locked_ledger_read,
+    fault_metadata_probe,
+    fault_read_text,
     git,
     ignore_before_commit,
     install_build_auto_skill,
+    refuse_to_resolve,
     set_sprint,
+    write_gated_ledger,
     write_ledger,
     write_spec,
     write_sprint,
@@ -34,15 +43,23 @@ from bmad_loop import deferredwork, runs, sprintstatus, verify, worktree_flow
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
-from bmad_loop.engine import Engine
+from bmad_loop.engine import Engine, _publication_refusal, _story_label_stripped
 from bmad_loop.install import (
     BMAD_SCRIPTS_SEED_REL,
     CENTRAL_CONFIG_REL,
     DEV_PRIMITIVE_NEW,
+    MODULE_SKILLS,
 )
-from bmad_loop.journal import Journal, load_state
-from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
-from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
+from bmad_loop.journal import Journal, load_state, save_state
+from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, SessionRecord, StoryTask, TokenUsage
+from bmad_loop.policy import (
+    GatesPolicy,
+    LimitsPolicy,
+    NotifyPolicy,
+    Policy,
+    ScmPolicy,
+    VerifyPolicy,
+)
 from bmad_loop.verify import (
     branch_exists,
     current_branch,
@@ -96,6 +113,12 @@ def wt_dev_effect(
             src = cwd / "src.txt"
             src.write_text(src.read_text() + f"change for {story_key}\n")
         sp = wt.implementation_artifacts / f"spec-{story_key}.md"
+        # A real dev session creates its artifacts dir. Most rows here commit the
+        # board, so the checkout delivers the dir and this is a no-op — but a row
+        # over a GITIGNORED board has nothing tracked in there at all, and without
+        # this the session would die on the spec write before reaching the gate the
+        # row is about (`wt_bundle_dev` in test_sweep.py says the same).
+        sp.parent.mkdir(parents=True, exist_ok=True)
         write_spec(
             sp,
             final_status,
@@ -195,8 +218,88 @@ def make_engine(project, script, policy=None, run_id="test-run", **kwargs):
     return engine, adapter
 
 
+def resume_engine(project, engine, script=(), *, policy=None) -> tuple[Engine, MockAdapter]:
+    """Rebuild an Engine over the run's persisted state, as `cli.cmd_resume` does."""
+    state = load_state(engine.run_dir)
+    # `cli._resume_paused_run` refuses a finished run outright. Without the same
+    # refusal here a test can "resume" what the CLI never would, and prove a
+    # recovery path that does not exist (#284 round-6 review, finding 1).
+    assert not state.finished, "cli._resume_paused_run refuses a finished run"
+    # as cli.cmd_resume does before compose_resume; this also resets the
+    # `stopped`/`crashed`/`crash_error` flags a crash-replay site resumes from
+    state.clear_pause()
+    adapter = MockAdapter(list(script))
+    new_engine = Engine(
+        paths=project,
+        policy=policy or engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        # A real resume REOPENS the journal: `cli.cmd_resume` builds a fresh
+        # `Journal(run_dir)` and hands it to `runsetup.compose_resume`, so this
+        # harness builds the same shape (DW-241). `Journal` is file-backed either
+        # way; what a SHARED object leaks across the boundary is its
+        # `_log_task`/`_log_path` binding, which stamps `log_task`/`log_pos` onto
+        # rows a real resumed engine writes bare. See the row right below.
+        journal=Journal(engine.run_dir),
+        state=state,
+        # mirror cli._resume_paused_run: the run's scope + cap are restored from
+        # persisted state so a resumed `--epic N` run keeps its selector.
+        epic_filter=state.epic_filter,
+        story_filter=state.story_filter,
+        max_stories=state.max_stories,
+    )
+    return new_engine, adapter
+
+
 def journal_kinds(engine):
     return [e["kind"] for e in engine.journal.entries()]
+
+
+def test_the_resumed_engine_reopens_the_journal_off_disk(project):
+    """The harness's own fidelity: `resume_engine` builds the journal a REAL resume
+    builds rather than handing the pre-pause engine's object back (DW-241) — the
+    `tests/test_sweep.py` row of the same name, carried over to the one helper this
+    file's resume sites now share.
+
+    `cli.cmd_resume` constructs `Journal(run_dir)` and passes it to
+    `runsetup.compose_resume`; a fresh `Journal` starts with `_log_task = None`.
+    Sharing one object carried the PRE-PAUSE session's `set_active_log` binding across
+    the resume boundary, and `Journal.append` stamps `log_task`/`log_pos` onto every
+    entry while that binding is set — so every row a resumed engine writes BEFORE
+    starting its own session (a replay pre-pass, a resume-carry, a merge replay) was
+    stamped with a log from the run before the pause. A real resume writes those rows
+    bare. `Journal` holds NO in-memory record list — `append` writes one line to
+    `run_dir/journal.jsonl` and `entries()` re-reads it — so the binding is the only
+    state a shared object could leak; every `journal_kinds(resumed)` claim in this
+    file's resume rows was already round-tripping through disk.
+
+    Graded on the CONSEQUENCE, never on object identity: `resumed.journal is not
+    engine.journal` would be tautological and would red for a refactor that changed
+    nothing observable.
+
+    Ablation, performed: hand `resume_engine` the pre-pause `engine.journal` back as
+    its `journal=` argument and the FINAL assertion reds — the appended row carries
+    the pre-pause `log_task` and `log_pos`. That one only: the two `first[...]` lines
+    above it are the PREMISE and stay green under both spellings (they describe the
+    pre-pause row, stamped either way), and the reopen half stays green too, because
+    the file is what both objects read."""
+    engine, _ = make_engine(project, [])
+    engine.journal.set_active_log("1-1-a-dev-1")  # stands in for the pre-pause session
+    engine.journal.append("run-start", cycle=1)
+    save_state(engine.run_dir, engine.state)
+
+    resumed, _ = resume_engine(project, engine)
+
+    # reopened, not re-created: the rows already on disk are still what it reads
+    assert journal_kinds(resumed) == ["run-start"]
+    resumed.journal.append("run-start", cycle=2)
+    first, second = [e for e in resumed.journal.entries() if e["kind"] == "run-start"]
+    assert (first["cycle"], second["cycle"]) == (1, 2)  # appended AFTER, same file
+    assert first["log_task"] == "1-1-a-dev-1"  # premise: the pre-pause row WAS stamped...
+    # ...with BOTH fields, so the conclusion below pins both. `0` is deliberate: it is
+    # `append`'s `except OSError: size = 0` arm, since no pane log exists on disk here.
+    assert first["log_pos"] == 0
+    assert "log_task" not in second and "log_pos" not in second
 
 
 # ----------------------------------------------------------------- happy path
@@ -226,6 +329,1075 @@ def test_worktree_happy_path_merges_to_target(project):
     assert "worktree-opened" in kinds and "unit-merged" in kinds
     # a clean teardown degrades nothing (gh-139): no warning event is emitted
     assert "worktree-teardown-degraded" not in kinds
+
+
+def test_isolated_verify_commands_execute_and_classify_in_the_unit_worktree(project, monkeypatch):
+    """A relative dev command is rooted on the live isolated checkout.
+
+    The marker exists only under the mounted unit worktree and is gitignored, so
+    its successful real command pins execution without merging test residue back
+    to the main checkout. The classifier spy delegates to production and pins the
+    second cwd hop independently.
+
+    Ablation: hand `project.repo_root` to either verifier call in
+    `Engine._verify_commands_with_results`; execution then records rc 1, while a
+    classifier-only change leaves the command green but reddens the cwd assertion.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = Path(".bmad-loop") / "runs" / "unit-only-verify.marker"
+    assert not (project.repo_root / marker).exists()
+    mounted: dict[str, Path] = {}
+    base_effect = wt_dev_effect(project, "1-1-a", followup_review=False)
+
+    def dev_with_marker(spec):
+        mounted["root"] = spec.cwd.resolve()
+        marker_path = spec.cwd / marker
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text("unit only\n", encoding="utf-8")
+        return base_effect(spec)
+
+    classified: list[Path] = []
+    real_classify = verify.verify_command_results_outcome
+
+    def spy_classify(results, cwd):
+        classified.append(cwd.resolve())
+        return real_classify(results, cwd)
+
+    monkeypatch.setattr(verify, "verify_command_results_outcome", spy_classify)
+    policy = replace(
+        wt_policy(),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker.as_posix()),)),
+    )
+    engine, _ = make_engine(project, [dev_with_marker], policy=policy)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    unit_root = mounted["root"]
+    assert unit_root != project.repo_root.resolve()
+    assert not (project.repo_root / marker).exists()
+    (dev_record,) = [
+        entry
+        for entry in engine.journal.entries()
+        if entry["kind"] == "verify-command-result" and entry["verification_stage"] == "dev"
+    ]
+    assert dev_record["returncode"] == 0
+    assert classified and all(cwd == unit_root for cwd in classified)
+
+
+def test_local_absolute_ignored_accepted_spec_is_seeded_and_bound_in_mount(project):
+    """Relativizing an accepted spec also delivers it to a tracked-only checkout."""
+    rel = "_bmad-output/implementation-artifacts/accepted-untracked.md"
+    ignore_before_commit(project, rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted operator bytes\n")
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    observed: dict[str, object] = {}
+
+    def bind_then_defer(current):
+        engine._bind_dispatched_spec_for_attempt(current)
+        observed["path"] = current.dispatched_spec_file
+        observed["snapshot"] = current.dispatched_spec_snapshot
+        observed["root"] = engine.workspace.root
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, bind_then_defer)
+
+    mounted_root = observed["root"]
+    assert isinstance(mounted_root, Path)
+    assert observed["path"] == str(mounted_root / rel)
+    assert observed["snapshot"] == b"accepted operator bytes\n"
+
+
+def test_prior_dispatch_does_not_block_fresh_mounted_spec_binding(project):
+    """A none-to-worktree re-drive relocates accepted input, then replaces old authority."""
+    rel = "_bmad-output/implementation-artifacts/accepted-rearm.md"
+    ignore_before_commit(project, rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"ignored accepted bytes\n")
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    old_dispatch = str(project.project / ".bmad-loop" / "runs" / "old" / "spec.md")
+    old_snapshot = b"prior dispatch bytes\x00"
+    task = StoryTask(
+        "1-1-a",
+        1,
+        spec_file=str(accepted),
+        dispatched_spec_file=old_dispatch,
+        dispatched_spec_snapshot=old_snapshot,
+    )
+    engine.state.tasks[task.story_key] = task
+    observed: dict[str, object] = {}
+
+    def bind_fresh_attempt(current):
+        observed["prior_path"] = current.dispatched_spec_file
+        observed["prior_snapshot"] = current.dispatched_spec_snapshot
+        engine._bind_dispatched_spec_for_attempt(current)
+        observed["accepted"] = current.spec_file
+        observed["bound"] = current.dispatched_spec_file
+        observed["snapshot"] = current.dispatched_spec_snapshot
+        observed["root"] = engine.workspace.root
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, bind_fresh_attempt)
+
+    mounted_root = observed["root"]
+    assert isinstance(mounted_root, Path)
+    assert observed["prior_path"] == old_dispatch
+    assert observed["prior_snapshot"] == old_snapshot
+    assert observed["accepted"] == rel
+    assert observed["bound"] == str(mounted_root / rel)
+    assert observed["snapshot"] == b"ignored accepted bytes\n"
+
+
+def test_relocated_accepted_spec_disappearance_does_not_bind_fallback(project):
+    """A normalized absolute spec keeps its exact project-path authority.
+
+    Ablation: resolve the seed through the ordinary relative fallback and omit
+    the mounted-file gate; the nested fallback is bound after the accepted source
+    disappears between normalization and seeding.
+    """
+    from bmad_loop.engine import RunPaused
+
+    rel = "_bmad-output/implementation-artifacts/accepted-race.md"
+    ignore_before_commit(project, rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted operator bytes\n")
+    fallback = project.implementation_artifacts / rel
+    fallback.parent.mkdir(parents=True, exist_ok=True)
+    fallback.write_bytes(b"unrelated fallback bytes\n")
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    real_open = engine._worktree_flow._open_unit_workspace
+
+    def open_then_remove_source(*args, **kwargs):
+        unit = real_open(*args, **kwargs)
+        accepted.unlink()
+        return unit
+
+    engine._worktree_flow._open_unit_workspace = open_then_remove_source
+    drove: list[bool] = []
+
+    with pytest.raises(RunPaused, match="accepted spec.*disappeared"):
+        engine._run_isolated(task, lambda _task: drove.append(True))
+
+    assert drove == []
+    assert task.phase == Phase.ESCALATED
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_relocated_accepted_spec_escaping_the_mount_does_not_bind_an_outside_file(
+    project, tmp_path
+):
+    """A probe that leaves the unit is not delivery, however file-shaped it reads.
+
+    The accepted spec's parent is a real directory in the main checkout but a
+    committed OUTWARD symlink in the commit the fresh worktree is cut from, so
+    `_accepted_spec_seed` refuses on its own containment arm. Since DW-104 the rel
+    is nominated into `seed_files` anyway and therefore NAMED in
+    `worktree-seed-dropped` — `provision_worktree` re-derives `dst`, sees it escape
+    and copies nothing, and `worktree_seed_undelivered` reports the same rel from
+    its own containment arm. (Before that widening this refusal journalled nothing
+    at all, which is what DW-104 was.) The escalation is unchanged: the mounted
+    probe is still the guard that stops the bind, and file-ness alone follows the
+    link to an unrelated external artifact and reads as delivered.
+
+    Ablation: drop the containment clause at that probe (or the whole condition)
+    and the unit dispatches, bound to the outside file instead of escalating.
+
+    No `accepted-spec-delivery-unreachable` here: this is the RELOCATED leg, and it
+    escalates. Stated as an OBSERVATION, not as a graded claim — the ablation does
+    not exist for it. Deleting the `if not accepted_spec_relocated:` gate at the
+    call site leaves this row green, because the escalation above raises
+    `RunPaused` before control ever reaches that call. The gate is belt-and-braces
+    over a probe that would answer the same way anyway, and the only shape that
+    could tell the two apart is a main checkout whose own symlinks make the
+    locator's rel differ from `task.spec_file`. What this row does grade is the
+    absence a reader would otherwise have to take on trust: a relocated unit that
+    escalates leaves exactly one advisory RECORD — none — alongside the
+    `worktree-seed-dropped` entry the seed refusal still emits.
+    """
+    from bmad_loop.engine import RunPaused
+
+    rel_dir = "_bmad-output/accepted-elsewhere"
+    rel = f"{rel_dir}/escape.md"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "escape.md").write_bytes(b"unrelated external bytes\n")
+    link = project.project / rel_dir
+    link.symlink_to(outside, target_is_directory=True)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    # The commit keeps the outward symlink, so the fresh worktree materializes the
+    # escape; only the main checkout gets the real directory holding the accepted
+    # artifact, which is what lets the absolute spelling normalize in the first place.
+    link.unlink()
+    link.mkdir()
+    accepted = project.project / rel
+    accepted.write_bytes(b"accepted operator bytes\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    drove: list[bool] = []
+
+    with pytest.raises(RunPaused, match="accepted spec.*disappeared"):
+        engine._run_isolated(task, lambda _task: drove.append(True))
+
+    assert drove == []
+    assert task.phase == Phase.ESCALATED
+    assert (outside / "escape.md").read_bytes() == b"unrelated external bytes\n"
+    # the refused rel is now NAMED rather than silently dropped, and nothing was
+    # written outside the mount to make that naming possible
+    assert rel in _dropped_seed_entries(engine)
+    assert _undelivered_records(engine) == []
+
+
+def _fault_read_bytes(monkeypatch, faults) -> None:
+    """Make ``read_bytes`` raise for the paths ``faults`` selects; others read on.
+
+    A selective monkeypatch rather than `chmod`, for `conftest.fault_read_text`'s
+    reason: chmod is a no-op for root and carries no read bit on Windows, so the
+    fault would silently not fire on half the CI matrix — and a probe that never
+    faults grades nothing. Takes a PREDICATE because one of the two copies this
+    grades — the mount's — lives under a worktree path the test cannot name until
+    the run has already provisioned it.
+    """
+    real = Path.read_bytes
+
+    def fake(self, *a, **kw):
+        if faults(self):
+            raise PermissionError(13, "Permission denied")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_bytes", fake)
+
+
+def _fault_is_file(monkeypatch, faults) -> list[Path]:
+    """Make ``Path.is_file`` raise EACCES for the paths ``faults`` selects.
+
+    The existence-probe twin of :func:`_fault_read_bytes`, and a selective
+    monkeypatch for the same stated reason: `chmod` is a no-op for root and carries
+    no read bit on Windows, so the fault would silently not fire on half the CI
+    matrix. EACCES is the errno that separates a RAW probe from ``install._is_file``
+    on the interpreters where the raw probe raises at all: on Python <=3.13
+    ``Path.is_file`` raises it while folding ENOENT/ENOTDIR/EBADF/ELOOP to false. On
+    3.14 the raw probe folds EACCES too (``install._is_file``'s docstring records
+    the split), which is exactly why the fault is injected rather than staged on a
+    real filesystem — a `chmod` fixture would grade nothing on half the matrix.
+
+    Returns the list of paths actually faulted, in call order. Every caller asserts
+    on it: these predicates are path-identity based, so a change in how the locator
+    spells either end (different resolve strictness, a normalized mount root) would
+    quietly stop matching, and the row would go green while grading nothing.
+    """
+    real = Path.is_file
+    faulted: list[Path] = []
+
+    def fake(self, *a, **kw):
+        if faults(self):
+            faulted.append(Path(self))
+            raise PermissionError(13, "Permission denied")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "is_file", fake)
+    return faulted
+
+
+def _superseded_records(engine):
+    return [
+        entry
+        for entry in engine.journal.entries()
+        if entry["kind"] == "accepted-spec-write-unreachable"
+    ]
+
+
+def _undelivered_records(engine):
+    return [
+        entry
+        for entry in engine.journal.entries()
+        if entry["kind"] == "accepted-spec-delivery-unreachable"
+    ]
+
+
+def _dropped_seed_entries(engine) -> list[str]:
+    return [
+        rel
+        for entry in engine.journal.entries()
+        if entry["kind"] == "worktree-seed-dropped"
+        for rel in entry["entries"]
+    ]
+
+
+def _defer_reading_mount(engine, rel: str, seen: list[bytes]):
+    def drive(current):
+        seen.append((engine.workspace.root / rel).read_bytes())
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    return drive
+
+
+def test_mount_superseding_an_uncommitted_accepted_spec_warns_and_still_dispatches(project):
+    """The approval gate's residue, warned about rather than written (DW-101).
+
+    `pause_after_spec` hands the operator a spec that is uncommitted BY
+    CONSTRUCTION. A re-drive's fresh mount is a checkout of a commit, so for a
+    TRACKED artifacts dir it delivers the pre-approval bytes, `_accepted_spec_seed`
+    skips (its destination exists) and the `accepted_delivered` probe passes on
+    existence + containment alone — the corrections are silently superseded.
+
+    Ablation: delete the byte comparison in `_warn_accepted_spec_superseded`
+    (return before it) and this test FAILS — an existence-only probe is green for
+    every reason the mounted file could be there, which is the whole defect.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-tracked.md"
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    # No trailing newline: the mount is a git CHECKOUT, and under Git-for-Windows'
+    # system `core.autocrlf=true` (which conftest deliberately leaves reachable) a
+    # committed LF would come back CRLF. The newline is not load-bearing here.
+    accepted.write_bytes(b"pre-approval bytes")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    # what the operator corrected at the gate, still uncommitted
+    accepted.write_bytes(b"operator corrections\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    seen: list[bytes] = []
+
+    engine._run_isolated(task, _defer_reading_mount(engine, rel, seen))
+
+    (record,) = _superseded_records(engine)
+    assert record["story_key"] == "1-1-a"
+    # the MAIN-CHECKOUT path — the file the operator has to commit — and the branch
+    # to commit it on, not the mount's copy and not the base
+    assert record["spec_file"] == str(accepted.resolve())
+    assert record["target_branch"] == "main"
+    assert record["compared"] is True
+    # advisory only: the unit still dispatched — and what it read is the MOUNT's
+    # copy, still the committed pre-approval bytes, so the warning did not repair
+    # what it reported. That is deliberate: a dirty TRACKED file inside the mount is
+    # not covered by the worktree-scoped exclude fold, so `finalize_commit`'s
+    # `git add -A` would fold the operator's in-progress edits into the story commit.
+    assert seen == [b"pre-approval bytes"]
+    # and the main checkout still holds the operator's corrections, untouched
+    assert accepted.read_bytes() == b"operator corrections\n"
+
+
+def test_byte_identical_accepted_spec_delivery_journals_no_warning(project):
+    """A committed spec the mount reproduces exactly is no loss, so no record."""
+    rel = "_bmad-output/implementation-artifacts/accepted-committed.md"
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    # No trailing newline: the mount is a git CHECKOUT, and under Git-for-Windows'
+    # system `core.autocrlf=true` (which conftest deliberately leaves reachable) a
+    # committed LF would come back CRLF. The newline is not load-bearing here.
+    accepted.write_bytes(b"accepted and committed")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    seen: list[bytes] = []
+
+    engine._run_isolated(task, _defer_reading_mount(engine, rel, seen))
+
+    assert seen == [b"accepted and committed"]
+    assert _superseded_records(engine) == []
+
+
+def test_accepted_spec_differing_only_in_line_endings_journals_no_warning(project):
+    """CRLF in the mount against LF in the main checkout is not a lost correction.
+
+    The mount is a git CHECKOUT: under Git-for-Windows' system `core.autocrlf=true`
+    an LF-authored spec comes back CRLF there while the main checkout keeps the LF
+    bytes the spec writer laid down. Git folds that difference away on the next
+    commit, so the record must not report it. Provoked here without autocrlf by
+    COMMITTING the spec as CRLF — a checkout delivers the committed bytes verbatim —
+    and leaving the LF spelling of the same text uncommitted in the main checkout;
+    under autocrlf the commit normalizes and the checkout re-expands, which lands
+    the same two spellings on the two sides.
+
+    Ablation: compare raw bytes in `_warn_accepted_spec_superseded` and this
+    journals a `compared: true` record for a spec nobody corrected.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-crlf.md"
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted text\r\nsecond line\r\n")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted.write_bytes(b"accepted text\nsecond line\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    seen: list[bytes] = []
+
+    engine._run_isolated(task, _defer_reading_mount(engine, rel, seen))
+
+    # premise: the two sides really do differ as bytes, and only in line endings
+    assert seen == [b"accepted text\r\nsecond line\r\n"]
+    assert accepted.read_bytes() == b"accepted text\nsecond line\n"
+    assert _superseded_records(engine) == []
+
+
+def test_a_lone_cr_in_the_accepted_spec_still_counts_as_a_correction(project):
+    """Only CRLF folds. A bare CR is a byte git would commit, so it is reported —
+    the normalization must not widen into "ignore all carriage returns"."""
+    rel = "_bmad-output/implementation-artifacts/accepted-lone-cr.md"
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted text")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted.write_bytes(b"accepted\rtext")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    seen: list[bytes] = []
+
+    engine._run_isolated(task, _defer_reading_mount(engine, rel, seen))
+
+    assert seen == [b"accepted text"]
+    (record,) = _superseded_records(engine)
+    assert record["compared"] is True
+
+
+def test_seeded_accepted_spec_journals_no_supersede_warning(project):
+    """The seed's own case: a gitignored spec the checkout cannot carry.
+
+    `_accepted_spec_seed` lays the operator's bytes into the mount before this
+    probe runs, so the comparison it then makes is against the file the seed just
+    wrote. Nothing was superseded and nothing is journalled — the warning must not
+    fire on the leg the seed already fixes.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-seeded.md"
+    ignore_before_commit(project, rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted operator bytes\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    seen: list[bytes] = []
+
+    engine._run_isolated(task, _defer_reading_mount(engine, rel, seen))
+
+    assert seen == [b"accepted operator bytes\n"]
+    assert _superseded_records(engine) == []
+
+
+def test_unreadable_main_accepted_spec_warns_with_compared_false(project, monkeypatch):
+    """A probe that cannot READ cannot prove the mount carries the operator's bytes.
+
+    The MAIN-checkout half of the matrix's "either copy" row. The bytes are
+    identical here, so an unfaulted run journals nothing — the record exists purely
+    because the comparison could not be made, which is what `compared: false` says.
+    No exception escapes `run_isolated`: the unit still dispatches.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-unreadable.md"
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted and committed\n")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    drove: list[bool] = []
+    _fault_read_bytes(monkeypatch, lambda path: path == accepted.resolve())
+
+    def drive(current):
+        drove.append(True)
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    (record,) = _superseded_records(engine)
+    assert record["spec_file"] == str(accepted.resolve())
+    assert record["target_branch"] == "main"
+    assert record["compared"] is False
+    assert drove == [True]
+
+
+def test_accepted_spec_outside_the_project_journals_no_supersede_warning(project, tmp_path):
+    """Nothing to supersede: the locator answers only for a project-local spec.
+
+    Two shapes in one run, because both reach `_accepted_spec_pair`'s first arm and
+    both must stay silent. An EXTERNAL absolute spec keeps its spelling through
+    `relativize_project_local_accepted_spec` (it is outside the project, so the
+    mount already reads that very file), and a spec-less task has no path to
+    compare at all — the shape most of this suite dispatches in.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    external = tmp_path / "outside-spec.md"
+    external.write_bytes(b"external accepted bytes\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+
+    def defer(current):
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    for key, spec in (("1-1-a", str(external)), ("1-1-b", "")):
+        task = StoryTask(key, 1, spec_file=spec)
+        engine.state.tasks[task.story_key] = task
+        engine._run_isolated(task, defer)
+
+    assert _superseded_records(engine) == []
+    assert external.read_bytes() == b"external accepted bytes\n"
+    # and neither shape is the delivery record's business either: an absolute
+    # spelling and an empty one both leave the locator all-None WITHOUT `faulted`,
+    # which is the state that separates "no claim here" from "a fault was
+    # swallowed". Ablation: fire the record whenever the mount cannot prove
+    # delivery (drop the `ends.relative is None and not ends.faulted` return) and
+    # this row reddens with two records for two specs this path never owned.
+    assert _undelivered_records(engine) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_relative_accepted_spec_resolving_outside_the_project_journals_nothing(project, tmp_path):
+    """The third out-of-project shape, and the one only the locator can tell apart.
+
+    A RELATIVE spelling is not automatically this path's business: resolved through
+    a symlinked directory it can land under a shared artifacts tree outside the
+    project, which the mount reads directly and which no seed may copy. The locator
+    answers `source` set / `relative` None for it — deliberately NOT `faulted`, so
+    the delivery record stays silent even though the mount plainly does not carry
+    the file.
+
+    Ablation: fold the source-outside-the-project arm of `_accepted_spec_pair` into
+    its fault arm (return `faulted=True` there) and this row reddens with an
+    `accepted-spec-delivery-unreachable` naming a spec the project never owned.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    outside = tmp_path / "shared-artifacts"
+    outside.mkdir()
+    (outside / "shared-spec.md").write_bytes(b"external accepted bytes\n")
+    link = project.project / "linked-artifacts"
+    link.symlink_to(outside, target_is_directory=True)
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    # relative on purpose: `accepted_spec_relocated` stays False, so the advisory
+    # probe actually runs rather than being skipped by the relocated gate
+    task = StoryTask("1-1-a", 1, spec_file="linked-artifacts/shared-spec.md")
+    engine.state.tasks[task.story_key] = task
+    drove: list[bool] = []
+
+    def drive(current):
+        drove.append(True)
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    assert drove == [True]
+    assert _undelivered_records(engine) == []
+    assert _superseded_records(engine) == []
+    assert (outside / "shared-spec.md").read_bytes() == b"external accepted bytes\n"
+
+
+def test_unreadable_mounted_accepted_spec_warns_with_compared_false(project, monkeypatch):
+    """The MOUNT half of the matrix's "either copy" row.
+
+    `source.read_bytes() == destination.read_bytes()` short-circuits nothing on the
+    left, but the two reads are separate syscalls and only the second one touches
+    the mount — so a fault on the main-checkout copy (the sibling test) never
+    reaches the destination read at all, and the mount-side leg needs its own row.
+
+    Ablation: narrow the comparison's `except` to the source read alone and this
+    reddens with a PermissionError out of `run_isolated`, which is the "no
+    filesystem fault may raise out of this path" clause failing.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-mount-unreadable.md"
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted and committed\n")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    drove: list[bool] = []
+    # every copy of this rel EXCEPT the main checkout's — i.e. the one the mount
+    # carries, whose path the test cannot name until provisioning has run
+    main_copy = accepted.resolve()
+    _fault_read_bytes(monkeypatch, lambda path: path.name == accepted.name and path != main_copy)
+
+    def drive(current):
+        drove.append(True)
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    (record,) = _superseded_records(engine)
+    assert record["spec_file"] == str(main_copy)
+    assert record["compared"] is False
+    assert drove == [True]
+
+
+def test_project_relative_accepted_spec_superseded_by_the_mount_warns(project):
+    """The leg the call site is UNGATED for: a spec already spelled relative.
+
+    `relativize_project_local_accepted_spec` has nothing to do here, so
+    `accepted_spec_relocated` is False, the `accepted_delivered` escalation above is
+    skipped — and the loss is identical, because the mount still delivers the
+    committed bytes over the operator's uncommitted corrections. This is also the
+    spelling a resume PERSISTS, so it is the shape a re-drive actually arrives in.
+
+    Ablation: re-gate the `_warn_accepted_spec_superseded` call under
+    `if accepted_spec_relocated:` and this test FAILS while every other row in this
+    group stays green — they all pass an absolute `spec_file`.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-relative.md"
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    # No trailing newline: the mount is a git CHECKOUT, and under Git-for-Windows'
+    # system `core.autocrlf=true` (which conftest deliberately leaves reachable) a
+    # committed LF would come back CRLF. The newline is not load-bearing here.
+    accepted.write_bytes(b"pre-approval bytes")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted.write_bytes(b"operator corrections\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=rel)
+    engine.state.tasks[task.story_key] = task
+    seen: list[bytes] = []
+
+    engine._run_isolated(task, _defer_reading_mount(engine, rel, seen))
+
+    (record,) = _superseded_records(engine)
+    # resolved to the main-checkout ABSOLUTE path even though the task spelled it
+    # relative — the record has to name the file the operator must commit
+    assert record["spec_file"] == str(accepted.resolve())
+    assert record["target_branch"] == "main"
+    assert record["compared"] is True
+    assert seen == [b"pre-approval bytes"]
+    # The DELIVERY control for the same call site: this is the one leg where both
+    # advisory probes run (relative spelling, so `accepted_spec_relocated` is False),
+    # and the mount PROVES delivery — wrong bytes, but present and contained. The
+    # delivery record must not fire on a loss that is not its own.
+    # Ablation: drop the `if delivered: return` arm in
+    # `_warn_accepted_spec_undelivered` and this row reddens.
+    assert _undelivered_records(engine) == []
+
+
+def test_unprobeable_main_accepted_spec_seeds_nothing_instead_of_raising(project, monkeypatch):
+    """The MAIN-checkout conjunct of the seed's existence arm, `not _is_file(source)`.
+
+    `_accepted_spec_seed`'s call site sits outside every `except` in
+    `run_isolated`, so a probe that RAISES kills the whole run rather than
+    allowing dispatch to continue. On Python <=3.13 a raw `Path.is_file` raises EACCES where
+    `install._is_file` folds it to the answer a copier already understands: there
+    are no bytes to promise, so seed nothing.
+
+    The fault is INJECTED at this one arm, and that is not a convenience — it is
+    the only way to reach it. A merely unsearchable parent never gets here on any
+    interpreter: `_accepted_spec_pair` resolves the source `strict=True`, which
+    raises first and folds the pair to None (measured on 3.13 and 3.14). What this
+    row grades is therefore the arm's totality against the faults that CAN reach
+    it — a TOCTOU between the locator's resolve and this stat, or a non-EACCES
+    OSError — not the unsearchable-parent story, which lands on the mount arm
+    below.
+
+    Ablation: restore `source.is_file()` on the left conjunct and this row reddens
+    with a `PermissionError` escaping `run_isolated`, while the mount-side row
+    below stays green.
+
+    The BARE BASENAME spelling is load-bearing, not incidental. `_accepted_spec_pair`
+    resolves a relative spec through `verify.resolve_spec_path`, whose own
+    `candidate.is_file()` is raw and sits inside the locator's `except OSError` — so
+    spelling the full project-relative rel points that probe at this very path, the
+    locator folds to None first, and the seed returns `()` no matter which probe its
+    existence arm uses. A basename makes `resolve_spec_path` probe
+    `project/<basename>` (absent, unfaulted) and fall back to the
+    implementation-artifacts copy UNPROBED, so the seed's own arm is the first
+    thing to touch the faulted path. Re-spell this as the full rel and the row
+    goes green against the bug it is here to pin.
+    """
+    name = "accepted-source-unprobeable.md"
+    rel = f"_bmad-output/implementation-artifacts/{name}"
+    ignore_before_commit(project, rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted operator bytes\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    # RELATIVE on purpose: `accepted_spec_relocated` stays False, so the
+    # `accepted_delivered` escalation cannot mask an unseeded mount with a pause.
+    task = StoryTask("1-1-a", 1, spec_file=name)
+    engine.state.tasks[task.story_key] = task
+    main_copy = accepted.resolve()
+    faulted = _fault_is_file(monkeypatch, lambda path: path == main_copy)
+    mounted: list[bool] = []
+
+    def drive(current):
+        mounted.append((engine.workspace.root / rel).exists())
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    # the fault really fired, and only on the arm this row means to grade
+    assert set(faulted) == {main_copy}
+    # the unit dispatched, ran to its own terminal phase and was neither escalated
+    # nor paused — `run_isolated` returning at all is what says no fault escaped it
+    assert mounted == [False]
+    assert task.phase == Phase.DEFERRED
+    assert "story-escalated" not in journal_kinds(engine)
+    # grades only that the DW-101 warning neither fired nor raised; it cannot
+    # distinguish a seed outcome, since the same faulted probe returns it early
+    assert _superseded_records(engine) == []
+    # DW-115: `mounted == [False]` above IS the defect — the unit dispatched against
+    # a mount lacking the operator's spec, un-escalated, and until this record
+    # nothing in the journal named why. No gate on this leg can see it: the
+    # `accepted_delivered` escalation is skipped for a relative spelling, and the rel
+    # never reaches `worktree-seed-dropped` because the seed's source arm folded its
+    # fault to "no bytes to promise" and nominated nothing. `located` is TRUE — the
+    # LOCATOR resolved the rel; it was the seed's existence arm that faulted.
+    #
+    # Ablation: delete the `self.journal.append` in
+    # `_warn_accepted_spec_undelivered` and this row reddens while every silent
+    # control stays green.
+    (unreachable,) = _undelivered_records(engine)
+    assert unreachable["story_key"] == "1-1-a"
+    # the MAIN-CHECKOUT path, matching the DW-101 record's spelling: both name the
+    # file the operator has to look at, never the mount's missing copy
+    assert unreachable["spec_file"] == str(main_copy)
+    assert unreachable["target_branch"] == "main"
+    assert unreachable["located"] is True
+
+
+def test_unprobeable_mounted_accepted_spec_folds_to_absent_instead_of_raising(project, monkeypatch):
+    """The MOUNT conjunct of the same arm, `_is_file(destination)`.
+
+    The two probes are separate syscalls and the left one answers true here, so
+    the source-side fault above never reaches this one — the conjunct needs its own
+    row. This is also the arm an unsearchable parent genuinely lands on: the
+    locator resolves the destination `strict=False`, which can leave an inaccessible
+    suffix unresolved. Other resolution failures can still fold the pair to None.
+
+    What is graded is the FOLD, not delivery: an unprobeable destination answers
+    ABSENT, so the rel is named and no exception escapes `run_isolated`. Whether
+    the operator's bytes then arrive is decided downstream by the seed loop's
+    `install._occupied`, which probes `exists()` — and under a REAL unsearchable
+    parent that raises too on <=3.13, folding to "occupied", so the loop would skip
+    the copy and journal `worktree-seed-skipped`. Delivery is asserted here only
+    because the injected fault is scoped to `Path.is_file`, leaving `exists()`
+    honest; it pins the arm's fold, not a promise about a real EACCES mount.
+
+    Ablation: restore `destination.is_file()` on the right conjunct and this row
+    reddens with a `PermissionError` escaping `run_isolated`, while the
+    source-side row above stays green.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-mount-unprobeable.md"
+    ignore_before_commit(project, rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted operator bytes\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=rel)
+    engine.state.tasks[task.story_key] = task
+    # every copy of this rel EXCEPT the main checkout's — i.e. the one the mount
+    # carries, whose path the test cannot name until provisioning has run. The
+    # predicate is deliberately broader than that one path; the assertion below is
+    # what pins the fault to exactly the mount's copy.
+    main_copy = accepted.resolve()
+    faulted = _fault_is_file(
+        monkeypatch,
+        lambda path: path.name == accepted.name and path not in (main_copy, accepted),
+    )
+    seen: list[bytes] = []
+    mounts: list[Path] = []
+
+    def drive(current):
+        mounts.append(engine.workspace.root)
+        seen.append((engine.workspace.root / rel).read_bytes())
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    # the fault fired on exactly the mount's copy of the rel, and nowhere else
+    (mount,) = mounts
+    assert set(faulted) == {(mount / rel).resolve()}
+    assert seen == [b"accepted operator bytes\n"]
+    assert task.phase == Phase.DEFERRED
+    assert "story-escalated" not in journal_kinds(engine)
+    # grades only that the DW-101 warning neither fired nor raised; it cannot
+    # distinguish a seed outcome, since the same faulted probe returns it early
+    assert _superseded_records(engine) == []
+    # The advisory delivery record DOES fire here, and correctly so: the injected
+    # fault is scoped to `Path.is_file`, which is the very probe that would prove
+    # delivery, so the record's own arm cannot prove it either. "Cannot prove" is
+    # what the record says — an unprovable delivery is exactly what it is for — and
+    # it stays advisory: the unit read the operator's bytes and ran to DEFERRED.
+    (unreachable,) = _undelivered_records(engine)
+    assert unreachable["located"] is True
+
+
+def test_unresolvable_accepted_spec_records_the_swallowed_locator_fault(project, monkeypatch):
+    """The locator's OWN `except`, which is the second mouth of DW-115's silence.
+
+    `_accepted_spec_pair` resolves the source `strict=True` inside a
+    `except (OSError, RuntimeError, ValueError)`. A real filesystem fault there —
+    the #529/#536 WSL UNC shape this stub reproduces — is swallowed, and the seed
+    returns `()` byte-identically to "this spelling is not ours". The mount then
+    lacks the operator's spec, the relative spelling skips the `accepted_delivered`
+    escalation, and the unit dispatches against the bare story key.
+
+    `located` is FALSE here, and that is the whole reason the discriminator exists:
+    it separates a fault the locator swallowed (no rel was ever derived) from the
+    unprobeable-source row above, where the rel WAS derived and only the seed's
+    existence arm folded. Same record, two different remedies.
+
+    Ablation: return `_AcceptedSpecEnds()` instead of `_AcceptedSpecEnds(faulted=True)`
+    from that `except` and this row reddens — the record's entry condition is
+    `faulted`, since a rel-less all-None locator result is otherwise exactly the
+    spelling this path has no claim on.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-unresolvable.md"
+    ignore_before_commit(project, rel)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted operator bytes\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    # RELATIVE on purpose: `accepted_spec_relocated` stays False, so no escalating
+    # gate can mask the silent dispatch this row is here to name.
+    task = StoryTask("1-1-a", 1, spec_file=rel)
+    engine.state.tasks[task.story_key] = task
+    # after every expectation is computed: the stub raises for this exact spelling
+    refuse_to_resolve(monkeypatch, project.project / rel)
+    mounted: list[bool] = []
+
+    def drive(current):
+        mounted.append((engine.workspace.root / rel).exists())
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    # the fault did not escape `run_isolated`, and nothing escalated
+    assert mounted == [False]
+    assert task.phase == Phase.DEFERRED
+    assert "story-escalated" not in journal_kinds(engine)
+    assert _superseded_records(engine) == []
+    (unreachable,) = _undelivered_records(engine)
+    assert unreachable["story_key"] == "1-1-a"
+    # no `source` to name, so the record falls back to the project-anchored spelling
+    assert unreachable["spec_file"] == str(project.project / rel)
+    assert unreachable["target_branch"] == "main"
+    assert unreachable["located"] is False
+
+
+def test_missing_accepted_spec_records_the_unresolvable_locator_arm(project):
+    """The ordinary shape of `located: false` — no injected fault at all.
+
+    `_accepted_spec_pair` resolves the source `strict=True` inside one
+    `except (OSError, RuntimeError, ValueError)`, so a spelling that simply is not
+    there lands on the same arm a swallowed filesystem fault does. That is why the
+    record's `located: false` is documented as "the locator could not resolve the
+    spec at all" rather than as a fault: from inside that `except` the two causes
+    are indistinguishable, and the record claims only what it can tell.
+
+    A missing accepted spec is not a hypothetical: a re-drive whose artifacts dir
+    was cleaned, or a task carrying a spelling from a tree that has moved, arrives
+    exactly here — the unit dispatches against the bare story key with nothing in
+    the journal naming the spec it was supposed to read.
+
+    Ablation: return `_AcceptedSpecEnds()` rather than `faulted=True` from the
+    locator's source-resolve `except`, and this row
+    reddens with no record for a spec the mount plainly lacks. The
+    `resolving_outside_the_project` row above is the control that keeps the widened
+    `faulted` arm from swallowing spellings this path has no claim on.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    rel = "_bmad-output/implementation-artifacts/accepted-never-written.md"
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    # relative on purpose: `accepted_spec_relocated` stays False, so no escalating
+    # gate can mask the silent dispatch
+    task = StoryTask("1-1-a", 1, spec_file=rel)
+    engine.state.tasks[task.story_key] = task
+    mounted: list[bool] = []
+
+    def drive(current):
+        mounted.append((engine.workspace.root / rel).exists())
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    assert mounted == [False]
+    assert task.phase == Phase.DEFERRED
+    assert "story-escalated" not in journal_kinds(engine)
+    (unreachable,) = _undelivered_records(engine)
+    assert unreachable["spec_file"] == str(project.project / rel)
+    assert unreachable["target_branch"] == "main"
+    assert unreachable["located"] is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("outside_present", [True, False])
+def test_project_relative_accepted_spec_escaping_the_mount_is_dropped_and_recorded(
+    project, tmp_path, outside_present
+):
+    """DW-104's own leg: the containment refusal with NO escalating gate above it.
+
+    Same shape as the relocated row further up — the accepted spec's parent is a
+    real directory in the main checkout and a committed OUTWARD symlink in the
+    commit the worktree is cut from — but the task already spells `spec_file`
+    relative, which is the spelling a resume PERSISTS. `accepted_spec_relocated` is
+    therefore False, the `accepted_delivered` escalation is skipped, and until
+    DW-104 the whole loss was silent: `_accepted_spec_seed` refused on the
+    locator's containment arm and the rel reached no journal at all.
+
+    Both halves of the fix are graded here. The rel is now nominated into
+    `seed_files`, which is safe only because `provision_worktree` re-derives `dst`
+    and `continue`s on its own containment check — so `worktree_seed_undelivered`
+    names it in `worktree-seed-dropped` while NOTHING is written outside the mount.
+    And the advisory record fires, because file-ness at the mounted probe follows
+    the outward link to an unrelated external artifact and so cannot prove
+    delivery.
+
+    Ablation for the seed half: return `()` from `_accepted_spec_seed` on
+    `destination is None` and the `worktree-seed-dropped` assertion reddens while
+    the record still fires. Ablation for the containment clause: drop it from the
+    new probe and the record assertion reddens while the drop stays green.
+    """
+    rel_dir = "_bmad-output/relative-accepted-elsewhere"
+    rel = f"{rel_dir}/escape.md"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if outside_present:
+        (outside / "escape.md").write_bytes(b"unrelated external bytes\n")
+    link = project.project / rel_dir
+    link.symlink_to(outside, target_is_directory=True)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    # the commit keeps the outward symlink, so the fresh worktree materializes the
+    # escape; only the main checkout gets the real directory holding the artifact
+    link.unlink()
+    link.mkdir()
+    accepted = project.project / rel
+    accepted.write_bytes(b"accepted operator bytes\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=rel)
+    engine.state.tasks[task.story_key] = task
+    drove: list[bool] = []
+
+    def drive(current):
+        drove.append(True)
+        current.phase = Phase.DEFERRED
+        current.defer_reason = "test complete"
+
+    engine._run_isolated(task, drive)
+
+    # advisory throughout: the unit dispatched and reached its own terminal phase
+    assert drove == [True]
+    assert task.phase == Phase.DEFERRED
+    assert "story-escalated" not in journal_kinds(engine)
+    assert rel in _dropped_seed_entries(engine)
+    (unreachable,) = _undelivered_records(engine)
+    assert unreachable["spec_file"] == str(accepted.resolve())
+    assert unreachable["target_branch"] == "main"
+    # the locator DID derive the rel — the refusal was containment, not a fault
+    assert unreachable["located"] is True
+    # nothing was copied out of the mount to make any of that reporting possible
+    if outside_present:
+        assert (outside / "escape.md").read_bytes() == b"unrelated external bytes\n"
+    else:
+        # Ablation: remove provisioning's destination-containment and raw/resolved
+        # mismatch guards plus _copy_traversable's target-containment check.
+        # The absent-file assertion fails; the occupied-file control stays green.
+        assert not (outside / "escape.md").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_accepted_spec_seed_nominates_a_file_but_never_a_directory(project, tmp_path):
+    """The seed's existence arm is shared by BOTH branches, nomination included.
+
+    Graded directly on `_accepted_spec_seed` rather than through `_run_isolated`:
+    this is the lowest layer that can catch the regression, and the two rows differ
+    in exactly one bit — whether the source is a regular file — against one
+    identical escaping mount, which an end-to-end row cannot hold that still.
+
+    The mount's artifacts dir is an OUTWARD symlink, so both destinations resolve
+    out of the worktree and the locator refuses on containment with its rel known.
+    That is the NOMINATION branch, and the file row is the control proving it is
+    reached: without the shared `_is_file(source)` arm the directory would be
+    nominated the same way, and `provision_worktree` recurses whatever it is handed
+    — a refusal that came from an unresolvable mount root rather than a real escape
+    would leave it a contained `dst` and copy the whole tree into the mount.
+
+    Ablation: move `if not _is_file(source): return ()` below the
+    `if ends.destination is None:` branch and the directory row reddens with the rel
+    nominated, while the file control stays green.
+    """
+    artifacts = project.implementation_artifacts
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (artifacts / "escaping-file.md").write_bytes(b"accepted operator bytes\n")
+    (artifacts / "escaping-dir").mkdir()
+    (artifacts / "escaping-dir" / "part.md").write_bytes(b"accepted operator bytes\n")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    mount = tmp_path / "mount"
+    (mount / "_bmad-output").mkdir(parents=True)
+    (mount / "_bmad-output" / "implementation-artifacts").symlink_to(
+        outside, target_is_directory=True
+    )
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    flow = engine._worktree_flow
+
+    # control: the containment refusal DOES reach the nomination branch — a regular
+    # file with an escaping destination is handed to the copier, which refuses it on
+    # its own re-derived containment check (the row above grades that end to end)
+    assert flow._accepted_spec_seed(StoryTask("1-1-a", 1, spec_file="escaping-file.md"), mount) == (
+        "_bmad-output/implementation-artifacts/escaping-file.md",
+    )
+    # the guard: same mount, same refusal, directory source — nominated by neither
+    assert flow._accepted_spec_seed(StoryTask("1-1-b", 1, spec_file="escaping-dir"), mount) == ()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -339,6 +1511,57 @@ def test_undelivered_arbitrary_seed_is_journaled_never_escalated(project, tmp_pa
     ]
     assert len(dropped) == 1 and dropped[0]["entries"] == [".mcp.json"]
     assert "story-escalated" not in journal_kinds(engine)
+
+
+def test_undelivered_module_skill_is_journaled_never_escalated(project):
+    """#464 — a wheel-bundled MODULE_SKILL whose content never reached the unit
+    worktree is journaled under its own kind, and the run still completes.
+
+    The obstruction is the real copier's, not a mock's: a plain FILE tracked at the
+    skill's destination rel is carried into the checkout by `git worktree add`, and
+    `_copy_traversable`'s no-clobber then prunes the whole subtree at its root (a
+    non-directory squatting a directory target wins, and mkdir must never replace
+    it). So the copy loop lands nothing and the real predicate reports it under the
+    real engine.
+
+    `attach_profile` is REQUIRED, not decoration: MockAdapter deliberately carries
+    no profile, `worktree_profiles` then yields no skill trees at all, and the
+    MODULE_SKILLS copy loop and this predicate never run — the test would pass
+    while asserting nothing.
+
+    Ablation: delete the `module_skills_seed_undelivered` call (or its journal
+    append) in `WorktreeFlow.run_isolated` and the entry assertion fails; route its
+    result into `escalate_unit` instead and the `summary.done == 1` assertion
+    fails. Both halves of "journaled, never escalated" are load-bearing."""
+    tree = ".claude/skills"
+    squatted = "bmad-loop-sweep"
+    assert squatted in MODULE_SKILLS  # the precondition that makes this bite
+    squatter = project.project / tree / squatted
+    squatter.parent.mkdir(parents=True, exist_ok=True)
+    squatter.write_text("a file where the wheel has a directory\n", encoding="utf-8")
+    # NOT gitignored and committed by `git add -A`: only a TRACKED squatter rides
+    # the checkout into the worktree, where the copier meets it.
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+        policy=wt_policy(),
+    )
+    attach_profile(adapter)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    dropped = [
+        entry
+        for entry in engine.journal.entries()
+        if entry["kind"] == "worktree-module-skills-dropped"
+    ]
+    assert len(dropped) == 1 and dropped[0]["entries"] == [f"{tree}/{squatted}"]
+    assert "story-escalated" not in journal_kinds(engine)
+    # Provenance stays observable: the wheel's own skills report under their own
+    # kind, never folded into the arbitrary-seed one.
+    assert "worktree-seed-dropped" not in journal_kinds(engine)
 
 
 def test_hook_config_is_seeded_for_every_non_hookless_profile(project, monkeypatch):
@@ -705,6 +1928,13 @@ def _harvest_carry_events(engine):
     return [entry for entry in engine.journal.entries() if entry["kind"] == "harvest-carried"]
 
 
+def _rows(engine, kind: str) -> list[dict]:
+    """Every journal row of one kind. The negative form (`== []`) is half of what the
+    DW-237 refusal rows below assert: the refusal REPLACES the publish, so both the
+    commit row and the `-uncommitted` degrade row must be absent, not merely joined."""
+    return [entry for entry in engine.journal.entries() if entry["kind"] == kind]
+
+
 def test_deferred_isolated_unit_carries_harvest_before_terminal_save(project):
     """A dropped failed worktree cannot be the only durable home of its finding."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -769,17 +1999,7 @@ def test_deferred_carry_commit_failure_resumes_before_terminal_integration(proje
     assert "story-deferred" not in journal_kinds(engine)
     assert "unit-closed" not in journal_kinds(engine)
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([])
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, adapter = resume_engine(project, engine)
     summary = resumed.run()
 
     restored = load_state(resumed.run_dir).tasks["1-1-a"]
@@ -839,17 +2059,7 @@ def test_dev_defer_carry_failure_resumes_the_rejected_decision(project, monkeypa
     assert "story-deferred" not in journal_kinds(engine)
     assert "unit-closed" not in journal_kinds(engine)
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([])
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, adapter = resume_engine(project, engine)
     summary = resumed.run()
 
     restored = load_state(resumed.run_dir).tasks["1-1-a"]
@@ -932,6 +2142,954 @@ def test_done_isolated_unit_carries_gitignored_harvests_from_every_successful_pa
     assert [event["dw_ids"] for event in _harvest_carry_events(engine)] == [["DW-1", "DW-2"]]
 
 
+def test_carry_harvest_over_undecodable_main_ledger_pauses_before_the_latch(project):
+    """The PUBLISH arm at the isolated carry (DW-231). The main ledger the unit's
+    findings are to be re-filed into cannot be read, so the carry pauses the run
+    for repair — `RunPaused` at `escalation`, `ledger-read-refused` site
+    `harvest-carry`, an `ACTION REQUIRED` notice naming the ledger — and does so
+    BEFORE `harvest_carry_commit_pending` is latched: nothing records a commit
+    obligation this call never took on, nothing is written, and the phase is
+    untouched, so the `defer_reason` re-entry or `_replay_unlatched_ledger_carries`
+    re-runs the carry on resume.
+
+    Ablation: delete the `except LedgerReadError` around the carry's
+    `read_for_write` and this reds with `LedgerReadError` escaping the call."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.model import PAUSE_ESCALATION
+
+    bad = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(bad)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[_harvest_record()])
+    engine.state.tasks[task.story_key] = task
+
+    with pytest.raises(RunPaused) as excinfo:
+        engine._carry_harvested_deferrals(task)
+
+    assert excinfo.value.stage == PAUSE_ESCALATION
+    assert excinfo.value.story_key == "1-1-a"
+    assert task.harvest_carry_commit_pending is False  # paused BEFORE the latch
+    assert project.deferred_work.read_bytes() == bad  # nothing written
+    assert _harvest_carry_events(engine) == []
+    (refused,) = _rows(engine, "ledger-read-refused")
+    assert refused["site"] == "harvest-carry"
+    assert refused["ledger"] == str(project.deferred_work) and "not valid UTF-8" in refused["error"]
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention and str(project.deferred_work) in attention
+    assert "`bmad-loop resume test-run`" in attention
+
+
+def test_carry_harvest_over_os_refused_main_ledger_pauses_before_the_latch(project, monkeypatch):
+    """The PUBLISH arm at the isolated carry for a read the OS refuses (DW-258),
+    the EACCES twin of the DW-231 row above. The main ledger the unit's findings
+    are to be re-filed into raises `PermissionError`, so the carry pauses the run
+    for repair — `RunPaused` at `escalation`, `ledger-read-refused` site
+    `harvest-carry` naming `PermissionError`, an `ACTION REQUIRED` notice naming
+    the ledger — BEFORE `harvest_carry_commit_pending` is latched: nothing records
+    a commit obligation, nothing is written, no `harvest-carried` row.
+
+    Injected with `conftest.fault_read_text` (selective, never `chmod`; `read_bytes`
+    is untouched so the bytes can be asserted unchanged).
+
+    Ablation: narrow the carry's `except` tuple back to `LedgerReadError` and this
+    reds with `PermissionError` escaping the call."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.model import PAUSE_ESCALATION
+
+    before = b"# Deferred Work\n"
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(before)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[_harvest_record()])
+    engine.state.tasks[task.story_key] = task
+    fault_read_text(monkeypatch, project.deferred_work)
+
+    with pytest.raises(RunPaused) as excinfo:
+        engine._carry_harvested_deferrals(task)
+
+    assert excinfo.value.stage == PAUSE_ESCALATION
+    assert excinfo.value.story_key == "1-1-a"
+    assert task.harvest_carry_commit_pending is False  # paused BEFORE the latch
+    assert project.deferred_work.read_bytes() == before  # nothing written
+    assert _harvest_carry_events(engine) == []
+    (refused,) = _rows(engine, "ledger-read-refused")
+    assert refused["site"] == "harvest-carry" and refused["story_key"] == "1-1-a"
+    assert refused["ledger"] == str(project.deferred_work)
+    assert "PermissionError" in refused["error"] and str(project.deferred_work) in refused["error"]
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention and str(project.deferred_work) in attention
+    assert "`bmad-loop resume test-run`" in attention
+
+
+def test_done_unit_carry_over_undecodable_main_ledger_pauses_and_resume_recarries(project):
+    """The carry pause on a FULL isolated run, and the recovery it is shaped for
+    (DW-231). The unit's dev session records a finding and files it in the unit's
+    own gitignored ledger; after the session, MAIN's ledger turns undecodable. The
+    merge lands, the carry cannot read main's ledger and pauses the run — task
+    `DONE`, `isolated_ledger_carried` still False, `ledger-read-refused` site
+    `harvest-carry`, no `harvest-carried`, main's bytes untouched. After the
+    repair, resume finds the merged-but-uncarried unit in
+    `_replay_unlatched_ledger_carries`, re-runs the carry (`resume-ledger-carry`,
+    then `harvest-carried`), files the entry into main and latches the carry —
+    with ZERO sessions re-run.
+
+    Ablation: delete the `except LedgerReadError` around the carry's
+    `read_for_write` and the first half reds with `run-crash`."""
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    bad = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+    dev = wt_dev_effect(project, "1-1-a", followup_review=False, deferred=[_HARVEST_CARRY])
+
+    def dev_then_corrupt_main(spec):
+        result = dev(spec)
+        project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+        project.deferred_work.write_bytes(bad)
+        return result
+
+    engine, _ = make_engine(project, [dev_then_corrupt_main])
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert summary.paused and not summary.crashed
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert task.phase == Phase.DONE and task.isolated_ledger_carried is False
+    assert [item["title"] for item in task.harvested_deferrals] == [_HARVEST_CARRY["summary"]]
+    (refused,) = _rows(engine, "ledger-read-refused")
+    assert refused["site"] == "harvest-carry" and refused["story_key"] == "1-1-a"
+    assert _harvest_carry_events(engine) == []
+    assert _rows(engine, "sweep-bundle-close-refused") == []
+    assert "run-crash" not in journal_kinds(engine)
+    assert project.deferred_work.read_bytes() == bad
+
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    resumed, adapter = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    kinds = journal_kinds(resumed)
+    assert "resume-ledger-carry" in kinds and "harvest-carried" in kinds
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried is True
+
+
+def test_carry_harvest_dedupe_stays_status_agnostic(project):
+    """A finding the sweep has since CLOSED must not be re-filed by the carry.
+
+    The carry's own pre-scan is the whole on-disk guard, and it has to stay
+    status-agnostic, because the batch writer's idempotence scan deliberately is
+    NOT: a closed entry with the same marker does not suppress an append there,
+    the work having come back. That is right for a fresh defer and wrong for this
+    caller, which is re-filing rows an isolated unit already filed once — a row
+    the sweep resolved between the unit's write and the merge would come back
+    from the dead as a second open entry, and nothing downstream would ever
+    reconcile the twins.
+
+    The mid-loop `parse_ledger` re-read this replaced kept the SAME-call dedupe
+    status-agnostic too; that half needs no guard here, since every row the batch
+    appends is open and its evolving scan therefore sees it.
+
+    Ablation: delete the `if any(... field_line_present ...): continue` pre-filter
+    and lean on the batch's open-only scan — a second row appears and this reddens
+    on the id list."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    record = _harvest_record()
+    dw_id = deferredwork.append_entry(
+        project.deferred_work,
+        title=record["title"],
+        origin=record["origin"],
+        location=record["location"],
+        source_spec=record["source_spec"],
+        reason=record["reason"],
+        severity=record["severity"],
+    )
+    assert dw_id is not None
+    assert deferredwork.mark_done(project.deferred_work, dw_id, "2026-06-01", "fixed upstream")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[record])
+    engine.state.tasks[task.story_key] = task
+
+    engine._carry_harvested_deferrals(task)
+
+    entries = _main_harvest_entries(project)
+    assert [entry.id for entry in entries] == [dw_id]  # the done twin, and nothing beside it
+    assert not entries[0].open
+    (carried,) = _harvest_carry_events(engine)
+    assert carried["dw_ids"] == []
+    assert task.harvest_carry_commit_pending is False  # nothing novel, so no latch
+
+
+def test_carry_harvest_dedupes_a_cross_spec_open_twin_in_the_writer(project):
+    """An open cross-spec twin is suppressed by the carry's writer.
+
+    The caller's frozen exact-pair pre-scan cannot match the deliberately
+    different source spec, so this reaches the opted-in writer arm.
+
+    Ablation: remove the carry producer's flag and a second open row is filed
+    and reported in ``harvest-carried.dw_ids``."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    record = _harvest_record()
+    rival = deferredwork.append_entry(
+        project.deferred_work,
+        title=record["title"],
+        origin=record["origin"],
+        location=record["location"],
+        source_spec="spec-9-9-z.md",
+        reason=record["reason"],
+        severity=record["severity"],
+    )
+    assert rival == "DW-1"
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[record])
+    engine.state.tasks[task.story_key] = task
+
+    engine._carry_harvested_deferrals(task)
+
+    entries = _main_harvest_entries(project)
+    assert [entry.id for entry in entries] == ["DW-1"]
+    assert entries[0].open
+    (carried,) = _harvest_carry_events(engine)
+    assert carried["dw_ids"] == []
+
+
+def test_carry_harvest_files_fresh_against_a_cross_spec_closed_twin(project):
+    """A closed cross-spec twin does not suppress the isolation carry.
+
+    The different source spec bypasses the caller's status-agnostic exact-pair
+    guard, while the writer's widened arm remains open-only.
+
+    Ablation: widen the caller pre-scan regardless of status, or remove the
+    writer's open guard, and DW-2 is not filed or reported."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    record = _harvest_record()
+    rival = deferredwork.append_entry(
+        project.deferred_work,
+        title=record["title"],
+        origin=record["origin"],
+        location=record["location"],
+        source_spec="spec-9-9-z.md",
+        reason=record["reason"],
+        severity=record["severity"],
+    )
+    assert rival == "DW-1"
+    assert deferredwork.mark_done(
+        project.deferred_work, rival, "2026-06-01", "fixed in another spec"
+    )
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[record])
+    engine.state.tasks[task.story_key] = task
+
+    engine._carry_harvested_deferrals(task)
+
+    entries = _main_harvest_entries(project)
+    assert [entry.id for entry in entries] == ["DW-1", "DW-2"]
+    assert not entries[0].open and entries[1].open
+    assert deferredwork.field_line_present(entries[1].body, "source_spec", record["source_spec"])
+    (carried,) = _harvest_carry_events(engine)
+    assert carried["dw_ids"] == ["DW-2"]
+
+
+def _replace_with_a_directory(path: Path) -> None:
+    """Swap a just-written operand for a DIRECTORY holding one tracked-looking file.
+
+    The shape DW-237 guards against, and the window it has to be staged in. Every
+    carry below WRITES its operand a statement or two before publishing it, so a
+    directory that was there all along never reaches the commit at all — the write
+    would have failed, or (for the board) `_carry_board_advance`'s own `is_file()`
+    pre-check would have refused first. What is reachable is the REPLACEMENT: an
+    operator, or a half-finished restore, putting a directory at the name inside the
+    window between the write and `commit_paths` — the same TOCTOU
+    `_carry_board_advance`'s docstring already names as #686. Each row opens that
+    window deterministically by wrapping the writer.
+
+    The descendant is what makes the hazard visible: `commit_paths` forces every
+    operand LITERAL, and `git add -- <dir>` stages a directory's descendants
+    RECURSIVELY, so an unrelated tree would be published under the carry's own
+    `chore(...)` message."""
+    path.unlink()
+    path.mkdir()
+    (path / "swept-in.txt").write_text("an unrelated tree\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "fault,cause,fragment",
+    [
+        ("not-a-file", "target-not-a-file", None),
+        ("absent", "target-absent", None),
+        ("undecodable", "target-undecodable", "not valid UTF-8"),
+    ],
+)
+def test_carry_harvest_refuses_a_durable_unpublishable_ledger(
+    project, monkeypatch, fault, cause, fragment
+):
+    """DW-237 at `_carry_harvested_deferrals`: the publishable-target guard its
+    sibling publishers already take, on the operand this one hands to `git add`,
+    for each of the three DURABLE causes.
+
+    The refusal never RAISES, where this method's `GitError` can: `may_degrade` asks
+    whether git can own the ledger, and a refusal answers a different question — the
+    operand is not a publishable file at all — which a replay re-reads and refuses
+    identically, so raising would cost the run its `integrate_unit` with nothing left
+    to retry. Every other statement in the frame is untouched: the latch clears and
+    `harvest-carried` is still journaled.
+
+    The three rows are three different things git would otherwise have done. A
+    DIRECTORY is staged recursively (`swept-in.txt` under a `chore(deferred-work):`
+    message). An ABSENT tracked ledger — unlinked after the append — is the
+    missing-but-TRACKED deletion `commit_paths` deliberately stages, which would
+    commit the ledger AWAY. Invalid UTF-8 is the one that, before DW-237's split,
+    arrived as `target-unreadable` and fell through: git
+    accepts any bytes, so the corrupt ledger reached HEAD; the guard now names it
+    `target-undecodable`, a durable cause, and it refuses here like the other two
+    while the transient `target-unreadable` still falls through (see the latch row
+    below). Every replacement is staged AFTER the append for the reason
+    `_replace_with_a_directory` states.
+
+    "No git" is graded at the call as well as on the outcome: a recording wrapper
+    around `verify.commit_paths` must see NO call, since an unchanged HEAD alone
+    would not tell a refusal from a `git add` that failed or staged read-only.
+
+    Ablation: delete the `refusal = _publication_refusal(...)` branch here and every
+    row reds — the directory row on `swept-in.txt` reaching `git ls-files`, the absent
+    row on HEAD advancing to the ledger's deletion, the undecodable row on HEAD
+    advancing to the corrupt blob — and all three on the `commit_paths` call count.
+    Collapse the guard's two ledger-leg `except` arms back into one returning
+    `target-unreadable` and the undecodable row alone reds the same way."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    # after the ledger write above: this helper's own `add -A` is what tracks it
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head = git(project.project, "rev-parse", "HEAD")
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[_harvest_record()])
+    engine.state.tasks[task.story_key] = task
+    real_append = deferredwork.append_entries
+
+    def append_then_break(ledger, specs):
+        ids = real_append(ledger, specs)
+        if fault == "not-a-file":
+            _replace_with_a_directory(ledger)
+        elif fault == "absent":
+            ledger.unlink()
+        else:
+            ledger.write_bytes(UNDECODABLE_LEDGER)
+        return ids
+
+    monkeypatch.setattr(deferredwork, "append_entries", append_then_break)
+    commits: list[list[Path]] = []
+    real_commit = verify.commit_paths
+
+    def recording_commit(repo_root, message, paths, *a, **kw):
+        commits.append(list(paths))
+        return real_commit(repo_root, message, paths, *a, **kw)
+
+    monkeypatch.setattr(verify, "commit_paths", recording_commit)
+
+    engine._carry_harvested_deferrals(task)
+
+    [refused] = _rows(engine, "harvest-carry-refused")
+    assert refused["refuse_cause"] == cause
+    assert refused["dw_ids"] == ["DW-1"]
+    if fragment is None:
+        assert "error" not in refused  # a wrong TYPE or an absence has no fault text
+    else:
+        assert fragment in refused["error"]  # ...where the decode fault has, and carries it
+    assert _rows(engine, "harvest-carry-uncommitted") == []
+    # no git ran for the operand: nothing was handed to `commit_paths`, HEAD is
+    # untouched, the tracked ledger is still tracked and nothing under it is tracked
+    assert commits == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    tracked = git(project.project, "ls-files").splitlines()
+    assert ledger_rel in tracked
+    assert "swept-in.txt" not in tracked
+    if fault == "undecodable":
+        assert git(project.project, "show", f"HEAD:{ledger_rel}").encode() != UNDECODABLE_LEDGER
+    # ...and the frame's own bookkeeping is unchanged by the refusal
+    assert [e["dw_ids"] for e in _harvest_carry_events(engine)] == [["DW-1"]]
+    assert task.harvest_carry_commit_pending is False
+    assert not load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
+
+
+def test_carry_harvest_keeps_its_latch_when_the_ledger_becomes_unreadable(project, monkeypatch):
+    """The cause the DW-237 guard must NOT short-circuit at this site.
+
+    `target-absent`, `target-not-a-file` and `target-undecodable` are durable on-disk
+    shapes a replay reads again and refuses again, so refusing them costs nothing
+    (the row above grades all three). `target-unreadable` is
+    whatever a probe RAISED — an EACCES parent here, a WinError 64 from a
+    registered-but-not-serving UNC provider on the original DW-195/#552 report — and
+    the next pass may well not see it. This publisher alone carries a durable
+    `harvest_carry_commit_pending` latch, so turning that cause into a refusal would
+    journal an advisory success and clear the commit obligation forever. It falls
+    through to `may_degrade`/`commit_paths` instead, exactly as it did before the
+    guard landed: a TRACKED ledger may not degrade, so the `GitError` is re-raised
+    and the latch survives for the replay.
+
+    Both probes are faulted because a real unsearchable parent faults both: `stat` is
+    what `unpublishable_target`'s `"ledger"` leg reaches through
+    `deferredwork.read_for_write`, and `lstat` is `commit_paths`' own presence probe
+    since DW-239. Injected AFTER the append for the reason
+    `_replace_with_a_directory` states — a ledger unreadable from the start never
+    produces a carry to publish.
+
+    Ablation: delete the `refusal[0] == "target-unreadable"` filter at this site and
+    this reds on every assertion — the call returns cleanly, journals
+    `harvest-carry-refused`, and `harvest_carry_commit_pending` comes back False with
+    the commit obligation gone."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    # after the ledger write above: this helper's own `add -A` is what tracks it
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert verify.path_tracked(project.project, ledger_rel)  # so it may NOT degrade
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[_harvest_record()])
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+    real_append = deferredwork.append_entries
+
+    def append_then_fault(ledger, specs):
+        ids = real_append(ledger, specs)
+        for probe in ("stat", "lstat"):
+            fault_metadata_probe(monkeypatch, ledger.resolve(), probe)
+        return ids
+
+    monkeypatch.setattr(deferredwork, "append_entries", append_then_fault)
+
+    with pytest.raises(verify.GitError, match="no exact commit operand remains"):
+        engine._carry_harvested_deferrals(task)
+
+    assert load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
+    assert "harvest-carry-refused" not in journal_kinds(engine)
+    assert "harvest-carried" not in journal_kinds(engine)
+
+
+@pytest.mark.parametrize("family", ["ledger", "store"])
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_publication_refusal_folds_a_value_error_from_the_resolve(
+    project, monkeypatch, fault, family
+):
+    """The `ValueError` CLASS of `_publication_refusal`'s resolve `except` tuple,
+    driven on its own (DW-275), at the pure-helper layer four of the five publishers
+    fold through.
+
+    `Path.resolve()` raises `ValueError` for an embedded NUL (`lstat: embedded null
+    character in path` on 3.12+; `embedded null byte` on 3.11) and
+    `UnicodeEncodeError` (a `ValueError` subclass) for a lone surrogate outside the
+    `surrogateescape` range on CPython 3.11-3.14 POSIX, and the
+    two-class tuple that stood here let both escape best-effort bookkeeping whose
+    whole degrade discipline exists to prevent exactly that. The fold lands on
+    `target-unreadable` with `str(e)` as its text — the same transient cause the
+    `OSError`/`RuntimeError` classes take, for the reason the docstring gives: a
+    caller reads the cause alone and never asks which call produced it.
+
+    INJECTED through `refuse_to_resolve(..., error=)` rather than driven with a real
+    NUL so the row holds on every supported interpreter and platform:
+    `ntpath.realpath` tolerates a NUL, so neither is a cross-platform driver at the
+    publisher. The real-driver sibling below shows both stand-ins match what
+    `Path.resolve()` actually raises on POSIX.
+    Parametrized over both families for the SHAPE only: the fold sits ahead of the
+    family leg, so `family` never reaches anything on this arm — which is what
+    `never` grades.
+
+    Ablation, per class: delete `ValueError` ALONE from `_publication_refusal`'s
+    `except (OSError, RuntimeError, ValueError)` and both rows red with the injected
+    fault escaping the helper; the `OSError`/`RuntimeError` rows in
+    `tests/test_sweep.py` and `tests/test_cli.py` stay green, which is why a per-class
+    row is the only honest one for a multi-class handler."""
+    ledger = project.deferred_work
+    refuse_to_resolve(monkeypatch, ledger, error=fault)
+
+    def never(*_a, **_k):
+        raise AssertionError("the family leg was asked about an unresolvable target")
+
+    monkeypatch.setattr(verify, "unpublishable_target", never)
+
+    assert _publication_refusal(ledger, family) == ("target-unreadable", str(fault))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="ntpath.realpath tolerates a NUL")
+@pytest.mark.parametrize(
+    "tail,fragment",
+    [
+        pytest.param("\0x", "embedded null", id="nul"),
+        pytest.param("\ud800", "surrogates not allowed", id="lone-surrogate"),
+    ],
+)
+def test_publication_refusal_folds_a_real_nul_path_on_posix(project, tail, fragment):
+    """The real faults behind the two injected rows above, on the one platform where
+    they ARE drivers (DW-275): a ledger path with an embedded NUL, and one with a lone
+    surrogate outside the `surrogateescape` range, no stub, each fold into
+    `target-unreadable` carrying CPython's own text — which is what shows the
+    `NUL_PATH_RESOLVE_FAULTS` stand-ins match what `Path.resolve()` actually raises.
+
+    The NUL leg asserts the shared `embedded null` fragment rather than the full
+    wording because CPython 3.11 says `embedded null byte` where 3.12+ says
+    `lstat: embedded null character in path`, and 3.11 is the `requires-python`
+    floor and a CI leg.
+
+    Ablation: delete `ValueError` from `_publication_refusal`'s resolve arm and both
+    legs red with the fault escaping the helper."""
+    ledger = Path(f"{project.deferred_work}{tail}")
+
+    refusal = _publication_refusal(ledger, "ledger")
+
+    assert refusal is not None
+    cause, error = refusal
+    assert cause == "target-unreadable"
+    assert error is not None and fragment in error
+
+
+@pytest.mark.parametrize(
+    "fault,cause,fragment",
+    [
+        ("not-a-file", "target-not-a-file", None),
+        ("absent", "target-absent", None),
+        ("undecodable", "target-undecodable", "not valid UTF-8"),
+    ],
+)
+def test_carry_story_deferred_closes_refuses_a_durable_unpublishable_ledger(
+    project, monkeypatch, fault, cause, fragment
+):
+    """The same guard at `_carry_story_deferred_closes`, whose commit was already
+    best effort — a refusal joins the `-uncommitted` row rather than replacing it,
+    because the two name different operator repairs. Every cause refuses here, the
+    three durable ones driven the way the harvest row above drives them: a
+    directory `git add` would stage recursively, a tracked ledger unlinked after
+    the write whose DELETION `commit_paths` would stage, and invalid UTF-8 git would
+    accept as any other bytes.
+
+    Ablation: delete this site's `refusal` branch and every row reds — the
+    directory row as `swept-in.txt` reaches `git ls-files` under a
+    `chore(deferred-work):` message, the absent row as HEAD advances to the
+    ledger's deletion, the undecodable row as HEAD advances to the corrupt blob."""
+    write_ledger(project, {"DW-1": "open"})
+    # after the ledger write above: this helper's own `add -A` is what tracks it
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head = git(project.project, "rev-parse", "HEAD")
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, story_closes_intended=["DW-1"])
+    engine.state.tasks[task.story_key] = task
+    real_mark = deferredwork.mark_done_many_reopenable
+
+    def mark_then_break(ledger, *a, **kw):
+        ids = real_mark(ledger, *a, **kw)
+        if fault == "not-a-file":
+            _replace_with_a_directory(ledger)
+        elif fault == "absent":
+            ledger.unlink()
+        else:
+            ledger.write_bytes(UNDECODABLE_LEDGER)
+        return ids
+
+    monkeypatch.setattr(deferredwork, "mark_done_many_reopenable", mark_then_break)
+
+    engine._carry_story_deferred_closes(task)
+
+    [refused] = _rows(engine, "story-deferred-close-carry-refused")
+    assert refused["refuse_cause"] == cause and refused["dw_ids"] == ["DW-1"]
+    if fragment is None:
+        assert "error" not in refused  # a wrong TYPE or an absence has no fault text
+    else:
+        assert fragment in refused["error"]
+    assert _rows(engine, "story-deferred-close-carry-uncommitted") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    tracked = git(project.project, "ls-files").splitlines()
+    assert ledger_rel in tracked
+    assert "swept-in.txt" not in tracked
+    if fault == "undecodable":
+        assert git(project.project, "show", f"HEAD:{ledger_rel}").encode() != UNDECODABLE_LEDGER
+    # the `-carried` row still lands: the flips are on disk, only the commit is not
+    assert [e["dw_ids"] for e in _rows(engine, "story-deferred-close-carried")] == [["DW-1"]]
+
+
+@pytest.mark.parametrize("fault_mode", ["decode", "stat", "read_text"])
+def test_carry_harvest_over_a_main_ledger_corrupted_under_the_lock_pauses(
+    project, monkeypatch, fault_mode
+):
+    """The writer's own locked re-read at the isolated harvest carry (DW-259).
+    The carry's pre-read succeeds. Decode rows corrupt main's bytes before
+    `append_entries`; OS rows keep them valid and refuse metadata/text access
+    under its real lock. The mutator raises ahead of any write.
+    The engine routes it exactly as the pre-read's fault — `RunPaused` at
+    `escalation`, `ledger-read-refused` site `harvest-carry-append-locked`, no
+    `harvest-carried`, main's bytes untouched — rather than letting a bare
+    `LedgerReadError` end the run. The commit latch was already set by then,
+    which is fine: a replay retries the append and the latched commit with it.
+
+    Ablation: delete the `except LedgerReadError` around the carry's
+    `append_entries` and this reds with `LedgerReadError` escaping the call."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.model import PAUSE_ESCALATION
+
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[_harvest_record()])
+    engine.state.tasks[task.story_key] = task
+    phase = task.phase
+    if fault_mode == "decode":
+        expected = UNDECODABLE_LEDGER
+        real_append = deferredwork.append_entries
+
+        def corrupt_then_append(ledger, *a, **kw):
+            ledger.write_bytes(UNDECODABLE_LEDGER)
+            return real_append(ledger, *a, **kw)
+
+        monkeypatch.setattr(deferredwork, "append_entries", corrupt_then_append)
+    else:
+        expected = fault_locked_ledger_read(monkeypatch, project.deferred_work, fault_mode)
+
+    with pytest.raises(RunPaused) as excinfo:
+        engine._carry_harvested_deferrals(task)
+
+    assert excinfo.value.stage == PAUSE_ESCALATION
+    assert excinfo.value.story_key == "1-1-a"
+    saved = load_state(engine.run_dir).tasks[task.story_key]
+    assert saved.phase == task.phase == phase
+    assert saved.harvested_deferrals == [_harvest_record()]
+    assert saved.harvest_carry_commit_pending
+    assert task.harvest_carry_commit_pending is True  # latched ahead of the write; a replay retries
+    assert project.deferred_work.read_bytes() == expected  # nothing written
+    assert _harvest_carry_events(engine) == []
+    (refused,) = _rows(engine, "ledger-read-refused")
+    assert refused["site"] == "harvest-carry-append-locked"
+    assert (
+        refused["ledger"] == str(project.deferred_work)
+        and ("not valid UTF-8" if fault_mode == "decode" else "PermissionError") in refused["error"]
+    )
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention and str(project.deferred_work) in attention
+    assert "`bmad-loop resume test-run`" in attention
+
+
+@pytest.mark.parametrize("fault_mode", ["decode", "stat", "read_text"])
+def test_carry_story_deferred_closes_over_an_undecodable_main_ledger_pauses(
+    project, monkeypatch, fault_mode
+):
+    """The close carry has no pre-read of its own: `mark_done_many_reopenable`'s
+    locked `read_for_write` is the only authoritative read. Decode rows corrupt
+    main's bytes before the mutator (DW-259); OS rows keep them valid and refuse
+    metadata/text access under its real lock (DW-279). Either raises ahead of
+    any write. The engine routes
+    it as a repair pause — `RunPaused` at `escalation`, `ledger-read-refused`
+    site `story-close-carry-locked`, no `story-deferred-close-carried`, no
+    commit, main's bytes untouched — rather than a bare `LedgerReadError`. A
+    pause leaves `isolated_ledger_carried` False, so
+    `_replay_unlatched_ledger_carries` re-runs the whole carry hook on resume.
+
+    Ablation: delete the `except LedgerReadError` around the close carry's
+    `mark_done_many_reopenable` and this reds with `LedgerReadError` escaping
+    the call."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.model import PAUSE_ESCALATION
+
+    write_ledger(project, {"DW-1": "open"})
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head = git(project.project, "rev-parse", "HEAD")
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, story_closes_intended=["DW-1"])
+    engine.state.tasks[task.story_key] = task
+    phase = task.phase
+    if fault_mode == "decode":
+        expected = UNDECODABLE_LEDGER
+        real_mark = deferredwork.mark_done_many_reopenable
+
+        def corrupt_then_mark(ledger, *a, **kw):
+            ledger.write_bytes(UNDECODABLE_LEDGER)
+            return real_mark(ledger, *a, **kw)
+
+        monkeypatch.setattr(deferredwork, "mark_done_many_reopenable", corrupt_then_mark)
+    else:
+        expected = fault_locked_ledger_read(monkeypatch, project.deferred_work, fault_mode)
+
+    with pytest.raises(RunPaused) as excinfo:
+        engine._carry_story_deferred_closes(task)
+
+    assert excinfo.value.stage == PAUSE_ESCALATION
+    assert excinfo.value.story_key == "1-1-a"
+    saved = load_state(engine.run_dir).tasks[task.story_key]
+    assert saved.phase == task.phase == phase
+    assert saved.story_closes_intended == ["DW-1"]
+    assert not saved.isolated_ledger_carried
+    assert task.isolated_ledger_carried is False
+    assert project.deferred_work.read_bytes() == expected  # nothing written
+    assert _rows(engine, "story-deferred-close-carried") == []
+    assert _rows(engine, "story-deferred-close-carry-refused") == []
+    assert git(project.project, "rev-parse", "HEAD") == head  # no commit
+    (refused,) = _rows(engine, "ledger-read-refused")
+    assert refused["site"] == "story-close-carry-locked"
+    assert (
+        refused["ledger"] == str(project.deferred_work)
+        and ("not valid UTF-8" if fault_mode == "decode" else "PermissionError") in refused["error"]
+    )
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention and str(project.deferred_work) in attention
+    assert "`bmad-loop resume test-run`" in attention
+
+
+def _in_place_policy(*, limits: LimitsPolicy | None = None):
+    """`wt_policy`'s mirror: the live mode a mid-pause `isolation = "none"` edit
+    leaves behind, with everything else identical so the two rows differ in one
+    field only. ``limits`` mirrors `wt_policy`'s own knob, for the row that has to
+    reach `max_review_cycles` exhaustion instead of the damped force-converge."""
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+        limits=limits if limits is not None else LimitsPolicy(),
+    )
+
+
+def test_defer_under_a_recorded_mount_carries_the_harvest_after_an_isolation_flip(
+    project, monkeypatch
+):
+    """`_defer` routes on the tree in hand, not on live policy alone.
+
+    `_finish_inflight` picks its arms on `mounted = bool(task.worktree_path)` and
+    reopens a recorded mount REGARDLESS of live policy — an accepted continuation owns
+    the verified work in that tree. So a run whose `scm.isolation` was edited
+    `"worktree" -> "none"` while it was paused re-enters this decision with the
+    workspace swapped onto a mount while `self._isolated` answers False. Gated on
+    policy alone, the in-place arm then reset the MAIN repo and skipped
+    `_carry_harvested_deferrals` entirely, and `_integrate_unit` deleted the mount on
+    the way out: the unit's harvested findings had no durable home left, and a ledger
+    row nothing will re-file is invisible to every later sweep.
+
+    `rolled` is the positive control and the discriminator — this row would also pass
+    on an engine that simply did nothing, so it pins WHICH arm ran, not merely that the
+    harvest survived.
+
+    Ablation: restore the bare `if self._isolated:` gate and this reddens on an empty
+    ledger, with the main-repo rollback recorded instead."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [], policy=_in_place_policy())
+    assert engine._isolated is False  # MEASURED: live policy really says in place
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_VERIFY,  # the phase the budget-exhausted defer fires from
+        worktree_path=str(project.project / ".bmad-loop" / "runs" / "test-run" / "wt" / "1-1-a"),
+        baseline_commit=rev_parse_head(project.project),
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+    rolled: list[str] = []
+    monkeypatch.setattr(engine, "_rollback_or_pause", lambda t: rolled.append(t.story_key))
+
+    engine._defer(task, "review did not converge within budget")
+
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert [event["dw_ids"] for event in _harvest_carry_events(engine)] == [["DW-1"]]
+    assert rolled == []  # no reset into the main repo under a live mount
+    assert task.phase == Phase.DEFERRED
+
+
+def test_defer_recovery_note_under_a_recorded_mount_names_the_branch_not_a_merge(project):
+    """The notice `_record_defer` emits two lines after `_defer` picked its arm must
+    pick the SAME arm. Selected on live policy alone, the flipped-policy defer above
+    printed the in-place `git -C <mount> merge --ff-only <ref>` — a command aimed at
+    a directory `_integrate_unit` deletes on the way out with `keep_failed` off, and
+    with it on, a notice that never names the branch holding the latest failed work.
+    An earlier in-worktree dev-retry rollback parks `preserve_ref` on the shared
+    refs (#333: the ref is not isolation-scoped), so both facts are live at once.
+
+    Ablation: restore the bare `if self._isolated:` gate in `_defer_recovery_note`
+    and this reddens on the merge line, then on the missing branch."""
+    engine, _ = make_engine(project, [], policy=_in_place_policy())
+    assert engine._isolated is False  # MEASURED: live policy really says in place
+    assert engine.policy.scm.keep_failed is True
+    ref = "attempt-preserve/test-run-0badc0de"
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        worktree_path=str(project.project / ".bmad-loop" / "runs" / "test-run" / "wt" / "1-1-a"),
+        branch="bmad-loop/1-1-a",
+        preserve_ref=ref,
+    )
+
+    note = engine._defer_recovery_note(task)
+
+    assert "merge --ff-only" not in note
+    assert "failed work kept on branch `bmad-loop/1-1-a`" in note
+    assert f"an earlier rolled-back attempt is parked at `{ref}`" in note
+
+
+def test_defer_with_no_recorded_mount_still_takes_the_in_place_arm(project, monkeypatch):
+    """The other half of the widened gate. `or task.worktree_path` must not swallow the
+    ordinary in-place defer, whose whole job is the rollback the isolated arm skips —
+    an in-place task carries `""`, and nothing else about this row differs from its
+    sibling above.
+
+    Ablation: widen the gate to an unconditional `True` (or drop the `worktree_path`
+    truthiness test so `Path("")` logic creeps back in) and this reddens on an
+    un-rolled-back tree and a harvest carried where none should be."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [], policy=_in_place_policy())
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_VERIFY,
+        baseline_commit=rev_parse_head(project.project),
+        harvested_deferrals=[_harvest_record()],
+    )
+    assert task.worktree_path == ""  # MEASURED: the discriminator is the empty one
+    engine.state.tasks[task.story_key] = task
+    rolled: list[str] = []
+    monkeypatch.setattr(engine, "_rollback_or_pause", lambda t: rolled.append(t.story_key))
+
+    engine._defer(task, "review did not converge within budget")
+
+    assert rolled == ["1-1-a"]  # the in-place reset DID run
+    assert _harvest_carry_events(engine) == []  # and no unit ledger was carried
+    assert task.phase == Phase.DEFERRED
+
+
+def test_defer_under_live_isolation_with_no_mount_yet_keeps_the_isolated_arm(project, monkeypatch):
+    """Isolation can be LIVE with no mount recorded — a defer reached before
+    `run_isolated` stores the path. That shape must keep the isolated arm rather than
+    fall through to a main-repo reset, which is why the gate is
+    `self._isolated OR worktree_path` and not the path alone.
+
+    Ablation: narrow the gate to `if task.worktree_path:` and this reddens on a
+    rollback that should never have run."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])  # wt_policy: isolation IS live
+    assert engine._isolated is True
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_VERIFY,
+        baseline_commit=rev_parse_head(project.project),
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+    rolled: list[str] = []
+    monkeypatch.setattr(engine, "_rollback_or_pause", lambda t: rolled.append(t.story_key))
+
+    engine._defer(task, "review did not converge within budget")
+
+    assert rolled == []
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+
+
+def test_review_timeout_salvage_refused_under_a_recorded_mount_after_an_isolation_flip(
+    project,
+):
+    """`_salvage_review_timeout` routes on the tree in hand, not on live policy alone.
+
+    The third member of the pair `_defer` and `_run_story` already select on. An
+    accepted continuation reopens the recorded mount REGARDLESS of live policy —
+    `_finish_inflight` swaps `self.workspace` onto it, and `self._isolated` is a
+    read-only property over LIVE policy with no setter anywhere — so a run whose
+    `scm.isolation` was edited `"worktree" -> "none"` while it was paused reaches this
+    decision mounted with `self._isolated` False. Gated on policy alone, salvage then
+    committed the mounted work for `_integrate_unit` to merge out: a timed-out review
+    landing DONE-and-merged, where the identical work under unchanged policy defers
+    with the unit's worktree and diff kept for review.
+
+    The bytes assertion is the discriminator, not the return value. The `in-review`
+    arm performs REPAIR WRITES the mounted path never performs — `reset_spec_status`
+    to `done` and `strip_auto_run_result` — and they fire before any later verify gate
+    could turn the answer back to False on its own; a return-value-only row would pass
+    for that unrelated reason.
+
+    Ablation: restore `if self._isolated or not task.spec_file:` and this reddens on a
+    spec rewritten to `done` with its terminal marker stripped."""
+    write_sprint(project, {"1-1-a": "done"})
+    sp = project.implementation_artifacts / "spec-1-1-a.md"
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    # `in-review` is the mid-review interrupt the salvage arm repairs forward; the
+    # terminal marker is the second thing it strips.
+    write_spec(sp, "in-review", rev_parse_head(project.project), prose_status="done")
+    before = sp.read_text()
+    engine, _ = make_engine(project, [], policy=_in_place_policy())
+    assert engine._isolated is False  # MEASURED: live policy really says in place
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_VERIFY,  # the phase the review loop calls salvage from
+        spec_file=str(sp),
+        worktree_path=str(project.project / ".bmad-loop" / "runs" / "test-run" / "wt" / "1-1-a"),
+    )
+
+    assert engine._salvage_review_timeout(task, SessionResult(status="timeout")) is False
+    assert sp.read_text() == before  # no repair write into a story the mount owns
+
+
+def test_budget_exhausted_rescue_defers_under_a_recorded_mount_after_an_isolation_flip(
+    project,
+):
+    """The budget-exhaustion rescue picks the same arm as the defer it replaces.
+
+    `test_budget_exhausted_finalized_work_commits`'s harness, with one field added: the
+    task carries the attempt's mount while live policy answers "in place" — exactly
+    what `_finish_inflight` leaves after an `isolation` flip across a resume, since it
+    sets only `self.workspace` and `self._isolated` keeps reading live policy. Selected
+    on policy alone, the rescue committed a story that never converged; `_commit` lands
+    in the mount and `_integrate_unit` merges that unit branch out to the target, so
+    the outcome inverts — DONE-and-merged instead of DEFERRED with the unit's worktree
+    and patch preserved.
+
+    The gate is inline in `_review_and_commit`, so a full sandbox run is the lowest
+    layer that reaches it: the loop has to actually exhaust `max_review_cycles` with a
+    finalized, verify-green tree still recommending a follow-up (`max_followup_reviews`
+    pinned high, or the damping converges the story before exhaustion and this row
+    never reaches the branch under test).
+
+    `review_cycle == 3` is the premise control — without it a story that deferred for
+    any earlier reason would satisfy the outcome assertions.
+
+    Ablation: restore `if refileable_followup and not self._isolated:` and this reddens
+    on a DONE task with a fresh commit at HEAD."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head_before = rev_parse_head(project.project)
+    mount = project.project / ".bmad-loop" / "runs" / "test-run" / "wt" / "1-1-a"
+    box: list[Engine] = []
+    dev = wt_dev_effect(project, "1-1-a")
+
+    def dev_then_record_the_mount(spec):
+        # The reopened mount, recorded on the task, is all `_finish_inflight` leaves
+        # behind for the review loop to read; recording it after dispatch keeps
+        # `_run_story` out of the row so the gate under test is the only selector.
+        result = dev(spec)
+        box[0].state.tasks["1-1-a"].worktree_path = str(mount)
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [dev_then_record_the_mount]
+        + [wt_review_effect(project, "1-1-a", clean=False) for _ in range(3)],
+        policy=_in_place_policy(limits=LimitsPolicy(max_followup_reviews=99)),
+    )
+    box.append(engine)
+    assert engine._isolated is False  # MEASURED: live policy really says in place
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert task.review_cycle == 3  # MEASURED: the budget really was exhausted
+    assert task.worktree_path == str(mount)  # and the mount really was in hand
+    assert summary.deferred == 1 and summary.done == 0 and not summary.paused
+    assert task.phase == Phase.DEFERRED
+    assert not task.commit_sha
+    assert rev_parse_head(project.project) == head_before  # nothing was committed
+    assert "review-budget-committed" not in journal_kinds(engine)
+
+
 def test_tracked_harvest_carry_commit_failure_propagates(project, monkeypatch):
     """A tracked ledger persistence fault cannot be reported as a completed carry."""
     project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
@@ -956,6 +3114,40 @@ def test_tracked_harvest_carry_commit_failure_propagates(project, monkeypatch):
     assert "harvest-carried" not in journal_kinds(engine)
     assert "harvest-carry-uncommitted" not in journal_kinds(engine)
     assert load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
+
+
+def test_uncertain_harvest_ledger_keeps_its_pending_commit(project, monkeypatch):
+    """Resolution uncertainty cannot turn a tracked carry into advisory success."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    record = _harvest_record()
+    deferredwork.append_entry(
+        project.deferred_work,
+        title=record["title"],
+        origin=record["origin"],
+        location=record["location"],
+        source_spec=record["source_spec"],
+        reason=record["reason"],
+        severity=record["severity"],
+    )
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        harvested_deferrals=[record],
+        harvest_carry_commit_pending=True,
+    )
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+    refuse_to_resolve(monkeypatch, project.deferred_work)
+
+    with pytest.raises(verify.GitError, match="no exact commit operand remains"):
+        engine._carry_harvested_deferrals(task)
+
+    assert load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
+    assert "harvest-carried" not in journal_kinds(engine)
+    assert "harvest-carry-uncommitted" not in journal_kinds(engine)
 
 
 def test_untracked_nonignored_harvest_carry_commit_failure_propagates(project, monkeypatch):
@@ -1018,7 +3210,11 @@ def test_external_harvest_carry_commit_failure_degrades(project, tmp_path, monke
 
 
 def test_host_loss_after_harvest_append_replays_the_pending_commit(project, monkeypatch):
-    """The commit intent is durable before append_entry can mutate the ledger."""
+    """The commit intent is durable before the append can mutate the ledger.
+
+    The carry files its whole batch in ONE `append_entries` call (#286/#469), so
+    that is where a host loss lands; `append_entry` is no longer on this path and
+    patching it would inject nothing."""
     from bmad_loop import deferredwork
 
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -1041,13 +3237,13 @@ def test_host_loss_after_harvest_append_replays_the_pending_commit(project, monk
         branch=task.branch,
         target="main",
     )
-    real_append = deferredwork.append_entry
+    real_append = deferredwork.append_entries
 
     def append_then_host_dies(*args, **kwargs):
         real_append(*args, **kwargs)
         raise SystemExit("host died after ledger append")
 
-    monkeypatch.setattr(deferredwork, "append_entry", append_then_host_dies)
+    monkeypatch.setattr(deferredwork, "append_entries", append_then_host_dies)
     with pytest.raises(SystemExit, match="host died"):
         engine._carry_harvested_deferrals(task)
 
@@ -1055,16 +3251,8 @@ def test_host_loss_after_harvest_append_replays_the_pending_commit(project, monk
     assert failed.harvest_carry_commit_pending is True
     assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
 
-    monkeypatch.setattr(deferredwork, "append_entry", real_append)
-    failed_state = load_state(engine.run_dir)
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=failed_state,
-    )
+    monkeypatch.setattr(deferredwork, "append_entries", real_append)
+    resumed, _ = resume_engine(project, engine)
     after_story: list[str] = []
     monkeypatch.setattr(
         resumed,
@@ -1074,7 +3262,7 @@ def test_host_loss_after_harvest_append_replays_the_pending_commit(project, monk
     resumed._replay_unlatched_ledger_carries()
 
     restored = load_state(resumed.run_dir).tasks[task.story_key]
-    assert failed_state.tasks[task.story_key].isolated_ledger_carried is True
+    assert resumed.state.tasks[task.story_key].isolated_ledger_carried is True
     assert restored.harvest_carry_commit_pending is False
     assert restored.isolated_ledger_carried is True
     assert after_story == [task.story_key]
@@ -1124,14 +3312,7 @@ def test_tracked_harvest_carry_commit_failure_retries_its_pending_commit(
     assert failed.isolated_ledger_carried is False
 
     monkeypatch.setattr(verify, "commit_paths", real_commit)
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=load_state(engine.run_dir),
-    )
+    resumed, _ = resume_engine(project, engine)
     resumed._replay_unlatched_ledger_carries()
 
     restored = load_state(resumed.run_dir).tasks[task.story_key]
@@ -1171,15 +3352,19 @@ def test_started_merge_replay_failure_does_not_carry_harvest(project, monkeypatc
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(project, [])
     engine.state.target_branch = "main"
-    worktree = engine.run_dir / "worktrees" / "1-1-a"
-    worktree.mkdir(parents=True)
-    source = rev_parse_head(project.project)
+    from bmad_loop.workspace import open_unit_workspace
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    source = rev_parse_head(unit.path)
     task = StoryTask(
         story_key="1-1-a",
         epic=1,
         phase=Phase.DONE,
-        worktree_path=str(worktree),
-        branch="bmad-loop/test-run/1-1-a",
+        worktree_path=str(unit.path),
+        branch=unit.branch,
+        baseline_commit=unit.baseline,
         commit_sha=source,
         harvested_deferrals=[_harvest_record()],
     )
@@ -1348,21 +3533,29 @@ def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
     crashed = load_state(engine.run_dir).tasks["1-1-a"]
     landed_head = rev_parse_head(project.project)
     assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert crashed.dw_ids == [] and crashed.integration_attempt is None
     assert "change for 1-1-a" in (project.project / "src.txt").read_text()
     assert Path(crashed.worktree_path).is_dir()
     assert not project.deferred_work.exists()
     assert "unit-merged" not in journal_kinds(engine)
 
-    monkeypatch.setattr(engine.journal, "append", real_append)
+    # no `append` restore: the resumed engine reopens its own `Journal` (DW-241)
     replay_collision_refs: list[str] = []
+    replay_protected: list[object] = []
     replay_merge_refs: list[str] = []
     replay_strategies: list[str] = []
     real_clean = verify.clean_incoming_collisions
     real_merge = verify.merge_branch
 
-    def record_collision_ref(repo, target, merge_ref):
+    def record_collision_ref(repo, target, merge_ref, **kwargs):
         replay_collision_refs.append(merge_ref)
-        return real_clean(repo, target, merge_ref)
+        # forward the keywords rather than dropping them: dropping `on_tolerated`
+        # would silently disable the journal event on the replay path (#460), and
+        # dropping `protected` would silently disable the carry-path guard there
+        # (#618). Recorded, not just forwarded, so the assertion below catches both
+        # a stub that swallows the keyword and a call site that stops passing it.
+        replay_protected.append(kwargs.get("protected"))
+        return real_clean(repo, target, merge_ref, **kwargs)
 
     def record_merge_ref(repo, merge_ref, **kwargs):
         replay_merge_refs.append(merge_ref)
@@ -1371,19 +3564,20 @@ def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
 
     monkeypatch.setattr(verify, "clean_incoming_collisions", record_collision_ref)
     monkeypatch.setattr(verify, "merge_branch", record_merge_ref)
-    resumed = Engine(
-        paths=project,
-        policy=wt_policy(merge_strategy=resumed_strategy),
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=load_state(engine.run_dir),
-    )
+    resumed, _ = resume_engine(project, engine, policy=wt_policy(merge_strategy=resumed_strategy))
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert resumed.state.tasks["1-1-a"].integration_attempt is None
     assert rev_parse_head(project.project) == landed_head
     assert replay_collision_refs == [crashed.commit_sha]
+    # The replay reaches `merge_local` by its own route, so the carry-path guard has
+    # to be wired inside it rather than at the live-run caller. Pinned as the exact
+    # tuple: a `protected=()` that reached here would satisfy "was passed" while
+    # guarding nothing. The board alone, not the ledger — this row gitignores the
+    # ledger, and an artifact git does not track has no committed baseline for the
+    # carry to diverge from, so the wiring omits it (`_carried_artifact_rels`).
+    assert replay_protected == [(project.sprint_status.relative_to(project.project).as_posix(),)]
     assert replay_merge_refs == [crashed.commit_sha]
     assert replay_strategies == [merge_strategy]
     assert "unit-merge-started" in journal_kinds(resumed)
@@ -1441,15 +3635,8 @@ def test_merge_replay_rejects_a_unit_branch_advanced_after_recorded_source(
     advanced_head = rev_parse_head(unit_path)
     assert advanced_head != crashed.commit_sha
 
-    monkeypatch.setattr(engine.journal, "append", real_append)
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=load_state(engine.run_dir),
-    )
+    # no `append` restore: the resumed engine reopens its own `Journal` (DW-241)
+    resumed, _ = resume_engine(project, engine)
     summary = resumed.run()
 
     assert summary.paused and summary.escalated == 1 and not summary.crashed
@@ -1494,17 +3681,7 @@ def test_crashed_post_merge_harvest_carry_replays_and_persists_its_latch(project
     assert not Path(crashed.worktree_path).exists()
     assert not project.deferred_work.exists()
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([])
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, adapter = resume_engine(project, engine)
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed and not summary.paused
@@ -1559,17 +3736,7 @@ def test_crashed_post_merge_harvest_carry_replays_when_teardown_leaves_directory
 
     monkeypatch.setattr(verify, "worktree_remove", real_remove)
     monkeypatch.setattr(workspace_mod, "_rmtree_confined", real_rmtree)
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([])
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, adapter = resume_engine(project, engine)
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed and not summary.paused
@@ -1624,10 +3791,10 @@ def test_branch_per_run_kept_failure_detaches_so_next_unit_runs(project):
 def test_worktree_followup_damped_commits_and_integrates(project):
     """Damping fires the same in worktree isolation (default cap 1, no _isolated
     guard): a finalized unit whose review keeps recommending a follow-up converges
-    after one honored round, the work MERGES into the main repo, and the refiled
-    follow-up lands in the MAIN repo's ledger — not stranded inside the discarded
-    unit worktree. Exempting isolation would leave isolated runs non-convergent AND
-    deferred (strictly worse), which this locks out."""
+    after one honored round and the work MERGES into the main repo. No ledger
+    entry is filed anywhere — the spent budget is journal-only. Exempting
+    isolation would leave isolated runs non-convergent AND deferred (strictly
+    worse), which this locks out."""
     from bmad_loop import deferredwork
 
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -1646,325 +3813,40 @@ def test_worktree_followup_damped_commits_and_integrates(project):
     kinds = journal_kinds(engine)
     assert "review-followup-damped" in kinds and "unit-merged" in kinds
     assert "story-deferred" not in kinds
-    # the refiled follow-up is in the MAIN repo ledger, integrated from the worktree
-    open_refiled = [
-        e
-        for e in deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
-        if e.open and "origin: review-budget-followup" in e.body
-    ]
-    assert len(open_refiled) == 1
+    # no refiled follow-up anywhere — the spent budget is journal-only
+    ledger = (
+        project.deferred_work.read_text(encoding="utf-8") if project.deferred_work.exists() else ""
+    )
+    assert not any(
+        e.open and "origin: review-budget-followup" in e.body
+        for e in deferredwork.parse_ledger(ledger)
+    )
 
 
-# --------------------------------------------- review-budget follow-up carry (#425)
-#
-# The third producer in the `git add -A` family. Every row here GITIGNORES the
-# ledger: with a tracked one the entry rides the unit commit and the merge
-# delivers it, which is why `test_worktree_followup_damped_commits_and_integrates`
-# passed all along while the reported defect was live.
+# The review-budget follow-up carry (#425) is retired with the ticket class it
+# delivered: a spent review budget is journaled, never filed as a ledger entry,
+# so an isolated merge has nothing to strand. One row locks that in on the
+# gitignored shape — the one whose row NEEDED the retired carry.
 
 
-def _refiled_followups(project):
-    """Open `review-budget-followup` rows in the MAIN checkout's ledger."""
-    if not project.deferred_work.is_file():
-        return []
-    return [
-        entry
-        for entry in deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
-        if entry.open and "origin: review-budget-followup" in entry.body
-    ]
-
-
-def _damping_script(project, story_key="1-1-a"):
-    """Dev, then three passes that keep recommending — the default cap 1 damps."""
-    return [wt_dev_effect(project, story_key)] + [
-        wt_review_effect(project, story_key, clean=False) for _ in range(3)
-    ]
-
-
-def test_gitignored_damped_followup_reaches_the_main_ledger(project):
-    """#425: `_record_review_budget_followup` writes `self.workspace.paths`, which
-    under isolation is the unit worktree's ledger. `finalize_commit`'s `git add -A`
-    skips a gitignored path in silence, the merge brings nothing over, and
-    `close_unit_workspace(success=True)` then deletes the worktree — the DONE leg
-    takes no `capture_diff`, so not even a `changes.patch` survives. Without the
-    carry the run journals `refiled: DW-1` while the main checkout has no ledger at
-    all.
-
-    `check-ignore` is the oracle, not the presence of the rule: a row that reads
-    the tracked-ledger shape by accident is the vacuity this whole block exists to
-    avoid."""
+def test_a_damped_isolated_story_journals_without_writing_any_ledger(project):
+    """Gitignored ledger — the shape whose row needed the retired #425 carry. A
+    damped force-converge journals the spent budget and writes NO ledger entry:
+    not in the unit worktree, not in the main checkout, nothing to carry."""
     ignore_before_commit(project, "deferred-work.md")
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    engine, _ = make_engine(project, _damping_script(project))
-
+    script = [wt_dev_effect(project, "1-1-a")] + [
+        wt_review_effect(project, "1-1-a", clean=False) for _ in range(3)
+    ]
+    engine, _ = make_engine(project, script)  # default wt_policy() → cap 1
     summary = engine.run()
 
     assert summary.done == 1 and summary.deferred == 0 and not summary.paused
-    rel = project.deferred_work.relative_to(project.project).as_posix()
-    assert git(project.project, "check-ignore", rel).strip() == rel
-    assert not verify.path_tracked(project.project, rel)
     damped = [e for e in engine.journal.entries() if e["kind"] == "review-followup-damped"]
-    assert len(damped) == 1 and damped[0]["refiled"]
-    assert [e.title for e in _refiled_followups(project)] == [
-        "Follow-up review still recommended for 1-1-a after the damping cap was spent"
-    ]
-    carried = [e for e in engine.journal.entries() if e["kind"] == "review-followup-carried"]
-    assert len(carried) == 1 and carried[0]["dw_ids"] == [_refiled_followups(project)[0].id]
-    # `git add -- <ignored path>` refuses with rc 1: the row lands, the commit
-    # cannot, and that is recorded rather than raised.
-    uncommitted = [
-        e for e in engine.journal.entries() if e["kind"] == "review-followup-carry-uncommitted"
-    ]
-    assert len(uncommitted) == 1
-
-
-def test_tracked_damped_followup_is_not_refiled_twice_by_the_carry(project):
-    """A tracked ledger delivers the row through the merge, so the carry re-reads
-    its own provenance and appends nothing. `append_entry` dedupes on `origin:` +
-    `source_spec:` against OPEN entries, which is what makes running the carry
-    unconditionally safe rather than needing a tracked/ignored predicate."""
-    write_ledger(project, {})
-    commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    engine, _ = make_engine(project, _damping_script(project))
-
-    summary = engine.run()
-
-    assert summary.done == 1 and not summary.paused
-    assert verify.path_tracked(
-        project.project, project.deferred_work.relative_to(project.project).as_posix()
-    )
-    assert len(_refiled_followups(project)) == 1
-    carried = [e for e in engine.journal.entries() if e["kind"] == "review-followup-carried"]
-    assert len(carried) == 1 and carried[0]["dw_ids"] == []
-
-
-def test_a_deduped_followup_is_still_recorded_for_the_carry(project):
-    """The record is the INTENT, not a receipt for a new id. A story whose
-    follow-up was already open appends nothing, and the producer still records it,
-    because the record has to be durable before the append that may dedupe it —
-    otherwise a replay after a host loss can never reconstruct authorship. The
-    carry then dedupes in turn and journals an empty `dw_ids`, which the tracked
-    path already produces routinely."""
-    write_ledger(project, {})
-    deferredwork.append_entry(
-        project.deferred_work,
-        title="already recommended",
-        origin="review-budget-followup",
-        source_spec="spec-1-1-a.md",
-        reason="filed by an earlier run",
-        severity="low",
-    )
-    git(project.project, "add", "-A")
-    git(project.project, "commit", "-q", "-m", "prior follow-up")
-    commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    engine, _ = make_engine(project, _damping_script(project))
-
-    summary = engine.run()
-
-    assert summary.done == 1 and not summary.paused
-    damped = [e for e in engine.journal.entries() if e["kind"] == "review-followup-damped"]
-    assert len(damped) == 1 and damped[0]["refiled"] is None
-    assert len(engine.state.tasks["1-1-a"].refiled_followups) == 1
-    carried = [e for e in engine.journal.entries() if e["kind"] == "review-followup-carried"]
-    assert len(carried) == 1 and carried[0]["dw_ids"] == []
-    # no duplicate: the pre-existing open row is the only one
-    assert len(_refiled_followups(project)) == 1
-
-
-def _host_loss_before_the_commit_save(engine, snap):
-    """A host loss inside `_commit`, before its `advance(COMMITTING)` + `_save()`.
-
-    `snap` captures the bytes that were DURABLE at that instant. Restoring them
-    over whatever `run()`'s unwind-`finally` wrote is what makes this a SIGKILL
-    rather than a SIGINT: the engine's own teardown save would otherwise persist
-    the very record whose durability is under test, and the row would arrive for
-    a reason the fix has nothing to do with.
-    """
-
-    def commit_with_host_loss(_task):
-        snap["state"] = (engine.run_dir / "state.json").read_bytes()
-        raise RuntimeError("host died between the ledger write and the COMMITTING save")
-
-    engine._commit = commit_with_host_loss
-
-
-def test_host_loss_before_the_commit_save_still_carries_the_followup(project):
-    """The producer's record must be persisted BEFORE its ledger append.
-
-    Nothing saves between `_record_review_budget_followup` and `_commit`'s
-    COMMITTING save, and that window spans every blocking `pre_commit_gate`
-    workflow — the shipped TEA plugin binds three, each a live session. Recording
-    after a successful append loses the row for good: the resumed run replays the
-    same review result in the same worktree, `append_entry` dedupes the row it
-    already wrote there to None, so the record is never made, the carry finds an
-    empty payload, and `close_unit_workspace` deletes the worktree holding the
-    only copy.
-    """
-    ignore_before_commit(project, "deferred-work.md")
-    commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    engine, _ = make_engine(project, _damping_script(project))
-    snap: dict = {}
-    _host_loss_before_the_commit_save(engine, snap)
-
-    assert engine.run().crashed
-
-    worktree = Path(engine.state.tasks["1-1-a"].worktree_path)
-    # the row exists, but only inside the unit worktree's gitignored ledger
-    assert [e.id for e in _refiled_followups(project.rebased(worktree))] == ["DW-1"]
-    assert not project.deferred_work.exists()
-
-    (engine.run_dir / "state.json").write_bytes(snap["state"])
-    durable = load_state(engine.run_dir).tasks["1-1-a"]
-    assert durable.phase == Phase.REVIEW_VERIFY
-    assert durable.refiled_followups
-
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([])
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
-    summary = resumed.run()
-
-    assert summary.done == 1 and not summary.crashed and not summary.paused
-    assert not worktree.is_dir()
-    assert [e.title for e in _refiled_followups(project)] == [
-        "Follow-up review still recommended for 1-1-a after the damping cap was spent"
-    ]
-
-
-def test_a_replayed_review_result_records_the_followup_once(project):
-    """The record is keyed on `origin:` + `source_spec:`, so the replay that
-    re-enters the damped path with the record already persisted appends no second
-    copy — and files no second ledger row."""
-    ignore_before_commit(project, "deferred-work.md")
-    commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    engine, _ = make_engine(project, _damping_script(project))
-    _host_loss_before_the_commit_save(engine, {})
-
-    assert engine.run().crashed
-    # the unwind-finally persisted the record, so the replay re-enters the damped
-    # path with it already in hand — the case the keyed dedupe exists for
-    assert len(load_state(engine.run_dir).tasks["1-1-a"].refiled_followups) == 1
-
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
-    summary = resumed.run()
-
-    assert summary.done == 1 and not summary.crashed
-    assert len(resumed.state.tasks["1-1-a"].refiled_followups) == 1
-    assert len(_refiled_followups(project)) == 1
-
-
-def test_crashed_post_merge_followup_carry_replays_from_its_record(project):
-    """A story whose ONLY ledger write is a damped follow-up has both other carry
-    payloads empty, so the resume pass has to name this one to reach it: crash in
-    the merge-to-latch window and the row is otherwise stranded in a worktree that
-    is already gone."""
-    ignore_before_commit(project, "deferred-work.md")
-    commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    engine, _ = make_engine(project, _damping_script(project))
-    crash_at_merge_back(engine, after="merge")
-
-    assert engine.run().crashed
-
-    crashed = load_state(engine.run_dir).tasks["1-1-a"]
-    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
-    assert crashed.refiled_followups and not crashed.harvested_deferrals
-    assert not project.deferred_work.exists()
-
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([])
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
-    summary = resumed.run()
-
-    assert summary.done == 1 and not summary.crashed and not summary.paused
-    assert adapter.sessions == []
-    assert "resume-ledger-carry" in journal_kinds(resumed)
-    assert len(_refiled_followups(project)) == 1
-    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
-
-
-def test_a_re_armed_story_does_not_carry_the_abandoned_attempt_s_followup(project, monkeypatch):
-    """The record is scoped to the attempt that made it, and `_dev_phase`'s
-    fresh-attempt clear is what enforces that.
-
-    An escalation between the damped record and the commit leaves the unit
-    worktree mounted and unmerged; the re-drive then DISCARDS it, taking the only
-    copy of the row with it. Without the clear the record outlives its attempt,
-    and the next attempt's DONE leg files a follow-up against the commit that
-    actually landed — one whose review recommended nothing. `rearm_escalation`
-    already resets `followup_reviews_spent` for a fresh damping budget, so keeping
-    the record contradicts the re-arm on its own terms.
-
-    Nothing upstream absorbs it either: the abandoned attempt's ledger write never
-    reached the main checkout, so `append_entry` has no open row to dedupe against
-    and a TRACKED ledger would commit the stale row rather than swallow it.
-    """
-    ignore_before_commit(project, "deferred-work.md")
-    commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    engine, _ = make_engine(project, _damping_script(project))
-
-    real_finalize = verify.finalize_commit
-
-    def commit_fails(*_a, **_k):
-        raise verify.GitError("simulated commit failure")
-
-    monkeypatch.setattr(verify, "finalize_commit", commit_fails)
-
-    assert engine.run().paused
-
-    escalated = load_state(engine.run_dir).tasks["1-1-a"]
-    assert escalated.phase == Phase.ESCALATED
-    assert escalated.refiled_followups  # persisted by the producer, pre-append
-    assert not project.deferred_work.exists()  # the row is only in the doomed worktree
-
-    monkeypatch.setattr(verify, "finalize_commit", real_finalize)
-    assert runs.rearm_escalation(engine.run_dir, "1-1-a") == "1-1-a"
-
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter(
-            [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)]
-        ),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
-    summary = resumed.run()
-
-    assert summary.done == 1 and not summary.paused and not summary.crashed
-    # the re-drive converged on its own review: only the ABANDONED attempt damped
-    assert journal_kinds(resumed).count("review-followup-damped") == 1
-    # the harm, asserted before its cause: no follow-up row for the commit that
-    # landed, and no carry claiming to have filed one
-    assert [e.title for e in _refiled_followups(project)] == []
-    assert "review-followup-carried" not in journal_kinds(resumed)
-    assert not resumed.state.tasks["1-1-a"].refiled_followups
+    assert len(damped) == 1 and damped[0]["re_review_capped"] is False
+    assert "refiled" not in damped[0]
+    assert not project.deferred_work.exists()  # no main-checkout row
+    assert "review-followup-carried" not in journal_kinds(engine)
 
 
 # ----------------------------------------------------------------- configured target
@@ -2065,6 +3947,890 @@ def test_branch_per_run_escalation_pauses_without_dispatching_next_unit(project)
 # ----------------------------------------------------------------- resume
 
 
+def test_worktree_reopen_reabsolutizes_both_spec_ownership_paths(project, tmp_path):
+    """Portable relative spec ownership is rebound to the live mounted worktree.
+
+    Ablation: remove ``dispatched_spec_file`` from reopen_unit's rebase fields and
+    this test fails alone on the attempt-owned path while accepted spec rebasing stays green.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    from bmad_loop.workspace import open_unit_workspace
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_VERIFY)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/dispatched.md"
+
+    reopened = engine._reopen_unit(task)
+
+    assert reopened.path == unit.path
+    assert task.spec_file == str(unit.path / "_bmad-output/accepted.md")
+    assert task.dispatched_spec_file == str(unit.path / "_bmad-output/dispatched.md")
+
+    outside_spec = str(tmp_path / "outside-accepted.md")
+    outside_dispatched = str(tmp_path / "outside-dispatched.md")
+    task.spec_file = outside_spec
+    task.dispatched_spec_file = outside_dispatched
+    engine._reopen_unit(task)
+    assert task.spec_file == outside_spec
+    assert task.dispatched_spec_file == outside_dispatched
+
+
+def test_reopen_rejects_existing_directory_that_is_not_the_recorded_worktree(project, monkeypatch):
+    """A plain directory below main must not make git fall back to main on resume."""
+    from bmad_loop.engine import RunPaused
+
+    engine, _ = make_engine(project, [], policy=wt_policy())
+    fake = engine.run_dir / "worktrees" / "plain-directory"
+    fake.mkdir(parents=True)
+    task = StoryTask(
+        "1-1-a",
+        1,
+        phase=Phase.COMMITTING,
+        worktree_path=str(fake),
+        branch="bmad-loop/test-run/1-1-a",
+    )
+    engine.state.tasks[task.story_key] = task
+    finalized: list[Path] = []
+    monkeypatch.setattr(
+        engine, "_finalize_commit_phase", lambda _task: finalized.append(engine.workspace.root)
+    )
+
+    with pytest.raises(RunPaused, match="gone or unopenable"):
+        engine._finish_inflight()
+
+    assert finalized == []
+    assert task.phase == Phase.ESCALATED
+    assert engine.workspace.root == project.project
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_reopen_rejects_symlink_alias_to_recorded_worktree(project, monkeypatch):
+    """A retargetable alias is not the exact persisted mount ownership claim."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.workspace import open_unit_workspace
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [], policy=wt_policy())
+    engine.state.target_branch = "main"
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    alias = unit.path.parent / "recorded-alias"
+    alias.symlink_to(unit.path, target_is_directory=True)
+    task = StoryTask(
+        "1-1-a",
+        1,
+        phase=Phase.COMMITTING,
+        worktree_path=str(alias),
+        branch=unit.branch,
+        baseline_commit=unit.baseline,
+    )
+    engine.state.tasks[task.story_key] = task
+    finalized: list[Path] = []
+    monkeypatch.setattr(
+        engine, "_finalize_commit_phase", lambda _task: finalized.append(engine.workspace.root)
+    )
+
+    with pytest.raises(RunPaused, match="gone or unopenable"):
+        engine._finish_inflight()
+
+    assert finalized == []
+    assert task.phase == Phase.ESCALATED
+
+
+@pytest.mark.parametrize("checkout", ["wrong-branch", "detached"])
+def test_reopen_rejects_registered_mount_on_wrong_recorded_branch(project, monkeypatch, checkout):
+    """Registration is not ownership when the linked checkout changed branch."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.workspace import open_unit_workspace
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [], policy=wt_policy())
+    engine.state.target_branch = "main"
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    if checkout == "wrong-branch":
+        git(unit.path, "checkout", "-q", "-b", "operator-branch")
+    else:
+        git(unit.path, "checkout", "-q", "--detach")
+    assert verify.worktree_is_registered(project.project, unit.path)
+    task = StoryTask(
+        "1-1-a",
+        1,
+        phase=Phase.COMMITTING,
+        worktree_path=str(unit.path),
+        branch=unit.branch,
+        baseline_commit=unit.baseline,
+    )
+    engine.state.tasks[task.story_key] = task
+    finalized: list[Path] = []
+    monkeypatch.setattr(
+        engine, "_finalize_commit_phase", lambda _task: finalized.append(engine.workspace.root)
+    )
+
+    with pytest.raises(RunPaused, match="not recorded branch"):
+        engine._finish_inflight()
+
+    assert finalized == []
+    assert task.phase == Phase.ESCALATED
+
+
+@pytest.mark.parametrize("damage", ["missing-marker", "foreign-repository"])
+def test_reopen_rejects_corrupted_but_registered_mount(project, monkeypatch, damage):
+    """Toplevel and common-dir identity fail closed before any continuation."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.workspace import open_unit_workspace
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [], policy=wt_policy())
+    engine.state.target_branch = "main"
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    if damage == "missing-marker":
+        (unit.path / ".git").unlink()
+    else:
+        shutil.rmtree(unit.path)
+        unit.path.mkdir()
+        git(unit.path, "init", "-q")
+        git(unit.path, "config", "user.email", "test@example.com")
+        git(unit.path, "config", "user.name", "Test User")
+        git(unit.path, "commit", "--allow-empty", "-q", "-m", "foreign root")
+    assert unit.path.resolve() in [path.resolve() for path in worktree_list(project.project)]
+    assert not verify.worktree_is_registered(project.project, unit.path)
+    task = StoryTask(
+        "1-1-a",
+        1,
+        phase=Phase.COMMITTING,
+        worktree_path=str(unit.path),
+        branch=unit.branch,
+        baseline_commit=unit.baseline,
+    )
+    engine.state.tasks[task.story_key] = task
+    finalized: list[Path] = []
+    monkeypatch.setattr(
+        engine, "_finalize_commit_phase", lambda _task: finalized.append(engine.workspace.root)
+    )
+
+    with pytest.raises(RunPaused, match="gone or unopenable"):
+        engine._finish_inflight()
+
+    assert finalized == []
+    assert task.phase == Phase.ESCALATED
+
+
+def test_restart_arm_anchors_spec_ownership_before_it_discards_the_mount(project, monkeypatch):
+    """The restart arm destroys the only tree that can resolve the persisted spelling.
+
+    `_finish_inflight`'s restart arm is the one arm that never calls `reopen_unit`:
+    it discards the worktree, clears `task.worktree_path` and saves. Both spec paths
+    are persisted RELATIVE to that mount (`model._serialized_worktree_path`), so
+    without a re-anchor the save leaves a worktree-relative spelling beside an empty
+    `worktree_path`, and the next resume resolves it against the MAIN checkout — which
+    carries the same layout, so `recovery_flow._attempt_owned_spec` finds exactly one
+    candidate and `spec_within_roots` accepts it. The snapshot restore then rewrites
+    the operator's own copy. Anchored on the mount instead, the binding names a tree
+    that no longer exists and recovery refuses it loudly.
+
+    Graded at the discard rather than after it: the ordering is the whole property, and
+    `_run_story` rebinds the field moments later, so a post-hoc assertion would pass
+    with the re-anchor deleted.
+
+    Ablation: drop `task.rebase_spec_paths_on(...)` from `_finish_inflight` and both
+    assertions fail with the bare relative spellings.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    from bmad_loop.workspace import open_unit_workspace
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/dispatched.md"
+    engine.state.tasks["1-1-a"] = task
+
+    seen: dict[str, str | None] = {}
+
+    class _StopAtDiscard(Exception):
+        pass
+
+    def _spy(*_args, **_kwargs):
+        seen["spec_file"] = task.spec_file
+        seen["dispatched_spec_file"] = task.dispatched_spec_file
+        raise _StopAtDiscard
+
+    monkeypatch.setattr("bmad_loop.engine.discard_worktree", _spy)
+
+    with pytest.raises(_StopAtDiscard):
+        engine._finish_inflight()
+
+    assert seen["spec_file"] == str(unit.path / "_bmad-output/accepted.md")
+    assert seen["dispatched_spec_file"] == str(unit.path / "_bmad-output/dispatched.md")
+
+
+def test_restart_arm_clears_the_baseline_it_measured_in_the_discarded_mount(project, monkeypatch):
+    """`baseline_commit`/`baseline_untracked` describe the mount and must die with it.
+
+    `_dev_phase` stamps both from `self.workspace.root` — the unit worktree under
+    isolation. The restart arm discards that mount and saves, so leaving them set
+    persists two operands that describe a tree which no longer exists. Any later
+    resume finding `worktree_path` empty takes the `elif task.baseline_commit:` leg
+    into `recovery_flow.rollback_or_pause` against the MAIN checkout, and neither
+    operand fails loud there: linked worktrees share the object database, so the
+    baseline still resolves and a reset onto it succeeds, while a fresh worktree's
+    empty untracked snapshot makes `verify._rollback_cleanup_plan` treat every
+    untracked file in the operator's checkout as this attempt's debris.
+
+    Asserted on the DURABLE state, not the in-memory task: state.json is what the
+    next resume reads, and the save happens between the discard and the re-run.
+
+    Ablation: drop the two `= None` clears from `_discard_unit_for_restart` and the
+    baseline assertions fail while the `worktree_path` one stays green — which is
+    precisely the split that made this reachable.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    from bmad_loop.workspace import open_unit_workspace
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    task.baseline_commit = rev_parse_head(unit.path)
+    task.baseline_untracked = []  # a fresh mount is a tracked-only checkout
+    engine.state.tasks["1-1-a"] = task
+
+    class _StopBeforeRerun(Exception):
+        pass
+
+    def _stop(*_args, **_kwargs):
+        raise _StopBeforeRerun
+
+    monkeypatch.setattr(engine, "_run_story", _stop)
+
+    with pytest.raises(_StopBeforeRerun):
+        engine._finish_inflight()
+
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.worktree_path == ""
+    assert saved.branch == ""
+    assert saved.baseline_commit is None
+    assert saved.baseline_untracked is None
+
+
+def test_restart_arm_leaves_a_spec_the_replacement_mount_can_bind(project, monkeypatch):
+    """The property the re-anchor broke: after the discard, the fresh mount BINDS.
+
+    `_finish_inflight` re-anchors `spec_file` onto the mount (correct — recovery must
+    not resolve it against the main checkout), and the restart arm then DELETES that
+    mount. Left absolute, the value names a tree that no longer exists:
+    `verify.resolve_spec_path` passes an absolute path through untouched,
+    `_dispatched_spec_for_attempt` resolves it `strict=True` and swallows the
+    `FileNotFoundError`, and the fresh attempt starts unbound on a story whose spec is
+    sitting in the replacement mount at the same relative place. Nothing downstream
+    repairs it — `_record_dev_spec` no-ops while `spec_file` is set — so the repair
+    prompt keeps naming the deleted path.
+
+    Graded on the DURABLE state and then on the resolution itself, because the
+    spelling is only a proxy: what matters is that the replacement mount answers with
+    ITS copy, and neither the dead path nor the main checkout's identical layout.
+
+    Ablation: drop `task.release_spec_paths_from_mount()` from
+    `_discard_unit_for_restart` and this reddens on the durable-spelling assertion —
+    the saved `spec_file` comes back absolute into the deleted mount, which is the
+    state that shipped. That assertion fires before the binding one, so the binding
+    assertion is not what the ablation proves; it is what states the CONSEQUENCE, and
+    it holds the row to the replacement mount's copy rather than merely to some
+    resolvable path (the main checkout carries the identical layout and would answer
+    a relative value too, from the wrong tree).
+    """
+    from bmad_loop import verify
+    from bmad_loop.workspace import open_unit_workspace
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    rel = "_bmad-output/implementation-artifacts/spec-1-1-a.md"
+    (unit.path / rel).parent.mkdir(parents=True, exist_ok=True)
+    (unit.path / rel).write_text("---\nstatus: ready-for-dev\n---\n", encoding="utf-8")
+
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    # persisted RELATIVE, exactly as `_serialized_worktree_path` writes it — the
+    # re-anchor inside `_finish_inflight` is what makes it absolute
+    task.spec_file = rel
+    task.dispatched_spec_file = rel
+    task.dispatched_spec_snapshot = b"pre-launch bytes"
+    engine.state.tasks["1-1-a"] = task
+
+    class _StopBeforeRerun(Exception):
+        pass
+
+    monkeypatch.setattr(
+        engine, "_run_story", lambda *a, **k: (_ for _ in ()).throw(_StopBeforeRerun())
+    )
+
+    with pytest.raises(_StopBeforeRerun):
+        engine._finish_inflight()
+
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.worktree_path == ""
+    assert saved.spec_file == rel  # relative again, not absolute into the deleted tree
+    assert saved.dispatched_spec_file is None  # the attempt died with its tree
+    assert saved.dispatched_spec_snapshot is None
+
+    # the replacement mount `_run_story` would have opened, carrying the same spec
+    replacement = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    (replacement.path / rel).parent.mkdir(parents=True, exist_ok=True)
+    (replacement.path / rel).write_text("---\nstatus: ready-for-dev\n---\n", encoding="utf-8")
+
+    # the binding `_dispatched_spec_for_attempt` makes, against the live workspace
+    bound = verify.resolve_spec_path(saved.spec_file, replacement.workspace.paths).resolve(
+        strict=True
+    )
+    assert bound == (replacement.path / rel).resolve()
+
+
+def test_finish_inflight_anchors_on_the_persisted_mount_not_the_live_isolation_policy(project):
+    """The relative spelling is persisted state; `isolated` is re-read policy.
+
+    `model._serialized_worktree_path` relativizes whenever `task.worktree_path` is
+    set, but `_finish_inflight` gates its `reopen_unit` arms on
+    `self._isolated and task.worktree_path` — and `self._isolated` comes from a policy
+    file re-read on every resume, where an `isolation` change is journaled and never
+    refused. Flip `[scm] isolation` to "none" between a crash and a resume and every
+    arm runs without `reopen_unit` on a task whose paths are still mount-relative.
+
+    The story gate stops the restart arm before it mutates anything, so what is graded
+    is the re-anchor alone — and it must have happened despite `isolated` being false.
+
+    Ablation: move `task.rebase_spec_paths_on(...)` inside the `if isolated:` arm (or
+    delete it) and both assertions fail with the bare relative spellings. Note the
+    sibling test above stays GREEN under that first ablation, which is why this row
+    exists separately.
+    """
+    from bmad_loop.engine import RunPaused
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    engine, _ = make_engine(project, [], policy=in_place)
+    assert not engine._isolated  # the premise: live policy says in-place
+
+    mount = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1-1-a"
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(mount)  # ...but the persisted task still carries one
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/dispatched.md"
+    engine.state.tasks["1-1-a"] = task
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+
+    with pytest.raises(RunPaused):
+        engine._finish_inflight()
+
+    assert task.spec_file == str(mount / "_bmad-output/accepted.md")
+    assert task.dispatched_spec_file == str(mount / "_bmad-output/dispatched.md")
+
+
+def test_isolation_flip_releases_the_units_baseline_before_the_in_place_rollback(
+    project, monkeypatch
+):
+    """The mount-measured operands must not reach a rollback of the MAIN checkout.
+
+    `[scm] isolation` is re-read on every resume and a change is journaled, never
+    refused, so `worktree -> none` reaches the restart arm with a mount still recorded.
+    That arm re-runs in place, and the leg below it hands `baseline_commit` /
+    `baseline_untracked` to `recovery_flow.rollback_or_pause` — but both were stamped
+    from `self.workspace.root`, the UNIT, and the workspace is now the main checkout.
+
+    Neither operand fails loud there. Linked worktrees share the object database, so
+    the unit baseline still resolves and a reset onto it succeeds; and a fresh
+    worktree is a tracked-only checkout, so its empty `baseline_untracked` makes
+    `verify._rollback_cleanup_plan` compute `untracked_files(repo) -
+    baseline_untracked` as EVERY untracked file in the operator's own checkout. Under
+    an auto-recovering cause those are deleted outright — the operator's own files,
+    for a story that merely changed isolation mode.
+
+    Graded on the rollback leg not being entered at all, rather than only on the
+    cleared fields: the fields are the mechanism, the un-entered leg is the property.
+
+    The mount's CLAIM and the mount's DIRECTORY are separated, and both are asserted.
+    `worktree_path` names a directory and is also how `runs` answers the RETROSPECTIVE
+    question — which tree owns the state this task already persisted (`task_spec_root`,
+    `task_stories_root`) — so a task that keeps the field set while executing in the
+    main checkout makes those readers answer for a tree the run has left. The directory
+    itself stays: this arm did not build it, and a policy change is not an instruction
+    to delete the operator's tree. The orphan is journaled so that is not silent.
+
+    The PROSPECTIVE readers are deliberately absent from that list and from the
+    assertions below. `redrive_base_ref` and `spec_reaches_the_redrive` describe the
+    re-drive that has not happened yet, and they take the live isolation mode as a
+    parameter rather than inferring it here — because `bmad-loop resolve` asks them in
+    a separate process BEFORE this resume runs, where no amount of claim-clearing is
+    visible. Asserting them here would grade the argument this test passes them, not
+    the field it is about; `test_redrive_base_ref_reads_live_policy_not_the_recorded_mount`
+    (tests/test_runs.py) carries that direction against both flips.
+
+    Ablation: narrow the arm back to `release_spec_paths_from_mount()` and this
+    reddens on the spy — the leg fires with the unit's operands, which is the state
+    that would have deleted them. Separately, drop the `worktree_path = ""` and the
+    claim assertions redden while the spy stays green, which is why both are here.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    engine, _ = make_engine(project, [], policy=in_place)
+    assert not engine._isolated  # the premise: live policy says in-place
+
+    mount = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1-1-a"
+    (mount / "_bmad-output").mkdir(parents=True, exist_ok=True)
+    (mount / "_bmad-output" / "accepted.md").write_text("# spec\n", encoding="utf-8")
+
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(mount)  # the persisted mount the live policy ignores
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_snapshot = b"pre-launch bytes"
+    # measured INSIDE the unit by `_dev_phase`; a fresh mount is tracked-only, which
+    # is what makes the untracked half so destructive against another tree
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    engine.state.tasks["1-1-a"] = task
+
+    rolled: list[str] = []
+    monkeypatch.setattr(engine, "_rollback_or_pause", lambda t, cause: rolled.append(cause))
+
+    class _StopBeforeRerun(Exception):
+        pass
+
+    def _stop(*_a, **_k):
+        raise _StopBeforeRerun
+
+    monkeypatch.setattr(engine, "_run_story", _stop)
+
+    with pytest.raises(_StopBeforeRerun):
+        engine._finish_inflight()
+
+    assert rolled == []  # the leg never ran, so the unit operands never travelled
+
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.baseline_commit is None
+    assert saved.baseline_untracked is None
+    assert saved.spec_file == "_bmad-output/accepted.md"  # relative again
+    assert saved.dispatched_spec_file is None
+    assert saved.dispatched_spec_snapshot is None
+
+    # the CLAIM is dropped: the retrospective readers must now answer the main checkout
+    assert saved.worktree_path == ""
+    assert saved.branch == ""
+    assert runs.task_stories_root(saved, engine.state) == project.project
+    assert runs.task_spec_root(saved, engine.state) == project.project
+
+    # ...but the DIRECTORY is not deleted, and the orphan is on the record
+    assert mount.is_dir()  # left standing: this arm did not build it
+    assert "isolation-flip-orphaned-worktree" in journal_kinds(engine)
+
+
+def test_isolation_flip_keeps_the_mount_for_an_accepted_continuation(project, monkeypatch):
+    """Recorded ownership wins over live policy until accepted work is integrated.
+
+    The worktree path is persisted state while ``self._isolated`` is live policy for
+    the next attempt. A verified DEV_VERIFY continuation must therefore reopen the
+    exact mount after ``worktree -> none`` instead of releasing its accepted spec and
+    running in main.
+
+    Ablation: gate the DEV_VERIFY reopen on ``self._isolated`` and the observed paths
+    are released to main (and ``isolation-flip-orphaned-worktree`` is journaled).
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    engine, _ = make_engine(project, [], policy=in_place)
+    assert not engine._isolated  # the premise: live policy says in-place
+
+    from bmad_loop.workspace import open_unit_workspace
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    mount = unit.path
+    rel = "_bmad-output/accepted.md"
+    (mount / rel).parent.mkdir(parents=True, exist_ok=True)
+    (mount / rel).write_text("# spec\n", encoding="utf-8")
+
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_VERIFY)
+    task.worktree_path = str(mount)  # persisted ownership survives the policy flip
+    task.branch = unit.branch
+    task.spec_file = rel  # persisted RELATIVE, as `_serialized_worktree_path` writes it
+    task.dispatched_spec_file = rel
+    task.dispatched_spec_snapshot = b"pre-launch bytes"
+    task.baseline_commit = unit.baseline
+    task.baseline_untracked = []
+    engine.state.tasks["1-1-a"] = task
+
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        engine,
+        "_resume_after_dev_verify",
+        lambda t: seen.update(
+            spec_file=t.spec_file,
+            dispatched=t.dispatched_spec_file,
+            worktree_path=t.worktree_path,
+            baseline_commit=t.baseline_commit,
+        ),
+    )
+
+    engine._finish_inflight()
+
+    assert seen, "the DEV_VERIFY continuation arm never ran"
+    assert seen["spec_file"] == str(mount / rel)
+    assert seen["dispatched"] == str(mount / rel)
+    assert seen["worktree_path"] == str(mount)
+    assert seen["baseline_commit"] == rev_parse_head(project.project)
+    assert "isolation-flip-orphaned-worktree" not in journal_kinds(engine)
+
+
+def test_open_unit_workspace_reclaims_the_orphan_holding_its_mount_path(project):
+    """A flip back to `worktree` is not blocked by the orphan the flip left behind.
+
+    `unit_branch_name` and the mount path are both DETERMINISTIC in
+    (run_id, unit_key, run_dir), so a re-mount targets the exact directory a previous
+    mount used. `engine._release_orphaned_mount` deliberately leaves that directory
+    standing when live policy drops isolation — a policy change is not an instruction
+    to delete the tree — so a later flip BACK re-derives the same path and met a
+    `git worktree add` that refuses both an existing target and a branch checked out
+    elsewhere, deferring the task instead of resuming it.
+
+    The BRANCH is deliberately spared by the reclaim: under `branch_per=run` this name
+    is the SHARED run branch carrying commits earlier units already landed, so a
+    force-delete would drop real work. The reclaim drops only the worktree, and the
+    `branch_exists` fork re-mounts the branch from its own HEAD — which is what the
+    committed file below grades.
+
+    Ablation: delete the `discard_worktree(...)` call in `open_unit_workspace` and the
+    second mount raises `GitError`; swap its `""` back to `branch` and `landed.txt` is
+    gone because the shared branch was force-deleted.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    args = (project.project, project, "test-run", "1-1-a", "main", "run", run_dir)
+
+    first = open_unit_workspace(*args)
+    (first.path / "landed.txt").write_text("earlier unit\n", encoding="utf-8")
+    git(first.path, "add", "landed.txt")
+    git(first.path, "commit", "-m", "landed on the shared run branch")
+
+    # the orphan: nothing tore this down, exactly as the isolation flip leaves it
+    assert first.path.is_dir()
+
+    second = open_unit_workspace(*args)
+
+    assert second.path == first.path  # the same deterministic mount point
+    assert second.branch == first.branch
+    # the branch was NOT force-deleted: the earlier unit's commit is still on it
+    assert (second.path / "landed.txt").read_text(encoding="utf-8") == "earlier unit\n"
+
+
+def test_story_remount_preserves_named_tip_and_restarts_from_pinned_base(project):
+    """Story branches are attempt-local while the preserve ref keeps abandoned work."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    args = (project.project, project, "test-run", "1-1-a", "main", "story", run_dir)
+    first = open_unit_workspace(*args)
+    (first.path / "abandoned.txt").write_text("old attempt\n", encoding="utf-8")
+    git(first.path, "add", "abandoned.txt")
+    git(first.path, "commit", "-q", "-m", "abandoned story attempt")
+    old_tip = rev_parse_head(first.path)
+
+    (project.project / "advanced.txt").write_text("new base\n", encoding="utf-8")
+    git(project.project, "add", "advanced.txt")
+    git(project.project, "commit", "-q", "-m", "advance requested base")
+    pinned_base = rev_parse_head(project.project)
+
+    second = open_unit_workspace(*args)
+
+    preserve_ref = f"attempt-preserve/test-run-{old_tip[:8]}"
+    assert rev_parse_head(second.path) == pinned_base
+    assert not (second.path / "abandoned.txt").exists()
+    assert (second.path / "advanced.txt").read_text(encoding="utf-8") == "new base\n"
+    assert git(project.project, "rev-parse", preserve_ref) == old_tip
+
+
+def test_story_remount_without_unique_commits_still_moves_to_advanced_base(project):
+    """Reset is unconditional for story scope, not coupled to preservation work.
+
+    Ablation: nest ``reset_branch_if_tip`` under ``if commits`` and this leaves the
+    replacement at the original base because there is no abandoned commit to park.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    args = (project.project, project, "test-run", "1-1-a", "main", "story", run_dir)
+    first = open_unit_workspace(*args)
+    old_base = rev_parse_head(first.path)
+
+    (project.project / "advanced-without-abandoned.txt").write_text("new base\n")
+    git(project.project, "add", "advanced-without-abandoned.txt")
+    git(project.project, "commit", "-q", "-m", "advance requested base")
+    advanced = rev_parse_head(project.project)
+
+    second = open_unit_workspace(*args)
+
+    assert old_base != advanced
+    assert rev_parse_head(second.path) == advanced
+    assert (second.path / "advanced-without-abandoned.txt").read_text() == "new base\n"
+
+
+def test_new_story_workspace_uses_base_sha_pinned_before_ref_moves(project, monkeypatch):
+    """A moving requested branch cannot change the operation's selected snapshot."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    real_resolve = verify.rev_parse_revision
+    observed: dict[str, str] = {}
+
+    def resolve_then_advance(repo, revision):
+        pinned = real_resolve(repo, revision)
+        if revision == "main" and "pinned" not in observed:
+            observed["pinned"] = pinned
+            (project.project / "late-base-move.txt").write_text("too late\n")
+            git(project.project, "add", "late-base-move.txt")
+            git(project.project, "commit", "-q", "-m", "concurrent base move")
+            observed["advanced"] = rev_parse_head(project.project)
+        return pinned
+
+    monkeypatch.setattr(verify, "rev_parse_revision", resolve_then_advance)
+    unit = open_unit_workspace(
+        project.project,
+        project,
+        "test-run",
+        "1-1-pinned",
+        "main",
+        "story",
+        project.project / ".bmad-loop" / "runs" / "test-run",
+    )
+
+    assert observed["pinned"] != observed["advanced"]
+    assert rev_parse_head(unit.path) == observed["pinned"]
+    assert not (unit.path / "late-base-move.txt").exists()
+
+
+def test_story_remount_preservation_failure_keeps_old_tip_and_mount(project, monkeypatch):
+    """Preservation must complete before either the story ref or mount is discarded.
+
+    INVERSE ablation: catch the preservation error and continue to reset/discard;
+    then the old branch tip and mounted directory assertions fail.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    args = (project.project, project, "test-run", "1-1-a", "main", "story", run_dir)
+    first = open_unit_workspace(*args)
+    git(first.path, "commit", "--allow-empty", "-q", "-m", "abandoned story attempt")
+    old_tip = rev_parse_head(first.path)
+    monkeypatch.setattr(
+        verify,
+        "preserve_commits",
+        lambda *_a, **_k: (_ for _ in ()).throw(verify.GitError("preserve refused")),
+    )
+
+    with pytest.raises(verify.GitError, match="preserve refused"):
+        open_unit_workspace(*args)
+
+    assert git(project.project, "rev-parse", first.branch) == old_tip
+    assert first.path.is_dir()
+
+
+def test_story_remount_cas_failure_keeps_concurrent_tip_and_mount(project, monkeypatch):
+    """A rival branch move after preservation is never overwritten by reclaim.
+
+    INVERSE ablation: remove the expected-old operand from ``update-ref`` and the
+    concurrently created tip is reset to main instead of surviving.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    args = (project.project, project, "test-run", "1-1-a", "main", "story", run_dir)
+    first = open_unit_workspace(*args)
+    git(first.path, "commit", "--allow-empty", "-q", "-m", "abandoned story attempt")
+    old_tip = rev_parse_head(first.path)
+    real_reset = verify.reset_branch_if_tip
+    rival: dict[str, str] = {}
+
+    def move_then_reset(repo, name, revision, expected_tip):
+        git(first.path, "commit", "--allow-empty", "-q", "-m", "concurrent story move")
+        rival["tip"] = rev_parse_head(first.path)
+        real_reset(repo, name, revision, expected_tip)
+
+    monkeypatch.setattr(verify, "reset_branch_if_tip", move_then_reset)
+
+    with pytest.raises(verify.GitError, match="update-ref"):
+        open_unit_workspace(*args)
+
+    assert git(project.project, "rev-parse", first.branch) == rival["tip"]
+    assert git(project.project, "rev-parse", f"attempt-preserve/test-run-{old_tip[:8]}") == old_tip
+    assert first.path.is_dir()
+
+
+def test_story_remount_rejects_branch_move_after_reset_before_checkout(project, monkeypatch):
+    """The second race window cannot smuggle a rival tip into the replacement."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    args = (project.project, project, "test-run", "1-1-a", "main", "story", run_dir)
+    first = open_unit_workspace(*args)
+    git(first.path, "commit", "--allow-empty", "-q", "-m", "abandoned story attempt")
+    old_tip = rev_parse_head(first.path)
+    pinned = rev_parse_head(project.project)
+    real_add = verify.worktree_add
+
+    def move_then_add(repo, path, branch, base=None, *, create=True):
+        if not create:
+            git(repo, "update-ref", f"refs/heads/{branch}", old_tip, pinned)
+        real_add(repo, path, branch, base, create=create)
+
+    monkeypatch.setattr(verify, "worktree_add", move_then_add)
+
+    with pytest.raises(verify.GitError, match="moved after reclaim reset"):
+        open_unit_workspace(*args)
+
+    assert git(project.project, "rev-parse", first.branch) == old_tip
+    assert not first.path.exists()
+
+
+def test_story_remount_does_not_reread_head_after_tip_validation(project, monkeypatch):
+    """A final moving HEAD read cannot replace the already-validated baseline.
+
+    Ablation: restore ``baseline = rev_parse_head(wt)`` and the injected rival
+    move lands between validation and that read, returning the rival as baseline.
+
+    Only reads of the MOUNTED checkout count: the orphan reclaim legitimately reads
+    the first mount's HEAD (at the same path) before ``worktree_add`` to park its
+    uncommitted state, so the spy arms itself on the mount call.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    args = (project.project, project, "test-run", "1-1-a", "main", "story", run_dir)
+    first = open_unit_workspace(*args)
+    git(first.path, "commit", "--allow-empty", "-q", "-m", "abandoned story attempt")
+    old_tip = rev_parse_head(first.path)
+    pinned = rev_parse_head(project.project)
+    real_head = verify.rev_parse_head
+    real_add = verify.worktree_add
+    reads = 0
+    mounted = False
+
+    def arm_on_mount(*a, **k):
+        nonlocal mounted
+        real_add(*a, **k)
+        mounted = True
+
+    def move_on_redundant_head_read(repo):
+        nonlocal reads
+        if mounted and Path(repo).resolve() == first.path.resolve():
+            reads += 1
+            if reads == 2:
+                git(project.project, "update-ref", f"refs/heads/{first.branch}", old_tip, pinned)
+        return real_head(repo)
+
+    monkeypatch.setattr(verify, "worktree_add", arm_on_mount)
+    monkeypatch.setattr(verify, "rev_parse_head", move_on_redundant_head_read)
+
+    second = open_unit_workspace(*args)
+
+    assert reads == 1
+    assert second.baseline == pinned
+
+
+def test_restart_discard_retains_shared_run_branch_history(project):
+    """Restart teardown frees the mount without deleting a cumulative run ref."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    engine, _ = make_engine(project, [], policy=wt_policy(branch_per="run"))
+    args = (
+        project.project,
+        project,
+        "test-run",
+        "1-1-a",
+        "main",
+        "run",
+        engine.run_dir,
+    )
+    first = open_unit_workspace(*args)
+    (first.path / "landed-before-restart.txt").write_text("retained\n")
+    git(first.path, "add", "landed-before-restart.txt")
+    git(first.path, "commit", "-q", "-m", "landed before restart")
+    landed_tip = rev_parse_head(first.path)
+    task = StoryTask(
+        "1-1-a",
+        1,
+        worktree_path=str(first.path),
+        branch=first.branch,
+        baseline_commit=first.baseline,
+    )
+
+    engine._discard_unit_for_restart(task)
+    second = open_unit_workspace(*args)
+
+    assert rev_parse_head(second.path) == landed_tip
+    assert (second.path / "landed-before-restart.txt").read_text() == "retained\n"
+
+
+def test_story_remount_bad_base_fails_before_discard(project):
+    """An unresolvable requested base leaves the existing story workspace intact."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    first = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", run_dir
+    )
+    tip = rev_parse_head(first.path)
+
+    with pytest.raises(verify.GitError, match="missing-base"):
+        open_unit_workspace(
+            project.project,
+            project,
+            "test-run",
+            "1-1-a",
+            "missing-base",
+            "story",
+            run_dir,
+        )
+
+    assert rev_parse_head(first.path) == tip
+    assert first.path.is_dir()
+
+
 def test_worktree_spec_approval_pause_resumes_in_same_worktree(project):
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     gated = Policy(
@@ -2083,16 +4849,13 @@ def test_worktree_spec_approval_pause_resumes_in_same_worktree(project):
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
     assert len(worktree_list(project.project)) == 2
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([wt_review_effect(project, "1-1-a", clean=True)])
-    resumed = Engine(
-        paths=project,
-        policy=gated,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    resumed, adapter = resume_engine(
+        project, engine, [wt_review_effect(project, "1-1-a", clean=True)], policy=in_place
     )
     summary2 = resumed.run()
 
@@ -2101,6 +4864,144 @@ def test_worktree_spec_approval_pause_resumes_in_same_worktree(project):
     assert "change for 1-1-a" in (project.project / "src.txt").read_text()
     assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
     assert worktree_clean(project.project)
+
+
+@pytest.mark.parametrize("role", ["dev", "review"])
+def test_isolation_flip_replays_recorded_session_in_mount_and_lands_it(project, monkeypatch, role):
+    """Completed dev/review results retain their recorded workspace through merge.
+
+    Ablation: gate the recorded-result reopen on live isolation and each row writes
+    the continuation marker in main directly, leaving no unit merge evidence.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    engine, _ = make_engine(project, [], policy=in_place)
+    engine.state.target_branch = "main"
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    phase = Phase.DEV_RUNNING if role == "dev" else Phase.REVIEW_RUNNING
+    task = StoryTask(
+        "1-1-a",
+        1,
+        phase=phase,
+        attempt=1,
+        review_cycle=1,
+        baseline_commit=unit.baseline,
+        worktree_path=str(unit.path),
+        branch=unit.branch,
+    )
+    task.record_session(
+        SessionRecord(
+            task_id=f"1-1-a-{role}-1",
+            role=role,
+            status="completed",
+            result_json={"workflow": f"recorded-{role}"},
+        )
+    )
+    engine.state.tasks[task.story_key] = task
+    observed: list[Path] = []
+
+    def continue_in_recorded_workspace(*_args, **_kwargs):
+        observed.append(engine.workspace.root)
+        marker = engine.workspace.root / f"continued-{role}.txt"
+        marker.write_text(f"{role}\n", encoding="utf-8")
+        git(engine.workspace.root, "add", marker.name)
+        git(engine.workspace.root, "commit", "-q", "-m", f"continue {role}")
+        task.phase = Phase.DONE
+
+    target = "_drive_story" if role == "dev" else "_review_and_commit"
+    monkeypatch.setattr(engine, target, continue_in_recorded_workspace)
+
+    engine._finish_inflight()
+
+    assert observed == [unit.path]
+    assert (project.project / f"continued-{role}.txt").read_text(encoding="utf-8") == f"{role}\n"
+    assert "unit-merged" in journal_kinds(engine)
+    assert "isolation-flip-orphaned-worktree" not in journal_kinds(engine)
+    assert not unit.path.exists()
+
+
+def test_isolation_flip_finishes_mounted_defer_before_teardown(project):
+    """A persisted defer decision is completed where its rejected work lives."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none", keep_failed=False),
+    )
+    engine, _ = make_engine(project, [], policy=in_place)
+    engine.state.target_branch = "main"
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    task = StoryTask(
+        "1-1-a",
+        1,
+        phase=Phase.DEV_VERIFY,
+        baseline_commit=unit.baseline,
+        worktree_path=str(unit.path),
+        branch=unit.branch,
+        defer_reason="accepted rejection",
+    )
+    engine.state.tasks[task.story_key] = task
+    rejected = unit.path / "rejected-work.txt"
+    rejected.write_text("preserve in failed patch\n", encoding="utf-8")
+
+    engine._finish_inflight()
+
+    assert task.phase == Phase.DEFERRED
+    assert "resume-defer" in journal_kinds(engine)
+    assert "isolation-flip-orphaned-worktree" not in journal_kinds(engine)
+    assert not unit.path.exists()
+    patch = engine.run_dir / "failed" / "1-1-a" / "changes.patch"
+    assert "rejected-work.txt" in patch.read_text(encoding="utf-8")
+    assert "preserve in failed patch" in patch.read_text(encoding="utf-8")
+
+
+def test_isolation_flip_missing_mount_escalates_before_continuation(project, monkeypatch):
+    """Missing recorded ownership never falls back to a continuation in main.
+
+    Ablation: select reopening from live isolation and the finalizer spy runs in the
+    main checkout instead of the task escalating.
+    """
+    from bmad_loop.engine import RunPaused
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    engine, _ = make_engine(project, [], policy=in_place)
+    engine.state.target_branch = "main"
+    task = StoryTask(
+        "1-1-a",
+        1,
+        phase=Phase.COMMITTING,
+        worktree_path=str(engine.run_dir / "worktrees" / "gone"),
+        branch="bmad-loop/test-run/1-1-a",
+    )
+    engine.state.tasks[task.story_key] = task
+    finalized: list[Path] = []
+    monkeypatch.setattr(
+        engine, "_finalize_commit_phase", lambda _task: finalized.append(engine.workspace.root)
+    )
+
+    with pytest.raises(RunPaused, match="is gone"):
+        engine._finish_inflight()
+
+    assert finalized == []
+    assert task.phase == Phase.ESCALATED
+    assert engine.workspace.root == project.project
 
 
 def test_worktree_crash_restart_discards_stale_worktree(project):
@@ -2123,18 +5024,11 @@ def test_worktree_crash_restart_discards_stale_worktree(project):
     engine._save()
 
     # resume with a full dev+review script → restart should succeed
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter(
-        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)]
-    )
-    resumed = Engine(
-        paths=project,
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
         policy=wt_policy(),
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
     )
     summary = resumed.run()
 
@@ -2188,17 +5082,12 @@ def test_worktree_resume_committing_finishes_and_merges(project):
     engine.state.tasks["1-1-a"] = task
     engine._save()
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([])
-    resumed = Engine(
-        paths=project,
-        policy=wt_policy(),
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
     )
+    resumed, adapter = resume_engine(project, engine, policy=in_place)
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed
@@ -2264,6 +5153,386 @@ def test_commit_message_template_applied(project):
     assert "implemented" not in log  # built-in default was not used
 
 
+def test_commit_message_template_story_title(project):
+    """{story_title} renders the spec's `title:` frontmatter — where a bmad-loop
+    spec's title actually lives — with the "Story <id>:" label dropped; a
+    template without the placeholder never pays the spec read."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    review = wt_review_effect(project, "1-1-a", clean=True)
+
+    def review_with_title(spec):
+        # the review pass is the spec's last writer, so the title the commit-time
+        # read sees must be stamped after it
+        result = review(spec)
+        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
+        sp.write_text(
+            sp.read_text().replace("title: 'test'", "title: 'Story 1.1: Wire the Frobnicator'")
+        )
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), review_with_title],
+        policy=wt_policy(commit_message_template="chore(bmad): {story_key}\n\n{story_title}"),
+    )
+    summary = engine.run()
+    assert summary.done == 1
+    log = git(project.project, "log", "--format=%B")
+    assert "chore(bmad): 1-1-a" in log
+    assert "Wire the Frobnicator" in log
+    assert "Story 1.1:" not in log  # the label would just repeat the key
+
+
+def test_commit_message_template_story_title_neutralizes_control_chars(project):
+    """A NUL in the title reaches `git commit -m` as an argv element, where
+    `subprocess.run` raises a bare ValueError. `_run_git` translates
+    TimeoutExpired/UnicodeDecodeError/OSError but not that, so it would escape as
+    itself into `_finalize_commit_phase`'s `except BaseException`, which restores
+    and re-raises — crashing the run with the task already persisted as
+    COMMITTING, so every later resume re-renders the same title and re-crashes.
+    No exotic file bytes are needed to get there: `title: "\\0"` is an ordinary
+    double-quoted YAML scalar.
+
+    Ablation target: drop the `_TITLE_CONTROL_RE` substitution and this fails
+    with `ValueError: embedded null byte` instead of committing."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    review = wt_review_effect(project, "1-1-a", clean=True)
+
+    def review_nul_title(spec):
+        result = review(spec)
+        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
+        sp.write_text(sp.read_text().replace("title: 'test'", 'title: "Wire\\0the Frobnicator"'))
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), review_nul_title],
+        policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
+    )
+    summary = engine.run()
+    assert summary.done == 1  # committed rather than wedged mid-COMMITTING
+    assert "chore(bmad): Wire the Frobnicator" in git(project.project, "log", "--format=%s")
+
+
+def test_commit_message_template_story_title_neutralizes_surrogates(project):
+    """The other unspawnable class, and the one a C0/DEL-only filter misses. A
+    lone surrogate has no UTF-8 encoding, so `subprocess.run` raises
+    UnicodeEncodeError while encoding the argv — a ValueError, but *not* the
+    UnicodeDecodeError `_run_git` translates, so it wedges the run exactly as an
+    embedded NUL does. `title: "\\uD800"` is an ordinary YAML escape and PyYAML
+    hands the unpaired code point straight back.
+
+    Ablation target: drop `\\ud800-\\udfff` from `_TITLE_CONTROL_RE` and this
+    fails with `UnicodeEncodeError: surrogates not allowed` instead of
+    committing."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    review = wt_review_effect(project, "1-1-a", clean=True)
+
+    def review_surrogate_title(spec):
+        result = review(spec)
+        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
+        sp.write_text(
+            sp.read_text().replace("title: 'test'", 'title: "Wire\\uD800the Frobnicator"')
+        )
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), review_surrogate_title],
+        policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
+    )
+    summary = engine.run()
+    assert summary.done == 1  # committed rather than wedged mid-COMMITTING
+    assert "chore(bmad): Wire the Frobnicator" in git(project.project, "log", "--format=%s")
+
+
+def test_commit_message_template_story_title_falls_back_to_h1(project):
+    """A spec written without a `title:` — i.e. not from this project's
+    template — still yields a title from a first markdown H1."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    review = wt_review_effect(project, "1-1-a", clean=True)
+
+    def review_h1_only(spec):
+        result = review(spec)
+        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
+        sp.write_text(sp.read_text().replace("title: 'test'\n", "") + "\n# Heading Sourced\n")
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), review_h1_only],
+        policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
+    )
+    summary = engine.run()
+    assert summary.done == 1
+    assert "chore(bmad): Heading Sourced" in git(project.project, "log", "--format=%s")
+
+
+def test_commit_message_template_story_title_falls_back_to_key(project):
+    """Neither a `title:` nor an H1 → the placeholder renders the story key,
+    never an empty string."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    review = wt_review_effect(project, "1-1-a", clean=True)
+
+    def review_titleless(spec):
+        result = review(spec)
+        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
+        sp.write_text(sp.read_text().replace("title: 'test'\n", ""))
+        return result
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), review_titleless],
+        policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
+    )
+    summary = engine.run()
+    assert summary.done == 1
+    log = git(project.project, "log", "--format=%s")
+    assert "chore(bmad): 1-1-a" in log
+
+
+def test_story_title_undecodable_spec_falls_back_to_key(project):
+    """A spec that is no longer valid UTF-8 takes the same fallback as an
+    unreadable one. Unit-level because the whole-file decode failure is masked
+    upstream on the normal path (read_frontmatter degrades it to a retry) but
+    live on the resume-into-COMMITTING arm, which renders the message without
+    re-reading frontmatter first."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_bytes(b"---\nstatus: done\n---\n\n# Story 1.1: caf\xe9 latte\n")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == "1-1-a"
+
+
+@pytest.mark.parametrize(
+    ("indent", "expected"),
+    [
+        ("", "Indented Heading"),
+        ("   ", "Indented Heading"),  # CommonMark allows up to three
+        ("    ", "1-1-a"),  # a fourth space is an indented code block, not an H1
+    ],
+)
+def test_story_title_h1_indent_bound(project, indent, expected):
+    """The H1 fallback follows CommonMark's indentation rule, so a heading a
+    hand-authored spec indented still yields a title instead of silently
+    degrading to the story key — while a code block at four spaces stays a code
+    block."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text(f"---\nstatus: done\n---\n\n{indent}# Indented Heading\n")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == expected
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("# Wire the Frobnicator", "Wire the Frobnicator"),
+        # `#` may be followed by a tab as well as a space...
+        ("#\tWire the Frobnicator", "Wire the Frobnicator"),
+        # ...but by something else it is not a heading at all, and two hashes
+        # are an H2. Both fall back rather than yielding a title.
+        ("#Wire the Frobnicator", "1-1-a"),
+        ("## Wire the Frobnicator", "1-1-a"),
+        # A closing hash run is syntax, not title. This is the only one of these
+        # that would otherwise render a WRONG subject rather than fall back.
+        ("# Wire the Frobnicator ###", "Wire the Frobnicator"),
+        ("# Wire the Frobnicator #", "Wire the Frobnicator"),
+        # ...and it takes whitespace to make one, so a hash fused to the last
+        # word stays part of the title.
+        ("# Wire it in C#", "Wire it in C#"),
+        # Setext is a valid CommonMark H1 and is refused ON PURPOSE: accepting it
+        # would make any prose line above a `===` divider the commit subject,
+        # trading a safe fallback for a confidently wrong title.
+        ("Wire the Frobnicator\n===", "1-1-a"),
+        ("Some ordinary prose\n=====", "1-1-a"),
+    ],
+)
+def test_story_title_h1_atx_forms(project, body, expected):
+    """Which H1 spellings the fallback honors, and which it declines. The
+    declines are the load-bearing half: each is a documented narrowing, not an
+    oversight, so a later "conformance" patch has to argue with these cases."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text(f"---\nstatus: done\n---\n\n{body}\n")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == expected
+
+
+@pytest.mark.parametrize(
+    ("fence", "content"),
+    [
+        # The shape that makes this common: any fenced snippet whose first line
+        # is a comment. A spec showing setup steps before its heading is
+        # ordinary, and `#` opens a comment in sh, python, yaml, toml, ruby...
+        ("```bash", "# Install the dependencies"),
+        ("```python", "# TODO: wire this up"),
+        # ...and the documentation-flavored shape, where the fenced heading is
+        # a deliberate example of the very syntax being scanned for.
+        ("````markdown", "# Example Heading"),
+        # Tildes open a fence too, and a fence may be indented up to three.
+        ("~~~yaml", "# generated - do not edit"),
+        ("   ```sh", "# nested under a list item"),
+    ],
+)
+def test_story_title_h1_ignores_fenced_blocks(project, fence, content):
+    """A `#` line inside a fenced block is a comment or an example, not this
+    spec's heading — CommonMark agrees the first H1 here is the one after the
+    fence. Getting this wrong is the bad kind of wrong: it renders a
+    confidently incorrect commit subject rather than falling back to the key."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    close = fence.lstrip(" ")[: 4 if fence.lstrip(" ").startswith("````") else 3]
+    spec.write_text(
+        f"---\nstatus: done\n---\n\n{fence}\n{content}\n{close}\n\n# Wire the Frobnicator\n"
+    )
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == "Wire the Frobnicator"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # A shorter run of the same character does not close a longer fence —
+        # this is why a ```` block may quote ``` at all.
+        "````markdown\n```\n# Fenced Heading\n```\n````\n\n# Wire the Frobnicator\n",
+        # ...and neither does a run of the *other* fence character.
+        "```markdown\n~~~\n# Fenced Heading\n~~~\n```\n\n# Wire the Frobnicator\n",
+        # A closing run must have nothing but whitespace after it, so a fence
+        # line carrying an info string is an opener, never a close.
+        "~~~\n# Fenced Heading\n~~~ still-open\n~~~\n\n# Wire the Frobnicator\n",
+    ],
+)
+def test_story_title_h1_nested_fence_does_not_close_early(project, body):
+    """The closing rule is same-character, at-least-as-long, nothing after it.
+    Relax any of those three and an inner fence ends the block early, putting a
+    fenced `# ...` back in scope as the title — which is the whole bug."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text(f"---\nstatus: done\n---\n\n{body}")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == "Wire the Frobnicator"
+
+
+def test_story_title_h1_unclosed_fence_falls_back(project):
+    """An unclosed fence swallows the rest of the file, so there is no heading
+    left to find and the story key is the answer. Pinned because the tempting
+    "reset at EOF" repair would resurrect exactly the comment-as-title bug this
+    scan exists to prevent."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_text("---\nstatus: done\n---\n\n```bash\n# Install the dependencies\n")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(spec)
+
+    assert engine._story_title(task) == "1-1-a"
+
+
+def test_render_commit_template_without_placeholder_skips_the_spec_read(project, monkeypatch):
+    """A template that never names {story_title} must not pay the spec read —
+    the claim the policy docs and CHANGELOG both make. Pinned by making the read
+    itself fatal, so the assertion cannot pass just because the title happened to
+    go unused."""
+    engine, _ = make_engine(project, [])
+    monkeypatch.setattr(
+        Engine, "_story_title", lambda self, task: pytest.fail("spec read for a template without")
+    )
+    engine.policy = wt_policy(commit_message_template="chore(bmad): {story_key}")
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(project.implementation_artifacts / "spec-1-1-a.md")
+
+    assert engine._render_commit_template(task) == "chore(bmad): 1-1-a"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # A story id is a dash/dot composite here, so the label strip must survive
+        # every shape this project actually issues...
+        ("Story 1.1: Wire the Frobnicator", "Wire the Frobnicator"),
+        ("Story 3-2: Dash composite", "Dash composite"),
+        ("Story 1-1-a: Trailing letter", "Trailing letter"),
+        ("story 1.1: lowercased label", "lowercased label"),
+        # ...while never eating a real title that merely opens with "Story".
+        # The label must start at a DIGIT: `\S+` would strip "Points:" here, and
+        # `\d+\.\d+` would stop matching the dash composites above.
+        ("Story Points: Add estimates", "Story Points: Add estimates"),
+        ("Storybook: Add a knob", "Storybook: Add a knob"),
+        ("  Plain title  ", "Plain title"),
+        # YAML hands back whatever an unquoted scalar looked like. A blank
+        # `title:` is None and must fall back; a bool is a typo, not a title; a
+        # number still beats rendering the bare story key.
+        (None, ""),
+        ("", ""),
+        ("Story 1.1:", ""),
+        (True, ""),
+        (1.1, "1.1"),
+        # Control characters are neutralized, not passed through: a NUL reaching
+        # `git commit -m` argv raises a bare ValueError out of subprocess, which
+        # _run_git does not translate — it would crash a task already persisted
+        # as COMMITTING and wedge every resume. `title: "\0"` is plain YAML.
+        ("\x00", ""),
+        ("Wire the\x00Frobnicator", "Wire the Frobnicator"),
+        ("Story 1.1:\x00Wire it", "Wire it"),
+        ("Story\x001.1: Split label", "Split label"),
+        # Lone surrogates go with them: `title: "\uD800"` is the same ordinary
+        # YAML escape, and one in the argv raises UnicodeEncodeError out of
+        # subprocess — a ValueError _run_git does not translate either.
+        ("\ud800", ""),
+        ("Wire\ud800the Frobnicator", "Wire the Frobnicator"),
+        ("Story 1.1:\udfffWire it", "Wire it"),
+        ("Two\nlines", "Two lines"),
+        ("Tabbed\ttitle", "Tabbed title"),
+        ("Collapse   the    runs", "Collapse the runs"),
+    ],
+)
+def test_story_label_stripped_cases(raw, expected):
+    """The label strip sits between two wrong answers: too loose eats the title,
+    too tight stops matching this project's ids. Pinned per-case rather than
+    derived, so a regex retune has to restate its intent here."""
+    assert _story_label_stripped(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "story_key", "expected"),
+    [
+        # stories.ID_RE admits alphabetic ids ("auth", "oauth-setup"), which the
+        # digit-led heuristic cannot recognize — so for the id we actually hold,
+        # match it exactly rather than guessing its shape.
+        ("Story auth: Add login", "auth", "Add login"),
+        ("Story oauth-setup: Wire the callback", "oauth-setup", "Wire the callback"),
+        ("story AUTH: case folds", "auth", "case folds"),
+        # The exact match is an ADDITION to the heuristic, never a replacement:
+        # a sprint spec labels itself "Story 1.1:" while its key is "1-1-a", so
+        # keying only off the task id would stop stripping the common case.
+        ("Story 1.1: Wire the Frobnicator", "1-1-a", "Wire the Frobnicator"),
+        # ...and it must not turn into a licence to eat real titles: a title
+        # whose first word merely follows "Story" is not this task's id.
+        ("Story Points: Add estimates", "auth", "Story Points: Add estimates"),
+        ("Story authentication: Add login", "auth", "Story authentication: Add login"),
+        # A key carrying regex metacharacters is matched literally, not compiled.
+        ("Story a.b: Escaped", "a.b", "Escaped"),
+        ("Story axb: Escaped", "a.b", "Story axb: Escaped"),
+    ],
+)
+def test_story_label_stripped_matches_the_task_id(raw, story_key, expected):
+    """Stories mode inherits this renderer and issues alphabetic ids, which the
+    digit-led pattern cannot match. Where the task's own id is known it is the
+    ground truth; the heuristic stays for the labels that do not repeat the key
+    verbatim."""
+    assert _story_label_stripped(raw, story_key) == expected
+
+
 # ------------------------------------------------ per_worktree engine plugin
 
 
@@ -2313,9 +5582,11 @@ def test_per_worktree_setup_then_gate_then_teardown_and_seed(project):
     # (docs/FEATURES.md), and this fixture has to say so itself: until #384 the
     # git-add shield wrote its patterns into the repo-wide `.git/info/exclude`, so
     # the untracked dir below was hidden in the MAIN checkout too and the pre-merge
-    # cleanliness gate never saw it. The shield is per-worktree now, and an
-    # untracked file in the operator's own checkout blocks a merge as it always has
-    # (`verify.dirty_paths` counts untracked). Committed before the dir exists.
+    # cleanliness gate never saw it. The shield is per-worktree now, so the gitignore
+    # line below is what keeps the dir out of `verify.dirty_paths` entirely — the gate
+    # never sees it. (Since #460 an untracked file the operator leaves in their own
+    # checkout is tolerated at merge rather than blocking it, so this fixture no longer
+    # depends on that refusal either way.) Committed before the dir exists.
     gitignore = project.project / ".gitignore"
     gitignore.write_text(gitignore.read_text() + ".claude/skills/\n", encoding="utf-8")
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -2477,15 +5748,68 @@ def test_merge_auto_recovers_editor_dirtied_target(project):
     assert cleaned["paths"] == ["Leak.cs"]
 
 
+def _operator_edit_dev_effect(project, story_key, *, rel_path, marker, stage):
+    """A dev effect that does the normal worktree work AND appends `marker` to a
+    TRACKED file in the *main* checkout that the branch never touches — the operator
+    editing their own working copy mid-run. Appends rather than overwrites so the
+    edit stays inert in whatever file it lands on.
+
+    ``stage`` picks which half of #618's split the fixture grades, and callers must
+    pass it deliberately: STAGED is the refusal (git can fold a staged stray into a
+    fast-forwardable squash), UNSTAGED is the tolerance (an edit git holds only in
+    the working tree can reach no merge commit at all). A caller that wants one and
+    writes the other grades the opposite path and still goes green, which is how the
+    pre-#618 version of this helper came to pin the wrong row.
+    """
+    base = wt_dev_effect(project, story_key)
+
+    def effect(spec):
+        result = base(spec)
+        fp = project.project / rel_path
+        fp.write_text(fp.read_text(encoding="utf-8") + marker, encoding="utf-8")
+        if stage:
+            git(project.project, "add", "--", rel_path)
+        return result
+
+    return effect
+
+
+def _committed_versions(project, rel: str) -> list[str]:
+    """Every committed version of `rel` reachable from HEAD, read out of git history.
+
+    The working tree cannot answer "did this land in a commit?". A pathspec carry
+    that swept an operator's edit into its own commit leaves the tree CLEAN and the
+    file's bytes unchanged on disk — the substitution is invisible from there, and
+    that invisibility is the whole hazard. `rev-list -- <rel>` names the commits that
+    touched the path; `show <sha>:<rel>` reads the blob each one recorded.
+    """
+    shas = git(project.project, "rev-list", "HEAD", "--", rel).splitlines()
+    return [git(project.project, "show", f"{sha}:{rel}") for sha in shas]
+
+
 def test_merge_stray_dirt_escalates_with_clear_message(project):
     """Dirt in the main checkout that is NOT part of the branch's incoming files
-    (possible real operator work) is never cleaned: the unit escalates with the
-    Editor-leak message and keeps its branch."""
+    (possible real operator work) is never cleaned: the unit escalates and keeps its
+    branch, with a message that names tracked dirt as the hazard and offers the two
+    SAFE resolutions rather than blaming a Unity Editor and saying "clean them" (#460).
+
+    Since #460 that refusal is scoped to dirt a merge could actually commit, and since
+    #618 the axis is the index rather than trackedness — an unstaged tracked stray is
+    inert and tolerated, like an untracked one
+    (`test_merge_tolerates_untracked_stray_in_main_checkout`). So the stray here is an
+    appended comment line in the repo's tracked `.gitignore`, STAGED by the effect:
+    the branch never touches the file, and a trailing comment changes no ignore
+    behavior."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    # The target must really be tracked, or this test silently degrades into the
+    # tolerated case it is no longer about. `git` raises on a nonzero rc.
+    git(project.project, "ls-files", "--error-unmatch", ".gitignore")
     engine, _ = make_engine(
         project,
         [
-            _leaking_dev_effect(project, "1-1-a", leak_name="stray.txt", in_branch_set=False),
+            _operator_edit_dev_effect(
+                project, "1-1-a", rel_path=".gitignore", marker="# operator edit\n", stage=True
+            ),
             wt_review_effect(project, "1-1-a", clean=True),
         ],
     )
@@ -2495,36 +5819,303 @@ def test_merge_stray_dirt_escalates_with_clear_message(project):
     task = engine.state.tasks["1-1-a"]
     assert task.phase == Phase.ESCALATED
     reason = engine.state.paused_reason or ""
-    assert "not part of this branch" in reason and "stray.txt" in reason
-    # branch kept for manual merge; the stray file was left untouched
+    # Each promise gets its own assertion so a failure names which one broke.
+    # The two NEGATIVE assertions are the whole of #460's second complaint and must
+    # not be "simplified" away by a later session: the old message asserted a Unity
+    # Editor as the likely cause on every isolated merge — including repos with no
+    # Unity anywhere — and told the operator to "clean" their own uncommitted work,
+    # which is the exact verb (`unlink`) this guard performs on incoming strays.
+    assert "Unity" not in reason
+    assert "clean them" not in reason
+    assert "Commit, stash or revert" in reason  # the two SAFE resolutions, named
+    assert ".gitignore" in reason  # the inner GitError still names the exact path
+    # The composed message says which half of the dirt actually blocks a merge. Note
+    # the inner GitError carries "tracked" too, so this one does not by itself pin the
+    # OUTER wording — "Commit, stash or revert" above is the assertion that does.
+    assert "tracked" in reason
+    # branch kept for manual merge; the operator's edit was left untouched
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
-    assert (project.project / "stray.txt").read_text() == "editor leaked\n"
+    assert (project.project / ".gitignore").read_text().endswith("# operator edit\n")
     assert "merge-target-cleaned" not in journal_kinds(engine)
+
+
+def test_merge_tolerates_untracked_stray_in_main_checkout(project):
+    """#460's headline row. An untracked file the operator left in the MAIN
+    checkout, unrelated to the run, no longer stops it: a merge writes only paths
+    that differ between target and branch, and git never stages an untracked file
+    into a merge or squash commit, so the file cannot be overwritten or swept in.
+    Before #460 this exact run ended `done=0 paused=True escalated=1` — one stray
+    `notes.txt` halted an unattended loop at its first story.
+
+    The `merge-preflight-refused` assertion at the end is a GREEN-ABLATION record:
+    no mutation of #623's code reddens it, because it asserts an absence on a path
+    that never raises. It is here to stop a later change firing the corrective event
+    unconditionally — pairing every tolerated stray with a refusal that did not
+    happen — and its positive counterpart is
+    `test_merge_shape_clash_journals_the_corrective_refusal`, which is the row that
+    goes red if the event stops firing."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            _leaking_dev_effect(
+                project, "1-1-a", leak_name="operator-notes.txt", in_branch_set=False
+            ),
+            wt_review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and summary.escalated == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.DONE
+    kinds = journal_kinds(engine)
+    assert "unit-merged" in kinds and "story-escalated" not in kinds
+    # tolerated, NOT cleaned: the guard skips the stray entirely rather than
+    # deleting the operator file it just decided to let through.
+    assert (project.project / "operator-notes.txt").read_text() == "editor leaked\n"
+    assert "merge-target-cleaned" not in kinds
+    # ...and walking past it is not silent. A merge that proceeded over operator dirt
+    # leaves the same kind of trace as one that cleaned a leak, so an operator reading
+    # the journal can see which of their files the run merged around.
+    assert "merge-target-tolerated" in kinds
+    tolerated = next(e for e in engine.journal.entries() if e["kind"] == "merge-target-tolerated")
+    assert tolerated["paths"] == ["operator-notes.txt"]
+    assert tolerated["story_key"] == "1-1-a"
+    assert tolerated["branch"] == "bmad-loop/test-run/1-1-a"
+    # ...and nothing corrects it, because nothing went wrong: the merge landed.
+    assert "merge-preflight-refused" not in kinds
+
+
+def _shape_clash_dev_effect(project, story_key, *, incoming_path, stray_path):
+    """A dev effect whose branch commits `incoming_path` while an untracked stray
+    lands at `stray_path` in the MAIN checkout. Neither path is a member of the
+    other's set, so #460's tolerance walks past the stray — but the two collide
+    STRUCTURALLY, so git refuses the merge at its own pre-flight. The two shapes are
+    the ones pinned at the verify layer by
+    `test_clean_incoming_collisions_shape_clash_stops_at_gits_own_preflight`."""
+    base = wt_dev_effect(project, story_key)
+
+    def effect(spec):
+        incoming = spec.cwd / incoming_path
+        incoming.parent.mkdir(parents=True, exist_ok=True)
+        incoming.write_text(f"branch content for {story_key}\n")
+        result = base(spec)
+        stray = project.project / stray_path
+        stray.parent.mkdir(parents=True, exist_ok=True)
+        stray.write_text("operator\n")
+        return result
+
+    return effect
+
+
+@pytest.mark.parametrize(
+    ("incoming_path", "stray_path"),
+    [
+        ("Assets/Leak.cs", "Assets"),  # untracked FILE where the merge needs a DIR
+        ("notes", "notes/keep.txt"),  # untracked DIR where the merge needs a FILE
+    ],
+    ids=["file-where-dir-needed", "dir-where-file-needed"],
+)
+def test_merge_shape_clash_journals_the_corrective_refusal(project, incoming_path, stray_path):
+    """#623. `merge-target-tolerated` is written from inside `clean_incoming_collisions`'s
+    callback, strictly BEFORE `merge_branch` runs, so it can only ever record what the
+    GUARD decided. A stray outside the incoming set by PATH can still clash with it by
+    SHAPE, and git then refuses the merge over the very path that event called harmless
+    — leaving the journal asserting the run tolerated something that in fact stopped it.
+
+    The fix is corrective, not a rewrite: the pre-merge event stays (emitting it only on
+    success would lose the trace in exactly the run worth debugging) and the pre-flight
+    arm appends `merge-preflight-refused` carrying the same paths plus git's own text.
+    Order is the whole claim — a reader scanning the journal top-down must meet the
+    correction after the assertion it corrects, not before it.
+
+    Real git, no monkeypatch: the wiring axis is
+    `test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict`, which
+    injects the exception; this row proves the two shapes really do reach that arm.
+
+    Ablation: delete the corrective `journal.append` from `merge_local` and both rows
+    fail here while `test_merge_tolerates_untracked_stray_in_main_checkout` stays green
+    — disjoint sets, which is what makes the negative pin there meaningful."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            _shape_clash_dev_effect(
+                project, "1-1-a", incoming_path=incoming_path, stray_path=stray_path
+            ),
+            wt_review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    entries = engine.journal.entries()
+    kinds = [e["kind"] for e in entries]
+    # both land, and in the order that makes the second one a correction of the first
+    assert kinds.index("merge-target-tolerated") < kinds.index("merge-preflight-refused")
+    assert kinds.index("merge-preflight-refused") < kinds.index("story-escalated")
+    tolerated = next(e for e in entries if e["kind"] == "merge-target-tolerated")
+    refused = next(e for e in entries if e["kind"] == "merge-preflight-refused")
+    assert tolerated["paths"] == [stray_path]  # the guard really did wave it through
+    assert refused["tolerated"] == tolerated["paths"]  # same list, so they can be paired
+    assert refused["story_key"] == tolerated["story_key"] == "1-1-a"
+    assert refused["branch"] == tolerated["branch"] == "bmad-loop/test-run/1-1-a"
+    # git's raw text rides along: it is the only thing that names WHICH path clashed,
+    # and "refused before starting" pins that this came off the pre-flight arm rather
+    # than the content-conflict one, which must never write this event.
+    assert "refused before starting" in refused["error"]
+    assert stray_path.split("/")[0] in refused["error"]
+    # the operator's bytes and shape survive, and the branch is kept for manual merge
+    stray = project.project / stray_path
+    assert stray.is_file() and stray.read_text() == "operator\n"
+    assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
+    assert "merge-target-cleaned" not in kinds
+
+
+def test_merge_tolerates_unstaged_tracked_stray_in_main_checkout(project):
+    """#618's headline row, and the engine-layer twin of
+    `test_merge_stray_dirt_escalates_with_clear_message`: the SAME file, the SAME
+    edit, differing only in whether git holds it in the index.
+
+    Before #618 an unstaged tracked stray escalated the story and paused an
+    unattended run. It should not: a merge writes only paths that differ between
+    target and branch, and it commits only what is STAGED, so an edit living solely
+    in the working tree can be neither overwritten by the merge nor written into its
+    commit. Measured across both topologies and both strategies (#618).
+
+    The history assertion is the half the working tree cannot make. `worktree_clean`
+    is False here either way — the operator's edit is still uncommitted, which is the
+    point — so "the bytes are still on disk" would pass just as well if a commit had
+    also taken a copy of them. Reading every committed version of the path is what
+    pins that no commit on the target branch carries the edit.
+
+    The run must reach `done`, not merely avoid raising: `escalated == 0` and a DONE
+    phase are what separate a tolerated stray from one that quietly deferred the unit.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    # The target must really be tracked, or this row silently degrades into the
+    # untracked case above. `git` raises on a nonzero rc.
+    git(project.project, "ls-files", "--error-unmatch", ".gitignore")
+    engine, _ = make_engine(
+        project,
+        [
+            _operator_edit_dev_effect(
+                project, "1-1-a", rel_path=".gitignore", marker="# operator edit\n", stage=False
+            ),
+            wt_review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and summary.escalated == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.DONE
+    kinds = journal_kinds(engine)
+    assert "unit-merged" in kinds and "story-escalated" not in kinds
+    # tolerated, NOT cleaned: the guard never touches a stray it decided to let through
+    assert (project.project / ".gitignore").read_text().endswith("# operator edit\n")
+    assert "merge-target-cleaned" not in kinds
+    # ...and no commit on the target branch took a copy of it on the way past. The
+    # non-empty check is not decoration: `any()` over an empty history is False, so
+    # a read that silently found no commits would pass this line for the wrong reason.
+    versions = _committed_versions(project, ".gitignore")
+    assert versions and not any("# operator edit" in v for v in versions)
+    # walking past operator dirt is journaled, exactly as cleaning a leak is
+    tolerated = next(e for e in engine.journal.entries() if e["kind"] == "merge-target-tolerated")
+    assert tolerated["paths"] == [".gitignore"]
+    assert tolerated["story_key"] == "1-1-a"
+    assert tolerated["branch"] == "bmad-loop/test-run/1-1-a"
+    assert "merge-preflight-refused" not in kinds
+
+
+def test_merge_refuses_dirt_on_a_path_the_run_commits_for_itself(project):
+    """The data-safety half of #618. An unstaged edit is inert for the MERGE and is
+    tolerated by the row above — but not when it sits on a path the RUN itself
+    commits after the merge, and the sprint board is one of those.
+
+    `_carry_board_advance` calls `verify.commit_paths`, which runs
+    `git add -- :(literal)<board>` and then a pathspec commit, so it takes whatever
+    the working tree holds at that path no matter who wrote it. Left tolerated, the
+    operator's private edit rides out under `chore(sprint-status): carry 1-1-a to
+    done` — their bytes, the run's name, and a CLEAN tree afterwards, which is
+    exactly why nothing surfaces it.
+
+    Reaching that requires the board to be dirty in the main checkout AND outside the
+    branch's incoming set, and this row's setup is the shape that produces it rather
+    than decoration:
+
+    * the board is committed with the row ALREADY at the target, so the unit
+      worktree checks that out, `_post_dev_state_sync`'s advance writes nothing there
+      and the board never enters `finalize_commit`'s `git add -A`. It is a stray, not
+      an incoming collision — the ordinary tracked board rides the merge instead, and
+      a stray inside the incoming set would be restored rather than swept.
+    * the operator reopens the row in their own checkout WITHOUT committing, which is
+      what `_pick_next` (main board, on disk) reads to pick the story at all, and
+      appends a private note beside it.
+
+    The last assertion reads git history, not the working tree, and that is the whole
+    point: the measured failure leaves the tree clean and the file's bytes unchanged
+    on disk, so "the edit is still there" is true in BOTH the safe and the unsafe
+    outcome. Only the committed blobs tell them apart.
+    """
+    marker = "# operator: reopened locally, do not ship\n"
+    commit_sprint(project, {"1-1-a": "done"})
+    board = project.sprint_status
+    rel = board.relative_to(project.project).as_posix()
+    set_sprint(project, "1-1-a", "ready-for-dev")
+    board.write_text(board.read_text(encoding="utf-8") + marker, encoding="utf-8")
+    before = board.read_text(encoding="utf-8")
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.done == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    reason = engine.state.paused_reason or ""
+    # the carry clause, not the staged-changes one: unstaging is no remedy for a path
+    # this run is going to commit either way.
+    assert "bookkeeping commit" in reason and "staged changes" not in reason
+    assert rel in reason
+    # the operator's bytes are byte-intact — the guard refuses, it never repairs
+    assert board.read_text(encoding="utf-8") == before
+    # ...and no commit on the target branch carries them. `_committed_versions` is
+    # non-empty here (commit_sprint committed the board), so this is not the vacuous
+    # pass an empty history would give.
+    versions = _committed_versions(project, rel)
+    assert versions and not any(marker.strip() in v for v in versions)
+    assert not any(
+        "chore(sprint-status)" in s for s in git(project.project, "log", "--format=%s").splitlines()
+    )
+    # branch kept for manual merge; nothing was cleaned or walked past
+    assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
+    kinds = journal_kinds(engine)
+    assert "merge-target-cleaned" not in kinds and "merge-target-tolerated" not in kinds
 
 
 @pytest.mark.parametrize(
     "make_exc",
     [
         lambda: OSError(13, "Permission denied"),
+        lambda: RuntimeError("Permission denied while resolving collision cleanup"),
         lambda: verify.GitSpawnError("git status failed to spawn: Permission denied"),
     ],
-    ids=["fs-oserror", "git-spawn"],
+    ids=["fs-oserror", "fs-runtimeerror", "git-spawn"],
 )
 def test_merge_env_fault_during_target_clean_keeps_branch_and_escalates(
     project, monkeypatch, make_exc
 ):
     """#343: `clean_incoming_collisions` mutates the checkout directly
-    (unlink/rmdir), so a non-spawn FS fault arrives as a plain OSError no
-    chokepoint can translate — and its git reads can raise a typed
-    GitSpawnError. The guard must treat both like any other reconcile
+    (resolve/unlink/rmdir), so non-spawn FS faults arrive as plain OSError or
+    RuntimeError values no chokepoint can translate — and its git reads can raise
+    a typed GitSpawnError. The guard must treat all three like any other reconcile
     failure: keep the branch and escalate rather than crash a DONE unit
     mid-merge — and the escalation must name the environment fault, not
     claim stray uncommitted files that may not exist.
 
-    Ablation targets: narrow the guard in `merge_local` back to
-    `verify.GitError` and the fs-oserror case fails — the OSError crashes the
-    run. Revert the reason branch to the unconditional stray-files text and
-    both cases fail on the message assertions."""
+    Ablation targets: remove `RuntimeError` only from `merge_local`'s catch and the
+    fs-runtimeerror row fails because the run crashes. Keep that catch but remove
+    `RuntimeError` only from its environmental `isinstance` arm and the same row
+    fails on stray-dirt guidance; the underlying-fault guidance is required."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
         project,
@@ -2542,27 +6133,399 @@ def test_merge_env_fault_during_target_clean_keeps_branch_and_escalates(
     assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
     reason = engine.state.paused_reason or ""
     assert "Permission denied" in reason
-    # environment fault, not the stray-files refusal: no "clean them" guidance
+    # environment fault, not the stray-dirt refusal. The second assertion is the
+    # discriminator and must name a phrase only the stray-dirt arm carries — there
+    # may be no stray files at all here, so that arm's remediation must not leak in.
     assert "could not reconcile" in reason
-    assert "clean them" not in reason
+    assert "Commit, stash or revert" not in reason
     # branch kept for manual merge — the unit's work is not stranded
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
 
 
-def test_spec_file_serialized_relative_to_worktree():
-    """A worktree task persists spec_file relative to its worktree so a kept run's
-    state stays portable (no dangling absolute path into a pruned worktree)."""
+# One phrase per escalation shape. The test asserts its own row's phrase present and
+# every OTHER row's absent, so the set is written once here rather than as a per-row
+# exclusion list that silently stops covering a shape the moment one is added.
+@pytest.mark.parametrize(
+    "paths, restored, present, absent",
+    [
+        (("Assets/Gen.cs",), True, "Clear those first", "needs nothing from you"),
+        ((), True, "needs nothing from you", "Clear those first"),
+        ((), False, "could NOT be rolled back", "needs nothing from you"),
+    ],
+    ids=["untracked-residue", "tracked-restored", "tracked-restore-failed"],
+)
+def test_half_applied_escalation_asks_only_for_the_residue_that_survives(
+    project, monkeypatch, paths, restored, present, absent
+):
+    """A half-applied checkout leaves residue on two axes, and only one of them is
+    ever the operator's job — so this escalation composes its middle instead of
+    stating both every time.
+
+    An incoming path the target did not track lands untracked and no restore
+    reaches it, so they clear it. One it DID track was rewritten in place and
+    `merge_branch` has already reset it, so asking them to clear anything would
+    send them to a checkout that is already correct. The third row is that same
+    tracked case with the reset ALSO failed, which inverts the instruction: the
+    tree is still holding incoming content and has to be restored before the cause
+    is worth fixing, exactly as `MergeCommitRefusedError.restored` does for its own
+    neighbour.
+
+    Each row asserts its phrase present AND another row's absent, because presence
+    alone passes for a message that simply says everything unconditionally — which
+    is the failure mode a composed message has and a fixed one does not.
+
+    Ablation: drop the `e.restored` branch and keep only the `e.paths` clause, and
+    the two tracked rows fail on the presence half; make every clause
+    unconditional instead and all three fail on the absence half."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    exc = verify.MergeHalfAppliedError(
+        "git merge --ff-only feat failed in /repo (failed part-way through checkout): "
+        "fatal: smudge filter boom failed",
+        paths=paths,
+        restored=restored,
+    )
+
+    def refuse_merge(*a, **kw):
+        raise exc
+
+    monkeypatch.setattr(verify, "merge_branch", refuse_merge)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    reason = engine.state.paused_reason or ""
+    assert present in reason
+    assert absent not in reason
+
+
+def test_half_applied_escalation_with_both_residues_orders_restore_first(project, monkeypatch):
+    """When BOTH residue axes survive — untracked paths to clear AND a tracked
+    rewrite whose rollback failed — the two asks must agree on an order. The
+    restore leads: a resume dies on the tracked residue first, and its clause
+    says "before anything else" and has to mean it. The untracked clause then
+    defers ("Then clear those") instead of also claiming first place — the
+    composed message used to say "Clear those first" and "before anything else"
+    about two different steps in the same breath.
+
+    Both `.index` calls double as presence asserts (ValueError = red), so the
+    row pins composition AND order in one place.
+
+    Ablation: swap the two `steps.append` blocks back and this row fails on the
+    order; make the untracked clause unconditional "Clear those first" and it
+    fails on the phrase. The three matrix rows above stay green — none of them
+    stages both residues at once, which is why this row exists."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    exc = verify.MergeHalfAppliedError(
+        "git merge --ff-only feat failed in /repo (failed part-way through checkout): "
+        "fatal: smudge filter boom failed; AND git reset --hard HEAD failed "
+        "(tree not restored): fatal: could not reset",
+        paths=("Assets/Gen.cs",),
+        restored=False,
+    )
+
+    def refuse_merge(*a, **kw):
+        raise exc
+
+    monkeypatch.setattr(verify, "merge_branch", refuse_merge)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    reason = engine.state.paused_reason or ""
+    assert "Clear those first" not in reason  # the restore is first; this may not claim it
+    restore_at = reason.index("could NOT be rolled back")
+    clear_at = reason.index("Then clear those")
+    assert restore_at < clear_at
+    assert "Assets/Gen.cs" in reason
+
+
+def test_half_applied_escalation_prescribes_a_path_scoped_restore(project, monkeypatch):
+    """The failed-restore clause hands the operator the SAME path-scoped write the
+    run itself attempted — `git checkout HEAD --` over `e.rewritten` — never the
+    repo-wide `git reset --hard HEAD` it used to prescribe. That advice went stale
+    the moment the restore became per-path: the restore can now fail with the
+    operator's own uncommitted work elsewhere in the tree (per-path attribution is
+    what allows it to run over such a tree at all), so following the old
+    prescription would flatten exactly the work the attribution spared.
+
+    Ablation: put the `git reset --hard HEAD` wording back in the clause and this
+    row fails on both command assertions; drop the `e.rewritten` interpolation
+    and it fails on the path."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    exc = verify.MergeHalfAppliedError(
+        "git merge --ff-only feat failed in /repo (failed part-way through checkout): "
+        "fatal: smudge filter boom; AND git checkout HEAD -- <paths> failed "
+        "(tracked residue not restored): fatal: could not restore",
+        restored=False,
+        rewritten=("boards/sprint.yaml",),
+    )
+
+    def refuse_merge(*a, **kw):
+        raise exc
+
+    monkeypatch.setattr(verify, "merge_branch", refuse_merge)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    reason = engine.state.paused_reason or ""
+    assert "`git checkout HEAD -- boards/sprint.yaml`" in reason
+    assert "reset --hard HEAD` in" not in reason  # the repo-wide advice is gone
+    assert "never a repo-wide `git reset --hard`" in reason
+
+
+def test_half_applied_merge_escalation_names_the_residue_from_the_exception_paths(
+    project, monkeypatch
+):
+    """The half-applied arm names the leftover files from the exception's `paths`
+    attribute, not by echoing git's text.
+
+    Both channels normally carry the same names, which is exactly why the matrix
+    row above cannot test this: its pass-through assertion (`git's own text is in
+    the reason`) stays true even if the arm ignores `paths` entirely. So this row
+    stages an exception whose MESSAGE never mentions the file and whose `paths`
+    does — the only shape where the two channels disagree — and asserts the name
+    reaches the operator anyway.
+
+    It is worth an arm of its own because the name is the actionable half. The
+    residue blocks every subsequent attempt as a pre-flight refusal, so an
+    escalation that says "some files were left behind" without saying WHICH sends
+    the operator to diff a checkout the run has been told to tolerate strays in.
+
+    Ablation: replace `residue` with a fixed phrase, or build it from `str(e)`
+    instead of `e.paths`, and this row fails alone — every matrix row above stays
+    green, since there the two channels agree."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    exc = verify.MergeHalfAppliedError(
+        "git merge --squash feat failed in /repo (failed part-way through checkout): "
+        "fatal: smudge filter boom failed",  # deliberately names no path
+        paths=("Assets/Generated.cs", "notes.txt"),
+    )
+
+    def refuse_merge(*a, **kw):
+        raise exc
+
+    monkeypatch.setattr(verify, "merge_branch", refuse_merge)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    reason = engine.state.paused_reason or ""
+    assert "Assets/Generated.cs" in reason and "notes.txt" in reason
+
+
+_MERGE_FAILURE_PHRASES = (
+    "refused by git before it started",
+    "the target checkout is back as it was",
+    "left MID-MERGE",
+    "left STAGED",
+    "content conflict",
+    "failed PART-WAY THROUGH",
+    "UNVERIFIED",
+    "was not classified",
+)
+
+
+@pytest.mark.parametrize(
+    "make_exc, present",
+    [
+        (
+            lambda: verify.MergePreflightError(
+                "git merge --squash feat failed in /repo (refused before starting): "
+                "error: The following untracked working tree files would be "
+                "overwritten by merge:\n\tleak.cs"
+            ),
+            "refused by git before it started",
+        ),
+        (
+            lambda: verify.MergeCommitRefusedError(
+                "git merge --no-ff feat failed in /repo (merged, but git refused the "
+                "commit): error: gpg failed to sign the data"
+            ),
+            "the target checkout is back as it was",
+        ),
+        (
+            lambda: verify.MergeCommitRefusedError(
+                "git merge --no-ff feat failed in /repo (merged, but git refused the "
+                "commit): error: gpg failed to sign the data; AND git merge --abort "
+                "failed (repo left mid-merge): fatal: could not abort",
+                restored=False,
+            ),
+            "left MID-MERGE",
+        ),
+        (
+            lambda: verify.MergeCommitRefusedError(
+                "git commit (squash feat) failed in /repo (merged, but git refused "
+                "the commit): error: gpg failed to sign the data; the squash result "
+                "is left staged (not rolled back: the checkout already carried "
+                "uncommitted work, which `reset --hard` would destroy with it)",
+                restored=False,
+                staged=True,
+            ),
+            "left STAGED",
+        ),
+        (
+            lambda: verify.MergeConflictError(
+                "git merge --no-ff feat failed in /repo (conflict): "
+                "CONFLICT (content): Merge conflict in src.txt"
+            ),
+            "content conflict",
+        ),
+        (
+            lambda: verify.MergeHalfAppliedError(
+                "git merge --squash feat failed in /repo (failed part-way through "
+                "checkout): fatal: zzz.dat: smudge filter boom failed; left untracked "
+                "in /repo: aaa.txt",
+                paths=("aaa.txt",),
+            ),
+            "failed PART-WAY THROUGH",
+        ),
+        (
+            lambda: verify.MergeResidueUnreadError(
+                "git merge --squash feat failed in /repo (checkout state unverified): "
+                "fatal: zzz.dat: smudge filter boom failed; AND the residue probe "
+                "failed: git ls-files --others failed in /repo: probe boom"
+            ),
+            "UNVERIFIED",
+        ),
+        (
+            lambda: verify.GitError(
+                "git merge --no-ff feat failed in /repo: fatal: some state no probe measured"
+            ),
+            "was not classified",
+        ),
+    ],
+    ids=[
+        "preflight-refusal",
+        "commit-refused",
+        "commit-refused-unrestored",
+        "commit-refused-staged",
+        "content-conflict",
+        "half-applied",
+        "residue-unread",
+        "unclassified",
+    ],
+)
+def test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict(
+    project, monkeypatch, make_exc, present
+):
+    """#619: `merge_local` caught every `verify.GitError` out of `merge_branch` and
+    told the operator to resolve "a content conflict against the target". Most of
+    those failures are git declining at pre-flight — nothing merged, the checkout
+    untouched, no markers anywhere — so the guidance sent them looking for a
+    conflict that does not exist. `MergePreflightError` is a GitError subclass, so
+    the two arms must be ordered subclass-first for the split to exist at all.
+
+    Each row asserts its own phrase PRESENT and every OTHER row's phrase ABSENT. The
+    absence half is the discriminator: a single catch-all arm still makes each row's
+    own phrase appear on one of them, and only the cross-check catches the collapse.
+    Every other rather than one neighbour, because past two arms a pair can collapse
+    into each other while the rest stay distinct.
+
+    `commit-refused` is the third state (#619): git merged cleanly and then declined
+    to COMMIT — a `pre-merge-commit`/`commit-msg` hook, or a signing step. Its arm
+    exists because neither neighbour's remedy fits it.
+
+    `commit-refused-unrestored` is that state with the abort ALSO failed. It is a
+    row and not a footnote because the two differ in what the operator must do
+    FIRST: a resume over a mid-merge checkout dies on the merge state however well
+    they fix the hook, so a message claiming the checkout was restored costs them
+    the one step that unblocks it.
+
+    `commit-refused-staged` is the squash leg's strand of that same state: its
+    commit is the leg's own `git commit` after the merge already staged the
+    result, so there is no MERGE_HEAD and "recover the merge" would be fiction —
+    the squash result is sitting STAGED and clearing it is the first step. The
+    `staged` flag is what parts the two unrestored wordings, which is the row's
+    whole point.
+
+    `content-conflict` pins the TYPED conflict arm: the conflict is measured
+    (unmerged stages) and raised as `MergeConflictError`, so the resolve-by-hand
+    wording rides the measurement rather than the absence of a better match.
+
+    `unclassified` pins the demoted catch-all. A bare `GitError` is a state
+    nothing measured, and the arm now says so — run `git status`, git's text
+    names the cause — instead of prescribing conflict resolution for it. Six
+    mislabeled git states in a row reached operators through the old wording;
+    this row is what turns a hypothetical seventh into a vague-but-true message
+    instead of a precise fiction.
+
+    `half-applied` is the fourth state: git died part-way through the checkout and
+    left incoming files behind, untracked. It reaches `merge_local` as a SIBLING of
+    the pre-flight error rather than a subclass, so it needs an arm of its own —
+    and it is the row the cross-check matters most for, since the phrase it must
+    never carry is the pre-flight arm's "the target checkout is unchanged" claim,
+    which is false here in the exact clause the operator acts on.
+
+    `residue-unread` is the terminal state: the merge failed and the post-merge
+    residue reading failed too, so neither the pre-flight claim (the checkout is
+    unchanged) nor the half-applied one (these files were left) is available. Its
+    arm says the state is UNVERIFIED and sends the operator to their own
+    `git status` — the reading the run could not take. Without the arm it falls
+    to the content-conflict catch-all, which is the #619 defect wearing a probe
+    error's text.
+
+    Ablation: delete either subclass arm from `merge_local` and its rows fail on
+    both halves while the others stay green; collapse the `e.restored` branch to the
+    restored wording and only `commit-refused-unrestored` reddens. Every verify-layer
+    row stays green throughout, because this is the wiring axis and those are the
+    predicate axis."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    exc = make_exc()
+
+    def refuse_merge(*a, **kw):
+        raise exc
+
+    monkeypatch.setattr(verify, "merge_branch", refuse_merge)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    reason = engine.state.paused_reason or ""
+    assert present in reason
+    for phrase in _MERGE_FAILURE_PHRASES:
+        if phrase != present:
+            assert phrase not in reason
+    assert str(exc).splitlines()[0] in reason  # git's own text is passed through
+    # branch kept for manual merge — the unit's work is not stranded either way
+    assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
+
+
+def test_spec_paths_serialize_relative_to_worktree_or_preserve_absolute_paths():
+    """Both spec paths stay portable without rewriting paths the worktree does not own."""
     task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEFERRED)
     task.worktree_path = "/repo/.bmad-loop/runs/run/worktrees/1-1-a"
     task.spec_file = "/repo/.bmad-loop/runs/run/worktrees/1-1-a/_out/spec.md"
+    task.dispatched_spec_file = "/repo/.bmad-loop/runs/run/worktrees/1-1-a/_out/dispatched.md"
     assert task.to_dict()["spec_file"] == "_out/spec.md"
-    # a spec living outside the worktree stays absolute
+    assert task.to_dict()["dispatched_spec_file"] == "_out/dispatched.md"
+    # specs living outside the worktree stay absolute
     task.spec_file = "/elsewhere/spec.md"
+    task.dispatched_spec_file = "/elsewhere/dispatched.md"
     assert task.to_dict()["spec_file"] == "/elsewhere/spec.md"
+    assert task.to_dict()["dispatched_spec_file"] == "/elsewhere/dispatched.md"
     # in-place mode (no worktree) is unchanged
     task.worktree_path = ""
     task.spec_file = "/repo/_out/spec.md"
+    task.dispatched_spec_file = "/repo/_out/dispatched.md"
     assert task.to_dict()["spec_file"] == "/repo/_out/spec.md"
+    assert task.to_dict()["dispatched_spec_file"] == "/repo/_out/dispatched.md"
 
 
 # ---------------------------------------------- gh-139 resilient teardown
@@ -3007,18 +6970,11 @@ def test_resume_remount_survives_discard_remove_failure(project, monkeypatch):
 
     monkeypatch.setattr(verify, "worktree_remove", always_fail)
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter(
-        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)]
-    )
-    resumed = Engine(
-        paths=project,
+    resumed, adapter = resume_engine(
+        project,
+        engine,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
         policy=wt_policy(),
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
     )
     summary = resumed.run()
 
@@ -3027,16 +6983,19 @@ def test_resume_remount_survives_discard_remove_failure(project, monkeypatch):
     assert "worktree-open-failed" not in journal_kinds(resumed)
 
 
-def test_spec_file_serialized_with_posix_separators():
-    """The relative spec_file is persisted with forward slashes (as_posix) so a
+def test_spec_paths_serialize_with_posix_separators():
+    """Relative spec paths persist with forward slashes (as_posix) so a
     state.json written under one OS reads back identically under another — no
     backslashes leak into the cross-OS state contract."""
     task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEFERRED)
     task.worktree_path = "/repo/wt"
     task.spec_file = "/repo/wt/_out/sub/spec.md"
-    serialized = task.to_dict()["spec_file"]
-    assert serialized == "_out/sub/spec.md"
-    assert "\\" not in serialized
+    task.dispatched_spec_file = "/repo/wt/_out/sub/dispatched.md"
+    serialized = task.to_dict()
+    assert serialized["spec_file"] == "_out/sub/spec.md"
+    assert serialized["dispatched_spec_file"] == "_out/sub/dispatched.md"
+    assert "\\" not in serialized["spec_file"]
+    assert "\\" not in serialized["dispatched_spec_file"]
 
 
 # ------------------------------------------------- retry recovery (issue #161)
@@ -3150,7 +7109,7 @@ def test_worktree_in_repo_ledger_closure_reaches_the_target_branch(project):
     assert "resolution: resolved by story 1-1-a" in entry.body
     assert worktree_clean(project.project)
     # #458's carry runs here too, and finds nothing to do: `_apply_done` returns
-    # None for a row that is already `done`, so `mark_done_many` writes nothing at
+    # None for a row that is already `done`, so `_mark_done_many` writes nothing at
     # all and no commit is attempted. That is what lets the carry be unconditional
     # rather than needing a tracked/ignored predicate.
     carried = [e for e in engine.journal.entries() if e["kind"] == "story-deferred-close-carried"]
@@ -3158,7 +7117,14 @@ def test_worktree_in_repo_ledger_closure_reaches_the_target_branch(project):
     assert "story-deferred-close-carry-uncommitted" not in journal_kinds(engine)
     # exactly one annotation — a second close would append a second resolution line
     assert entry.body.count("resolution:") == 1
-    assert "resolution-undo:" not in entry.body
+    # ...and exactly one undo marker beside it. This line read `not in` until #286
+    # made the story close REOPENABLE: the commit-boundary rollback now undoes these
+    # entries through their own markers instead of restoring the whole document over
+    # a concurrent writer, so the marker is permanent and rides the unit's commit to
+    # the target branch like the resolution line does. A second marker here would
+    # mean the carry re-closed a row the merge had already delivered — the very
+    # byte-identity the carry shares `_story_close_operation_id` to preserve.
+    assert entry.body.count("resolution-undo:") == 1
 
 
 def test_gitignored_declared_closure_reaches_the_main_ledger(project):
@@ -3220,10 +7186,734 @@ def test_gitignored_declared_closure_reaches_the_main_ledger(project):
     assert "resolution: resolved by story 1-1-a" in entry.body
 
 
+# ------------------------------------------------------- gitignored sprint board
+
+
+def ignored_sprint(project, statuses: dict[str, str]) -> str:
+    """Gitignore the board, then write and commit in that order — `ignored_ledger`'s
+    shape (test_sweep.py) for the other seeded artifact.
+
+    Order matters both ways: committing the rule first leaves the `git add -A` below
+    with nothing to stage (empty-index commit failure), and writing the board first
+    would TRACK it, which is the shape that needs no seed at all. `check-ignore` is
+    the oracle — a pattern that is present is not necessarily effective.
+
+    The deliberate opposite of `commit_sprint`, which every other row in this file
+    uses: that helper tracks the board, which is precisely why #350 had no coverage.
+    The `add -A` is safe here only because the rule is already in the working-tree
+    .gitignore, so the board cannot be swept into the commit; a later `add -A` over
+    an untracked board would be, and a baseline reset would then delete it.
+    """
+    ignore_before_commit(project, "sprint-status.yaml")
+    write_sprint(project, statuses)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "gitignore the board")
+    rel = project.sprint_status.relative_to(project.project).as_posix()
+    assert git(project.project, "check-ignore", rel).strip() == rel
+    assert not verify.path_tracked(project.project, rel)
+    return rel
+
+
+def test_gitignored_board_under_isolation_survives_verify(project):
+    """#350 — the board's absence from a unit worktree is a CRASH, not a lost write.
+
+    `git worktree add` checks out tracked files only, so a gitignored board reaches
+    no unit; `_post_dev_state_sync` then advances `self.workspace.paths.sprint_status`
+    — that missing file — where `sprintstatus.advance` returns None in silence, and
+    `verify_dev` reads the SAME missing file through `story_status`, where
+    `sprintstatus.load` raises `SprintStatusError`. cli, operatoractions and the TUI
+    all catch that class; engine.py and verify.py do not, so it escapes to `run()`'s
+    catch-all and the story takes the whole run down with it.
+
+    Seeding the board removes that structurally: the gate reads the orchestrator's
+    own write. Ablating the seed (`_board_seed` -> `()`) puts the pre-fix behavior
+    back — `summary.crashed`, `state.crash_error` naming `SprintStatusError`.
+
+    Scoped to no-crash plus a passing verify ON PURPOSE. The worktree copy is
+    canonical for the duration of the story (#350's maintainer decision) and the
+    main board is advanced separately, by the post-merge carry — which has its own
+    rows below. Keeping the two halves on separate oracles is what lets an ablation
+    of either redden only its own.
+    """
+    rel = ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+
+    summary = engine.run()
+
+    # crash_error first: it is the field that NAMES the exception class, so an
+    # ablation of the seed reddens this row with `SprintStatusError` in the failure
+    # message rather than a bare `crashed=True` that any fault would produce.
+    assert engine.state.crash_error is None and not summary.crashed
+    assert summary.done == 1 and not summary.paused
+    assert engine.state.tasks["1-1-a"].phase == Phase.DONE
+    # the seed was delivered, not merely requested: an undelivered or no-op seed
+    # entry names itself in one of these two journals.
+    seeded = [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] in ("worktree-seed-skipped", "worktree-seed-dropped")
+        and rel in e.get("entries", [])
+    ]
+    assert seeded == []
+    # the unit's work landed and the board stayed the orchestrator's own file
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert not verify.path_tracked(project.project, rel)
+    assert worktree_clean(project.project)
+    assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
+
+
+def _board_carry_events(engine, kind="board-advance-carried"):
+    return [e for e in engine.journal.entries() if e["kind"] == kind]
+
+
+def _sprint_carry_commits(project) -> list[str]:
+    """Every commit the board carry authored, by subject. Empty is the assertion
+    that ``commit_paths`` found nothing to commit — a claim `worktree_clean` alone
+    cannot make, since a carry that DID commit also leaves a clean tree."""
+    subjects = git(project.project, "log", "--format=%s").splitlines()
+    return [s for s in subjects if s.startswith("chore(sprint-status)")]
+
+
+def test_done_isolated_unit_carries_its_board_advance_after_merge(project):
+    """#350's carry half: the story's advance reaches the MAIN board.
+
+    The advance lands on the seeded worktree board, which is shielded from the
+    unit's `git add -A` with every other seeded rel, so nothing about it rides the
+    merge. Without the carry the main board keeps the story at `ready-for-dev` —
+    inside ACTIONABLE_STATUSES — and `_pick_next`, which reads the MAIN board, hands
+    finished work back to the next run.
+
+    The `board-advance-carry-uncommitted` row is the expected outcome here, not a
+    fault: `git add` refuses an ignored pathspec with rc 1 every time, which is why
+    the carry commits best effort. The status on disk is the value.
+    """
+    rel = ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert summary.done == 1 and task.phase == Phase.DONE and not summary.crashed
+    assert task.board_advance_intended == "done"
+    assert task.isolated_ledger_carried
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert [(e["target"], e["status"]) for e in _board_carry_events(engine)] == [("done", "done")]
+    assert len(_board_carry_events(engine, "board-advance-carry-uncommitted")) == 1
+    # the carry writes the board, never tracks it: an ignored path stays ignored
+    assert not verify.path_tracked(project.project, rel)
+    assert _sprint_carry_commits(project) == []
+    assert worktree_clean(project.project)
+
+
+def test_awaiting_operator_isolated_unit_carries_its_board_advance(project):
+    """A park is the other terminal `_post_dev_state_sync` records, and
+    `integrate_unit` merges it beside DONE — so it carries beside DONE too.
+
+    `awaiting-operator` sits immediately below `done` in STATUS_ORDER, so this is an
+    ordinary forward advance the later `bmad-loop confirm` finishes.
+    """
+    ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                followup_review=False,
+                operator_actions=["publish the DNS record"],
+            )
+        ],
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert summary.awaiting_operator == 1 and task.phase == Phase.AWAITING_OPERATOR
+    assert task.board_advance_intended == "awaiting-operator"
+    assert task.isolated_ledger_carried
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert [(e["target"], e["status"]) for e in _board_carry_events(engine)] == [
+        ("awaiting-operator", "awaiting-operator")
+    ]
+
+
+def test_board_carry_refuses_a_board_replaced_by_a_directory(project, monkeypatch):
+    """DW-237 at `_carry_board_advance`, the one guarded site whose family is
+    `"store"` rather than `"ledger"`: the family names the validation POLICY, not the
+    file's role — `"ledger"` is the leg that additionally asks
+    `deferredwork.read_for_write`, and a board wants only "a regular file is there".
+
+    Staged as a REPLACEMENT for the reason `_replace_with_a_directory` states, and
+    here the code says so itself: the method's own `is_file()` pre-check refuses a
+    board that was a directory all along, so what remains is the window that check
+    leaves open — the #686 TOCTOU its comment names. The `target` field rides the row
+    beside `refuse_cause`, as it does on all four of this method's sibling records.
+
+    Ablation: delete this site's `refusal` branch and this reds on both HEAD
+    assertions — `swept-in.txt` lands under a `chore(sprint-status):` message."""
+    from bmad_loop import engine as engine_module
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head = git(project.project, "rev-parse", "HEAD")
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, board_advance_intended="done")
+    engine.state.tasks[task.story_key] = task
+    real_advance = engine_module.sprint_advance
+
+    def advance_then_replace(board, *a, **kw):
+        landed = real_advance(board, *a, **kw)
+        _replace_with_a_directory(board)
+        return landed
+
+    monkeypatch.setattr(engine_module, "sprint_advance", advance_then_replace)
+
+    engine._carry_board_advance(task)
+
+    [refused] = _rows(engine, "board-advance-carry-refused")
+    assert refused["refuse_cause"] == "target-not-a-file" and refused["target"] == "done"
+    assert "error" not in refused
+    assert _rows(engine, "board-advance-carry-uncommitted") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert "swept-in.txt" not in git(project.project, "ls-files")
+    assert _sprint_carry_commits(project) == []
+    # the advance itself happened and is still reported: only the commit was withheld
+    assert [(e["target"], e["status"]) for e in _board_carry_events(engine)] == [("done", "done")]
+
+
+def test_tracked_board_carry_is_a_no_op_that_still_reports_itself(project):
+    """The common shape: a TRACKED board needs no carry and must not get a commit.
+
+    The worktree's advance is an ordinary modification of a tracked file, which no
+    ignore rule masks, so it rides the unit commit through the merge and the main
+    board is already at the target when the carry runs. `advance` then returns the
+    current status without writing, `commit_paths` finds nothing to commit, and
+    `board-advance-carried` names a status the carry did not itself write — an
+    ordinary outcome, and the reason the journal carries the landed status rather
+    than a wrote/did-not flag it cannot honestly produce.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert [(e["target"], e["status"]) for e in _board_carry_events(engine)] == [("done", "done")]
+    # nothing to commit and nothing refused: the merge already delivered the flip
+    assert _board_carry_events(engine, "board-advance-carry-uncommitted") == []
+    assert _sprint_carry_commits(project) == []
+    assert worktree_clean(project.project)
+
+
+# `advance` cannot report whether it WROTE — a never-regress echo returns the target
+# too, which is why the row above is a legitimate ("done", "done"). It can report that
+# the row did not REACH the target, and these two rows are that answer's two shapes.
+# Both matter because the run tears down the worktree holding the advanced copy on the
+# strength of the carry's record: latched as carried, the advance is lost AND the
+# journal says it landed. Ablation for both: drop the `_at_or_past` guard and each row
+# fails on the `board-advance-carried` assertion, the false success it exists to stop.
+
+
+def test_board_carry_over_a_vanished_main_row_is_not_journalled_as_carried(project):
+    """Shape one: `advance` returns `None` because the story's row is gone. Reachable
+    while an isolated session runs — the worktree holds its own seeded copy, so the
+    story completes normally and only the carry finds nothing to write to.
+
+    The ROW rather than the whole FILE, and a second row left standing: a main board
+    that is missing outright — or left with an empty `development_status` — raises
+    `SprintStatusError` out of `advance` itself, which ends the run over the carry's
+    shoulder and proves nothing about the carry's own record. `1-1-b` is parked at
+    `done` so it holds the map open without being actionable."""
+    ignored_sprint(project, {"1-1-a": "ready-for-dev", "1-1-b": "done"})
+    inner = wt_dev_effect(project, "1-1-a", followup_review=False)
+
+    def effect(spec):
+        result = inner(spec)
+        board = project.sprint_status  # the MAIN board, not the worktree's
+        kept = [
+            ln
+            for ln in board.read_text(encoding="utf-8").splitlines(keepends=True)
+            if "1-1-a" not in ln
+        ]
+        board.write_text("".join(kept), encoding="utf-8")
+        return result
+
+    engine, _ = make_engine(project, [effect])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") is None  # premise
+    assert _board_carry_events(engine) == []  # no success filed for a carry that isn't
+    assert [
+        (e["target"], e["status"])
+        for e in _board_carry_events(engine, "board-advance-carry-failed")
+    ] == [("done", None)]
+    assert _sprint_carry_commits(project) == []
+
+
+def test_board_carry_that_cannot_rewrite_the_row_is_not_journalled_as_carried(project):
+    """Shape two, and the one a `None` check alone would miss: the row is THERE and
+    `advance` still leaves it below target. `story_status` resolves a quoted key
+    through a full YAML parse, `_set_mapping_value`'s line regex then declines it,
+    and `advance` returns the row's current status rather than falsely claiming the
+    target — a distinction this method has to carry through to its journal."""
+    ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    inner = wt_dev_effect(project, "1-1-a", followup_review=False)
+
+    def effect(spec):
+        result = inner(spec)
+        board = project.sprint_status
+        text = board.read_text(encoding="utf-8").replace("1-1-a:", '"1-1-a":')
+        board.write_text(text, encoding="utf-8")
+        return result
+
+    engine, _ = make_engine(project, [effect])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert _board_carry_events(engine) == []
+    assert [
+        (e["target"], e["status"])
+        for e in _board_carry_events(engine, "board-advance-carry-failed")
+    ] == [("done", "ready-for-dev")]
+    # the premise, stated: the row is readable and still did not move
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "ready-for-dev"
+    assert _sprint_carry_commits(project) == []
+
+
+def test_crashed_post_merge_board_advance_replays_from_its_record(project):
+    """The merge-to-carry window, for the payload that reaches it most often.
+
+    A generic story usually records a board advance and NOTHING else, so the resume
+    pass reaches it only because the eligibility disjunct names this field — the
+    strand the comment above that disjunct warns about, on the ordinary case rather
+    than a rare one.
+    """
+    ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    # durable, and the ONLY payload that can reach the carry for this story
+    assert crashed.board_advance_intended == "done"
+    assert not crashed.harvested_deferrals
+    assert not crashed.story_closes_intended and not crashed.bundle_closes_intended
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "ready-for-dev"
+
+    resumed, adapter = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert adapter.sessions == []  # replayed, not re-driven
+    assert "resume-ledger-carry" in journal_kinds(resumed)
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
+
+
+def test_replayed_board_carry_leaves_an_operators_edit_out_of_its_commit(project):
+    """#618's carry hazard, on the one leg its merge pre-flight cannot reach.
+
+    `merge_local` refuses a stray on a protected artifact BEFORE it merges, and that
+    refusal is the whole of what keeps `_carry_board_advance`'s pathspec commit from
+    taking bytes the run never wrote. `_replay_unlatched_ledger_carries` skips it:
+    the re-merge block is guarded on `merged_key not in merged_units`, so a unit whose
+    `unit-merged` was already journaled falls straight through to the carry with no
+    merge — and therefore no pre-flight — in front of it. The operator's window is the
+    crash itself: the host is down, they edit their own checkout, the run comes back.
+
+    `unit-merged` in the crashed run's journal is that leg's precondition and is
+    asserted rather than assumed. Without it the resume takes the OTHER branch,
+    re-runs the merge, and the pre-flight would have caught the edit after all —
+    which is exactly how this row stays disjoint from #618's own witnesses.
+
+    A tracked board's flip rides the merge, so by the time the carry runs it has
+    nothing of its own left to write: every byte its commit could take belongs to
+    somebody else. That is asserted too, because it is what makes the sweep total
+    rather than partial.
+
+    The last assertions read git HISTORY, not the working tree, for the reason
+    `_committed_versions` exists: a pathspec carry that swept the edit in leaves the
+    tree clean and the file's bytes unchanged on disk, so "the edit is still there"
+    passes in the unsafe outcome just as well as in the safe one.
+    """
+    marker = "# operator: reopened locally, do not ship\n"
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    board = project.sprint_status
+    rel = board.relative_to(project.project).as_posix()
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+    assert "unit-merged" in journal_kinds(engine)
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert crashed.board_advance_intended == "done"
+    assert sprintstatus.story_status(board, "1-1-a") == "done"
+    assert rel not in verify.dirty_paths(project.project)
+
+    board.write_text(board.read_text(encoding="utf-8") + marker, encoding="utf-8")
+    before = board.read_text(encoding="utf-8")
+
+    resumed, _ = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed
+    # The DAMAGE assertions lead, so that an ablation of the guard reddens this row on
+    # the operator's bytes reaching a commit and not on a journal kind going missing.
+    # Non-empty first: `any()` over an empty history is False, so a read that found no
+    # commits at all would pass the next line for the wrong reason.
+    versions = _committed_versions(project, rel)
+    assert versions and not any(marker.strip() in v for v in versions)
+    assert not any(
+        "chore(sprint-status)" in s for s in git(project.project, "log", "--format=%s").splitlines()
+    )
+    # refused, never repaired: the operator's bytes and the row's status both survive
+    assert board.read_text(encoding="utf-8") == before
+    assert sprintstatus.story_status(board, "1-1-a") == "done"
+    kinds = journal_kinds(resumed)
+    assert "resume-ledger-carry" in kinds and "board-advance-carry-foreign-dirt" in kinds
+
+
+def test_replayed_board_carry_refuses_before_it_overwrites_an_operators_row_edit(project):
+    """The same hazard on the one row the commit proof cannot be asked about in time:
+    the story's own.
+
+    That proof guards the COMMIT, and `sprint_advance` runs first — so for this row it
+    arrives after the evidence it would have judged is already overwritten, and then
+    agrees, the board holding exactly HEAD's bytes plus this advance because that is
+    what `advance` just made of them. Refusing the commit at that point saves nothing
+    either: the operator's status is gone from disk, which is the value `_pick_next`
+    reads and the value the next run schedules from. Hence a row check BEFORE the
+    write, additive to the proof that still guards every other row.
+
+    The reopened status is `awaiting-operator` for two independent reasons. It sits
+    BELOW `done` in STATUS_ORDER, so `advance` really writes over it rather than
+    handing back the never-regress echo a same-or-later status would — no write, no
+    hazard, nothing to pin. And it is outside ACTIONABLE_STATUSES, so the resumed
+    engine does not re-pick the story and drive a MockAdapter with no sessions left.
+
+    `before` is captured AFTER the operator's write, so the row asserts survival of
+    exactly their bytes and stays indifferent to how the board happens to be
+    serialized. Ablation: drop the pre-advance check and the row is `done` on disk
+    with `board-advance-carried` filed over it.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    board = project.sprint_status
+    rel = board.relative_to(project.project).as_posix()
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+    assert "unit-merged" in journal_kinds(engine)
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert crashed.board_advance_intended == "done"
+    # the tracked flip rode the merge, so HEAD already holds the target this carry
+    # would re-apply: whatever the row says now, somebody else put there.
+    assert sprintstatus.story_status(board, "1-1-a") == "done"
+    assert rel not in verify.dirty_paths(project.project)
+
+    set_sprint(project, "1-1-a", "awaiting-operator")
+    before = board.read_bytes()
+
+    resumed, _ = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed
+    # The DAMAGE assertions lead: an ablation must redden on the operator's status
+    # being overwritten, not on a journal kind going missing.
+    assert sprintstatus.story_status(board, "1-1-a") == "awaiting-operator"
+    assert board.read_bytes() == before
+    kinds = journal_kinds(resumed)
+    assert "board-advance-carry-foreign-dirt" in kinds
+    # nothing was written, so the event that says the status is on disk would lie
+    assert "board-advance-carried" not in kinds
+    assert _sprint_carry_commits(project) == []
+
+
+def test_replayed_board_carry_still_commits_a_crashed_passs_own_advance(project):
+    """The regression the row above could cause, and why the guard compares BYTES
+    rather than refusing on dirt.
+
+    A pass that advanced the board and died before its commit leaves that advance as
+    uncommitted dirt on exactly the path the guard watches — and finishing it is what
+    the replay leg is for. A guard that refused on dirt alone would strand it: the
+    row's status would keep being right on disk and wrong in every commit, for ever.
+
+    So the state is built, not raced for, and built through `sprintstatus.advance` —
+    the same call the carry itself makes — so the bytes under test are the carry's own
+    and not a hand-rolled imitation of them. HEAD is moved below the target first,
+    because that is what makes the advance a real write rather than the never-regress
+    echo a merged tracked board gives.
+
+    Green with the guard ablated as well as with it in place: this row exists to pin
+    that the guard costs nothing here, so it is deliberately NOT part of the ablation
+    set. The row above is.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    board = project.sprint_status
+    rel = board.relative_to(project.project).as_posix()
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+    assert "unit-merged" in journal_kinds(engine)
+    assert not load_state(engine.run_dir).tasks["1-1-a"].isolated_ledger_carried
+
+    # HEAD below the target, so the carry has real work; then the dead pass's own
+    # write on top of it, uncommitted — the exact shape a crash leaves behind.
+    set_sprint(project, "1-1-a", "ready-for-dev")
+    git(project.project, "commit", "-q", "-m", "operator reopens the row", "--", rel)
+    sprintstatus.advance(board, "1-1-a", "done")
+    assert rel in verify.dirty_paths(project.project)
+
+    resumed, _ = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed
+    # As above, the substantive assertions lead: a guard that refused on dirt alone
+    # has to redden this row on the carry never reaching a commit, not on a journal
+    # kind. Non-empty first, for the reason the sibling row spells out.
+    versions = _committed_versions(project, rel)
+    assert versions and "1-1-a: done" in versions[0]
+    assert any(
+        s == "chore(sprint-status): carry 1-1-a to done"
+        for s in git(project.project, "log", "--format=%s").splitlines()
+    )
+    assert rel not in verify.dirty_paths(project.project)
+    assert sprintstatus.story_status(board, "1-1-a") == "done"
+    kinds = journal_kinds(resumed)
+    assert "board-advance-carried" in kinds
+    assert "board-advance-carry-foreign-dirt" not in kinds
+    assert "board-advance-carry-uncommitted" not in kinds
+
+
+def test_replayed_board_carry_with_a_deleted_board_journals_failed_not_a_crash(project):
+    """A tracked board DELETED while the host was down, on the replay leg — the
+    shape where the carry's own docstring promise (`board-advance-carry-failed`
+    for "a board that is gone") and its probes' behavior used to disagree.
+
+    Deletion is dirt (` D` in `dirty_paths`), so it turns proving ON — and the
+    pre-advance row probe's live read (`sprint_story_status` → `load`) RAISES
+    `SprintStatusError` over a missing file, where `advance`, whose behavior the
+    no-catch rationale was written against, returns None. That raise escaped
+    `_replay_unlatched_ledger_carries` (which catches only `RunPaused`), so every
+    resume died before `_loop()` — the one caller every resume runs through, on a
+    shape a retry cannot repair. The carry now refuses a missing board up front,
+    on the journal row already named for it.
+
+    Driven through `_replay_unlatched_ledger_carries` itself so the raise, when
+    the guard is ablated, is the failure graded — a full `resumed.run()` would
+    also trip over the missing board in `_pick_next` and muddy the axis.
+
+    Ablation: drop the `board.is_file()` guard and this row dies on
+    `SprintStatusError: sprint status file not found` at the replay call — the
+    measured pre-fix behavior — while the foreign-dirt and own-advance siblings
+    above stay green, their boards being present in every scene."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    board = project.sprint_status
+    rel = board.relative_to(project.project).as_posix()
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+    assert "unit-merged" in journal_kinds(engine)
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert crashed.board_advance_intended == "done"
+
+    board.unlink()  # the operator's window is the crash itself
+    assert verify.dirty_paths(project.project).get(rel, "").strip() == "D"  # proving turns ON
+
+    resumed, _ = resume_engine(project, engine)
+    resumed._replay_unlatched_ledger_carries()  # must not raise
+
+    kinds = journal_kinds(resumed)
+    assert "board-advance-carry-failed" in kinds
+    assert "board-advance-carried" not in kinds
+    assert not board.exists()  # refused, never recreated or half-written
+
+
+def test_board_advance_carried_twice_by_a_crash_before_its_latch_is_a_no_op(project):
+    """The carry-to-latch window: the resume replays a carry that already ran.
+
+    That is safe for the board because `advance` never regresses — the second
+    application reads `done` and returns it unwritten. This is the window that pins
+    call-site latching: a latch moved inside the hook would already be durable here
+    and the resume would never replay at all.
+    """
+    ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+    crash_at_merge_back(engine, after="carry")
+
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    # the carry itself completed before the host died
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    before = project.sprint_status.read_bytes()
+
+    resumed, _ = resume_engine(project, engine)
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert "resume-ledger-carry" in journal_kinds(resumed)
+    # byte-identical: a re-applied advance rewrites nothing, comments included
+    assert project.sprint_status.read_bytes() == before
+    assert [(e["target"], e["status"]) for e in _board_carry_events(resumed)] == [
+        ("done", "done"),
+        ("done", "done"),
+    ]
+    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
+
+
+def test_unmerged_terminal_unit_does_not_replay_a_board_advance(project):
+    """Merge evidence still gates the replay now that nearly every story has a
+    payload.
+
+    Before #350 a DONE story with no ledger write fell out of the eligibility
+    disjunct and never reached the merge-evidence check at all; the board record
+    puts it there on the ordinary path, so the guard that used to be shadowed is now
+    the only thing standing between a terminal phase and a carry onto a branch that
+    never landed. A tracked board makes the refusal legible: the carry would advance
+    it, so `ready-for-dev` is proof the body did not run.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    engine.state.target_branch = "main"
+    worktree = engine.run_dir / "worktrees" / "1-1-a"
+    worktree.mkdir(parents=True)
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.DONE,
+        worktree_path=str(worktree),
+        branch="bmad-loop/test-run/1-1-a",
+        board_advance_intended="done",
+    )
+    engine.state.tasks[task.story_key] = task
+
+    engine._replay_unlatched_ledger_carries()
+
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "ready-for-dev"
+    assert task.isolated_ledger_carried is False
+    assert "resume-ledger-carry" not in journal_kinds(engine)
+    assert _board_carry_events(engine) == []
+
+
+def test_a_park_confirms_only_after_its_board_advance_is_carried(project):
+    """`confirm` reads the COMMITTED board, so the crash window is visible to it.
+
+    In the merge-to-carry window the park record and its spec have landed on the
+    target while the main board still says `ready-for-dev`, and `confirm` refuses
+    on exactly that disagreement rather than flipping a board on the record's word.
+    The replay is what makes the story confirmable — this is the operator-facing
+    consequence of stranding the carry, and it lives here rather than in
+    test_operatoractions.py because only the engine can reach the window.
+    """
+    from bmad_loop import operatoractions
+
+    ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                followup_review=False,
+                operator_actions=["publish the DNS record"],
+            )
+        ],
+    )
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+
+    (parked,) = operatoractions.resolve(project.project, project)
+    assert parked.spec_status == "awaiting-operator"  # the spec rode the merge
+    assert parked.board_status == "ready-for-dev"  # the board did not
+    assert not parked.confirmable
+    assert parked.committed_drift() == "the board now says ready-for-dev"
+
+    resumed, _ = resume_engine(project, engine)
+    assert resumed.run().awaiting_operator == 1
+
+    (parked,) = operatoractions.resolve(project.project, project)
+    assert parked.board_status == "awaiting-operator"
+    assert parked.committed_drift() is None
+    assert parked.confirmable
+
+
+def test_a_gitignored_board_story_finished_by_one_run_is_not_re_picked_by_the_next(project):
+    """#350 end to end, across the run boundary that is the only place it shows.
+
+    Both halves have to hold for this to pass, and neither can stand in for the
+    other. WITHOUT THE SEED run 1 does not finish at all: the worktree has no board,
+    `verify_dev` reads that missing file through `story_status`, and
+    `SprintStatusError` takes the run down. WITHOUT THE CARRY run 1 finishes
+    perfectly and the damage is invisible until run 2 — inside a single run
+    `state.tasks` shields a finished story from `_pick_next` no matter what the board
+    says, so a fresh RunState reading the MAIN board is the only thing that can tell
+    a carried advance from a lost one.
+
+    That makes run 2 the discriminating assertion of the whole bundle: it is
+    `_pick_next`'s own reader, against `ACTIONABLE_STATUSES`, over the file the
+    orchestrator actually kept. A lost advance leaves `ready-for-dev` there, and the
+    next unattended run hands finished work back to a dev session.
+
+    The board's FULL text is asserted, not just the story's status: the carry runs
+    through `_set_mapping_value`, so this doubles as #366's oracle at the top layer —
+    one value moved, `last_updated`'s unquoted `01-06-2026 10:00` (spaces and all)
+    untouched, no line fabricated. A `yaml.safe_load` comparison would see none of
+    that.
+    """
+    rel = ignored_sprint(project, {"1-1-a": "ready-for-dev"})
+    parked_board = project.sprint_status.read_text()
+    first_engine, first_adapter = make_engine(
+        project, [wt_dev_effect(project, "1-1-a", followup_review=False)]
+    )
+
+    first = first_engine.run()
+
+    # run 1: the seed's half — it completes rather than crashing on the missing board
+    assert first_engine.state.crash_error is None and not first.crashed
+    assert first.done == 1 and not first.paused
+    assert first_engine.state.tasks["1-1-a"].phase == Phase.DONE
+    assert len(first_adapter.sessions) == 1
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    # run 1: the carry's half — the main board moved, and ONLY where it should have
+    assert project.sprint_status.read_text() == parked_board.replace(
+        "1-1-a: ready-for-dev", "1-1-a: done"
+    )
+    assert not verify.path_tracked(project.project, rel)  # still git's to refuse
+    assert worktree_clean(project.project)
+
+    # Run 2 is a fresh RunState over the same project: nothing shields the story now
+    # except the board itself.
+    second_engine, second_adapter = make_engine(project, [], run_id="test-run-2")
+
+    second = second_engine.run()
+
+    assert second_adapter.sessions == []  # never re-picked, so never re-driven
+    assert second.done == 0 and not second.crashed and not second.paused
+    assert second_engine.state.tasks == {}
+    assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
+    assert project.sprint_status.read_text() == parked_board.replace(
+        "1-1-a: ready-for-dev", "1-1-a: done"
+    )
+
+
 def test_crashed_post_merge_story_close_replays_from_its_record(project):
     """A story whose ONLY ledger write is a declared close has every other carry
-    payload empty, so the resume pass has to name this one to reach it — the same
-    reachability the damped follow-up needed, for the fourth producer."""
+    payload empty, so the resume pass has to name this one to reach it."""
     ignore_before_commit(project, "deferred-work.md")
     write_ledger(project, {"DW-1": "open"})
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -3239,20 +7929,10 @@ def test_crashed_post_merge_story_close_replays_from_its_record(project):
     assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
     # only the new disjunct can reach the carry
     assert crashed.story_closes_intended == ["DW-1"]
-    assert not crashed.harvested_deferrals and not crashed.refiled_followups
+    assert not crashed.harvested_deferrals
     assert _ledger_entry(project, "DW-1").open
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    adapter = MockAdapter([])
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=adapter,
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, adapter = resume_engine(project, engine)
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed and not summary.paused
@@ -3269,7 +7949,7 @@ def test_a_re_armed_story_does_not_carry_a_withdrawn_declaration(project, monkey
 
     `_close_declared_deferred` reads `closes_deferred:` LIVE and reassigns
     `story_closes_intended` before its own early return, so it needs no
-    `_dev_phase` clear the way `refiled_followups` does: DONE is reachable only
+    `_dev_phase` clear: DONE is reachable only
     through `_finalize_commit_phase`, which always re-enters the producer. A human
     who resolves an escalation by WITHDRAWING the declaration must not have the
     abandoned attempt's ids closed on their behalf — the exact stale-snapshot case
@@ -3298,20 +7978,18 @@ def test_a_re_armed_story_does_not_carry_a_withdrawn_declaration(project, monkey
     assert _ledger_entry(project, "DW-1").open
 
     monkeypatch.setattr(verify, "finalize_commit", real_finalize)
-    assert runs.rearm_escalation(engine.run_dir, "1-1-a") == "1-1-a"
+    assert (
+        runs.rearm_escalation(
+            engine.run_dir, "1-1-a", isolated_redrive=True, resolution_recorded=True
+        ).story_key
+        == "1-1-a"
+    )
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter(
-            # the resolve outcome: the story no longer claims to close anything
-            [wt_dev_effect(project, "1-1-a", followup_review=False)]
-        ),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        # the resolve outcome: the story no longer claims to close anything
+        [wt_dev_effect(project, "1-1-a", followup_review=False)],
     )
     summary = resumed.run()
 
@@ -3370,16 +8048,7 @@ def test_a_replayed_commit_still_records_the_story_close(project, monkeypatch):
     assert durable.phase == Phase.COMMITTING
     assert not durable.story_closes_intended  # never reached disk — the replay re-derives it
 
-    state = load_state(engine.run_dir)
-    state.clear_pause()
-    resumed = Engine(
-        paths=project,
-        policy=engine.policy,
-        adapter=MockAdapter([]),
-        run_dir=engine.run_dir,
-        journal=engine.journal,
-        state=state,
-    )
+    resumed, _ = resume_engine(project, engine)
     summary = resumed.run()
 
     assert summary.done == 1 and not summary.crashed and not summary.paused
@@ -3389,3 +8058,708 @@ def test_a_replayed_commit_still_records_the_story_close(project, monkeypatch):
     entry = _ledger_entry(project, "DW-1")
     assert entry.status.startswith("done") and not entry.open
     assert "resolution: resolved by story 1-1-a" in entry.body
+
+
+# ------------------------------------------- remount reclaim: orphan preservation
+
+
+def _open_args(project, key="1-1-a", branch_per="story"):
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    return (project.project, project, "test-run", key, "main", branch_per, run_dir)
+
+
+def _dirty_refs(project) -> list[str]:
+    out = git(
+        project.project, "for-each-ref", "--format=%(refname)", "refs/attempt-preserve-dirty/"
+    )
+    return out.splitlines()
+
+
+def _commit_project(project, message: str) -> str:
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", message)
+    return rev_parse_head(project.project)
+
+
+def test_remount_parks_dirty_orphan_before_reclaim(project):
+    """An orphan the isolation flip left standing is force-removed by the remount's
+    reclaim; its UNCOMMITTED state — a tracked edit and a run-created untracked file
+    — is parked under ``refs/attempt-preserve-dirty/<run>-<head>-orphan`` first and
+    the callback names the ref. A second orphaning of the same HEAD probes to
+    ``-r2`` rather than overwriting the first snapshot.
+
+    Ablation: drop the ``_preserve_orphan_state`` call and the remount still
+    succeeds but ``preserved == []`` and no ref holds either file.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    (project.project / "tracked.txt").write_text("v1\n")
+    first, _ = _open_unit(project)  # commits tracked.txt with the sprint board
+    (first.path / "tracked.txt").write_text("edited in the orphan\n")
+    (first.path / "created.txt").write_text("run-created\n")
+    orphan_head = rev_parse_head(first.path)
+
+    preserved: list[tuple[str, str]] = []
+    second = open_unit_workspace(
+        *_open_args(project), on_orphan_preserved=lambda p, r: preserved.append((p, r))
+    )
+
+    assert second.path == first.path and second.path.is_dir()
+    assert (second.path / "tracked.txt").read_text() == "v1\n"  # a fresh checkout
+    assert not (second.path / "created.txt").exists()
+    ref = f"refs/attempt-preserve-dirty/test-run-{orphan_head[:8]}-orphan"
+    assert preserved == [(str(first.path), ref)]
+    assert verify.ref_exists(project.project, ref)
+    assert git(project.project, "show", f"{ref}:tracked.txt") == "edited in the orphan"
+    assert git(project.project, "show", f"{ref}:created.txt") == "run-created"
+    assert git(project.project, "rev-parse", f"{ref}^") == orphan_head  # parented at HEAD
+    # the family scm.preserve_keep bounds — one ref, keep=1, nothing over budget
+    assert verify.prune_preserve_dirty_refs(project.project, 1) == []
+
+    (second.path / "created.txt").write_text("second orphaning\n")
+    preserved.clear()
+    open_unit_workspace(
+        *_open_args(project), on_orphan_preserved=lambda p, r: preserved.append((p, r))
+    )
+    assert preserved == [(str(first.path), f"{ref}-r2")]
+    assert git(project.project, "show", f"{ref}:created.txt") == "run-created"  # untouched
+    assert git(project.project, "show", f"{ref}-r2:created.txt") == "second orphaning"
+    assert len(_dirty_refs(project)) == 2  # both in the family preserve_keep bounds
+
+
+def test_remount_over_clean_orphan_parks_nothing(project):
+    """A clean orphan (tree == HEAD) is reclaimed silently: no ref, no callback."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    first, _ = _open_unit(project)
+    preserved: list[tuple[str, str]] = []
+    second = open_unit_workspace(
+        *_open_args(project), on_orphan_preserved=lambda p, r: preserved.append((p, r))
+    )
+    assert second.path == first.path and second.path.is_dir()
+    assert preserved == []
+    assert _dirty_refs(project) == []
+
+
+SPEC_REL = "_bmad-output/implementation-artifacts/story-1-1-a.md"
+
+
+def _ref_tree(project, ref: str) -> list[str]:
+    return git(project.project, "ls-tree", "-r", "--name-only", ref).splitlines()
+
+
+def _mount_ignored_artifacts(project, unit, *, ledger: str, board: str, spec: str) -> None:
+    """Lay the three orchestrator-owned artifacts into a mount as IGNORED files —
+    the state `WorktreeFlow` leaves behind when its ledger/board/accepted-spec seeds
+    copy them in and the shield folds every seeded rel into the worktree-local
+    `info/exclude`. Here the project's own committed `.gitignore` — checked out into
+    the mount like any tracked file — is the shield; the predicate git answers is the
+    same one, and `open_unit_workspace` is exercised directly, without provisioning."""
+    mounted = project.rebased(unit.path)
+    mounted.implementation_artifacts.mkdir(parents=True, exist_ok=True)
+    mounted.deferred_work.write_text(ledger, encoding="utf-8")
+    mounted.sprint_status.write_text(board, encoding="utf-8")
+    (unit.path / SPEC_REL).write_text(spec, encoding="utf-8")
+
+
+def test_remount_parks_the_orphans_owned_artifacts_over_a_clean_tree(project):
+    """The orchestrator's OWN artifacts — deferred-work ledger, sprint board, bound
+    spec — are ignored inside every mount by construction (seeded into a tracked-only
+    checkout, then folded into the shield), so `untracked_files` never offers them as
+    snapshot candidates and the reclaim's force-remove destroys the mount's only copy.
+
+    The severity is the SILENCE: with a clean tracked tree the old snapshot returned
+    ``None``, so there was no ref, no ``on_orphan_preserved`` callback and no journal
+    line while the files went. This pins the clean-tree case specifically — nothing
+    tracked is edited and there is not one non-ignored untracked file in the mount.
+
+    Ablation: drop ``force_include`` from ``_preserve_orphan_state``'s
+    ``snapshot_worktree`` call and the remount parks nothing — ``preserved == []``.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    ignore_before_commit(project, "**/deferred-work.md", "**/sprint-status.yaml", "**/story-*.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    unit = open_unit_workspace(*_open_args(project), spec_file=SPEC_REL)
+    _mount_ignored_artifacts(
+        project,
+        unit,
+        ledger="# Deferred Work\n\n### DW-1: closed in the orphan\n\nstatus: done\n",
+        board="development_status:\n  1-1-a: in-progress\n",
+        spec="# story 1-1-a\n\nthe orphan's bound spec\n",
+    )
+    orphan_head = rev_parse_head(unit.path)
+    # the tracked tree is CLEAN and nothing non-ignored is untracked: the whole
+    # uncommitted delta is the three ignored artifacts
+    assert git(unit.path, "status", "--porcelain") == ""
+    assert verify.untracked_files(unit.path) == set()
+
+    preserved: list[tuple[str, str]] = []
+    second = open_unit_workspace(
+        *_open_args(project),
+        spec_file=SPEC_REL,
+        on_orphan_preserved=lambda p, r: preserved.append((p, r)),
+    )
+
+    assert second.path == unit.path and second.path.is_dir()
+    ref = f"refs/attempt-preserve-dirty/test-run-{orphan_head[:8]}-orphan"
+    assert preserved == [(str(unit.path), ref)]
+    assert "closed in the orphan" in git(
+        project.project,
+        "show",
+        f"{ref}:{project.deferred_work.relative_to(project.project).as_posix()}",
+    )
+    assert "in-progress" in git(
+        project.project,
+        "show",
+        f"{ref}:{project.sprint_status.relative_to(project.project).as_posix()}",
+    )
+    assert "bound spec" in git(project.project, "show", f"{ref}:{SPEC_REL}")
+    # the reclaim did what it always did — the mount's copies are gone
+    assert not project.rebased(second.path).deferred_work.exists()
+    assert not (second.path / SPEC_REL).exists()
+
+
+def test_remount_never_parks_an_orphans_unowned_ignored_files(project):
+    """The forced include is NARROW on purpose. Parking every ignored path instead
+    would push the seeded `_bmad/` tree, the adapters' MCP configs and venv residue
+    into a ``refs/attempt-preserve-dirty/*`` object ``scm.preserve_keep`` retains 20
+    deep — which is why that remedy was rejected. Only the three orchestrator-owned
+    rels ride the snapshot; every other ignored file is reclaimed as before.
+
+    Ablation A: widen ``_orphan_owned_rels`` to name every file under the mount.
+    Ablation B: widen the staging instead — make ``snapshot_worktree``'s forced add
+    ``git add -f -A``. Both park ``.venv/residue.txt`` and fail this test.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    ignore_before_commit(
+        project, "**/deferred-work.md", "**/sprint-status.yaml", "**/story-*.md", ".venv/", "*.log"
+    )
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    unit = open_unit_workspace(*_open_args(project), spec_file=SPEC_REL)
+    _mount_ignored_artifacts(
+        project,
+        unit,
+        ledger="# Deferred Work\n\n### DW-1: item\n\nstatus: open\n",
+        board="development_status:\n  1-1-a: in-progress\n",
+        spec="# story 1-1-a\n",
+    )
+    (unit.path / ".venv").mkdir()
+    (unit.path / ".venv" / "residue.txt").write_text("venv residue\n", encoding="utf-8")
+    (unit.path / "session.log").write_text("stray ignored artifact\n", encoding="utf-8")
+    orphan_head = rev_parse_head(unit.path)
+
+    preserved: list[tuple[str, str]] = []
+    open_unit_workspace(
+        *_open_args(project),
+        spec_file=SPEC_REL,
+        on_orphan_preserved=lambda p, r: preserved.append((p, r)),
+    )
+
+    ref = f"refs/attempt-preserve-dirty/test-run-{orphan_head[:8]}-orphan"
+    assert preserved == [(str(unit.path), ref)]
+    assert ".venv/residue.txt" not in _ref_tree(project, ref)
+    assert "session.log" not in _ref_tree(project, ref)
+    # exhaustive, not just those two: HEAD's tracked tree plus exactly the three
+    assert sorted(_ref_tree(project, ref)) == sorted(
+        [
+            *git(project.project, "ls-tree", "-r", "--name-only", "HEAD").splitlines(),
+            project.deferred_work.relative_to(project.project).as_posix(),
+            project.sprint_status.relative_to(project.project).as_posix(),
+            SPEC_REL,
+        ]
+    )
+
+
+def test_remount_parks_the_mounted_spec_when_the_artifacts_dir_is_out_of_tree(project):
+    """An artifacts dir configured OUTSIDE the project tree is a supported shape, and
+    `ProjectPaths.rebased` deliberately leaves it unmoved there — so the ledger and the
+    board resolve outside the mount and must drop from the forced include: they are
+    shared, not per-checkout, and the reclaim cannot destroy them.
+
+    The spec must NOT drop with them. `_accepted_spec_seed` lays it inside the mount
+    whatever the artifacts dir is doing, so there it is still the mount's only copy and
+    the force-remove still takes it. Judging the candidates as a group is what made
+    that leg inert: the ledger raises `ValueError` on `relative_to` first.
+
+    Ablation: put the whole candidate loop back under one `try ... except (OSError,
+    RuntimeError, ValueError): return ()` and the first candidate voids all three —
+    nothing is forced in, the clean tracked tree parks nothing, `preserved == []`.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    shared = project.project.parent / "shared-artifacts"
+    shared.mkdir()
+    paths = ProjectPaths(
+        project=project.project,
+        implementation_artifacts=shared,
+        planning_artifacts=project.planning_artifacts,
+    )
+    # the two shared artifacts really exist, out of the repo entirely
+    (shared / "deferred-work.md").write_text("# Deferred Work\n", encoding="utf-8")
+    (shared / "sprint-status.yaml").write_text(
+        "development_status:\n  1-1-a: ready-for-dev\n", encoding="utf-8"
+    )
+    ignore_before_commit(project, "**/story-*.md")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ignore specs")
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    open_args = (project.project, paths, "test-run", "1-1-a", "main", "story", run_dir)
+    spec_rel = "specs/story-1-1-a.md"
+    unit = open_unit_workspace(*open_args, spec_file=spec_rel)
+    (unit.path / "specs").mkdir()
+    (unit.path / spec_rel).write_text("# story 1-1-a\n\nthe mount's only copy\n", encoding="utf-8")
+    orphan_head = rev_parse_head(unit.path)
+    # the ledger and board rebase OUTSIDE the mount; the spec is inside it
+    mounted = paths.rebased(unit.path)
+    assert mounted.deferred_work == shared / "deferred-work.md"
+    assert not mounted.deferred_work.is_relative_to(unit.path)
+    # and the tracked tree is clean, so only the forced include can park anything
+    assert git(unit.path, "status", "--porcelain") == ""
+    assert verify.untracked_files(unit.path) == set()
+
+    preserved: list[tuple[str, str]] = []
+    open_unit_workspace(
+        *open_args,
+        spec_file=spec_rel,
+        on_orphan_preserved=lambda p, r: preserved.append((p, r)),
+    )
+
+    ref = f"refs/attempt-preserve-dirty/test-run-{orphan_head[:8]}-orphan"
+    assert preserved == [(str(unit.path), ref)]
+    assert "the mount's only copy" in git(project.project, "show", f"{ref}:{spec_rel}")
+    # the shared pair is not in the ref — and was never the reclaim's to destroy
+    assert sorted(_ref_tree(project, ref)) == sorted(
+        [*git(project.project, "ls-tree", "-r", "--name-only", "HEAD").splitlines(), spec_rel]
+    )
+    assert (shared / "deferred-work.md").read_text(encoding="utf-8") == "# Deferred Work\n"
+    assert (shared / "sprint-status.yaml").is_file()
+
+
+def test_remount_over_plain_directory_never_snapshots_the_project_tree(project):
+    """The run dir lives INSIDE the project checkout, so a plain (non-worktree)
+    directory at the mount path must not have git run in it: `status`/`add` there
+    would address the PROJECT's own working tree and park the operator's edits as
+    the orphan's. The guard is ``verify.worktree_is_registered``; a failing guard
+    falls through to the reclaim exactly as before.
+
+    Ablation: drop the ``worktree_is_registered`` half of the guard and the dirty
+    project checkout is snapshotted — ``_dirty_refs`` is non-empty and holds
+    ``operator.txt``.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    (project.project / "tracked.txt").write_text("v1\n")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    plain = run_dir / "worktrees" / "1-1-a"
+    plain.mkdir(parents=True)
+    (plain / "leftover.txt").write_text("rmtree residue\n")
+    # the operator's own uncommitted work in the project checkout
+    (project.project / "tracked.txt").write_text("operator edit\n")
+    (project.project / "operator.txt").write_text("operator untracked\n")
+
+    preserved: list[tuple[str, str]] = []
+    unit = open_unit_workspace(
+        *_open_args(project), on_orphan_preserved=lambda p, r: preserved.append((p, r))
+    )
+
+    assert unit.path == plain.resolve() and unit.path.is_dir()
+    assert not (unit.path / "leftover.txt").exists()  # reclaimed as before
+    assert preserved == []
+    assert _dirty_refs(project) == []
+    # the project tree was neither read as the orphan nor touched
+    assert (project.project / "tracked.txt").read_text() == "operator edit\n"
+    assert (project.project / "operator.txt").read_text() == "operator untracked\n"
+
+
+def test_remount_refuses_when_orphan_snapshot_fails(project, monkeypatch):
+    """A capture failure over a dirty orphan is a gate (#340): the remount raises
+    ``GitError`` and the orphan is left standing, dirty files intact, for manual
+    recovery — never force-removed past work that could not be parked.
+
+    Ablation: swallow the ``snapshot_worktree`` failure in ``_preserve_orphan_state``
+    (``except GitError: return``) and the remount succeeds over the orphan — no
+    ``GitError``, ``created.txt`` gone.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    first, _ = _open_unit(project)
+    (first.path / "created.txt").write_text("run-created\n")
+
+    def boom(*a, **k):
+        raise verify.GitError("commit-tree: disk says no")
+
+    monkeypatch.setattr(verify, "snapshot_worktree", boom)
+
+    with pytest.raises(verify.GitError, match="left standing.*disk says no"):
+        open_unit_workspace(*_open_args(project))
+
+    assert first.path.is_dir()
+    assert (first.path / "created.txt").read_text() == "run-created\n"
+    assert verify.worktree_is_registered(project.project, first.path)
+    assert _dirty_refs(project) == []
+
+
+def test_engine_remount_journals_orphan_preservation(project):
+    """Engine wiring: the orphan snapshot the open parks is journaled as
+    ``isolation-flip-orphan-preserved`` with the worktree and ref, so an operator
+    reading the run's journal can find the recovery ref next to the
+    ``isolation-flip-orphaned-worktree`` record that named the orphan."""
+    orphan, _ = _open_unit(project)
+    (orphan.path / "created.txt").write_text("run-created\n")
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    entries = [
+        e for e in engine.journal.entries() if e["kind"] == "isolation-flip-orphan-preserved"
+    ]
+    assert len(entries) == 1
+    assert entries[0]["story_key"] == "1-1-a"
+    assert entries[0]["worktree"] == str(orphan.path)
+    assert entries[0]["ref"].startswith("refs/attempt-preserve-dirty/test-run-")
+    assert git(project.project, "show", f"{entries[0]['ref']}:created.txt") == "run-created"
+
+
+# ------------------------------------------- run-branch remount catches up to base
+
+
+def test_run_branch_remount_fast_forwards_to_an_advanced_base(project):
+    """branch_per=run: a run branch whose tip is an ancestor of the (advanced)
+    pinned base is fast-forwarded to the base before the mount — the isolation-flip
+    shape where a story landed in place on the target while the run branch was
+    unmounted. The mount and the baseline come up at the base.
+
+    Ablation: drop the ``reset_branch_if_tip`` fast-forward arm and the mount comes
+    up at the stale run tip (``HEAD == old_tip``, not the advanced base).
+    """
+    from bmad_loop.workspace import discard_worktree, open_unit_workspace
+
+    first, run_dir = _open_unit(project, branch_per="run")
+    old_tip = rev_parse_head(first.path)
+    discard_worktree(project.project, str(first.path), "", run_dir=run_dir)  # flip away
+    (project.project / "landed-in-place.txt").write_text("story committed on main\n")
+    advanced = _commit_project(project, "story landed in place")
+    assert advanced != old_tip
+
+    second = open_unit_workspace(*_open_args(project, branch_per="run"))
+
+    assert rev_parse_head(second.path) == advanced
+    assert git(project.project, "rev-parse", f"refs/heads/{second.branch}") == advanced
+    assert second.baseline == advanced
+    assert (second.path / "landed-in-place.txt").exists()
+
+
+def test_run_branch_remount_merges_a_diverged_base(project):
+    """branch_per=run, diverged: the run branch carries a unit the target lacks
+    AND the target advanced without the run tip. The remount mounts at the tip and
+    merges the base into the run branch inside the fresh mount; HEAD is a merge
+    commit whose parents are exactly the run tip and the base, and the returned
+    baseline is that merge commit (the tree the session starts from).
+
+    Ablation: drop the ``catch_up_base`` merge and HEAD stays at the run tip with
+    a single parent and no ``target.txt``.
+    """
+    from bmad_loop.workspace import discard_worktree, open_unit_workspace
+
+    first, run_dir = _open_unit(project, branch_per="run")
+    (first.path / "unit.txt").write_text("landed on the run branch\n")
+    git(first.path, "add", "-A")
+    git(first.path, "commit", "-q", "-m", "unit on run branch")
+    run_tip = rev_parse_head(first.path)
+    discard_worktree(project.project, str(first.path), "", run_dir=run_dir)
+    (project.project / "target.txt").write_text("advanced without the run tip\n")
+    base = _commit_project(project, "target advances")
+
+    second = open_unit_workspace(*_open_args(project, branch_per="run"))
+
+    head = rev_parse_head(second.path)
+    parents = git(second.path, "rev-list", "--parents", "-n", "1", "HEAD").split()[1:]
+    assert set(parents) == {run_tip, base}
+    assert second.baseline == head
+    assert git(project.project, "rev-parse", f"refs/heads/{second.branch}") == head
+    assert (second.path / "unit.txt").exists() and (second.path / "target.txt").exists()
+    assert worktree_clean(second.path)
+
+
+def test_run_branch_remount_refuses_a_conflicting_base(project):
+    """branch_per=run, diverged with a content conflict: the catch-up merge is
+    aborted, the just-created mount is dropped, the run branch tip is unchanged,
+    and ``GitError`` names the refusal — an operator must reconcile.
+
+    Ablation: swallow the merge failure (``except GitError: pass`` around the
+    catch-up) and the open returns a mounted worktree — no ``GitError``.
+    """
+    from bmad_loop.workspace import discard_worktree, open_unit_workspace
+
+    (project.project / "conflict.txt").write_text("base\n")
+    first, run_dir = _open_unit(project, branch_per="run")
+    (first.path / "conflict.txt").write_text("run branch\n")
+    git(first.path, "commit", "-q", "-am", "run side")
+    run_tip = rev_parse_head(first.path)
+    discard_worktree(project.project, str(first.path), "", run_dir=run_dir)
+    (project.project / "conflict.txt").write_text("target\n")
+    _commit_project(project, "target side")
+
+    with pytest.raises(verify.GitError, match="diverged from main"):
+        open_unit_workspace(*_open_args(project, branch_per="run"))
+
+    assert not first.path.exists()
+    assert first.path not in [p.resolve() for p in worktree_list(project.project)]
+    assert git(project.project, "rev-parse", f"refs/heads/{first.branch}") == run_tip
+
+
+def test_run_branch_remount_after_squash_integration_merges_clean(project):
+    """The diverged arm is the NORMAL serial-unit shape under
+    ``merge_strategy = "squash"``: the target receives a squash commit that does not
+    contain the run tip. Identical content on both sides merges clean, so the next
+    unit mounts on a merge commit holding both histories with no conflict."""
+    from bmad_loop.workspace import discard_worktree, open_unit_workspace
+
+    first, run_dir = _open_unit(project, branch_per="run")
+    (first.path / "unit.txt").write_text("landed on the run branch\n")
+    git(first.path, "add", "-A")
+    git(first.path, "commit", "-q", "-m", "unit on run branch")
+    run_tip = rev_parse_head(first.path)
+    discard_worktree(project.project, str(first.path), "", run_dir=run_dir)
+    git(project.project, "merge", "--squash", "-q", run_tip)
+    squashed = _commit_project(project, "squash of the unit")
+
+    second = open_unit_workspace(*_open_args(project, branch_per="run"))
+
+    parents = git(second.path, "rev-list", "--parents", "-n", "1", "HEAD").split()[1:]
+    assert set(parents) == {run_tip, squashed}
+    assert worktree_clean(second.path)
+    assert git(second.path, "diff", "--stat", squashed, "HEAD") == ""  # same tree
+
+
+@pytest.mark.parametrize("strategy", ["ff", "merge", "squash"])
+def test_run_branch_serial_units_stay_green_under_every_strategy(project, strategy):
+    """Regression fence for the catch-up: two serial units under ``branch_per=run``
+    integrate under all three strategies and main ends with both changes."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(project, "1-1-a"),
+            wt_review_effect(project, "1-1-a", clean=True),
+            wt_dev_effect(project, "1-2-b"),
+            wt_review_effect(project, "1-2-b", clean=True),
+        ],
+        policy=wt_policy(branch_per="run", merge_strategy=strategy),
+    )
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused and not summary.crashed
+    src = (project.project / "src.txt").read_text()
+    assert "change for 1-1-a" in src and "change for 1-2-b" in src
+    assert "worktree-open-failed" not in journal_kinds(engine)
+
+
+# --------------------------------------- remount refuses a branch held elsewhere
+
+
+def test_story_remount_refuses_a_branch_checked_out_at_a_foreign_path(project, tmp_path):
+    """`reset_branch_if_tip` is ``update-ref`` — a ref compare-and-swap that does not
+    care which worktree has the branch checked out. When the story branch is held
+    by a worktree OTHER than this unit's deterministic mount path (here: the
+    operator ``git worktree move``d the retained recovery mount), the reset would
+    move the ref under that checkout — its files and index still at the old tip —
+    and the following ``worktree_add`` would fail on the held branch anyway. The
+    remount refuses BEFORE any mutation: ``GitError`` names the branch and the
+    foreign path, the branch tip is unchanged, the foreign checkout's HEAD still
+    equals it, no preserve ref was written, and nothing was mounted at ``wt``.
+
+    The branch held only by the orphan AT the mount path keeps remounting fine —
+    `test_open_unit_workspace_reclaims_the_orphan_holding_its_mount_path` and
+    `test_story_remount_preserves_named_tip_and_restarts_from_pinned_base` grade
+    that arm.
+
+    Ablation: drop the `_refuse_foreign_checkout` call in `open_unit_workspace` and
+    this reddens — `GitError` still arrives (from ``worktree add``), but the branch
+    ref has already been reset to the pinned base and the preserve ref written.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    first, _run_dir = _open_unit(project, branch_per="story")
+    (first.path / "attempt.txt").write_text("committed on the attempt\n")
+    git(first.path, "add", "-A")
+    git(first.path, "commit", "-q", "-m", "story attempt")
+    tip = rev_parse_head(first.path)
+    foreign = tmp_path / "moved-recovery-mount"
+    git(project.project, "worktree", "move", str(first.path), str(foreign))
+    assert not first.path.exists()
+    (project.project / "advanced.txt").write_text("new base\n")
+    pinned = _commit_project(project, "base advances")
+
+    with pytest.raises(verify.GitError, match=rf"{first.branch}.*checked out at .*moved-recovery"):
+        open_unit_workspace(*_open_args(project, branch_per="story"))
+
+    assert git(project.project, "rev-parse", f"refs/heads/{first.branch}") == tip
+    assert rev_parse_head(foreign) == tip
+    assert tip != pinned
+    assert git(project.project, "for-each-ref", "refs/attempt-preserve/") == ""
+    assert not first.path.exists()
+    assert first.path not in [p.resolve() for p in worktree_list(project.project)]
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_story_remount_refuses_value_error_family_from_checkout_holder_resolution(
+    project, tmp_path, monkeypatch, resolve_fault
+):
+    """Checkout identity uncertainty refuses before preserving or moving the branch."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    first, _run_dir = _open_unit(project, branch_per="story")
+    (first.path / "attempt.txt").write_text("committed on the attempt\n")
+    git(first.path, "add", "-A")
+    git(first.path, "commit", "-q", "-m", "story attempt")
+    tip = rev_parse_head(first.path)
+    holder = tmp_path / "unresolvable-holder"
+    monkeypatch.setattr(verify, "branch_checkout_path", lambda _repo, _branch: holder)
+    refuse_to_resolve(monkeypatch, holder, error=resolve_fault)
+
+    with pytest.raises(verify.GitError) as excinfo:
+        open_unit_workspace(*_open_args(project, branch_per="story"))
+
+    assert isinstance(excinfo.value.__cause__, type(resolve_fault))
+    assert excinfo.value.__cause__.args == resolve_fault.args
+    assert git(project.project, "rev-parse", f"refs/heads/{first.branch}") == tip
+    assert rev_parse_head(first.path) == tip
+    assert git(project.project, "for-each-ref", "refs/attempt-preserve/") == ""
+
+
+def test_run_branch_remount_refuses_a_fast_forward_under_a_foreign_checkout(project, tmp_path):
+    """Same hazard on the `branch_per=run` arm: the fast-forward would fire (run tip
+    is an ancestor of the advanced base) but the run branch is checked out at a
+    path other than this unit's mount. The single occupancy check refuses before
+    the ref move: the run branch stays at its tip, the foreign checkout's HEAD
+    still equals it, and nothing was mounted.
+
+    Ablation: drop the `_refuse_foreign_checkout` call and the run branch is
+    fast-forwarded to the advanced base before ``worktree add`` refuses — the
+    ``rev-parse`` assertion reddens.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    first, _run_dir = _open_unit(project, branch_per="run")
+    old_tip = rev_parse_head(first.path)
+    foreign = tmp_path / "moved-recovery-mount"
+    git(project.project, "worktree", "move", str(first.path), str(foreign))
+    (project.project / "landed-in-place.txt").write_text("story committed on main\n")
+    advanced = _commit_project(project, "story landed in place")
+    assert advanced != old_tip
+
+    with pytest.raises(verify.GitError, match=rf"{first.branch}.*checked out at .*moved-recovery"):
+        open_unit_workspace(*_open_args(project, branch_per="run"))
+
+    assert git(project.project, "rev-parse", f"refs/heads/{first.branch}") == old_tip
+    assert rev_parse_head(foreign) == old_tip
+    assert not first.path.exists()
+    assert first.path not in [p.resolve() for p in worktree_list(project.project)]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="win32 strips trailing spaces at the API layer, so the shape cannot be registered",
+)
+def test_branch_checkout_path_keeps_a_foreign_checkouts_trailing_space(project):
+    """The occupancy guard exempts the unit's OWN mount, so the reader must not hand it
+    a foreign path that has been trimmed INTO that spelling.
+
+    `branch_checkout_path` read `for-each-ref --format=%(worktreepath)` through
+    `_git_out`, which returns `stdout.strip()`. A worktree registered at the unit's
+    deterministic mount path PLUS a trailing space came back as the bare mount path,
+    compared EQUAL to `wt` in `_refuse_foreign_checkout`, and was exempted as if it were
+    this unit's own orphan. The ref then moved under a live foreign checkout — files and
+    index left at the old tip — its tree went spuriously dirty, and `worktree add` failed
+    on the held branch anyway: precisely the harm the guard was added to prevent, WITH the
+    guard present. The function's own docstring already promised the opposite ("git's
+    registered spelling, un-canonicalized"), so this is the promise being kept.
+
+    The error could only ever go that unsafe way. `safe_segment` rstrips `". "` from every
+    segment we compose, so our own mount path can never end in whitespace and a spurious
+    REFUSE is unreachable; the negative control below pins that half.
+
+    The shape is produced the same way the two sibling rows above produce a foreign
+    checkout — a deliberate operator `git worktree move` — with a destination one space
+    longer than the mount. git registers and reports that spelling verbatim.
+
+    Three claims, because the first two alone cannot show the harm: the returned spelling
+    keeps its space, it is therefore NOT equal to the mount path, and the remount refuses
+    BEFORE any mutation — the branch tip is unchanged and the foreign checkout still
+    holds it. Pre-fix a `GitError` still arrived (from `worktree add`), which is why the
+    `match=` names the guard's own sentence and the tip assertion stands behind it.
+
+    Ablation: revert the read to `_git_out` and this reddens on the returned spelling,
+    with the unchanged-tip assertion reddening behind it (the exempted branch is reset to
+    the pinned base before `worktree add` refuses).
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    first, _run_dir = _open_unit(project, branch_per="story")
+    (first.path / "attempt.txt").write_text("committed on the attempt\n")
+    git(first.path, "add", "-A")
+    git(first.path, "commit", "-q", "-m", "story attempt")
+    tip = rev_parse_head(first.path)
+    # the unit's own deterministic mount path plus ONE trailing space: the whole point is
+    # that `.strip()` collapses this spelling onto the path the guard exempts
+    foreign = Path(f"{first.path} ")
+    git(project.project, "worktree", "move", str(first.path), str(foreign))
+    assert foreign.is_dir() and not first.path.exists()
+    (project.project / "advanced.txt").write_text("new base\n")
+    pinned = _commit_project(project, "base advances")
+    assert tip != pinned
+
+    holder = verify.branch_checkout_path(project.project, first.branch)
+
+    assert holder is not None
+    assert str(holder) == f"{first.path} "  # git's registered spelling, verbatim
+    assert holder != first.path  # ...so it is not mistaken for this unit's own mount
+
+    with pytest.raises(verify.GitError, match="would move the branch under that checkout"):
+        open_unit_workspace(*_open_args(project, branch_per="story"))
+
+    assert git(project.project, "rev-parse", f"refs/heads/{first.branch}") == tip
+    assert rev_parse_head(foreign) == tip
+
+
+def test_branch_checkout_path_answers_an_ordinary_mount_path_exactly(project):
+    """Negative control for the row above: the un-stripped read must not OVER-refuse.
+
+    Only the single `\\n` that `for-each-ref` frames each record with is removed, never
+    arbitrary whitespace — so an ordinary registered path (the overwhelming majority, and
+    the only shape `safe_segment` can compose) still round-trips to exactly the mount path
+    the guard compares against, and the unit's own checkout stays EXEMPT. A reader that
+    trimmed too little would leave the framing newline on, make every path unequal to its
+    own mount, and turn the guard into a refusal on every ordinary remount.
+
+    `_refuse_foreign_checkout` is called directly rather than through a remount because
+    the exemption is the claim: it returns None on the unit's own mount and raises
+    otherwise, so the call itself is the assertion.
+
+    Ablated TWICE, because "does not raise" passes for every reason:
+
+    * Return `Path(out)` un-trimmed (keep the framing `\\n`) and the equality assertion
+      reddens — the spelling gains a newline.
+    * With that equality assertion ALSO removed, the same ablation still reddens, now on
+      `_refuse_foreign_checkout` raising `GitError` over the unit's own mount. So the
+      negative half is not vacuous: it fails when the function over-refuses.
+    """
+    from bmad_loop.workspace import _refuse_foreign_checkout
+
+    first, _run_dir = _open_unit(project, branch_per="story")
+
+    holder = verify.branch_checkout_path(project.project, first.branch)
+
+    assert holder == first.path  # exact round-trip: no framing left on, nothing eaten
+
+    # the exemption still holds — this raises if the guard over-refuses its own mount
+    _refuse_foreign_checkout(project.project, first.branch, first.path)

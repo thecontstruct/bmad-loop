@@ -6,7 +6,9 @@ invocation and POSIX-shell trailer lives here (and in its POSIX leaf
 the native-Windows :mod:`.psmux_backend` leaf — can subclass :class:`BaseTmuxBackend` and
 swap only class attributes (:attr:`BaseTmuxBackend._BINARY` for the spawned
 binary, :attr:`BaseTmuxBackend._ENCODING` / :attr:`BaseTmuxBackend._ERRORS`
-for output decoding — a scrubbed
+for output decoding, :attr:`BaseTmuxBackend._SESSION_GONE_STDERR` for the stderr
+wordings that prove a session is gone rather than a listing merely failed, #525
+— a scrubbed
 per-call ``env`` is a ``_run`` parameter, and an :meth:`BaseTmuxBackend._run`
 override is left for timeout tweaks) plus the shell-dialect hooks (``_shell_wrap``, ``_join_argv``,
 ``_parked_trailer``, ``_source_prefix``, ``_window_launch`` and the
@@ -59,10 +61,29 @@ class BaseTmuxBackend(TerminalMultiplexer):
     #: Output decoding for captured tmux text. ``None`` (POSIX) = locale default,
     #: byte-identical to a bare ``text=True``; a Windows leaf sets ``"utf-8"``.
     _ENCODING: str | None = None
-    #: Decode error handling to pair with :attr:`_ENCODING`. ``None`` (POSIX) =
-    #: the default strict handler; a Windows leaf sets ``"backslashreplace"`` so
-    #: a stray non-UTF-8 byte degrades visibly instead of raising mid-capture.
-    _ERRORS: str | None = None
+    #: Decode error handling to pair with :attr:`_ENCODING`. ``"backslashreplace"``
+    #: on every platform (#380): a stray byte the codec cannot decode degrades
+    #: visibly to a ``\xNN`` escape in the captured text instead of raising
+    #: mid-capture. Honored even where :attr:`_ENCODING` is None, so POSIX keeps
+    #: the locale codec and only stops being strict. A leaf may still override.
+    _ERRORS: str | None = "backslashreplace"
+    #: stderr fragments (matched case-insensitively, as substrings) that PROVE
+    #: the target session is gone, as opposed to a listing that merely failed.
+    #: This is the whole discrimination rule behind :meth:`_session_proved_gone`
+    #: — see it for why the answer has to be stderr and why the tuple is narrow.
+    #: A tmux-family leaf whose multiplexer words this differently overrides the
+    #: tuple; psmux deliberately does not (its own wordings are covered — see
+    #: the note in :mod:`.psmux_backend`).
+    _SESSION_GONE_STDERR: tuple[str, ...] = ("no server running", "can't find session")
+    #: Diagnostic from the last :meth:`version` probe (see
+    #: :meth:`TerminalMultiplexer.version_error`). A class-level default so an
+    #: instance that never probed answers None instead of AttributeError.
+    #: Per-instance and unsynchronized: only a caller that OWNS the instance may
+    #: read it back (``detect_multiplexers`` builds one per row). The
+    #: ``get_multiplexer()`` singleton is shared across the TUI's worker threads,
+    #: and ``mux_usable`` probes ``version()`` on it — a reader there can be
+    #: handed another thread's failure.
+    _version_error: str | None = None
 
     def _run(
         self,
@@ -98,6 +119,99 @@ class BaseTmuxBackend(TerminalMultiplexer):
             raise TmuxError(f"{self._BINARY} {' '.join(argv[:2])} failed: {proc.stderr.strip()}")
         return proc
 
+    def _session_proved_gone(self, proc: subprocess.CompletedProcess[str]) -> bool:
+        """Whether a non-zero listing exit PROVES the session no longer exists.
+
+        The discrimination the seam's ``[]`` rests on (#525). A non-zero exit
+        covers two unrelated answers: the session is gone (an ordinary,
+        knowable fact) and the listing could not be taken at all (a server that
+        errored while its windows are alive, a rejected auth, an unreachable
+        port). Folding both to ``[]`` reports the second as "this session has
+        no windows" — a death the engine acts on and a kill the prune reports
+        as verified.
+
+        Only stderr can tell them apart: the exit CODE cannot (both multiplexers
+        exit 1 for everything), and a confirming ``has_session`` round trip
+        cannot either — that predicate folds every non-zero exit to False by its
+        own documented contract, so it answers "gone" for exactly the auth and
+        timeout faults this discrimination exists to catch.
+
+        The tuple is an ALLOWLIST, deliberately: an unrecognized wording is
+        unknowable, never proof. The failure mode of a too-narrow tuple (a
+        vanished session read as unverifiable) is loud and self-clearing; a
+        too-wide one silently restores the bug. Measured rather than assumed,
+        on tmux 3.4 and psmux 3.3.8 — see the ``_SESSION_GONE_STDERR`` rows in
+        tests/test_multiplexer.py, which carry the transcript. Neither binary
+        localizes these strings, so a case-insensitive substring match is enough.
+
+        Both operands are folded, not just the captured text: the case-folding is
+        a promise to the OVERRIDING leaf, and folding one side only would honor it
+        for the base's own (already lower-case) tuple while silently breaking a
+        leaf that spelled its fragment the way its binary prints it. A BLANK
+        fragment is dropped rather than matched: ``"" in err`` is true for every
+        error there is, and ``" " in err`` for very nearly as many — any message
+        with a space in it. Either is #525 restored in full and in silence, from
+        an authoring slip (a trailing comma, a fragment built from config) that
+        no reviewer would see, so the two slips that could reintroduce the bug
+        cannot. The fragment is dropped, not stripped: a leaf that meant a
+        leading space meant it, and silently re-anchoring its fragment would
+        substitute a different rule for the one it declared.
+        """
+        err = proc.stderr.lower()
+        return any(f.lower() in err for f in self._SESSION_GONE_STDERR if f.strip())
+
+    def _warn_unproven_listing(
+        self, verb: str, proc: subprocess.CompletedProcess[str] | BaseException
+    ) -> None:
+        """Say out loud that a METADATA listing failed for a reason other than the
+        session being gone (#525).
+
+        The same lens as :meth:`list_window_ids`, the opposite conclusion: these
+        callers read tags and window rows, not liveness, and their sentinel
+        degrades toward doing NOTHING — an empty candidate list prunes nothing,
+        an unread tag reads as untagged and is left alone — so the documented
+        ``[]`` / ``{}`` stays. What was missing is the signal: a server erroring
+        on every call made the tool behave as if the sessions it manages had
+        simply stopped existing, with nothing on stderr to say why. Silent for a
+        genuinely gone session, which is an answer, not a fault.
+
+        Takes the completed process OR the transport exception that replaced one:
+        a timeout and a spawn that died prove no more about the session than an
+        unrecognized non-zero exit does, and the caller's sentinel is the same,
+        so the signal must be too.
+
+        The one failure left deliberately silent is a multiplexer that is not
+        installed at all: a box without one has no sessions to report on, so the
+        absence is an answer rather than a fault (the standing reading, see
+        :meth:`list_sessions`). That check lives HERE, gating only the
+        diagnostic, and must not be hoisted into the callers as an early return.
+        A ``shutil.which`` short-circuit ahead of :meth:`_run` decides the
+        RETURN VALUE from the ambient PATH, which makes the seam unreachable
+        through the one spawn primitive — every caller and every test that
+        injects a transport gets the sentinel no matter what it injected, and
+        the divergence hides on whichever platform happens to have the binary.
+        Gating the warning costs one failed exec on a binary-less box and keeps
+        the answer where the contract says it comes from.
+
+        Warn-only by construction, like every other diagnostic in this module:
+        under the TUI stderr is captured for the app's whole run (see
+        ``tui/app.py``), so this is a CLI-visible signal.
+        """
+        if not shutil.which(self._BINARY):
+            return
+        if isinstance(proc, BaseException):
+            outcome, detail = "failed", f"{type(proc).__name__}: {proc}"
+        else:
+            if self._session_proved_gone(proc):
+                return
+            outcome = f"exited {proc.returncode}"
+            detail = proc.stderr.strip() or "(no stderr)"
+        print(
+            f"warning: {self._BINARY} {verb} {outcome} without proving "
+            f"the session gone; reading it as empty: {detail}",
+            file=sys.stderr,
+        )
+
     def _tmux(self, *args: str) -> str:
         # The strict form: a non-zero exit already raises TmuxError inside _run.
         # A timeout / missing binary escapes _run raw, so trap it here once and
@@ -116,6 +230,16 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # error), so this can't use check=True. But a timeout or a missing binary
         # is a real backend failure: raise the seam type so callers catch it via
         # MultiplexerError instead of a raw subprocess error escaping.
+        #
+        # Strength of a False: EVERY nonzero exit maps to it — "no such session",
+        # "no server running", and a target the grammar could not parse alike. That
+        # is exactly right for the create-if-missing callers this predicate was
+        # written for, where a wrong False self-corrects on the next line. It is
+        # weaker than it looks for a caller that reports the answer as evidence
+        # (#489), which is why that one words its output as what the negative
+        # withdraws rather than what it proves. Deliberately NOT tightened here:
+        # `list_window_ids` raises on transport failure because it backs a liveness
+        # probe, and this predicate has no such duty to its existing callers.
         try:
             probe = self._run(["has-session", "-t", f"={name}"], check=False)
         except (subprocess.TimeoutExpired, OSError) as exc:
@@ -169,9 +293,15 @@ class BaseTmuxBackend(TerminalMultiplexer):
             proc = self._run(
                 ["list-sessions", "-F", f"#{{session_name}}\t#{{{option}}}"], check=False
             )
-        except (subprocess.SubprocessError, OSError):
+        except (subprocess.SubprocessError, OSError, UnicodeError) as exc:
+            # UnicodeError for the reason list_window_ids names it: a leaf that
+            # overrides _ERRORS back to a strict handler raises a ValueError-family
+            # decode error neither other arm covers, and this method's contract is
+            # warn-and-sentinel, never a raise.
+            self._warn_unproven_listing("list-sessions", exc)
             return {}
         if proc.returncode != 0:  # no server / no sessions
+            self._warn_unproven_listing("list-sessions", proc)
             return {}
         options: dict[str, str] = {}
         for line in proc.stdout.splitlines():
@@ -297,19 +427,37 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # display-message -t <dead-window> exits 0 with empty output, so list the
         # session's window ids and check membership instead.
         #
-        # A transport failure (timeout / missing binary) must RAISE, not return [].
-        # window_alive() is the engine's liveness probe; a sentinel [] would falsely
-        # read as "window dead -> session crashed" on a mere tmux hang. The honest
-        # answer to "is it alive?" is "unknowable" -> MultiplexerError. A real dead
-        # window still returns [] via the returncode != 0 path below (no exception).
+        # A failed listing must RAISE, not return []. window_alive() is the engine's
+        # liveness probe; a sentinel [] would falsely read as "window dead -> session
+        # crashed". The honest answer to "is it alive?" is "unknowable" ->
+        # MultiplexerError. That covers the transport failures below (timeout /
+        # missing binary / decode) AND a non-zero exit that does not prove the
+        # session is gone (#525) — see _session_proved_gone for the discrimination
+        # and why an exit code alone cannot make it. A session that really vanished
+        # still returns [] (no exception): the prune must be able to report its
+        # kills as removed rather than invent a phantom survivor.
+        #
+        # UnicodeError is a transport failure too. _run no longer decodes strictly
+        # on any platform (_ERRORS is backslashreplace, #380), so this arm is now
+        # defence for a leaf that overrides _ERRORS back to a strict handler: such
+        # a decode raises a ValueError-family error that neither exception arm
+        # above names. It stays because the seam-honesty contract above is what
+        # callers rely on — prune_ctl_windows takes its post-kill verdict from this
+        # probe and only a MultiplexerError lands the candidates in `unverifiable`
+        # rather than aborting cleanup mid-receipt (#435).
         try:
             probe = self._run(
                 ["list-windows", "-t", f"={session}", "-F", "#{window_id}"], check=False
             )
-        except (subprocess.TimeoutExpired, OSError) as exc:
+        except (subprocess.TimeoutExpired, OSError, UnicodeError) as exc:
             raise TmuxError(f"{self._BINARY} list-windows failed: {exc}") from exc
         if probe.returncode != 0:
-            return []
+            if self._session_proved_gone(probe):
+                return []
+            raise TmuxError(
+                f"{self._BINARY} list-windows on {session} exited {probe.returncode} "
+                f"without proving the session gone: {probe.stderr.strip() or '(no stderr)'}"
+            )
         return probe.stdout.split()
 
     def pipe_pane(self, window_id: str, log_file: Path) -> None:
@@ -332,11 +480,76 @@ class BaseTmuxBackend(TerminalMultiplexer):
 
     def kill_window(self, target: str) -> None:
         # Best-effort teardown: a hang / missing binary is no worse than the window
-        # already being gone, so swallow to the documented no-op sentinel.
+        # already being gone, so swallow to the documented no-op sentinel. A
+        # non-zero exit still says so out loud — the return value stays None and
+        # nothing raises — but only when the window the target names is still
+        # there to leak.
+        #
+        # An ALREADY-GONE window exits non-zero too, and that is ordinary
+        # teardown, not a fault — the DOMINANT case, not an edge one:
+        # CodingCLIAdapter.run kills in a `finally` on every session, and a
+        # session that completed by window death has nothing left to kill. The
+        # return code cannot separate the two, so the survivor is what decides.
+        # Replaying the failed target cannot decide it: a target the kill could
+        # not resolve is a target a probe cannot resolve either, so a
+        # same-target probe reads "gone" for the very failures it exists to
+        # catch. For a session-qualified id target the session's OWN window
+        # list answers instead — it resolves independently of the failed
+        # target, and a leaked window is by definition still in it. So the
+        # warning covers exactly the detectable leak class: the kill failed and
+        # the window it named is still listed. A target that names no window at
+        # all leaks nothing and stays silent. The probe is paid only on a
+        # non-zero exit — which on psmux includes ordinary window-death
+        # teardown, one listing alongside the ones the psmux override already
+        # pays. An unreadable probe stays silent: this is a diagnostic, and
+        # guessing would put the noise back on the path the probe exists to
+        # clear.
         try:
-            self._run(["kill-window", "-t", target], check=False)
+            proc = self._run(["kill-window", "-t", target], check=False)
         except (subprocess.SubprocessError, OSError):
-            pass
+            return
+        if proc.returncode == 0 or not self._window_survived_kill(target):
+            return
+        detail = proc.stderr.strip()
+        print(
+            f"warning: kill-window {target} exited {proc.returncode} and the window "
+            f"is still alive{f': {detail}' if detail else ''}",
+            file=sys.stderr,
+        )
+
+    def _window_survived_kill(self, target: str) -> bool:
+        """Whether the window ``target`` names outlived a failed kill.
+
+        False for both "provably gone" and "cannot tell" — the caller only warns,
+        so an unanswerable probe must not manufacture a warning.
+        """
+        session, sep, window = target.partition(":")
+        if sep and window.startswith("@"):
+            # Membership is checked against both id shapes list_window_ids can
+            # answer with: bare `@N` (this base) and session-qualified (the
+            # psmux override qualifies to match its native_id form). Both are
+            # rebuilt from the `=`-stripped session the listing was actually
+            # asked for, never compared against the raw target: an exact-match
+            # `=session:@N` target — the shape _option_scope also normalizes —
+            # matches neither listed shape verbatim, and would read a survivor
+            # as gone.
+            session = session.removeprefix("=")
+            try:
+                live = self.list_window_ids(session)
+            except TmuxError:
+                return False
+            return f"{session}:{window}" in live or window in live
+        # An unqualified or name-token target carries no session to list, so
+        # only the same-resolution probe remains: blind to a wrong-target leak,
+        # but it still catches a kill that failed while the target resolves.
+        # UnicodeError for the same reason list_window_ids names it: a leaf
+        # overriding _ERRORS back to a strict codec raises a ValueError-family
+        # decode error neither other arm covers, and this helper never raises.
+        try:
+            probe = self._run(["list-panes", "-t", target], check=False)
+        except (subprocess.SubprocessError, OSError, UnicodeError):
+            return False
+        return probe.returncode == 0
 
     def window_pane_pids(self, target: str) -> list[int]:
         # Capability method (see the seam default): a transport failure, a dead
@@ -352,16 +565,42 @@ class BaseTmuxBackend(TerminalMultiplexer):
             return []
 
     def list_windows(self, session: str, fields: list[str]) -> list[tuple[str, ...]]:
+        # No missing-binary pre-gate here, deliberately, unlike list_sessions /
+        # session_options: those two answer "what exists" and may decide that from
+        # the ambient PATH, but this one is reached with a session already in hand
+        # and its answer must come from _run — the one spawn primitive the seam
+        # documents. A `shutil.which` short-circuit ahead of it returns the
+        # sentinel without consulting the transport at all, so an injected _run is
+        # never asked, and the behavior silently diverges by whether the binary
+        # happens to be on THIS box's PATH. The no-multiplexer silence this was
+        # reaching for is gated inside _warn_unproven_listing instead, where it
+        # costs a failed exec and nothing else.
         fmt = "\t".join(f"#{{{field}}}" for field in fields)
         try:
             probe = self._run(["list-windows", "-t", f"={session}", "-F", fmt], check=False)
-        except (subprocess.SubprocessError, OSError):
+        except (subprocess.SubprocessError, OSError, UnicodeError) as exc:
+            # UnicodeError as in session_options: a strict-codec leaf must get the
+            # documented sentinel, not a raw decode error out of a best-effort op.
+            self._warn_unproven_listing("list-windows", exc)
             return []
         if probe.returncode != 0:
+            self._warn_unproven_listing("list-windows", probe)
             return []
         rows: list[tuple[str, ...]] = []
         for line in probe.stdout.splitlines():
-            parts = line.split("\t")
+            # Bounded split, so the LAST field may itself contain tabs. An
+            # unbounded split turns a row whose last field carries arbitrary
+            # text into extra parts that the slice below then truncates,
+            # silently corrupting the value. Callers requesting a free-text
+            # field must therefore ask for it last; every current caller does.
+            # This is the seam's standing contract, not a fix for one caller:
+            # no field requested today can hold a tab — PROJECT_OPTION is a
+            # digest and window names carry a shape-validated run id — so the
+            # bound is here for the next free-text field rather than these.
+            # (A newline in a value still splits the row, which no parse here
+            # can undo; runs.project_tag's digest is what keeps the tag clear
+            # of one.)
+            parts = line.split("\t", len(fields) - 1)
             parts += [""] * (len(fields) - len(parts))  # tolerate unset trailing fields
             rows.append(tuple(parts[: len(fields)]))
         return rows
@@ -438,29 +677,78 @@ class BaseTmuxBackend(TerminalMultiplexer):
             return False
         return proc.returncode == 0
 
-    def switch_client(self, target: str, last_fallback: bool = False) -> bool:
-        # Returns True iff a switch happened; a transport failure didn't switch, so
-        # the documented False sentinel is the honest answer.
+    def _attached_here(self) -> int | None:
+        """Clients attached to this process's session, or None when tmux cannot
+        say. Only :meth:`switch_client`'s failure path needs it, so it is read
+        after the verb — nothing moved on that path, and the success path pays
+        no probe at all."""
+        text = self._display_message("#{session_attached}")
+        return int(text) if text is not None and text.isdigit() else None
+
+    def switch_client(self, target: str, last_fallback: bool = False) -> bool | None:
+        # rc 0 is a real move and needs no gate: tmux runs one server, and it
+        # refuses rather than no-ops when there is nobody to move.
+        #
+        # A nonzero rc is where the exit code stops being the whole answer. It
+        # is TWO facts wearing one code — a target this client cannot reach, and
+        # no client here at all — and only the first is the seam's False.
+        # Measured on tmux 3.7c from inside a pane whose server had no attached
+        # client: `-t <live session>`, `-t <other session>`, `-l` and `-t
+        # <nonexistent>` ALL exit 1 with "no current client". So a bare rc would
+        # answer False — "no switch, and the client is still here" — for the one
+        # state where there is no client here at all, which is #659's hazard on
+        # the default backend. The attached count is what separates them, the
+        # same gate the psmux leaf applies to its own rc.
+        #
+        # A TIMEOUT is neither: the server may have completed the switch before
+        # the wait expired, so False would report a human still watching a
+        # window the client has already left. A spawn-level fault IS the joint
+        # claim — proof the verb never ran, so nothing moved.
         try:
             proc = self._run(["switch-client", "-t", target], check=False)
             if proc.returncode == 0:
                 return True
-            if last_fallback:
-                fb = self._run(["switch-client", "-l"], check=False)
-                return fb.returncode == 0
+            if last_fallback and self._run(["switch-client", "-l"], check=False).returncode == 0:
+                return True
+        except subprocess.TimeoutExpired:
+            return None
         except (subprocess.SubprocessError, OSError):
             return False
+        attached = self._attached_here()
+        if attached is None or attached == 0:
+            # Unreadable and zero part company as facts and meet as verdicts:
+            # neither can vouch that a human is still in front of this window.
+            return None
         return False
 
     def available(self) -> bool:
         return shutil.which(self._BINARY) is not None
 
     def version(self) -> str | None:
+        # Every exit path rewrites the diagnostic, so it always describes THIS
+        # call (the seam's read-it-after-version rule) — a probe that recovers
+        # must not leave the old failure standing for `mux` to warn about.
+        self._version_error = None
         if not shutil.which(self._BINARY):
             return None
         try:
             raw = self._tmux("-V")
-        except (MultiplexerError, subprocess.SubprocessError, OSError):
+        # UnicodeError is in the list for a leaf that overrides _ERRORS back to a
+        # strict handler. _run still decodes with the LOCALE codec on POSIX
+        # (_ENCODING is None there), but no longer strictly on any platform
+        # (_ERRORS is backslashreplace, #380), so an undecodable byte — a corrupt
+        # install, or a binary emitting text in another encoding, exactly what
+        # this diagnostic exists for — now degrades to a \xNN escape rather than
+        # raising. Where a leaf does restore strictness it is a ValueError,
+        # outside the SubprocessError/OSError family, so it would escape as a raw
+        # crash for every caller above to guard; this arm keeps that closed.
+        except (MultiplexerError, subprocess.SubprocessError, OSError, UnicodeError) as exc:
+            # None stays the seam's answer, but the identity of the failure is
+            # what separates a crashing binary from one that reports no version
+            # (#428). On the nonzero-exit arm _run has already folded the probe's
+            # stderr into the TmuxError text, so str(exc) carries it; the other
+            # arms carry only the failure itself, which is all there is to carry.
+            self._version_error = str(exc)
             return None
         # The seam promises one line (TerminalMultiplexer.version). `-V` is one
         # line on tmux, two on psmux (a `tmux X.Y.Z` compat line then its own),
@@ -469,3 +757,6 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # parses the compat segment with an anchored match, so the first
         # segment must stay first.
         return fold_version(raw)
+
+    def version_error(self) -> str | None:
+        return self._version_error

@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from bmad_loop import adapters
 from bmad_loop.adapters import multiplexer as m
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
@@ -27,9 +28,10 @@ class _Stub:
     """Minimal backend double for selection tests: fixed availability/version.
     Selection only touches available()/version(), so the full ABC is overkill."""
 
-    def __init__(self, avail=True, version=None):
+    def __init__(self, avail=True, version=None, version_error=None):
         self._avail = avail
         self._version = version
+        self._version_error = version_error
 
     def available(self):
         if isinstance(self._avail, Exception):
@@ -40,6 +42,11 @@ class _Stub:
         if isinstance(self._version, Exception):
             raise self._version
         return self._version
+
+    def version_error(self):
+        if isinstance(self._version_error, Exception):
+            raise self._version_error
+        return self._version_error
 
 
 def _platform_default_name():
@@ -356,6 +363,66 @@ def test_detect_multiplexers_version_crash_keeps_availability(fresh_registry):
     assert rows["verless"].selected is True and rows["verless"].reason == "first-match"
 
 
+def test_detect_multiplexers_carries_the_dropped_version_diagnostic(fresh_registry):
+    """The row is what `bmad-loop mux` renders, so the diagnostic version() drops
+    has to survive the trip out of the backend (#428) — a VERSION cell of `-`
+    otherwise says the same thing for a crashed probe and a quiet binary."""
+    fresh_registry._BUILTINS_LOADED = True
+    fresh_registry.register_multiplexer(
+        "crasher",
+        lambda p: p == sys.platform,
+        lambda: _Stub(avail=True, version=None, version_error="tmux -V failed: killed"),
+    )
+    rows = {r.name: r for r in fresh_registry.detect_multiplexers()}
+    assert rows["crasher"].version is None
+    assert rows["crasher"].version_error == "tmux -V failed: killed"
+
+
+def test_detect_multiplexers_carries_the_diagnostic_off_an_unavailable_backend(fresh_registry):
+    """The flagship #428 shape. psmux's available() gates on its own version()
+    (psmux_backend), so an AV-blocked or corrupt binary reads available=False —
+    the row that most needs an explanation is the one where the availability
+    verdict already failed. The read hangs off the factory `try`, not off the
+    availability answer, and nothing else pins that."""
+    fresh_registry._BUILTINS_LOADED = True
+    fresh_registry.register_multiplexer(
+        "blocked",
+        lambda p: p == sys.platform,
+        lambda: _Stub(avail=False, version=None, version_error="psmux -V failed: [WinError 5]"),
+    )
+    rows = {r.name: r for r in fresh_registry.detect_multiplexers()}
+    assert rows["blocked"].available is False
+    assert rows["blocked"].version_error == "psmux -V failed: [WinError 5]"
+
+
+def test_detect_multiplexers_reads_no_diagnostic_off_a_working_version(fresh_registry):
+    """Only a None version has a failure to explain. Asking a backend that just
+    answered would report a stale error from some earlier probe — the accessor
+    describes the LAST call, and this one succeeded."""
+    fresh_registry._BUILTINS_LOADED = True
+    fresh_registry.register_multiplexer(
+        "fine",
+        lambda p: p == sys.platform,
+        lambda: _Stub(avail=True, version="fine 1.0", version_error="stale"),
+    )
+    rows = {r.name: r for r in fresh_registry.detect_multiplexers()}
+    assert rows["fine"].version == "fine 1.0"
+    assert rows["fine"].version_error is None
+
+
+def test_detect_multiplexers_guards_a_raising_version_error(fresh_registry):
+    """The never-raises contract covers the new probe too: a backend whose
+    version_error() blows up must still produce a row."""
+    fresh_registry._BUILTINS_LOADED = True
+    fresh_registry.register_multiplexer(
+        "rude",
+        lambda p: p == sys.platform,
+        lambda: _Stub(avail=True, version=None, version_error=RuntimeError("boom")),
+    )
+    rows = {r.name: r for r in fresh_registry.detect_multiplexers()}
+    assert rows["rude"].available is True and rows["rude"].version_error is None
+
+
 # ------------------------------------------------ fold_version, directly (#321)
 #
 # The seam folds and then every inline consumer folds again defensively, so the
@@ -439,3 +506,109 @@ def test_win32_bottoms_out_at_psmux_with_no_externals(fresh_registry, monkeypatc
     assert (name, reason) == ("psmux", "fallback")
     # psmux is both the win32 platform default and the sole bundled win32 match
     assert fresh_registry._PLATFORM_DEFAULTS.get("win32") == "psmux"
+
+
+# Builtin seeding inside `register_multiplexer` (#565). First-wins only protects a
+# bundled name if the bundled entry is guaranteed to be registered first; these pin
+# that guarantee and the flag position that makes the seeding safe to re-enter.
+
+
+def test_builtins_win_over_an_external_registered_before_any_resolution(
+    fresh_registry, monkeypatch
+):
+    """The shadowing hole that first-wins ALONE does not close.
+
+    An out-of-tree backend registers as an import side effect, and that import is
+    not always triggered by a mux resolution: a plugin's ``[python]`` module is
+    exec'd in-process by ``plugins/registry.py``, with no ordering relationship to
+    the first ``get_multiplexer()`` call. Arriving first under a bundled name, it
+    would sit ahead of the bundled tmux entry in the ordered ``_BACKENDS`` list and
+    every first-match consumer would pick it — the whole process silently driving a
+    third-party transport. Only ``register_multiplexer`` seeding the builtins on
+    its own side makes first-wins an invariant instead of an ordering coincidence.
+
+    ABLATION: drop the ``_load_builtin_backends()`` call from
+    ``register_multiplexer`` and this reddens — while
+    ``tests/test_external_backends.py``'s ``test_externals_load_after_builtins``
+    stays green, because ``_select`` seeds the builtins on that path before the
+    scan's registration ever runs. That asymmetry is the finding: the existing test
+    pins the scan path and cannot see this hole at all."""
+    sentinel = object()
+    # The plugin trigger: a direct registration under a bundled name, with no
+    # entry-point scan involved (the fixture parks `_EXTERNALS_LOADED = True`).
+    fresh_registry.register_multiplexer("tmux", lambda p: True, lambda: sentinel)
+
+    # (a) the bundled backend still wins the name. Forcing by name bypasses both
+    # the platform predicate and available(), so this is deterministic on the
+    # Linux and Windows CI legs alike.
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "tmux")
+    fresh_registry.get_multiplexer.cache_clear()
+    assert isinstance(fresh_registry.get_multiplexer(), TmuxMultiplexer)
+
+    # (b) the ordering that makes (a) true: the bundled entry is first and the
+    # external is still present behind it — an append-only list, not a dedup'ing
+    # dict, so a shadowed name legitimately appears twice.
+    names = [name for name, _, _ in fresh_registry._BACKENDS]
+    assert names[0] == "tmux" and names.count("tmux") == 2
+    # Names alone do not discriminate: the shadowing external registers under
+    # "tmux" too, so both assertions above still hold under the ABLATION. The
+    # first entry being the *bundled* factory is the half that carries the
+    # guarantee, so pin it explicitly rather than inferring it from the name.
+    first_tmux = next(factory for name, _, factory in fresh_registry._BACKENDS if name == "tmux")
+    assert first_tmux is TmuxMultiplexer
+
+
+def test_builtin_seeding_is_reentrant_and_registers_each_builtin_once(fresh_registry):
+    """One ordinary registration seeds the builtins exactly once and terminates.
+
+    ``_load_builtin_backends`` registers its two backends by calling
+    ``register_multiplexer``, which now calls ``_load_builtin_backends`` — so the
+    seeding re-enters itself, and only the flag's position stops it.
+
+    ABLATION: move ``_BUILTINS_LOADED = True`` back below the two
+    ``register_multiplexer(...)`` calls and this reddens with a RecursionError."""
+    # Without the flag move, the `register_multiplexer` calls inside
+    # `_load_builtin_backends` re-enter it with the flag still False, and it
+    # recurses without end.
+    fresh_registry.register_multiplexer("extra", lambda p: False, lambda: object())
+    names = [name for name, _, _ in fresh_registry._BACKENDS]
+    # Seeded once, in bundled order, with the caller's own entry appended last.
+    assert names == ["tmux", "psmux", "extra"]
+
+
+def test_a_failed_builtin_import_leaves_the_seeding_retryable(fresh_registry, monkeypatch):
+    """A transient import failure must not permanently poison the registry.
+
+    ABLATION: move ``_BUILTINS_LOADED = True`` to the very top of
+    ``_load_builtin_backends``, above the two imports, and this reddens — the flag
+    reads True after the failed import and the retry early-outs on a registry that
+    is permanently missing both bundled backends."""
+    # The flag sits BELOW the two backend imports precisely so a transient import
+    # failure retries; the function's docstring and comment both claim exactly
+    # that property. The adapter twin sets its flag at the very top only because
+    # its builtins are lazy thunks with nothing to import first.
+    key = "bmad_loop.adapters.psmux_backend"
+    # Evicting the entry alone leaks: the retry below re-imports the module for
+    # real, which rebinds `psmux_backend` on the *parent package object* to the
+    # new module, and restoring sys.modules does not undo that rebinding. Pin the
+    # attribute through monkeypatch so the original comes back with it. Without
+    # it the two import spellings disagree for the rest of the worker --
+    # `from bmad_loop.adapters import psmux_backend` is a getattr on the package
+    # and answers the new module, while `from bmad_loop.adapters.psmux_backend
+    # import x` resolves through sys.modules and answers the original -- so a
+    # later test asserts on one module's globals while the code under test writes
+    # the other's. (Same hazard, same fix, as the `bmad_loop.tui` eviction in
+    # tests/test_tui_app.py.)
+    monkeypatch.setattr(adapters, "psmux_backend", sys.modules[key])
+    # A None value in sys.modules makes `from ... import ...` raise
+    # ModuleNotFoundError (an ImportError subclass) without touching the disk.
+    monkeypatch.setitem(sys.modules, key, None)
+    with pytest.raises(ImportError):
+        fresh_registry._load_builtin_backends()
+    assert fresh_registry._BACKENDS == []
+    assert fresh_registry._BUILTINS_LOADED is False
+
+    # Let the import succeed again and confirm the retry seeds both builtins.
+    monkeypatch.delitem(sys.modules, key)
+    fresh_registry._load_builtin_backends()
+    assert [name for name, _, _ in fresh_registry._BACKENDS] == ["tmux", "psmux"]

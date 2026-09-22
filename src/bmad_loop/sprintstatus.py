@@ -1,19 +1,37 @@
 """Model of sprint-status.yaml — the single source of workflow truth.
 
-The dev primitive `bmad-dev-auto` deliberately does not touch sprint-status
+The dev primitive `bmad-build-auto` deliberately does not touch sprint-status
 ("the orchestrator's business"), so the orchestrator is the single writer via
 :func:`advance` — idempotent, never-regress, epic-lift. The orchestrator
 otherwise only re-reads this file to pick the next story and verify what a
-session claims, so the no-races invariant holds.
+session claims.
+
+Concurrency (#286/#469): being the sole writer is not on its own mutual
+exclusion — a second orchestrator process (another `bmad-loop run`, a sweep, the
+TUI) runs the same sole writer, and :func:`advance` is a read-modify-write of the
+whole board, so two of them would both read, both edit, and let the last atomic
+write win. :func:`advance` therefore serializes itself cross-process on the
+board's state-root sidecar lock, and holds it across every read that decides the
+PUBLISHED BYTES as well as the write itself. That invariant is deliberately
+narrower than "every read": one advisory pre-lock probe may answer a
+read-dependent no-op — an absent row, or a row already at or past target —
+without acquiring at all (#736), because such a call publishes nothing and so has
+no bytes for the hold to protect. Readers stay lock-free: the publish is an
+atomic replace, so a reader sees either the old board entire or the new one.
 """
 
 from __future__ import annotations
 
 import re
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+
+from .platform_util import atomic_write_bytes, file_lock
 
 EPIC_RE = re.compile(r"^epic-(\d+)$")
 RETRO_RE = re.compile(r"^epic-(\d+)-retrospective$")
@@ -172,30 +190,112 @@ def story_status(path: Path, key: str) -> str | None:
     return None
 
 
+# Stage 2 of the value/comment split, applied to the remainder after the key's
+# colon and its gap. Which one runs is decided by the remainder's FIRST
+# character, because that is the only place the scalar's own boundary is
+# knowable from a line edit: a quote opens a scalar that owns every `#` to its
+# right, an unquoted scalar cedes the first whitespace-preceded one.
+#
+# `_QUOTED_VALUE_RE` recognizes NO comment (there is no `rest` group to carry):
+# the whole remainder is the value. `_UNQUOTED_VALUE_RE`'s `val` is lazy, so the
+# FIRST ` #` wins rather than the last — the split is where YAML puts it, not
+# wherever the line happens to end. Both arms demand a trailing `\S`, so a line
+# carrying anything after the value that neither arm can account for — trailing
+# whitespace, no comment — is refused whole rather than silently rewritten
+# without it. Line terminators are excluded before either scalar matcher runs
+# and carried separately per line, so CRLF's `\r` is never mistaken for trailing
+# scalar whitespace (#576).
+_QUOTED_VALUE_RE = re.compile(r"^(?P<val>['\"](?:.*\S)?)$")
+_UNQUOTED_VALUE_RE = re.compile(r"^(?P<val>\S(?:.*?\S)?)(?P<rest>[ \t]+#.*)?$")
+
+
 def _set_mapping_value(lines: list[str], key: str, new_value: str) -> bool:
     """In-place replace the value of the first `key:` line, preserving
     indentation and any trailing ` # comment`. Returns True on a real change. A
     minimal line edit (not a YAML round-trip) so the file's comments and
-    structure — STATUS DEFINITIONS, WORKFLOW NOTES — survive verbatim. The value
-    region may contain spaces (e.g. `last_updated: 01-06-2026 10:00`); a trailing
-    inline comment is recognized only when preceded by whitespace (YAML rule)."""
-    # value = everything after the gap up to an optional ` #...` inline comment
-    pat = re.compile(
-        rf"^(?P<indent>\s*){re.escape(key)}:(?P<gap>[ \t]+)"
-        r"(?P<val>\S(?:.*?\S)?)(?P<rest>[ \t]+#.*)?$"
-    )
+    structure — STATUS DEFINITIONS, WORKFLOW NOTES — survive verbatim.
+
+    The split between value and comment is two-stage: the key prefix is matched
+    first and the whole remainder captured, then that remainder decides for
+    itself. An unquoted value keeps the wide class this board needs — it
+    legitimately contains spaces (`last_updated: 01-06-2026 10:00`), which is why
+    it cannot borrow `frontmatter._VALUE_COMMENT_RE`'s conservative token gate —
+    and cedes an inline comment only at whitespace, as YAML does. A remainder
+    that OPENS WITH A QUOTE is taken whole and no comment is recognized in it at
+    all: a fused pattern would guess the boundary from the last ` #` on the line
+    and turn `status: "a # b"` into `status: done # b"`, promoting scalar text
+    into a comment the board never had (#366). Nothing here can tell where a
+    quoted scalar ends — the closing quote may be escaped, or on another line —
+    so a comment sitting after one is dropped rather than guessed at. Lossy,
+    never wrong, and only a hand-edit reaches it: the writer replaces such a
+    value with a bare token on the next advance.
+
+    A remainder neither arm can read leaves the line alone, exactly like a key
+    that never matched — `advance` reports the unchanged status rather than
+    claiming a write it did not make. Each line's terminator is excluded from
+    the scalar match and then reattached exactly as authored (#576)."""
+    key_pat = re.compile(rf"^(?P<indent>\s*){re.escape(key)}:(?P<gap>[ \t]+)(?P<body>\S.*)$")
     for i, line in enumerate(lines):
-        m = pat.match(line.rstrip("\n"))
+        stripped = line.rstrip("\r\n")
+        m = key_pat.match(stripped)
         if not m:
             continue
-        if m.group("val") == new_value:
+        body = m.group("body")
+        value_pat = _QUOTED_VALUE_RE if body[0] in "'\"" else _UNQUOTED_VALUE_RE
+        vm = value_pat.match(body)
+        if not vm:
+            continue  # unreadable remainder — leave the line as authored
+        if vm.group("val") == new_value:
             return False  # already at target — idempotent no-op
-        nl = "\n" if line.endswith("\n") else ""
-        lines[i] = (
-            f"{m.group('indent')}{key}:{m.group('gap')}{new_value}{m.group('rest') or ''}" + nl
-        )
+        rest = vm.groupdict().get("rest") or ""
+        nl = line[len(stripped) :]
+        lines[i] = f"{m.group('indent')}{key}:{m.group('gap')}{new_value}{rest}" + nl
         return True
     return False
+
+
+@contextmanager
+def _board_lock(path: Path) -> Iterator[None]:
+    """Cross-process mutual exclusion for one sprint-status board (#286/#469).
+
+    The board's counterpart to :func:`~bmad_loop.deferredwork.ledger_lock`, and
+    private for the same reason it is narrow: :func:`advance` is the only writer,
+    so the only thing that ever needs to hold this is the read-modify-write below.
+    Held around file I/O only — never across a subprocess, a coding-CLI session,
+    or an operator pause (#286).
+
+    The import of :mod:`~bmad_loop.runs` is lazy and has to stay lazy: ``runs``
+    imports ``verify``, which imports this module, so a top-level import would
+    close the cycle.
+    """
+    from . import runs
+
+    with file_lock(runs.lock_path_for(path)):
+        yield
+
+
+def _row_at_or_past(current: str, target: str) -> bool:
+    """Is a row at ``current`` already at or past ``target`` in :data:`STATUS_ORDER`?
+
+    The never-regress comparison :func:`_advance_locked` makes, factored out so
+    that :func:`advance`'s advisory pre-lock probe and the authoritative locked
+    decision run one body and cannot drift apart (#736). A probe that answered
+    this question even slightly differently from the writer would either skip a
+    write the board needed or take a lock it did not.
+
+    Deliberately NOT :func:`~bmad_loop.engine._at_or_past`, the reader-side twin:
+    that one counts an exact match OUTSIDE ``STATUS_ORDER`` as reached, which is
+    right for reading what :func:`advance` RETURNED and wrong as input to its
+    WRITE decision. An off-order status equal to ``target`` is a no-op owned by
+    :func:`_set_mapping_value` under the lock — it refuses a value it already
+    holds — and routing it through this predicate instead would hand the answer
+    to a pre-lock probe on a comparison the writer does not make.
+    """
+    return (
+        current in STATUS_ORDER
+        and target in STATUS_ORDER
+        and STATUS_ORDER.index(current) >= STATUS_ORDER.index(target)
+    )
 
 
 def advance(path: Path, story_key: str, target: str, *, now: str | None = None) -> str | None:
@@ -208,20 +308,119 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
     refresh `last_updated` when `now` is given. Comments/structure are preserved
     via line edits. Returns the story's status after the call (== `target` on a
     write), or None when nothing was eligible.
+
+    The rewrite is atomic and symlink-following (#379), and every existing CRLF,
+    LF, bare CR, or mixed per-line terminator is preserved (#576). The board is
+    read as raw UTF-8 bytes, each edited line carries its own terminator, and
+    `atomic_write_bytes` publishes the byte-exact result. This is a
+    read-modify-rewrite of the board, and a truncating write that faults partway
+    through corrupts it SILENTLY: YAML cut at a line boundary is still a valid
+    mapping, just a smaller one, so the epics past the tear cease to exist rather
+    than raising. AGENTS.md makes this the orchestrator's sole write path to
+    sprint-status.yaml, so nothing downstream would contradict the shortened
+    board — the run would simply walk off the end of the sprint. The atomic
+    helper keeps the file entire: either the old contents or the whole new ones,
+    never a prefix.
+
+    Symlinks are FOLLOWED (the helper's default), which is what the old
+    truncating write did too — the board is an operator-curated file at a
+    project-relative path, and a repo that symlinks it somewhere must keep being
+    a symlink. That rules out the confined writers, which are no-follow by
+    construction: this site takes the #597 flag and nothing else.
+
+    ``require_writable_target=True`` is that flag, and it restores what going
+    atomic silently dropped: `os.replace` needs write permission on the parent
+    DIRECTORY, never on the entry it replaces, so a board an operator had marked
+    read-only was rewritten anyway — and because the mode is inherited it came
+    back reading ``0444``, leaving nothing in the permission bits to record that
+    it changed (#597). The truncating `write_bytes` this replaced raised
+    `PermissionError` there as a side effect of opening the file; that refusal is
+    a property worth keeping deliberately, because AGENTS.md makes this the
+    orchestrator's SOLE write path to the board — a read-only board is the only
+    way an operator can say "stop rewriting this", and it has to mean something.
+
+    Serialized cross-process (#286/#469) on the board's advisory lock — the
+    state-root sidecar :func:`~bmad_loop.runs.lock_path_for` names for it, not a
+    sibling of the board itself, because the board is a tracked file and the
+    engine's own ``git add -A`` would commit a sidecar beside it. The hold spans
+    the whole read-modify-write and nothing else: three reads (the status probe,
+    the raw bytes, the epic-lift ``load``) and the one atomic write, with no
+    subprocess, session, or operator pause inside it (#286). That also closes the
+    intra-call TOCTOU, since the never-regress decision and the bytes it is
+    applied to now come from one hold rather than from two independent reads.
+
+    Two answers are reached BEFORE the lock. The missing-board check runs first,
+    so asking about a board that does not exist leaves no sidecar behind. Then an
+    ADVISORY probe (#736) reads the row once and answers the two cases in which
+    this call would write nothing at all: an absent row (``None``) and a row
+    already at or past ``target`` (the current status, via :func:`_row_at_or_past`
+    — the same predicate the locked body applies). Acquiring for those was the
+    defect: an idempotent replay — ``bmad-loop confirm`` against a story the board
+    already records as done is a designed path, not an error
+    (:meth:`~bmad_loop.model.ParkedStory.resumable` accepts it), as is
+    ``_carry_board_advance``'s routine no-op on a tracked board — could fail on
+    lock contention, or on a :class:`~bmad_loop.runs.StateRootError` from
+    :func:`~bmad_loop.runs.lock_path_for`, for work it was never going to do.
+
+    The probe is advisory in the strict sense: only a "would write nothing"
+    answer is acted on, and such a call simply linearizes at the probe's read
+    rather than at an acquisition. Every other outcome — including ANY exception
+    raised while probing — falls through to the locked path, which re-reads,
+    re-decides authoritatively and raises on the channel it always did. So the
+    probe can neither authorize a write nor add a failure mode the hold lacks: a
+    malformed board still raises :class:`SprintStatusError` from under the lock.
+    ``now`` needs no handling here, because both no-op arms of
+    :func:`_advance_locked` return before the ``last_updated`` write; a
+    probe-satisfied early-out is write-equivalent to the locked answer.
+
+    Acquisition failure — for the calls that do reach the lock — surfaces as
+    ``OSError`` (or :class:`~bmad_loop.runs.StateRootError` when no state root can
+    be derived) on the channel callers already route this function's raises
+    through — the engine's crash/escalation handling, the CLI's failure exit — so
+    a board that could not be serialized fails loudly rather than being rewritten
+    unlocked. :func:`advanced_bytes` deliberately does NOT come through
+    here: it calls :func:`_advance_locked` against a private throwaway copy, so it
+    neither contends on the real board's sidecar nor mints one of its own.
     """
+    if not path.is_file():
+        return None  # no board, nothing to serialize against — take no lock
+    try:
+        current = story_status(path, story_key)
+        if current is None:
+            return None  # absent row — nothing this call would write
+        if _row_at_or_past(current, target):
+            return current  # already at or past target — never regress, no write
+    except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        # Broad by design, and the swallow is the point: narrowing the catch would
+        # let the probe invent a failure mode the locked path does not have. An
+        # unreadable board decides nothing here — the path below re-reads,
+        # re-decides, and raises on the channel callers already route this
+        # function's raises through.
+        pass
+    with _board_lock(path):
+        return _advance_locked(path, story_key, target, now=now)
+
+
+def _advance_locked(
+    path: Path, story_key: str, target: str, *, now: str | None = None
+) -> str | None:
+    """:func:`advance`'s read-modify-write, run with the board's lock already held.
+
+    Split out so the hold is exactly the file I/O and so every read inside it sees
+    one board. The reads below repeat work the caller's pre-lock answers may
+    already have done, and deliberately: those answers are taken without
+    exclusion, so a delete can land between the ``is_file`` check and the
+    acquisition, and the advisory probe's row (#736) can be stale by the time the
+    lock is held. Only what this function reads decides the published bytes."""
     if not path.is_file():
         return None
     current = story_status(path, story_key)
     if current is None:
         return None
-    if (
-        current in STATUS_ORDER
-        and target in STATUS_ORDER
-        and STATUS_ORDER.index(current) >= STATUS_ORDER.index(target)
-    ):
+    if _row_at_or_past(current, target):
         return current  # already at or past target — never regress
 
-    text = path.read_text(encoding="utf-8")
+    text = path.read_bytes().decode("utf-8")
     lines = text.splitlines(keepends=True)
     # story_status() resolves keys via a full YAML parse, but _set_mapping_value
     # rewrites via a line regex that can't touch every shape it finds (quoted or
@@ -244,8 +443,72 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
         changed = _set_mapping_value(lines, "last_updated", now) or changed
 
     if changed:
-        path.write_text("".join(lines), encoding="utf-8")
+        atomic_write_bytes(path, "".join(lines).encode("utf-8"), require_writable_target=True)
     return target
+
+
+def advanced_bytes(source: bytes, story_key: str, target: str) -> bytes | None:
+    """What :func:`advance` would leave behind, given ``source`` as the board's bytes.
+
+    For the caller that has to know whether a board on disk holds THIS run's advance
+    and nothing else, and so needs the intended content recomputed from a baseline it
+    trusts rather than read back out of the file it is about to commit.
+
+    Goes through the real writer's own body (``_advance_locked``), against a
+    throwaway copy, rather than reimplementing the edit. Never-regress, the epic lift, and
+    ``_set_mapping_value``'s quoted-scalar, inline-comment and per-line-terminator
+    handling ARE what makes two boards "the same advance" — a second implementation of
+    them would drift from the writer silently, and for this caller a silent drift means
+    committing somebody else's bytes.
+
+    No ``now=``: the caller's own carry passes none either, and a ``last_updated`` line
+    rewritten here and not there would make every comparison fail.
+
+    Returns None only when the board's row is absent. The other None — a missing
+    file — cannot be reached from here, the shadow being this function's own
+    copy. There is then no intended content to compare against, and a caller must not
+    read "I could not compute it" as "the tree is mine".
+
+    Declining to WRITE is a different answer, and it comes back as bytes: a row already
+    at or past ``target``, and a row whose line ``_set_mapping_value`` will not rewrite,
+    both report the unchanged status and hand ``source`` back byte-identical. A caller
+    comparing against that is right to accept an untouched board, because for those rows
+    an untouched board IS this run's advance."""
+    with tempfile.TemporaryDirectory() as tmp:
+        shadow = Path(tmp) / "sprint-status.yaml"
+        shadow.write_bytes(source)
+        # Straight to the locked body, deliberately skipping `advance`'s own
+        # acquisition. The shadow is this function's private copy inside a
+        # TemporaryDirectory that no other process can name, so there is no
+        # second writer to exclude — and taking the lock anyway would mint a
+        # state-root sidecar keyed on a path that exists only for this call.
+        # `file_lock` never removes a sidecar and the TemporaryDirectory removes
+        # only the shadow, so every ownership computation would strand another
+        # dead lock file under `<state root>/locks` (#286).
+        if _advance_locked(shadow, story_key, target) is None:
+            return None
+        return shadow.read_bytes()
+
+
+def status_in_bytes(source: bytes, story_key: str) -> str | None:
+    """:func:`story_status` asked of a board held as BYTES rather than as a file.
+
+    For the caller comparing a live row against the same row at a git revision,
+    where one side is a blob and never a path on disk.
+
+    Goes through ``story_status`` against a throwaway copy, like
+    :func:`advanced_bytes` above and for its reason: the full YAML resolution and the
+    ``LEGACY_STORY_STATUSES`` folding ARE what makes two rows "the same status", and a
+    second reading of them would drift from the one every other caller uses.
+
+    Returns None when the row is absent. A board that does not parse raises
+    ``SprintStatusError``, exactly as ``story_status`` does — "I could not read it"
+    must not reach a caller spelled as "the row is gone".
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        shadow = Path(tmp) / "sprint-status.yaml"
+        shadow.write_bytes(source)
+        return story_status(shadow, story_key)
 
 
 @dataclass(frozen=True)

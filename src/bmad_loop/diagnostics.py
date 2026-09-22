@@ -18,7 +18,13 @@ directly; every value that could carry content is dropped, reduced to a boolean,
 otherwise survive verbatim), or scrubbed. Unknown/future fields default to a
 ``scrub_json`` pass, never raw. As a final backstop the rendered bytes are run
 through :func:`sanitize.guard` — the fail-closed egress self-check shared with
-``probe-adapter`` since #199. A stray pseudonymized original (a
+``probe-adapter`` since #199. That backstop re-scans the rendered bytes for known
+*shapes* — email, URL credentials, credential-shaped tokens, the absolute-home
+spellings in both separator forms (#512 added the backslash WSL-UNC one), and *this
+process's* username — and refuses to emit on a hit; it is not a proof of absence, since
+a home spelling it does not know, or a username that is not this process's (the Linux
+account behind a WSL UNC path), passes it untouched. Per-field routing is the primary
+defense and the guard is defense in depth. A stray pseudonymized original (a
 per-field routing gap — the value is in the legend, so its safe alias is known)
 is **repaired** by substituting the alias, re-verified, and disclosed in the
 dump itself — a "Backstop repairs" section in the markdown report, an optional
@@ -33,8 +39,11 @@ The guiding assumption: the dump will be posted publicly.
 from __future__ import annotations
 
 import json
+import os
 import platform
 import re
+import stat
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -42,8 +51,9 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__, sanitize
-from .journal import Journal, load_state
+from .journal import SELF_MINTED_FIELDS, VERIFY_DIR, Journal, load_state
 from .model import RunState, StoryTask
+from .platform_util import walk_files_unlinked
 
 # The guard machinery (fail-closed egress self-check + alias-substitution
 # repair) moved to sanitize.py so probe-adapter shares the single audited
@@ -59,13 +69,56 @@ from .sanitize import LeakDetected  # noqa: F401 — re-export
 # would falsely tell a consumer pinned to v1 that the fields it reads are gone,
 # while a consumer actually broken by the repackaging finds out immediately —
 # the fence is gone and json.loads fails. Bump only on a payload break.
-SCHEMA_VERSION = 1
+# v2 replaces journal-entry `patch` / `stashed_to` values with the presence keys
+# `patch_present` / `stashed_to_present`.
+# v3 does the same thing to two more journal-entry values, which is the same
+# payload break for the same reason: `question` (on `decision-pending`) becomes
+# `question_present`, and on `preference-escalation` EVERY key outside the
+# `{type, severity, detail}` schema becomes `<name>_present` — see
+# `_JOURNAL_KIND_SCHEMAS`. A consumer reading `entry["question"]` finds it gone,
+# so this is a break under `machine.py`'s additive-only rule, exactly as v2 was.
+# The third change shipping with it — `_JOURNAL_KEYLIST_FIELDS` failing closed on a
+# non-list value — is deliberately NOT part of this rationale, but the reason is the
+# JSONL ROUND-TRIP, not the call sites. Two producers do pass a tuple
+# (`sweep.py`'s `dw_ids=(decision.id,)` and `dw_ids=tuple(task.dw_ids)`), so a survey
+# of producers would be the wrong argument and is false as such. What makes it a
+# non-break is that `_scrub_entry` never sees a producer's object: entries are
+# serialized to `journal.jsonl` and read back, and JSON has no tuple type, so every
+# sequence arrives as a `list` and takes the same arm it always did. The new arm is
+# reachable only by a shape no round-tripped entry can hold.
+# v4 removes the overloaded journal-entry `path` value in favour of `path_present`
+# and replaces `stale-restore-excluded.files` with `files_count`. The same release
+# explicitly aliases `stale-restore-commits.commits` and `sentinel-cleared.sentinel`;
+# those two fields keep their names, but their values no longer carry source ids.
+SCHEMA_VERSION = 4
 DEFAULT_JOURNAL_CAP = 200
 
-# Run-dir subdirectories whose mere existence/size is diagnostic but whose
-# CONTENTS are off-limits (raw tmux panes = code, prompts, feedback prose,
-# patches, full worktree checkouts). We stat them; we never read into output.
-_FILE_CATEGORIES = ("logs", "tasks", "feedback", "bundles", "failed", "worktrees", "events")
+# Subdirectories whose mere existence/size is diagnostic but whose CONTENTS are
+# off-limits (raw tmux panes = code, prompts, feedback prose, patches, full
+# worktree checkouts). We stat them; we never read into output.
+#
+# All are run-dir-relative EXCEPT "events", which since #494 lives out of the
+# project tree at the user state root — see `_category_roots`.
+#
+# VERIFY_DIR belongs here for the reason the category exists: retained verifier
+# stdout/stderr is a build's own output — off-limits to read, but its SIZE is
+# exactly the diagnostic. `[verify] stream_capture_kb` defaults to 256 KiB per
+# stream, so a run retains up to 512 KiB per command per attempt with no GC
+# behind it yet, which can make this store one of the larger things in a run
+# dir. Omitting it left `diagnose` unable to show a retention or disk-usage
+# problem it is the natural place to notice. Imported, not re-spelled, so the
+# reporter cannot drift from the writer that creates the directory.
+_FILE_CATEGORIES = (
+    "logs",
+    "tasks",
+    "feedback",
+    "bundles",
+    "failed",
+    "worktrees",
+    "events",
+    VERIFY_DIR,
+)
+_EVENTS_CATEGORY = "events"
 
 # Journal fields that name a proprietary identifier — pseudonymized, not dropped,
 # so events stay correlatable. Maps field name -> alias namespace.
@@ -79,6 +132,35 @@ _JOURNAL_ALIAS_FIELDS = {
     "target_branch": "branch",
     "commit": "commit",
     "baseline": "commit",
+    # The baseline a re-arm's re-stamp replaced (`rearm-baseline-restamped`). Its
+    # OWN entry rather than the `baseline` one beside it, because both shas ride a
+    # single record: alias one and leave the other and a dump pseudonymizes half a
+    # comparison, which is worse than either doing both or doing neither.
+    "overwritten": "commit",
+    # A THIRD spelling of a baseline sha, journalled by `runs._stale_restore_residue`
+    # on BOTH of its commit records: `stale-restore-commits` (the probe answered, and
+    # these shas sit above it) and `rearm-commits-probe-failed` (the probe could not
+    # answer). Routing is by NAME, so this one entry gives that one value ONE alias
+    # across both kinds — which is also why the producer was not respelled to the
+    # already-routed `baseline`: that would give one sha two spellings and two
+    # aliases in a single dump.
+    #
+    # Routed for CORRELATION, not to stop a leak — this table's header states that
+    # purpose ("pseudonymized, not dropped, so events stay correlatable") and it is
+    # the whole reason this entry exists. Left unrouted a real sha does NOT ship
+    # verbatim: `_scrub_str` applies `looks_like_secret` AFTER `looks_like_identifier`,
+    # and a real 40-hex sha clears the length+entropy bar, so the fallback renders
+    # `<redacted:secret>` — USUALLY, and the exception is the point. Real shas
+    # straddle that check's bar: measured over this repo's own history (1790 commits,
+    # 2026-08-31), about one sha in twenty-five is NOT caught and ships verbatim. So
+    # routing closes a real, intermittent leak. On the ~96% the fallback does catch it
+    # buys the other thing this table exists for: `<redacted:secret>` is safe and
+    # useless — an operator can no longer tell that the probe-failure record and the
+    # commits record name the SAME baseline, which is the one comparison those two
+    # kinds exist to support. That the name ALSO had to leave the routing guard's
+    # benign inventory follows from that inventory's own rule: a name carrying a sha
+    # belongs in a `diagnostics` table.
+    "old_baseline": "commit",
     # A spec name IS the customer's feature name — `Pseudonymizer`'s own docstring
     # has always listed "spec filenames" among what it exists to alias, so the
     # omission here was a routing gap, not a policy. A producer that journals a
@@ -92,13 +174,98 @@ _JOURNAL_ALIAS_FIELDS = {
     # whose epic could not be resolved. See `_JOURNAL_BASENAME_NAMESPACES` for why
     # the value is normalized first: the producers do NOT agree on a bare basename.
     "spec": "spec",
+    # The same value also arrives under a second field NAME, from the re-arm family in
+    # `runs` — FIVE kinds, and no longer from a single function. `rearm_escalation`
+    # writes four of them (`rearm-spec-write-unreachable`, `rearm-spec-flip-skipped`,
+    # `rearm-baseline-restamp-skipped`, `rearm-baseline-restamped`); the fifth,
+    # `rearm-aborted`, is written by `runs._rollback_rearm` from the transaction guard's
+    # error path — a DIFFERENT function, which is why "the only producer" is no longer
+    # the right shape for this note. A SIXTH and a SEVENTH kind,
+    # `accepted-spec-write-unreachable` and `accepted-spec-delivery-unreachable`, are
+    # NOT re-arm records at all: both are written mid-run, from another module
+    # entirely, by `worktree_flow` — the first by `_warn_accepted_spec_superseded`
+    # when a fresh mount supersedes an accepted-but-uncommitted spec (DW-101), the
+    # second by `_warn_accepted_spec_undelivered` when the mount cannot be shown to
+    # carry that spec at all (DW-104, DW-115). Both carry the same two
+    # hazardous fields as `rearm-spec-write-unreachable` — `spec_file` here and
+    # `target_branch` above — plus one bare boolean discriminator apiece, `compared`
+    # and `located`, declared benign in the routing guard. Routing is by field NAME,
+    # not by kind, so the list
+    # is documentation rather than a gate — but an enumeration that undercounts is how
+    # the next reader concludes a kind is unrouted, so it is corrected rather than
+    # left to age. `rearm-aborted` also carries `error` (dropped as free text) and
+    # `rollback`, a literal enum string declared benign in the routing guard.
+    # `engine._park_awaiting_operator` passes
+    # `spec_file=` to `operatoractions.record_park`, which is a record file, not the
+    # journal. So the divergence is BETWEEN FIELDS, not between two producers of this
+    # one — but BOTH fields are mixed-shape, and neither is the reliable one:
+    # Both fields now journal an absolute path wherever they carry one: `spec_file`
+    # through `str(task_spec_path(...))` on all five kinds — `rearm-aborted` forwards
+    # the same already-anchored value, and writes `""` rather than a story key when the
+    # aborted re-arm never resolved a spec path — and `spec` through
+    # `engine._operator_spec_path` (which anchors `checkpoint-pause` the same
+    # way) alongside engine's already-absolute reconcile and marker-repair kinds. Same
+    # value, same namespace. Do NOT read that convergence as "both fields are
+    # normalized, so the basename step is dead" — it is not a guarantee this module
+    # holds. `_operator_spec_path` still answers a bare STORY KEY for a spec-less task,
+    # nothing stops a future producer from journaling a raw `task.spec_file`, and
+    # `_JOURNAL_BASENAME_NAMESPACES` keys on the NAMESPACE rather than the field
+    # precisely so every spelling reduces to one alias whichever shape it carries.
+    "spec_file": "spec",
+}
+# Kind-scoped routing, consulted BEFORE the by-name table above and losing to
+# `_JOURNAL_DROP_FIELDS`, which is stricter than any alias.
+#
+# `target` is the field for which a by-name rule genuinely cannot work: it carries
+# the target BRANCH on the three merge kinds below and a sprint STATUS on the
+# `board-advance-*` family (`board-advance-carried`, `-carry-failed`,
+# `-carry-foreign-dirt`, `-carry-uncommitted`). Aliasing it by NAME would pseudonymize
+# statuses as branches, turning a legible `"target": "done"` into `branch-3f2a` and
+# destroying the field a maintainer reads those kinds for; leaving it unrouted — what
+# happened until now — ships an identifier-shaped branch name VERBATIM. A normal run
+# journals the same string as `branch` first (`ensure_target_branch`), so the egress
+# backstop repairs it and discloses a `backstop_repairs` gap, but that is a defense in
+# depth that only works because the value is already in the legend: a journal truncated
+# past that event, or a `unit-merged` read out of a bundle on its own, has nothing to
+# repair from.
+#
+# Deliberately NOT fixed by renaming the producers to `target_branch`, which is the
+# obvious move and is unsafe: `engine._replay_unlatched_ledger_carries` correlates
+# `unit-merge-started` against `unit-merged` on a tuple that INCLUDES this field, and it
+# reads a journal written by an earlier process — and possibly an earlier version. A
+# rename would make a run started before the change and resumed after it fail to
+# correlate, silently skipping the carry replay so a resumed sweep re-triages work that
+# already landed. The scrub is what is wrong, so the scrub is where the fix belongs.
+#
+# Any new branch producer should pick a name the by-name table already routes
+# (`branch`, or `target_branch` — see `runs.rearm_escalation`, and from OUTSIDE
+# that family `worktree_flow._warn_accepted_spec_superseded`) rather than add a
+# target
+# row here. `sentinel` is scoped for a different reason: its sole producer carries a
+# spec basename, so that known shape is aliased without making the same claim about a
+# future kind that reuses the generic name.
+_JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
+    "unit-merge-started": {
+        "target": "branch",
+        "operation_id": "operation",
+        "pre_target_revision": "commit",
+    },
+    "unit-merged": {
+        "target": "branch",
+        "operation_id": "operation",
+    },
+    "resume-unit-merge": {"target": "branch", "operation_id": "operation"},
+    "sentinel-cleared": {"sentinel": "spec"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's
 # reconcile and marker-repair kinds journal `str(spec_path)` (absolute —
-# `verify.resolve_spec_path` returns an absolute path), while stories_engine's
-# `checkpoint-pause` journals `task.spec_file`, which `StoryTask` persists
-# worktree-relative (a bare basename for a spec at the worktree root). Aliasing
+# `verify.resolve_spec_path` returns an absolute path). Every producer is absolute
+# TODAY — `checkpoint-pause` moved to `_operator_spec_path` — but the reduction is
+# keyed on the NAMESPACE rather than on any producer precisely so that stays a
+# property this module does not have to trust: `_operator_spec_path` still answers a
+# bare STORY KEY for a spec-less task, and nothing stops a future producer journaling
+# a raw `task.spec_file`. Aliasing
 # the raw string would give ONE spec TWO aliases in a single dump, defeating the
 # correlation these fields are aliased rather than dropped to preserve, and would
 # park an absolute home path in the local `--legend` file (before `spec` was
@@ -115,6 +282,20 @@ _PATH_SEP_RE = re.compile(r"[\\/]")
 # Journal fields that carry free text (LLM/merge prose, prompts, errors). Never
 # emitted — replaced with a boolean presence marker so a maintainer still learns
 # the field was set without seeing it.
+#
+# The `verify-command-result` group at the end is the same convention applied to
+# the verifier records: `command` is operator-authored shell (`[verify] commands`),
+# `output_tail` is a build's own output, `capture_error` is an OSError string
+# carrying a path, `spawn_error` names the run's code root explicitly as its cwd
+# (and a cwd-related wrapped exception may name it again), and the two pointers
+# embed the story key. Routing them here
+# rather than leaving them to `scrub_json` is deliberate — that fallback fails
+# closed only by accident of shape, since `_IDENTIFIER_RE` forbids `/` and spaces
+# and so collapses paths, argv-ish commands and multi-line tails, while a
+# one-word `command` (`make`) or a one-word tail (`FAILED`) is identifier-shaped
+# and would ship verbatim. The presence boolean is also strictly more useful for
+# the pointers: it separates "a stream was retained" from "the cap is 0 or the
+# write failed", which a redacted string cannot.
 _JOURNAL_DROP_FIELDS = frozenset(
     {
         "prompt",
@@ -125,12 +306,197 @@ _JOURNAL_DROP_FIELDS = frozenset(
         "message",
         "note",
         "blocker",
+        # The deferred-work decision text a sweep parks on (`sweep.py`'s
+        # `decision-pending`) — operator-facing prose about the customer's own
+        # work, so it belongs beside `detail`/`reason`/`blocker`/`suggestion`/`note`
+        # under this set's free-text rule. Routed rather than left to `scrub_json`
+        # for the reason stated above that fallback: it collapses a MULTI-WORD
+        # question only by accident of `_IDENTIFIER_RE` forbidding spaces, and a
+        # one-token question (`"AcmeVault"`) is identifier-shaped and shipped
+        # verbatim (reproduced against `_scrub_entry`, 2026-08-30). No user-facing
+        # surface loses the text: both operator-facing readers take it from the RAW
+        # journal on the operator's own machine, not from this dump —
+        # `tui.data.pending_decision` (which returns the `(dw_id, question)` pair)
+        # and `tui.launch.decision_pending` (which answers the boolean). Named
+        # exactly, in both directions: an earlier version of this comment attributed
+        # `decision_pending` to `tui/data.py`, where no such symbol exists.
+        "question",
         "commit_message",
         "was_paused",
+        "command",
+        "output_tail",
+        "capture_error",
+        "spawn_error",
+        "stdout_path",
+        "stderr_path",
+        # An absolute host path naming the run's code tree
+        # (`rearm-baseline-advance-failed`). Dropped rather than aliased: unlike a
+        # spec filename it correlates nothing across events — one run has one code
+        # root — while carrying the customer's directory layout. Dropped rather
+        # than left to the `scrub_json` fallback: that fallback happens to redact an
+        # absolute path (`_IDENTIFIER_RE` forbids `/`, `\` and `:`, so any real root
+        # collapses to `<redacted:str>`), but it fails closed only by accident of
+        # shape — a root that did parse as a bare identifier would pass verbatim, and
+        # nothing here should depend on a path never looking like one. The `error=`
+        # field on the very same record is dropped too, but under this set's
+        # free-text rule above (it is a `GitError` string quoting git's own stderr),
+        # not this identifier-shape argument — same set, different rationale.
+        "repo",
+        # An absolute host path naming the folder a sentinel's upstream correction has
+        # to land in (`rearm-upstream-write-unreachable`). Dropped for `repo`'s reason,
+        # not aliased for `spec_file`'s: it is a DIRECTORY, journalled by one kind, and
+        # one run has one spec folder — so it correlates nothing across events, while a
+        # `spec` alias would additionally be wrong, since that namespace reduces to a
+        # basename and every run we author would collapse onto the same `stories`-ish
+        # tail. `scrub_json` already redacts any real path (`_IDENTIFIER_RE` forbids
+        # `/`, `\` and `:`), so — exactly as for `repo` — only an assertion on the
+        # field's ABSENCE can grade this, and the canary sweep cannot.
+        "stories_root",
+        # A relative or absolute operator-selected or retained forensic patch path.
+        # `story_key` already correlates these records, so aliasing adds no value;
+        # drop it because the fallback redacts separator-bearing paths but lets a
+        # bare feature- or spec-named patch through verbatim.
+        #
+        # This set routes by field NAME, so the drop reaches EVERY kind spelling
+        # `patch`, not only the operator-selected restore pair the sentence above
+        # describes: `stale-restore-unparseable` and `stale-restore-excluded`
+        # (`runs.py`), `attempt-restore-failed` and `attempt-restored`
+        # (`recovery_flow.py`), and `unit-closed` (`worktree_flow.py`). The drop is
+        # the right answer on each of them for the same reason — each carries a path
+        # the fallback cannot be relied on to redact — but the reach is a property of
+        # the rule, not of that reasoning, so a FURTHER kind would inherit it silently.
+        # `tests/test_portability_guard.py::JOURNAL_PATCH_KINDS` pins the list and
+        # reddens when a producer joins or leaves it; when it does, this comment and
+        # `tests/test_diagnostics.py::_PATCH_PATH_ROUTING_ROWS` — which asserts the
+        # drop per kind at the routing seam — both need updating by hand.
+        "patch",
+        # The absolute deferred-stash target embeds the run directory, story key,
+        # and spec filename. Drop rather than create a second spec correlation;
+        # the fallback redacts it only by virtue of its current separators.
+        "stashed_to",
+        # An overloaded path spelling used for a generated sweep intent and for
+        # isolated worktrees. None of those host/customer paths adds useful
+        # correlation beyond the record's story key, so every kind gets the same
+        # presence-only treatment.
+        "path",
     }
 )
-# Journal fields whose value is a LIST of story keys (sprint unknown-keys).
-_JOURNAL_KEYLIST_FIELDS = frozenset({"keys", "dw_ids"})
+# Journal fields whose value is a LIST of identifiers, aliased element-wise rather
+# than dropped so a dump stays correlatable. Two namespaces live here: `keys`
+# (sprint unknown-keys) and `story_keys` (`sweep._warn_stranded_bundles`, the
+# bundle keys a cycle left in flight) are story keys; `dw_ids` are deferred-work
+# ids. The fallback is what makes this routing necessary rather than cosmetic —
+# `scrub_json` is the IDENTITY on a list of identifier-shaped strings, so an
+# unrouted `story_keys` shipped its keys verbatim while the singular `story_key`
+# beside it in the neighbouring record was aliased.
+_JOURNAL_KEYLIST_FIELDS = frozenset({"keys", "dw_ids", "story_keys"})
+
+# Kind-scoped container policies for names whose other producers carry a different
+# shape. `commits` is a SHA list on the stale-restore record but an integer count on
+# `rollback-manual-required`, so a by-name list rule would destroy that useful count.
+# Filename lists are reduced to counts rather than aliases: filename correlation
+# adds no diagnostic value and would put the proprietary names into the legend.
+_JOURNAL_KIND_KEYLIST_FIELDS: dict[str, dict[str, str]] = {
+    "stale-restore-commits": {"commits": "commit"},
+    # `sweep-bundle-dwids-adopted` carries TWO deferred-work id lists: the ids the
+    # reset task held and the ids it adopted from the bundle now being run. The
+    # new ones ride the by-name `dw_ids` rule above; the previous ones are the
+    # same kind of identifier and must land in the SAME `dw` namespace, or one
+    # dump would carry two aliases for one ledger entry — and unrouted they would
+    # ship verbatim, `scrub_json` being the identity on a list of
+    # identifier-shaped strings.
+    "sweep-bundle-dwids-adopted": {"previous_dw_ids": "dw"},
+}
+_JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
+    "merge-preflight-refused": frozenset({"tolerated"}),
+    "merge-target-cleaned": frozenset({"paths"}),
+    "merge-target-tolerated": frozenset({"paths"}),
+    "stale-restore-excluded": frozenset({"files"}),
+}
+
+# ``kind -> the field names that kind's record is DECLARED to carry``. On a kind
+# listed here the usual ``scrub_json`` fallback is replaced by a fail-closed one:
+# any key outside its declared set renders as ``<name>_present`` rather than as a
+# value. Every other routing rule above still runs first and still wins, so a
+# declared-schema kind's ``story_key`` is aliased and its ``detail`` is dropped
+# exactly as on any other kind — this table only decides what happens to the names
+# nothing else claimed.
+#
+# It exists because ONE kind's field names are not authored by this codebase at all.
+# ``engine._review_and_commit`` splats ``escalation.preference_escalations(rj)`` —
+# entries lifted straight out of a session's own ``result.json`` — into
+# ``journal.append``, so an LLM chooses the journal FIELD NAMES. The by-name tables
+# cannot route a name nobody can enumerate, and the ``scrub_json`` fallback is the
+# IDENTITY on an identifier-shaped scalar: an entry carrying
+# ``customer="AcmeVault"`` came back byte-identical (reproduced against
+# ``_scrub_entry``, 2026-08-30).
+#
+# The declared shape is ``{type, severity, detail}``. Its PROVENANCE, stated
+# precisely because an earlier version of this comment got it wrong: the sole
+# producer of this kind is ``engine._review_and_commit``, splatting a
+# bmad-build-auto REVIEW session's ``result.json`` entries. Sweep does not journal
+# ``preference-escalation`` at all. ``data/skills/bmad-loop-sweep/automation-mode.md``
+# declares the same three-key shape for a DIFFERENT session type, so it corroborates
+# the shape and is not the contract that produces this record. Anything outside those
+# three keys is off-schema and has no diagnostic claim on being shown verbatim.
+#
+# ⚠️ ACCEPTED RESIDUAL — decided 2026-08-30, not an oversight, and NOT to be
+# re-filed or "fixed" as a fresh finding. This table closes the NAME axis only, and
+# three things still reach the dump. Stated in full, because a disclosure that
+# understates its own scope is the same defect as a comment naming the wrong
+# mechanism.
+#
+#  1. The key NAME. ``AcmeVaultTenant=1`` renders as ``AcmeVaultTenant_present``.
+#     A name-free collapse (a single ``unrouted_field_count`` integer) closes this
+#     and was OFFERED AND DECLINED, in favour of the per-key marker's diagnostic
+#     value — a maintainer can see WHICH off-schema key a session invented, which is
+#     most of why the record is read. The suffix also carries the name PAST the
+#     egress backstop: `sanitize.guard` repairs a pseudonymizer original only where
+#     it stands alone, and ``AcmeVaultTenant_present`` is one token to it — so a
+#     key that happens to be a registered story key or branch is not re-aliased
+#     here the way the same string would be as a bare value.
+#  2. Arbitrary key SHAPES, which follows from 1 and is easy to miss: nothing
+#     constrains an LLM-authored key to be identifier-shaped, so a free-text key
+#     survives as a JSON key with the suffix glued on —
+#     ``"customer AcmeVault owes 5k"`` renders as
+#     ``"customer AcmeVault owes 5k_present"`` (reproduced).
+#  3. The VALUES of the three DECLARED names, which this table does not touch at
+#     all: they stay on the ``scrub_json`` fallback, so
+#     ``type="acmevault-tenant-isolation"`` and ``severity="AcmeVaultHigh"`` both come
+#     back byte-identical, as does a container in a declared name
+#     (``type={"customer": "AcmeVault"}``) — all reproduced.
+#
+# Do NOT "fix" 3 by routing ``type``/``severity``: the intent this table implements
+# requires the declared schema to be emitted as it is today, on the ground that
+# collapsing it destroys the field the record is read for. A further leak here is
+# DISCLOSED — which is what this comment is — never routed.
+#
+# ``detail`` is named here for completeness even though ``_JOURNAL_DROP_FIELDS``
+# reaches it first: the set states the record's schema, and a schema that omitted a
+# field because some other table happened to cover it would mislead the next reader.
+_JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
+    "preference-escalation": frozenset({"type", "severity", "detail"}),
+    # The six kinds `render_markdown` lifts out of the scrubbed collection and
+    # prints as a JSON block in the DEFAULT dump (DW-191/192/201/246). Their names ARE
+    # authored here, so the premise above does not hold for them — an unclaimed
+    # key on one of these is a field a future producer added without routing.
+    # Declared anyway, because Markdown is the render an operator pastes into an
+    # issue: on these kinds an unrouted field fails closed to `<name>_present`
+    # instead of riding `scrub_json` into the block, and the row that adds a field
+    # to one of them has to add it here as well, where a reviewer sees it. The
+    # DROP fields (`message`, `repo`, `error`, `reason`) and the aliased `commit`
+    # are named for completeness, on the same reasoning as `detail` above: the
+    # set states the record's shape, and the stricter tables still reach them
+    # first.
+    "sweep-ledger-commit": frozenset({"message", "commit", "file"}),
+    "sweep-ledger-commit-clean": frozenset({"message", "file"}),
+    "sweep-ledger-commit-refused": frozenset({"message", "file", "refuse_cause", "error"}),
+    "sweep-ledger-commit-unavailable": frozenset({"message", "repo", "error", "file"}),
+    # DW-246/250. `dw_ids` is a `_JOURNAL_KEYLIST_FIELDS` name and aliases before
+    # this table is consulted; named for the same completeness as `commit` above.
+    "sweep-ledger-commit-withheld": frozenset({"message", "file", "reason", "dw_ids"}),
+    "sweep-repeat-done": frozenset({"cycles", "reason", "stop_cause"}),
+}
 
 # Policy keys whose values can carry secrets/paths/free text. Dropped or reduced
 # rather than scrubbed, since a single-token API key or repo name could be
@@ -151,6 +517,22 @@ class EnvInfo:
     package_version: str
     multiplexer: str
     tmux_version: str | None
+    # The host's git, as git names itself — `verify.GIT_FLOOR` is the floor a run is
+    # refused below, so "which git ran this" is the first thing a dump has to answer
+    # about a refusal. `None` when git could not be asked at all, which is itself the
+    # finding: the same probe that fails here is the one that aborts a run.
+    git_version: str | None
+    # `platform.system()` above says "Windows" for both a native shell and a WSL
+    # interop launch. `sys_platform` carries the raw token instead, so a dump can be
+    # matched character-for-character against validate's `platform default for {token}`
+    # line; `win32_on_wsl_path` is the #332 condition itself. Named for exactly what it
+    # observes — a win32 interpreter working a distro path — and NOT "wsl interop":
+    # `cd \\wsl.localhost\...` from native PowerShell reaches the same state, so this
+    # must not claim where the operator is standing (the matching `host.win32-on-wsl-path`
+    # finding is worded to the same limit). Additive fields — no SCHEMA_VERSION bump;
+    # `--json` evolution is additive-only, see the contract note in machine.py.
+    sys_platform: str
+    win32_on_wsl_path: bool
 
 
 @dataclass
@@ -182,6 +564,15 @@ class TaskDiag:
     deferred_with_reason: bool
     spec_present: bool
     worktree_isolated: bool
+    # The discriminator a #705-class replay turns on. Without it a collided re-drive
+    # dumps as `rearmed=True, attempt=1, n_sessions=2` — byte-identical to a HEALTHY
+    # post-re-arm task. A counter, so it carries no customer content.
+    generation: int
+    # DW-11's watermark: how far into the append-only `sessions` list an accepted
+    # resolution reached. Without it a support bundle cannot explain a SHORT
+    # `context.json` — a story whose older escalations are filtered out dumps
+    # identically to one that only ever raised the entries shown. A counter too.
+    escalations_resolved_upto: int
     dw_count: int
     n_sessions: int
     sessions: SessionTally
@@ -213,9 +604,17 @@ class RunDiag:
     paused: bool
     paused_stage: str | None
     paused_reason_present: bool
+    # Whether this run's code tree is a DIFFERENT directory from its project root.
+    # A presence flag in the `paused_reason_present` / `worktree_isolated` style, never
+    # the path — `_JOURNAL_DROP_FIELDS` drops `repo` as an absolute host path, and that
+    # drop otherwise removes the last trace of the split from a dump. The split layout
+    # is exactly the one in which the re-anchored baseline probes behave differently,
+    # so a bug report that cannot show it cannot be triaged.
+    repo_root_diverges: bool
     current_epic: int | None
     sweep_cycle: int
     sweeps_triggered: list[str]
+    sweeps_refused: dict[str, str]
     plugin_shared_keys: int
     policy: dict
     n_tasks: int
@@ -240,8 +639,26 @@ class Diagnostics:
 # ----------------------------------------------------------------- collectors
 
 
-def collect_env() -> EnvInfo:
+def collect_env(project: Path) -> EnvInfo:
+    """Host facts for the dump's Environment block.
+
+    ``project`` feeds only the #332 verdict. It is required — here *and* on
+    ``collect`` — so a new caller must consciously supply the project it actually
+    diagnosed; the type cannot force that choice to be *right* (any ``Path``
+    yields a confident verdict), and the sole production caller, ``cmd_diagnose``,
+    passes the resolved project.
+
+    The project *path* itself is never emitted: it is a redaction hazard — the
+    redactor leaves the Linux username in a ``\\\\wsl.localhost\\...\\home\\<user>\\...``
+    path standing (it compares against the *Windows* account), and ``collect_env``
+    has no pseudonymizer to alias it against — so the boolean is what ships, and since
+    #512 that shape trips the egress guard, which refuses the whole dump rather than
+    passing it. Same
+    reason ``sys.executable`` is absent despite naming the exact mismatch: the venv
+    path carries the project name past the redactor."""
+    from . import verify
     from .adapters.multiplexer import fold_version, get_multiplexer
+    from .platform_util import is_wsl_unc_path
 
     mux = "none"
     tmux_v = None
@@ -258,6 +675,34 @@ def collect_env() -> EnvInfo:
         tmux_v = fold_version(sanitize.scrub_text(raw)) if raw else None
     except Exception:  # nosec B110 - env probe is best-effort; absent mux is fine
         pass
+
+    git_v = None
+    try:
+        # Same scrub-then-fold order as the mux probe above, for the same #321
+        # reason: folding first can cut a home path mid-way, leaving a fragment
+        # `redact_home` no longer matches. `git version` is one short line today,
+        # but a vendor build is free to say more and the bound is what makes that
+        # safe. Reported RAW rather than as a verdict — a dump is evidence, and the
+        # floor it is read against can move after the dump was written.
+        # `git_bytes` ANSWERS with a non-zero rc rather than raising, so the rc is
+        # checked here for the same reason `git_below_floor` checks it: stdout on a
+        # failed probe is not a version, and folding it would put a fabricated
+        # answer in the dump. `None` — "could not be asked" — is the honest value.
+        # Bounded rather than inheriting the engine's `GIT_TIMEOUT_S` (120s), via
+        # the #390 per-call seam the other two best-effort probes already use
+        # (`install`'s init hint, the TUI's commit-subject render). `diagnose` is a
+        # FOREGROUND recovery aid — the command you reach for when the host is
+        # already broken — and a git that hangs is one of the states it exists to
+        # be usable in. Inheriting the engine bound made it sit silent for two
+        # minutes and then swallow the fault anyway, so the whole wait bought a
+        # `None` this returns in five seconds. The dump is worth far more than the
+        # one line this probe fills.
+        probed = verify.git_bytes(project, "version", timeout_s=5)
+        if probed.returncode == 0:
+            git_v = fold_version(sanitize.scrub_text(os.fsdecode(probed.stdout))) or None
+    except Exception:  # nosec B110 - env probe is best-effort; absent git is fine
+        pass
+
     return EnvInfo(
         os=platform.system(),
         os_release=sanitize.scrub_text(platform.release()),
@@ -265,33 +710,107 @@ def collect_env() -> EnvInfo:
         package_version=__version__,
         multiplexer=mux,
         tmux_version=tmux_v,
+        git_version=git_v,
+        sys_platform=sys.platform,
+        win32_on_wsl_path=sys.platform == "win32" and is_wsl_unc_path(project),
     )
 
 
-def summarize_files(run_dir: Path) -> list[FileGroup]:
-    """Counts/sizes only — file contents are NEVER opened into the output."""
+def _category_roots(category: str, run_dir: Path, events_dir: Path | None) -> list[Path]:
+    """Where a category's files live. One directory for all but ``events``.
+
+    The events channel has TWO live roots since #494 (Phase 3): the primary is
+    out of the project tree under the user state root, and the legacy in-tree
+    ``<run-dir>/events`` is still both written and polled. It has to be, because
+    the hook relay is COPIED into the project by ``init`` — an upgraded
+    orchestrator routinely drives sessions whose relay predates the move and
+    still writes in-tree, so the watcher dual-polls. Counting only one root would
+    report zero events for precisely the runs whose event routing is what a
+    maintainer is reading the dump to understand.
+
+    Both are summed into ONE ``FileGroup`` named ``events``: the payload shape is
+    the schema, and splitting the category (or adding a field) would be a payload
+    break requiring another schema bump. Which root the events came from is not
+    what the count is for — "did the hooks fire at all" is.
+    """
+    if category != _EVENTS_CATEGORY:
+        return [run_dir / category]
+    legacy = run_dir / _EVENTS_CATEGORY
+    # Deduped by spelling so a state root deliberately pointed inside the run dir
+    # (BMAD_LOOP_STATE_DIR is honoured as spelled) cannot double-count.
+    if events_dir is None or events_dir == legacy:
+        return [legacy]
+    return [events_dir, legacy]
+
+
+def _count_lines(path: Path) -> int:
+    """Lines in a regular file, or 0 — never blocking on a FIFO a session planted.
+
+    ``O_NONBLOCK`` plus an ``S_ISREG`` check **on the descriptor**, the idiom
+    ``runs.read_trusted_config_digest`` and ``tui.launch._read_ctl_window``
+    already carry for the same hazard: the run directory is exported to the
+    driven session as ``BMAD_LOOP_RUN_DIR``, so an lstat taken before the open is
+    a check-then-open race, and ``fstat`` describes the object actually opened.
+    Opening a FIFO read-only without ``O_NONBLOCK`` blocks until a writer
+    arrives — indefinitely, for a diagnostic dump nobody is feeding, and
+    ``diagnose`` is a foreground command a human is waiting on. ``O_NOFOLLOW``
+    keeps the final component from redirecting the read out of the run, which is
+    the one hop :func:`platform_util.walk_files_unlinked` cannot refuse for it.
+    The POSIX-only flags degrade to 0 on win32, where the fd check carries alone.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)  # win32: no CRLF translation on the raw fd
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return 0
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return 0
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+    finally:
+        os.close(fd)
+
+
+def summarize_files(run_dir: Path, *, events_dir: Path | None = None) -> list[FileGroup]:
+    """Counts/sizes only — file contents are NEVER opened into the output.
+
+    ``events_dir`` is this run's out-of-tree event channel (#494); ``None`` when
+    the caller could not derive one, which degrades to the legacy in-tree
+    location alone rather than dropping the category.
+    """
     groups: list[FileGroup] = []
     for category in _FILE_CATEGORIES:
-        root = run_dir / category
-        if not root.is_dir():
-            continue
         count = 0
         total_bytes = 0
         total_lines = 0
-        for p in root.rglob("*"):
-            if not p.is_file():
+        for root in _category_roots(category, run_dir, events_dir):
+            if not root.is_dir():
                 continue
-            count += 1
-            try:
-                total_bytes += p.stat().st_size
-            except OSError:
-                pass
-            if category == "logs":
+            # walk_files_unlinked, not rglob: `is_dir()` above FOLLOWS a link, so a
+            # planted redirect at a category root reads as a directory and rglob
+            # then counts the target's tree as this run's retained output.
+            for p in walk_files_unlinked(root):
+                # The regular-file filter `rglob` + `is_file()` used to carry, and
+                # which came off with the switch: `os.walk` reports every
+                # non-directory entry, so `files` holds FIFOs, device nodes and
+                # symlinks too. None of those is retained output of this run, and
+                # the `logs` arm below OPENS what it counts. lstat, not
+                # `is_file()` — that FOLLOWS, so it answers about the target of a
+                # planted link rather than about the entry in this run's tree.
                 try:
-                    with p.open("rb") as f:
-                        total_lines += sum(1 for _ in f)
+                    info = p.lstat()
                 except OSError:
-                    pass
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                count += 1
+                total_bytes += info.st_size
+                if category == "logs":
+                    total_lines += _count_lines(p)
         if count:
             groups.append(
                 FileGroup(
@@ -334,6 +853,8 @@ def _task_diag(task: StoryTask, pseudo: sanitize.Pseudonymizer, weight: float) -
         deferred_with_reason=bool(task.defer_reason),
         spec_present=bool(task.spec_file),
         worktree_isolated=bool(task.worktree_path),
+        generation=task.generation,
+        escalations_resolved_upto=task.escalations_resolved_upto,
         dw_count=len(task.dw_ids),
         n_sessions=len(task.sessions),
         sessions=_session_tally([task]),
@@ -359,6 +880,26 @@ def _scrub_policy(obj: Any) -> Any:
                     k for k in (str(x) for x in value) if sanitize.looks_like_identifier(k)
                 )
             else:
+                # Keys pass through VERBATIM here, deliberately — unlike
+                # `sanitize._scrub`, which scrubs keys as well as values. The
+                # warrant is what this snapshot IS: `Policy.to_dict()` is
+                # `asdict()` over frozen dataclasses, so every key is a
+                # compile-time field name — developer-authored, non-PII, and the
+                # point of the dump (a reader diagnosing a run needs to see
+                # `max_review_cycles`, not `<redacted:str>`). The one user-keyed
+                # table, `plugins.settings`, never reaches this branch:
+                # `_POLICY_KEYSET_KEYS` intercepts it above and reduces it to its
+                # identifier-gated plugin-id keyset (#186).
+                #
+                # That rests on an invariant nothing else stated until #202: NO
+                # policy section has a free-keyed table. Add one — say an
+                # `adapter.overrides` keyed by binary path — and its keys ship
+                # verbatim in a dump meant to be shareable.
+                # `test_no_policy_section_has_a_free_keyed_table`
+                # (tests/test_diagnostics.py) enforces it over the field TYPES, so
+                # it fires when such a table is declared rather than when a user
+                # first populates it; route a new one through `_POLICY_KEYSET_KEYS`
+                # or `_POLICY_COUNT_KEYS` rather than widening that test.
                 out[key] = _scrub_policy(value)
         return out
     if isinstance(obj, (list, tuple)):
@@ -387,6 +928,45 @@ def _alias_input(value: Any, ns: str) -> Any:
     return _PATH_SEP_RE.split(value)[-1] or value
 
 
+def _reserved_output_names(
+    entry: dict,
+    kind_aliases: dict[str, str],
+    kind_keylists: dict[str, str],
+    kind_countlists: frozenset[str],
+    declared: frozenset[str] | None,
+) -> frozenset[str]:
+    """Names synthesized from this complete raw entry.
+
+    Computing them before the entry is traversed makes a derived presence marker or
+    count authoritative when the source also contains that name, independent of JSON
+    key order. The branches deliberately mirror `_scrub_entry`'s routing precedence:
+    a routed alias on a declared-schema kind does not also generate a presence name.
+    """
+    # ``ts_offset`` is synthesized before the raw fields are traversed. It is never
+    # a meaningful producer field, so reserve it even for a malformed entry whose
+    # timestamp cannot produce the derived value; a caller-supplied value must not
+    # replace the truthful offset or leak through the generic scrubber.
+    generated: set[str] = {"ts_offset"}
+    for key, value in entry.items():
+        if key in ("ts", "kind"):
+            continue
+        if key in _JOURNAL_DROP_FIELDS:
+            generated.add(f"{key}_present")
+        elif key in _JOURNAL_KEYLIST_FIELDS:
+            if not isinstance(value, list):
+                generated.add(f"{key}_present")
+        elif key in kind_keylists:
+            if not isinstance(value, list):
+                generated.add(f"{key}_present")
+        elif key in kind_countlists:
+            generated.add(f"{key}_{'count' if isinstance(value, list) else 'present'}")
+        elif key in kind_aliases or key in _JOURNAL_ALIAS_FIELDS:
+            continue
+        elif declared is not None and key not in declared and key not in SELF_MINTED_FIELDS:
+            generated.add(f"{key}_present")
+    return frozenset(generated)
+
+
 def _scrub_entry(
     entry: dict,
     pseudo: sanitize.Pseudonymizer,
@@ -394,27 +974,99 @@ def _scrub_entry(
     first_ts: float | None,
 ) -> dict:
     """One journal entry reduced to a shareable form: relative timestamp, kind
-    verbatim, identifier fields aliased, free-text fields collapsed to a
-    presence boolean, and every remaining/unknown field scrub_json'd."""
+    verbatim, identifier fields aliased, free-text fields collapsed to a presence
+    boolean, and every remaining/unknown field scrub_json'd.
+
+    Several field classes never reach that last fallback, because for them
+    ``scrub_json`` fails closed only by accident of a value's shape. Identifier-list
+    and count-list policies validate their containers, while a kind with a declared
+    schema (``_JOURNAL_KIND_SCHEMAS``) collapses every unnamed key to presence."""
     out: dict[str, Any] = {}
     ts = entry.get("ts")
     if isinstance(ts, (int, float)) and first_ts is not None:
         out["ts_offset"] = round(ts - first_ts, 3)
     kind = str(entry.get("kind", "?"))
     out["kind"] = kind if sanitize.looks_like_identifier(kind) else "<redacted:str>"
+    # Read off the RAW kind, not the redacted spelling above: a kind that failed
+    # `looks_like_identifier` is not one of the three below anyway, and keying on the
+    # placeholder would silently unroute every entry in a dump that had one.
+    by_kind = _JOURNAL_KIND_ALIAS_FIELDS.get(kind, {})
+    kind_keylists = _JOURNAL_KIND_KEYLIST_FIELDS.get(kind, {})
+    kind_countlists = _JOURNAL_KIND_COUNTLIST_FIELDS.get(kind, frozenset())
+    declared = _JOURNAL_KIND_SCHEMAS.get(kind)
+    reserved_outputs = _reserved_output_names(
+        entry, by_kind, kind_keylists, kind_countlists, declared
+    )
     for k, v in entry.items():
         if k in ("ts", "kind"):
             continue
+        if k in reserved_outputs:
+            # A raw field cannot overwrite a value derived from another field in this
+            # entry. The reservation is computed above from the complete shape, so
+            # this is deterministic in both source-key orders.
+            continue
+        kind_ns = by_kind.get(k)
         if k in _JOURNAL_DROP_FIELDS:
             out[f"{k}_present"] = v is not None and v != ""
-        elif k in _JOURNAL_KEYLIST_FIELDS and isinstance(v, list):
-            ns = "story" if k == "keys" else "dw"
-            out[k] = [pseudo.alias(x, ns=ns, epic=epic_by_key.get(str(x))) for x in v]
-        elif k in _JOURNAL_ALIAS_FIELDS:
-            ns = _JOURNAL_ALIAS_FIELDS[k]
+        elif k in _JOURNAL_KEYLIST_FIELDS:
+            if isinstance(v, list):
+                # Namespace by field, not by "everything that is not `keys`": both
+                # story-key list fields must land in the SAME namespace as the
+                # singular `story_key`, or one dump would carry two aliases for one
+                # story.
+                ns = "dw" if k == "dw_ids" else "story"
+                out[k] = [pseudo.alias(x, ns=ns, epic=epic_by_key.get(str(x))) for x in v]
+            else:
+                # A name in this set is DECLARED to carry a list of identifiers, so a
+                # non-list is an unknown shape — and falling through to `scrub_json`
+                # for it is exactly the accident this whole set exists to stop: a
+                # scalar `story_keys="1-1-acme-auth"` is identifier-shaped and ships
+                # verbatim (reproduced, 2026-08-30). Every producer passes a list
+                # today, so this is latent rather than live — which is the reason to
+                # fail closed on it rather than to rest on that survey staying true.
+                # A presence marker rather than an alias because the shape is
+                # genuinely unknown: a dict or an int has no sensible alias, and the
+                # one thing worth reporting is that the field was set.
+                out[f"{k}_present"] = v is not None and v != ""
+        elif k in kind_keylists:
+            if isinstance(v, list):
+                ns = kind_keylists[k]
+                out[k] = [pseudo.alias(x, ns=ns) for x in v]
+            else:
+                out[f"{k}_present"] = v is not None and v != ""
+        elif k in kind_countlists:
+            if isinstance(v, list):
+                out[f"{k}_count"] = len(v)
+            else:
+                out[f"{k}_present"] = v is not None and v != ""
+        elif kind_ns is not None or k in _JOURNAL_ALIAS_FIELDS:
+            ns = kind_ns or _JOURNAL_ALIAS_FIELDS[k]
             v = _alias_input(v, ns)
             epic = epic_by_key.get(str(v)) if ns == "story" else None
             out[k] = pseudo.alias(v, ns=ns, epic=epic)
+        elif kind == "artifact-publication-refused" and k == "publication_cause":
+            out[k] = v if v in ("file-limit", "payload-limit") else None
+        elif kind == "artifact-publication-refused" and k in ("measured_bytes", "limit_bytes"):
+            out[k] = v if type(v) is int and v >= 0 else None
+        elif kind == "artifact-publication-refused" and k == "measurement_is_lower_bound":
+            out[k] = v if type(v) is bool else None
+        elif declared is not None and k not in declared and k not in SELF_MINTED_FIELDS:
+            # A kind with a declared schema (`_JOURNAL_KIND_SCHEMAS`) replaces the
+            # `scrub_json` fallback with a fail-closed one, because on such a kind an
+            # unclaimed name is not a field nobody has routed yet — it is a field
+            # nobody in this codebase NAMED. See that table for the accepted residual:
+            # the key name itself still ships.
+            #
+            # `SELF_MINTED_FIELDS` is exempt because the premise does not hold for it.
+            # `Journal.append` stamps `log_task`/`log_pos` onto EVERY entry, including
+            # this kind's, so they are engine-authored and arrive on a record whose
+            # other keys are not. Collapsing them buys no safety — `log_task` is
+            # aliased before it ever reaches here, and `log_pos` is a byte offset —
+            # while `log_pos_present: true` would silently destroy the pane-log
+            # pointer on precisely the records an operator opens a dump to trace.
+            # Imported from `journal` rather than restated, so this exemption cannot
+            # drift from the `setdefault` pair that creates the fields.
+            out[f"{k}_present"] = v is not None and v != ""
         else:
             out[k] = sanitize.scrub_json(v)
     return out
@@ -471,6 +1123,33 @@ def _coarsen_date(started_at: str | None) -> str | None:
     return head if sanitize.looks_like_identifier(head.replace("-", "0")) else None
 
 
+def _events_dir(state: RunState) -> Path | None:
+    """This run's out-of-tree event channel, or ``None`` if it is not derivable.
+
+    Derived from the run's OWN recorded project and id rather than threaded down
+    from ``cmd_diagnose``'s ``--project``, which is the smaller change and the
+    truer one: ``--all`` dumps every run under a project, and a run carries the
+    project it was started against. ``run_dir`` cannot answer this — the state
+    root is keyed by a digest of the resolved project, not by the run dir's
+    ancestry.
+
+    Every failure mode is observation, so every one of them degrades. The
+    derivation resolves the project (``runs.project_tag``) and consults the host
+    for a state root, and a dump is routinely read on a machine that is not the
+    one that produced it: an unresolvable project, or a host with no derivable
+    state root, must cost the events count and nothing else.
+    """
+    from . import runs
+
+    try:
+        return runs.events_dir_for(Path(state.project), state.run_id)
+    except Exception:
+        # No `# nosec`: bandit's B110/B112 are about `pass`/`continue` bodies, and
+        # a directive naming a rule that never fires here would read as a waived
+        # finding. The breadth is deliberate and stated above, not silenced.
+        return None
+
+
 def collect_run(run_dir: Path, *, pseudo: sanitize.Pseudonymizer, cap: int) -> RunDiag:
     state: RunState = load_state(run_dir)
     tasks = list(state.tasks.values())
@@ -498,12 +1177,24 @@ def collect_run(run_dir: Path, *, pseudo: sanitize.Pseudonymizer, cap: int) -> R
         paused=state.paused,
         paused_stage=state.paused_stage,
         paused_reason_present=state.paused_reason is not None,
+        repo_root_diverges=bool(state.repo_root) and Path(state.repo_root) != Path(state.project),
         current_epic=state.current_epic,
         sweep_cycle=state.sweep_cycle,
         sweeps_triggered=[
             s if sanitize.looks_like_identifier(str(s)) else "<redacted:str>"
             for s in state.sweeps_triggered
         ],
+        # BOTH halves are filtered. The value is a closed SWEEP_REFUSED_* slug by
+        # construction, but the key is a trigger string off state.json — the same
+        # untrusted footing as sweeps_triggered above — and a hand-edited or
+        # foreign state file must not be able to route a home path into a report
+        # that `sanitize.guard` would then refuse to emit at all.
+        sweeps_refused={
+            (k if sanitize.looks_like_identifier(str(k)) else "<redacted:str>"): (
+                v if sanitize.looks_like_identifier(str(v)) else "<redacted:str>"
+            )
+            for k, v in state.sweeps_refused.items()
+        },
         plugin_shared_keys=len(state.plugin_shared),
         policy=_scrub_policy(state.policy_snapshot),
         n_tasks=len(tasks),
@@ -512,7 +1203,7 @@ def collect_run(run_dir: Path, *, pseudo: sanitize.Pseudonymizer, cap: int) -> R
         session_tally=_session_tally(tasks),
         tasks=[_task_diag(t, pseudo, weight) for t in tasks],
         journal=summarize_journal(Journal(run_dir).entries(), pseudo, epic_by_key, cap=cap),
-        files=summarize_files(run_dir),
+        files=summarize_files(run_dir, events_dir=_events_dir(state)),
     )
 
 
@@ -522,6 +1213,7 @@ def collect(
     pseudo: sanitize.Pseudonymizer,
     cap: int = DEFAULT_JOURNAL_CAP,
     generated_at: str | None = None,
+    project: Path,
 ) -> Diagnostics:
     runs: list[RunDiag] = []
     for run_dir in run_dirs:
@@ -533,7 +1225,7 @@ def collect(
         schema_version=SCHEMA_VERSION,
         generated_at=generated_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         tool_version=__version__,
-        env=collect_env(),
+        env=collect_env(project),
         runs=runs,
     )
 
@@ -549,9 +1241,11 @@ def _unreadable_run(run_dir: Path, err: Exception) -> RunDiag:
         paused=False,
         paused_stage=None,
         paused_reason_present=False,
+        repo_root_diverges=False,
         current_epic=None,
         sweep_cycle=0,
         sweeps_triggered=[],
+        sweeps_refused={},
         plugin_shared_keys=0,
         policy={},
         n_tasks=0,
@@ -627,14 +1321,24 @@ def render_markdown(
     out.append(_fmt_kv("bmad-loop version", e.package_version))
     out.append(_fmt_kv("python", e.python_version))
     out.append(_fmt_kv("os", f"{e.os} {e.os_release}"))
+    out.append(_fmt_kv("sys.platform", e.sys_platform))
+    out.append(_fmt_kv("win32 on WSL distro path", "yes" if e.win32_on_wsl_path else "no"))
     out.append(_fmt_kv("multiplexer", e.multiplexer))
     out.append(_fmt_kv("tmux", e.tmux_version or "—"))
+    out.append(_fmt_kv("git", e.git_version or "—"))
     out.append(_fmt_kv("schema / generated", f"v{d.schema_version} @ {d.generated_at}"))
     out.append("")
 
     for r in d.runs:
         out.append(f"## Run `{r.run_id}` ({r.run_type})")
         out.append(_fmt_kv("project", f"`{r.project_alias}`"))
+        # Rendered here and not only in `--json`: this is the report an operator
+        # produces by default and hands a maintainer, and the split layout is the
+        # one the re-anchored baseline probes behave differently in. A dump that
+        # cannot show it cannot be triaged — the whole warrant for the field.
+        out.append(
+            _fmt_kv("code root differs from project", "yes" if r.repo_root_diverges else "no")
+        )
         out.append(_fmt_kv("started", r.started_date or "—"))
         out.append(
             _fmt_kv(
@@ -650,6 +1354,13 @@ def render_markdown(
         out.append(_fmt_kv("epic / sweep_cycle", f"{r.current_epic} / {r.sweep_cycle}"))
         if r.sweeps_triggered:
             out.append(_fmt_kv("sweeps_triggered", ", ".join(f"`{s}`" for s in r.sweeps_triggered)))
+        if r.sweeps_refused:
+            out.append(
+                _fmt_kv(
+                    "sweeps_refused",
+                    ", ".join(f"`{k}`: {v}" for k, v in r.sweeps_refused.items()),
+                )
+            )
         out.append(_fmt_kv("tasks", r.n_tasks))
         out.append(_fmt_kv("phase histogram", _dict_inline(r.phase_histogram)))
         out.append(_fmt_kv("token totals", _dict_inline(r.token_totals)))
@@ -662,16 +1373,26 @@ def render_markdown(
 
         out.append("### Tasks")
         if r.tasks:
+            # `gen` rides beside `att` because the pair is the discriminator: a
+            # #705-class replay and a healthy post-re-arm task agree on every other
+            # column here, so dropping it from the human report leaves the one field
+            # that separates them visible only under `--json`. `esc-upto` rides beside
+            # `gen` on that same rule: DW-11's watermark is the only field separating
+            # "this story raised one escalation" from "its earlier ones are filtered
+            # out as already answered", and a short `context.json` is read off exactly
+            # this report.
             out.append(
-                "| alias | epic | phase | att | rev | committed | spec | dw | sessions "
-                "| weighted | raw |"
+                "| alias | epic | phase | att | gen | esc-upto | rev | committed | spec | dw "
+                "| sessions | weighted | raw |"
             )
-            out.append("|---|---|---|---|---|---|---|---|---|---|---|")
+            out.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
             for t in r.tasks:
                 out.append(
-                    f"| `{t.alias}` | {t.epic} | {t.phase} | {t.attempt} | {t.review_cycle} "
-                    f"| {t.committed} | {t.spec_present} | {t.dw_count} | {t.n_sessions} "
-                    f"| {t.tokens.get('weighted', 0)} | {t.tokens.get('total', 0)} |"
+                    f"| `{t.alias}` | {t.epic} | {t.phase} | {t.attempt} | {t.generation} "
+                    f"| {t.escalations_resolved_upto} "
+                    f"| {t.review_cycle} | {t.committed} | {t.spec_present} | {t.dw_count} "
+                    f"| {t.n_sessions} | {t.tokens.get('weighted', 0)} "
+                    f"| {t.tokens.get('total', 0)} |"
                 )
         else:
             out.append("_no tasks._")
@@ -692,6 +1413,37 @@ def render_markdown(
             out.append("\n_Per-task event counts:_")
             for alias, counts in sorted(j.per_alias_event_counts.items()):
                 out.append(f"- `{alias}`: {_dict_inline(counts)}")
+        # Use the bounded, already-scrubbed collection, just as JSON does. These
+        # outcomes need their file/stop identity and presence flags in the default
+        # dump too; a kind histogram alone loses those distinctions.
+        sweep_entries = [
+            entry
+            for entry in j.entries
+            if entry.get("kind")
+            in {
+                # Preserve the withheld cycle and count beyond the kind histogram.
+                "sweep-bundles-withheld",
+                "sweep-ledger-commit",
+                "sweep-ledger-commit-clean",
+                "sweep-ledger-commit-refused",
+                "sweep-ledger-commit-unavailable",
+                # DW-246: a publish the run declined over its own ledger doubt;
+                # `file` names which file, `reason` collapses to presence.
+                "sweep-ledger-commit-withheld",
+                "sweep-repeat-done",
+            }
+        ]
+        if sweep_entries:
+            out.extend(
+                [
+                    "",
+                    "_Sweep publication and repeat stops (collected entries):_",
+                    "",
+                    "```json",
+                    json.dumps(sweep_entries, indent=2, ensure_ascii=False),
+                    "```",
+                ]
+            )
         out.append("")
 
         out.append("### Run-dir files (counts only)")

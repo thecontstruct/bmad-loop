@@ -14,12 +14,110 @@ treating every CLI as a dumb terminal:
 
 from __future__ import annotations
 
+import stat
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..model import TokenUsage
+from ..platform_util import is_link_like, safe_segment
+
+if TYPE_CHECKING:
+    # `journal.py` imports nothing from `adapters/`, so the runtime import would be
+    # cycle-free too; TYPE_CHECKING keeps the adapter seam's import graph as thin as
+    # it was (journal pulls in model + platform_util) for the annotation alone.
+    from ..journal import Journal
+
+
+class AdapterTaskDirectoryError(ValueError):
+    """A built-in adapter refused an unsafe or redirected task directory."""
+
+
+def validated_task_directory(tasks_dir: Path, task_id: str) -> Path:
+    """Return ``tasks/<task_id>`` only when its authored name is confined.
+
+    Validation is deliberately identity-based rather than sanitizing: callers use
+    ``task_id`` for handles, environment, logs, and artifacts, so rewriting it here
+    would split one session across multiple identities.  The link-like check covers
+    both symlinks and Windows directory junctions through ``platform_util``.
+
+    This is a pre-write boundary, not descriptor-anchored I/O; callers must invoke
+    it before any operation derived from the task id.
+    """
+    if safe_segment(task_id) != task_id:
+        raise AdapterTaskDirectoryError(
+            f"unsafe adapter task id {task_id!r}: expected one clean path segment"
+        )
+
+    if is_link_like(tasks_dir):
+        raise AdapterTaskDirectoryError(
+            f"adapter tasks directory is a symlink or junction: {tasks_dir}"
+        )
+
+    task_dir = tasks_dir / task_id
+    if is_link_like(task_dir):
+        raise AdapterTaskDirectoryError(
+            f"adapter task directory is a symlink or junction: {task_dir}"
+        )
+    return task_dir
+
+
+def validate_adapter_artifact_paths(root_dir: Path, paths: tuple[Path, ...]) -> None:
+    """Refuse redirecting or special standing entries before adapter writes.
+
+    A regular file with one link is the only existing leaf an adapter may open in
+    place.  Symlinks, junctions, hardlinks, FIFOs, and devices can redirect or
+    block a later write; callers provide every leaf they will write during the
+    session and invoke this boundary before mutating any task or log artifact.
+    """
+    if is_link_like(root_dir):
+        raise AdapterTaskDirectoryError(
+            f"adapter artifact directory is a symlink or junction: {root_dir}"
+        )
+
+    for path in paths:
+        if is_link_like(path):
+            raise AdapterTaskDirectoryError(f"adapter artifact is a symlink or junction: {path}")
+        try:
+            entry = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise AdapterTaskDirectoryError(
+                f"cannot inspect adapter artifact before writing: {path}"
+            ) from exc
+        if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+            raise AdapterTaskDirectoryError(
+                f"adapter artifact is special or multiply linked: {path}"
+            )
+
+
+def reset_task_prompt(task_dir: Path, prompt: str) -> None:
+    """Write ``prompt.txt`` without following a redirecting filesystem entry.
+
+    A normal single-link file is truncated in place so its inode and metadata keep
+    the clean-session behavior.  A symlink, hardlink, FIFO, or device is unlinked
+    first so the replacement is an ordinary file and no outside target is touched.
+    """
+    prompt_path = task_dir / "prompt.txt"
+    try:
+        entry = prompt_path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise AdapterTaskDirectoryError(
+            f"cannot inspect adapter prompt before writing: {prompt_path}"
+        ) from exc
+    else:
+        if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+            try:
+                prompt_path.unlink()
+            except OSError as exc:
+                raise AdapterTaskDirectoryError(
+                    f"cannot replace unsafe adapter prompt: {prompt_path}"
+                ) from exc
+    prompt_path.write_text(prompt + "\n", encoding="utf-8")
 
 
 @dataclass(frozen=True)
@@ -106,6 +204,14 @@ class SessionSpec:
     # resumed run is protected too — always an absolute path by the time it lands
     # here. Kept LAST alongside spec_snapshot so positional constructions stay valid.
     expected_spec: str | None = None
+    # Reasoning effort (#643), free-form because the legal names are provider- and
+    # model-specific; "" = provider default. Resolved per stage by
+    # `AdapterPolicy.resolved()` with the same client-specific inheritance as
+    # `model`. Only the opencode-http adapter has a channel for it — it rides every
+    # `prompt_async` body as `variant` — and the tmux generic family ignores it
+    # (`bmad-loop validate` warns). Never reaches argv, so `config_digest` is
+    # untouched. Kept LAST so positional SessionSpec constructions stay valid.
+    effort: str = ""
 
 
 @dataclass(frozen=True)
@@ -117,7 +223,12 @@ class SessionHandle:
 
 @dataclass(frozen=True)
 class SessionResult:
-    status: str  # "completed" | "stalled" | "timeout" | "crashed" | "over_budget"
+    # "aborted" is the in-session hard-stop verdict (#319): the wait loop saw a
+    # `mode: "hard"` stop-request.json and tore the session down. It is an abort,
+    # NEVER a completion — sessions complete only on hook Stop events or window
+    # death (AGENTS.md) — and it never escapes `Engine._run_session`, which
+    # unwinds it as a RunStopped before any SessionRecord is written.
+    status: str  # "completed" | "stalled" | "timeout" | "crashed" | "over_budget" | "aborted"
     result_json: dict[str, Any] | None = None
     session_id: str | None = None
     transcript_path: str | None = None
@@ -145,6 +256,31 @@ class SessionResult:
     # and both fire on a CLI that launched and wedged without doing anything. Stop
     # is the only canonical event that means a turn actually ended.
     stop_seen: bool = False
+    # Set on a `crashed` verdict when the mux no longer reports the SESSION, not
+    # just its window (#489) — see `GenericAdapter._session_vanished` for why the
+    # two are otherwise indistinguishable. Diagnostic label only: it changes the
+    # reason text, never the routing. Deliberately NOT carried by
+    # `_post_kill_reconcile`'s hand-built result — that path gates on
+    # stalled/timeout/over_budget, which this flag can never accompany; add it
+    # there if `crashed` ever joins that rescue set.
+    session_vanished: bool = False
+    # Whether the session showed ANY sign of working before it ended on a
+    # non-completed verdict (#727). `True` when a `Stop` arrived, when the adapter
+    # has no pane log to read (opencode-http, unit fixtures — "unknown never
+    # blocks"), when the pane log changed on a tick later than
+    # `generic.FIRST_FRAME_S` after the wait loop started and before the first
+    # stall wake nudge was sent, or when the CLI's own transcript changed after
+    # its first sample / the usage sampler read a nonzero spend from it (writes a
+    # misbound pane sink cannot hide). `False` means the CLI painted at most its
+    # first frame and then sat still until the grace, the nudge and the exit: a
+    # permission dialog, a login prompt, a dead-on-arrival window. `decide_dev`
+    # PAUSEs such a session ahead of the attempt budget, the way an environment
+    # fault does, so re-arm restores the attempt instead of a fresh session being
+    # launched into the identical wall. Distinct from `stop_seen` (the hook half
+    # alone) and from `_ResultFileMixin._produced_work` (the #261 read-back gate's
+    # byte floor, which a rendered dialog clears). Default `True` so every
+    # positional construction keeps today's routing. APPENDED, never inserted.
+    produced_work: bool = True
 
 
 class CodingCLIAdapter(ABC):
@@ -152,6 +288,14 @@ class CodingCLIAdapter(ABC):
     injection: str = ""
     observation: str = ""
     state: str = ""
+    # The run's journal, attached by the engine to every adapter it owns so the
+    # adapter can record what only it can see (the #680 `session-idle` /
+    # `session-active` pair). None outside an engine — `resolve.run_session`,
+    # `probe`, unit fixtures — and every adapter-side emit is gated on it: no
+    # journal, no entry. The wait loop runs on the engine thread while the
+    # engine's own journal is quiescent, so this adds no second writer, and
+    # entries keep the engine's `log_task`/`log_pos` stamps.
+    journal: Journal | None = None
 
     @abstractmethod
     def start_session(self, spec: SessionSpec) -> SessionHandle: ...
@@ -217,14 +361,25 @@ class CodingCLIAdapter(ABC):
         self, handle: SessionHandle, spec: SessionSpec, result: SessionResult
     ) -> SessionResult:
         """Last-chance post-mortem: label a non-completed session an environment
-        fault (#194) when the CLI lost its API connection and idled out the
-        session clock rather than doing real work.
+        fault (#194) when the CLI never got usable work out of the provider —
+        connection lost, or quota/rate limit refused — and idled out the session
+        clock rather than doing real work.
 
         Runs LAST in ``run()`` — after ``_post_kill_reconcile`` — so a reconcile
         upgrade to ``completed`` is never re-classified, and only a genuinely
         non-completed verdict (``result_json is None``) is ever inspected. Base
-        behavior: identity, like ``_post_kill_reconcile``, so adapters with no
-        post-mortem signal (HTTP/mock) stay inert. Adapters that tee the pane
-        (see GenericAdapter) may match profile patterns against the log tail here
-        and stamp ``env_fault`` / ``env_fault_evidence`` onto the result."""
+        behavior: identity, like ``_post_kill_reconcile``, so an adapter with no
+        session log at all (mock) stays inert.
+
+        Any adapter that writes a per-task diagnostic log should mix in
+        ``EnvFaultMixin``, which matches profile patterns against the tail of the
+        file its ``ENV_FAULT_LOG_SUFFIX`` names and stamps ``env_fault`` /
+        ``env_fault_evidence`` onto the result. That covers the tmux adapters
+        (pane capture, ``<task_id>.log``) and the opencode HTTP adapter (the
+        serve process's stdout/stderr, ``<task_id>.server.out``, NOT its
+        conversation transcript) alike — the signal is the log, not the
+        transport. This docstring used to say HTTP adapters had no
+        post-mortem signal; that stopped being true once opencode_http began
+        teeing its server log, and the stale premise is why a provider quota
+        outage went unclassified and burned three stories' retry budgets."""
         return result

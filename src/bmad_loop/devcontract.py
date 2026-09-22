@@ -1,7 +1,7 @@
-"""Translate the generic `bmad-dev-auto` skill's output into the orchestrator's
+"""Translate the generic `bmad-build-auto` skill's output into the orchestrator's
 result.json contract.
 
-Alex Verhovsky's upstream `bmad-dev-auto` skill (BMAD-METHOD PR #2500) is a
+Alex Verhovsky's upstream `bmad-build-auto` skill (BMAD-METHOD PR #2500) is a
 decoupled autonomous-coding primitive: it writes NO result.json. Its outcome
 lives in the spec it produced — `status:` in the frontmatter (the machine-
 consumable signal) plus an appended `## Auto Run Result` prose section (intended
@@ -9,13 +9,25 @@ for an LLM deciding how to handle failure). This module is the thin Python shim
 that turns that on-disk spec into the legacy result dict that verify.py /
 escalation.py already consume, so the rest of the pipeline stays unchanged.
 
-DOCTRINE — never trust prose for a gate. The frontmatter `status:` read straight
-off disk is authoritative; the `## Auto Run Result` prose is only used to route
-the blocked→PAUSE decision and to carry a human-readable detail. Where the two
-disagree we surface it (`status_consistent=False`) so the caller can fail safe
-(treat a mismatch as a retry rather than silently proceeding). Every real
-deterministic gate (git baseline, worktree-changed, sprint advancement, dw_id
-match) still runs in verify.py against actual on-disk state.
+DOCTRINE — never let terminal prose override populated frontmatter status. The
+frontmatter `status:` read straight off disk is authoritative whenever it is
+present. A genuine `## Auto Run Result` marker has three narrow roles: its
+status/detail route the blocked→PAUSE decision; its status is a compatibility
+fallback that may populate the synthesized result when frontmatter is blank or
+missing; and proof that the current session authored the marker supplies
+attempt ownership for `park_asserted` — and, since DW-273, for `artifact_only`,
+the bundle leg's assertion that its whole deliverable lives under the gitignored
+artifacts dir. Both booleans are minted by the same four-part shape (a present,
+genuine, session-authored marker carrying the line, with no orchestrator synth
+note) and `park_marker_session_authored` is the one authorship proof serving
+both; frontmatter never mints either. From that compatibility result, `done`
+alone may be reconciled onto disk, `blocked` routes to PAUSE, and
+`awaiting-operator` remains subject to the on-disk frontmatter/status gate.
+Where the marker and populated frontmatter disagree we surface it
+(`status_consistent=False`) so the caller can fail safe (treat a mismatch as a
+retry rather than silently proceeding). Every real deterministic gate (git
+baseline, worktree-changed, sprint advancement, dw_id match) still runs in
+verify.py against actual on-disk state.
 """
 
 from __future__ import annotations
@@ -28,8 +40,9 @@ from pathlib import Path
 from typing import Any
 
 from . import deferredwork
-from .frontmatter import _edit_frontmatter_block, status_of
-from .platform_util import atomic_replace
+from .fences import fenced as _fenced
+from .frontmatter import _edit_frontmatter_block, auto_dev_baseline_of, status_of
+from .platform_util import atomic_write_bytes, atomic_write_bytes_confined
 from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 
 # The section the skill appends on EVERY terminal path (success and blocked),
@@ -37,12 +50,55 @@ from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 # marker on the spec-watch fallback; the `Status:` line within it is the only
 # field we parse structurally — everything else is free prose.
 AUTO_RUN_HEADING_RE = re.compile(r"^##\s+Auto Run Result\s*$", re.MULTILINE)
-# `Status:` possibly bulleted ("- Status: blocked") / bolded ("**Status:** done"),
-# case-insensitive on the label, value is the first token on the line.
+# Python's whitespace class includes several characters that ``str.splitlines``
+# treats as line boundaries. Structural gaps must exclude every such separator
+# while retaining horizontal Unicode whitespace such as tab and NBSP.
+_HORIZONTAL_WS_RE = r"[^\S\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]"
+# `Status:` possibly bulleted ("- Status: blocked") / bolded
+# ("**Status:** **done**"), case-insensitive on the label, value is the first
+# alphabetic-or-hyphen token on the line. Every structural gap is horizontal
+# whitespace: a bare label cannot borrow its value from the following line.
 STATUS_LINE_RE = re.compile(
-    r"^\s*(?:[-*]\s*)?(?:\*\*)?status(?:\*\*)?\s*:\s*(?:\*\*)?\s*([A-Za-z-]+)",
+    rf"^{_HORIZONTAL_WS_RE}*(?:[-*]{_HORIZONTAL_WS_RE}*)?"
+    rf"(?:\*\*)?status(?:\*\*)?{_HORIZONTAL_WS_RE}*:"
+    rf"(?:\*\*)?{_HORIZONTAL_WS_RE}*(?:\*\*)?{_HORIZONTAL_WS_RE}*([A-Za-z-]+)",
     re.IGNORECASE | re.MULTILINE,
 )
+# The bundle leg's artifact-only assertion (DW-273): an `Artifact only: true` /
+# `artifact_only: true` / `Artifact-only: true` line (a run of AT LEAST ONE
+# space/underscore/hyphen between the words — `[ _-]+`, never `*`, so the fused
+# `Artifactonly: true` is no spelling of the contract and cannot relax the
+# bundle gate (#794 review) — case-insensitive) inside the SAME marker. It takes
+# the same bulleted/bolded label and value shapes `STATUS_LINE_RE` tolerates
+# (`**Artifact only:** **true**`, `- **Artifact only: true**`): every `**` is
+# optional and the closing one is consumed before the end-of-line anchor. Only
+# the literal value `true` ALONE on the line asserts — anchored to end of line so
+# prose such as
+# `Artifact only: true for the ledger, false for code` is no assertion; neither is
+# `false`, a bare label, or any other token. Every gap is `_HORIZONTAL_WS_RE`
+# (space, tab, NBSP... — never CR/LF nor the vertical separators `splitlines`
+# honours), so as with `Status:`, the label and its value must share one line.
+# `Artifact only:` followed by `true` on the next line, or `Artifact only` with
+# `: true` on the next line, is a bare label and a stray token, not an
+# assertion — and so is `Artifact only:\x0btrue`, which `[^\S\r\n]` admitted
+# while MULTILINE `$` anchors on LF alone (#795 review). Matches are read
+# through `_artifact_only_asserted`, which skips a match inside a fenced block
+# (a pasted example within the marker).
+ARTIFACT_ONLY_LINE_RE = re.compile(
+    rf"^{_HORIZONTAL_WS_RE}*(?:[-*]{_HORIZONTAL_WS_RE}*)?"
+    rf"(?:\*\*)?artifact[ _-]+only(?:\*\*)?{_HORIZONTAL_WS_RE}*:"
+    rf"(?:\*\*)?{_HORIZONTAL_WS_RE}*(?:\*\*)?{_HORIZONTAL_WS_RE}*true"
+    rf"(?:\*\*)?{_HORIZONTAL_WS_RE}*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _artifact_only_asserted(detail: str) -> bool:
+    """True when the marker body carries a genuine (non-fenced) artifact-only line.
+    A match inside a fenced block is documentation, not an assertion — the same
+    reading `_section_headings` gives a fenced heading."""
+    return any(not _fenced(detail, m.start()) for m in ARTIFACT_ONLY_LINE_RE.finditer(detail))
+
 
 # Terminal frontmatter statuses the skill can leave behind.
 DONE = "done"
@@ -87,7 +143,7 @@ _FRONTMATTER_RE = re.compile(r"\A(---\r?\n)(.*?\r?\n)(---[ \t]*\r?\n)", re.DOTAL
 # A frontmatter `status:` line, preserving indent, the `: ` gap, optional quotes,
 # and any trailing inline comment. Only the value token is rewritten. The value is
 # `*` (not `+`) so a present-but-empty status (`status:` / `status: ""`) is matched
-# and filled — a bmad-dev-auto template can leave it blank.
+# and filled — a bmad-build-auto template can leave it blank.
 _FM_STATUS_RE = re.compile(
     r"^(?P<pre>[ \t]*status[ \t]*:[ \t]*)(?P<q>['\"]?)(?P<val>[A-Za-z-]*)(?P=q)(?P<rest>.*)$",
     re.MULTILINE,
@@ -111,37 +167,6 @@ class AutoRunResult:
     present: bool
     status: str  # lowercased Status: value, or "" when absent/unparsed
     detail: str  # the prose body after the heading, trimmed (human-readable)
-
-
-# A fence line: up to three spaces of indent, then a maximal run of >= 3 backticks
-# or tildes (its char AND length both matter per CommonMark), then the rest of the
-# line — an info string on an opener; on a close, only whitespace is allowed.
-_FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})([^\n]*)$", re.MULTILINE)
-
-
-def _fenced(text: str, offset: int) -> bool:
-    """True when `offset` falls inside a ``` / ~~~ fenced code block.
-
-    A fence opens on a line of three-or-more backticks or tildes (indentable up
-    to three spaces; a tab would make an indented code block instead). Per
-    CommonMark it closes only on a later line using the SAME character, at least
-    as long as the opener, with no trailing non-whitespace — so a shorter run, a
-    different fence char, or an info-bearing line inside the block is content,
-    not a close. Tracking the open fence's char+length (not a bare line-parity
-    count) is what stops a nested-or-mismatched inner fence from flipping state
-    early and exposing a quoted `## Auto Run Result` as a real heading — a
-    destructive misread on the strip path."""
-    open_marker: str | None = None
-    for m in _FENCE_LINE_RE.finditer(text):
-        if m.start() >= offset:
-            break
-        marker, rest = m.group(1), m.group(2)
-        if open_marker is None:
-            open_marker = marker  # opening fence — an info string is allowed
-        elif marker[0] == open_marker[0] and len(marker) >= len(open_marker) and not rest.strip():
-            open_marker = None  # valid closing fence
-        # else: a shorter / mismatched / info-bearing fence line — literal content
-    return open_marker is not None
 
 
 def _section_headings(
@@ -184,9 +209,30 @@ def parse_auto_run_result(text: str) -> AutoRunResult:
         return AutoRunResult(present=False, status="", detail="")
     last = matches[-1]
     body = text[last.end() : _next_heading_start(text, last.end())]
-    status_m = STATUS_LINE_RE.search(body)
+    status_m = next(
+        (match for match in STATUS_LINE_RE.finditer(body) if not _fenced(body, match.start())),
+        None,
+    )
     status = status_m.group(1).strip().lower() if status_m else ""
     return AutoRunResult(present=True, status=status, detail=body.strip())
+
+
+def auto_run_result_fingerprint(text: str) -> tuple[int, str]:
+    """Identity of the current last real Auto Run Result marker.
+
+    The count distinguishes a newly appended marker even when its text repeats
+    the previous result verbatim; the digest distinguishes an in-place rewrite.
+    Fenced examples remain invisible through the shared heading reader.
+    """
+    matches = _section_headings(text)
+    if not matches:
+        return (0, "")
+    last = matches[-1]
+    section = text[last.start() : _next_heading_start(text, last.end())]
+    return (
+        len(matches),
+        hashlib.sha256(section.encode("utf-8"), usedforsecurity=False).hexdigest(),
+    )
 
 
 # ------------------------------------------------ deferred review findings
@@ -228,15 +274,23 @@ def harvest_fingerprint(*parts: str) -> str:
 
 
 def _flatten(value: Any, limit: int) -> str:
-    """Collapse a YAML scalar to one clamped line.
+    """Collapse a YAML scalar to one line clamped at a word boundary.
 
-    Strip after clamping because the cut can land on a join space. Keeping that
-    cleanup here makes the value written to the ledger and the value used in its
-    fingerprint identical.
+    A cut landing mid-word backs up to the last join space so the ledger never
+    records a truncated half-token; a cut ending exactly at a word end keeps the
+    full cut, and a single unbroken token longer than the limit keeps the hard
+    clamp. Fingerprints (``harvest_fingerprint(summary, location)``) therefore
+    drift only for over-limit multi-word values -- accepted.
     """
     if value is None:
         return ""
-    return " ".join(str(value).split())[:limit].strip()
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    if text[limit] == " ":
+        return text[:limit]
+    head, sep, _ = text[:limit].rpartition(" ")
+    return head if sep else text[:limit]
 
 
 def _is_yaml_scalar(value: Any) -> bool:
@@ -356,6 +410,7 @@ def synthesize_result(
     story_key: str | None,
     dw_ids: list[str] | None = None,
     plan_halt: bool = False,
+    park_marker_session_authored: bool = False,
 ) -> SynthResult:
     """Build the legacy result dict from the generic skill's on-disk spec.
 
@@ -380,6 +435,15 @@ def synthesize_result(
     whose prose ``## Auto Run Result`` says ``done`` while the frontmatter lags,
     so a plan-halt ``ready-for-dev`` (no such prose) is never reconciled to
     ``done`` and this leg's success outcome is not clobbered.
+
+    ``park_marker_session_authored`` is the adapter's proof that the LAST genuine
+    marker was written by the session being synthesized (``GenericDevAdapter``
+    fingerprints the marker at launch and compares at Stop). It serves two mints,
+    deliberately under one name: ``park_asserted`` (a park's proof-of-work
+    waiver, #676) and ``artifact_only`` (a bundle's artifact-only receipt,
+    DW-273). Both are attempt-ownership claims about the same marker, so one
+    authorship proof is the right number — a second flag could only disagree
+    with the first.
     """
     try:
         fm = read_frontmatter(spec_path)
@@ -393,7 +457,7 @@ def synthesize_result(
         # merely had open for writing.
         return SynthResult(result_json=None, status_consistent=True)
     # Through `status_of`, never a local `str(...)`: it normalizes a YAML-null
-    # `status:` (the blank line a bmad-dev-auto template legitimately leaves — see
+    # `status:` (the blank line a bmad-build-auto template legitimately leaves — see
     # `_FM_STATUS_RE`) to `""` alongside the missing key. A local stringification
     # made that `"none"`, which is truthy, so the prose fallback below never fired
     # and a blank-frontmatter/prose-`done` spec synthesized `status="none"` with
@@ -416,13 +480,21 @@ def synthesize_result(
     status = fm_status or arr.status
     consistent = (not arr.present) or (not arr.status) or (arr.status == status)
 
-    # The skill names the baseline `baseline_revision`; verify reads `baseline_commit`.
-    baseline = str(fm.get("baseline_commit", fm.get("baseline_revision", ""))).strip()
+    # One reader, shared with verify's baseline-match gate, so the two halves of
+    # the contract cannot disagree about which key wins (#716).
+    baseline = auto_dev_baseline_of(fm)
 
     escalations: list[dict[str, Any]] = []
     if status == BLOCKED or arr.status == BLOCKED:
         detail = arr.detail or "generic dev session reported a blocked outcome"
-        escalations.append({"type": "blocked", "severity": "CRITICAL", "detail": detail[:2000]})
+        escalations.append(
+            {
+                "type": "blocked",
+                "severity": "CRITICAL",
+                "detail": detail,
+                "spec_file": str(spec_path),
+            }
+        )
 
     result: dict[str, Any] = {
         "workflow": DEV_WORKFLOW,
@@ -431,10 +503,31 @@ def synthesize_result(
         "baseline_commit": baseline,
         "status": status,
         "escalations": escalations,
+        # Attempt ownership comes only from the current session's terminal marker.
+        # Frontmatter-only fallback is deliberately insufficient, and a marker
+        # written later by the orchestrator's missing-marker repair cannot
+        # retroactively authorize the session that omitted it.
+        "park_asserted": (
+            arr.present
+            and arr.status == AWAITING_OPERATOR
+            and ORCHESTRATOR_SYNTH_NOTE not in arr.detail
+            and park_marker_session_authored
+        ),
+        # The bundle leg's artifact-only assertion (DW-273), minted by the same
+        # four-part shape and from the same authorship proof: the current
+        # session's genuine marker carries the line, and nothing else — not
+        # frontmatter, not a repaired marker — can assert it. `verify_dev_bundle`
+        # is the only consumer; the sprint and stories gates never read it.
+        "artifact_only": (
+            arr.present
+            and _artifact_only_asserted(arr.detail)
+            and ORCHESTRATOR_SYNTH_NOTE not in arr.detail
+            and park_marker_session_authored
+        ),
     }
     if dw_ids:
         result["dw_ids"] = list(dw_ids)
-    # bmad-dev-auto (BMAD-METHOD PR #2505) self-reviews inline and, on a `done`
+    # bmad-build-auto (BMAD-METHOD PR #2505) self-reviews inline and, on a `done`
     # exit, sets `followup_review_recommended: true` when its review-driven
     # changes warrant an independent second-opinion pass. The skill never sets it
     # on a blocked exit, so only carry it through on `done`.
@@ -463,12 +556,14 @@ def find_result_artifact(impl_artifacts: Path, *, since_ns: int) -> Path | None:
     writes no result.json, so on the session's Stop event we locate the spec it
     produced. The common case is a `spec-*.md` carrying a terminal `## Auto Run
     Result` section (appended by the skill's HALT on success AND blocked, when a
-    spec exists). The skill's no-spec fallback — `bmad-dev-auto-result-*.md`,
-    written when intent was too unclear to even create a spec — carries a
-    terminal frontmatter `status:` but NO `## Auto Run Result` heading, so it is
-    matched by filename instead. Scans `impl_artifacts` for the most-recently-
-    modified qualifying markdown modified at/after `since_ns` (the session launch
-    floor, so a stale prior artifact can't be mistaken for this run's output).
+    spec exists). The skill's no-spec fallback — `bmad-build-auto-result-*.md`,
+    or `bmad-dev-auto-result-*.md` pre-rename, written when intent was too
+    unclear to even create a spec — carries a terminal frontmatter `status:` but
+    NO `## Auto Run Result` heading, so it is matched by filename instead. Both
+    spellings match: see `FALLBACK_RESULT_PREFIXES`. Scans `impl_artifacts` for
+    the most-recently-modified qualifying markdown modified at/after `since_ns`
+    (the session launch floor, so a stale prior artifact can't be mistaken for
+    this run's output).
     Returns None when nothing qualifies.
     """
     if not impl_artifacts.is_dir():
@@ -579,27 +674,48 @@ def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
     return status_of(fm) in (DONE, BLOCKED, AWAITING_OPERATOR)
 
 
-def _atomic_write_spec(spec_path: Path, text: str) -> None:
+def _atomic_write_spec(spec_path: Path, text: str, *, confine_root: Path) -> None:
     """Rewrite ``spec_path`` with ``text`` via a same-directory temp file + atomic
     rename, so an interrupted / short / disk-full write can never truncate the
     canonical spec — a failed repair must lose no work (fault injection on the old
     truncating ``write_text`` reduced a 46-byte spec to 12). Bytes are written
-    verbatim (``write_bytes``, not ``write_text``): every caller here has already
-    captured and preserved the file's own line endings, and ``write_text``'s
+    verbatim (``atomic_write_bytes``, not the text sibling): every caller here has
+    already captured and preserved the file's own line endings, and text mode's
     ``newline=None`` default would re-translate ``\\n``→``\\r\\n`` on Windows. The
-    ``.tmp`` sibling ends in ``.tmp`` (not ``.md``), so the ``*.md`` artifact scans
-    never see it. On any failure the temp file is removed and the error re-raised —
-    the callers impose best-effort, the writer never swallows."""
-    tmp = spec_path.with_suffix(spec_path.suffix + ".tmp")
-    try:
-        tmp.write_bytes(text.encode("utf-8"))
-        atomic_replace(tmp, spec_path)
-    except BaseException:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
+    temp ends in ``.tmp`` (not ``.md``), so the ``*.md`` artifact scans never see
+    it. On any failure the temp file is removed and the error re-raised — the
+    callers impose best-effort, the writer never swallows.
+
+    Now a thin name over `platform_util`'s atomic byte writers (#379) rather than
+    a hand-rolled temp: same shape, plus an fsync before the replace and a temp
+    name unique per write instead of a fixed ``<spec>.md.tmp`` two concurrent
+    writers would collide on.
+
+    Which writer is the spec-writer chokepoint rule (#593), stated once in
+    `frontmatter.set_frontmatter_status` and implemented identically here and in
+    `verify.set_frontmatter_field`: a spec under ``confine_root`` is written
+    through the anchored, component-walked helper; a spec in an artifacts folder
+    configured outside the checkout keeps the plain ``follow_symlinks=False``
+    write. That no-follow keeps the name-replacing semantics the `atomic_replace`
+    here always had — the spec path comes from a session-driven scan, so writing
+    THROUGH a planted link would hand that session a host-side write wherever it
+    chose — and the confined arm needs no flag, because it never follows
+    anything. ``require_writable_target=True`` on both arms restores the
+    `PermissionError` an operator's read-only spec used to earn (#597).
+
+    ``confine_root`` is a REQUIRED keyword here and on all four public writers
+    that reach this one, so a caller that has not decided which checkout the spec
+    belongs to is a pyright error rather than an unconfined write. The two
+    `frontmatter`-side writers of these same files land on the identical pair of
+    calls (#379); this wrapper stays for its callers' ``str``-in signature and
+    this docstring."""
+    payload = text.encode("utf-8")
+    if spec_path.is_relative_to(confine_root):
+        atomic_write_bytes_confined(
+            spec_path, payload, confine_root=confine_root, require_writable_target=True
+        )
+    else:
+        atomic_write_bytes(spec_path, payload, follow_symlinks=False, require_writable_target=True)
 
 
 def _render_status_line(line: str, m: re.Match[str], value: str) -> str:
@@ -626,10 +742,10 @@ def _render_status_line(line: str, m: re.Match[str], value: str) -> str:
     return f"{pre}{q}{value}{q}{rest}" + ("\n" if line.endswith("\n") else "")
 
 
-def reset_spec_status(spec_path: Path, new_status: str) -> bool:
+def reset_spec_status(spec_path: Path, new_status: str, *, confine_root: Path) -> bool:
     """Rewrite the frontmatter ``status:`` value of a spec in place.
 
-    Used by the generic-skill repair path: bmad-dev-auto self-finalizes a spec to
+    Used by the generic-skill repair path: bmad-build-auto self-finalizes a spec to
     ``done``/``in-review``, and its step-01 routes such a spec to "ingest as
     context, do not resume" — so to repair in place the orchestrator must re-open
     the spec by flipping its status back to ``in-progress``. A minimal line edit
@@ -682,11 +798,13 @@ def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     )
     if new_body is None:
         return False
-    _atomic_write_spec(spec_path, head + new_body + tail + text[fm.end() :])
+    _atomic_write_spec(
+        spec_path, head + new_body + tail + text[fm.end() :], confine_root=confine_root
+    )
     return True
 
 
-def strip_auto_run_result(spec_path: Path) -> bool:
+def strip_auto_run_result(spec_path: Path, *, confine_root: Path) -> bool:
     """Remove every ``## Auto Run Result`` section from a spec, in place.
 
     Companion to `reset_spec_status` on the re-drive path: re-opening a spec by
@@ -725,7 +843,42 @@ def strip_auto_run_result(spec_path: Path) -> bool:
         kept.append(text[pos : m.start()])
         pos = _next_heading_start(text, m.end())
     kept.append(text[pos:])
-    _atomic_write_spec(spec_path, "".join(kept))
+    _atomic_write_spec(spec_path, "".join(kept), confine_root=confine_root)
+    return True
+
+
+def reset_spec_for_replan(spec_path: Path, *, confine_root: Path) -> bool:
+    """Reset a spec to ``draft`` and strip its stale result transactionally.
+
+    The TUI exposes those two writes as one operator action. Capture the exact
+    preimage before the status write and restore it through the same confined
+    atomic writer if either stage faults after changing (or removing) the file,
+    so a failed replan never publishes only its first half. A reset that makes no
+    change is a refusal, not permission to strip the result independently.
+
+    Rollback deliberately catches ``BaseException`` so an interrupt between the
+    two writes cannot leave a partial replan. A fault that leaves the preimage
+    untouched does not rewrite it. If the restore itself fails, that failure
+    escapes; otherwise the original stage failure is re-raised.
+    """
+    original = spec_path.read_bytes()
+    try:
+        reset = reset_spec_status(spec_path, "draft", confine_root=confine_root)
+        if not reset:
+            if not spec_path.is_file():
+                raise FileNotFoundError(f"replan spec vanished during status reset: {spec_path}")
+            return False
+        stripped = strip_auto_run_result(spec_path, confine_root=confine_root)
+        if not stripped and not spec_path.is_file():
+            raise FileNotFoundError(f"replan spec vanished during result strip: {spec_path}")
+    except BaseException:
+        try:
+            unchanged = spec_path.read_bytes() == original
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            _atomic_write_spec(spec_path, original.decode("utf-8"), confine_root=confine_root)
+        raise
     return True
 
 
@@ -761,7 +914,9 @@ OPERATOR_CONFIRM_NOTE = (
 )
 
 
-def append_auto_run_result(spec_path: Path, status: str, *, detail: str = "") -> bool:
+def append_auto_run_result(
+    spec_path: Path, status: str, *, confine_root: Path, detail: str = ""
+) -> bool:
     """Append a synthesized ``## Auto Run Result`` marker section — the inverse of
     `strip_auto_run_result`.
 
@@ -819,11 +974,13 @@ def append_auto_run_result(spec_path: Path, status: str, *, detail: str = "") ->
     section = f"## Auto Run Result{nl}{nl}Status: {status}{nl}{nl}{ORCHESTRATOR_SYNTH_NOTE}{nl}"
     if detail:
         section += f"{nl}{detail.strip()}{nl}"
-    _atomic_write_spec(spec_path, text + section)
+    _atomic_write_spec(spec_path, text + section, confine_root=confine_root)
     return True
 
 
-def append_operator_confirmation(spec_path: Path, actions: Sequence[str], *, date: str) -> bool:
+def append_operator_confirmation(
+    spec_path: Path, actions: Sequence[str], *, date: str, confine_root: Path
+) -> bool:
     """Append the ``## Operator Confirmation`` audit section `bmad-loop confirm`
     writes when a human signs off a parked story (#335).
 
@@ -869,7 +1026,7 @@ def append_operator_confirmation(spec_path: Path, actions: Sequence[str], *, dat
         f"Confirmed {date}: the external actions this story owed were carried out.{nl}{nl}"
         f"{items}{nl}{OPERATOR_CONFIRM_NOTE}{nl}"
     )
-    _atomic_write_spec(spec_path, text + section)
+    _atomic_write_spec(spec_path, text + section, confine_root=confine_root)
     return True
 
 

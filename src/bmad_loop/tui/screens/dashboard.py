@@ -39,7 +39,7 @@ from ... import policy as policy_mod
 from ... import sprintstatus, stories
 from ...model import RunState, StoryTask
 from ...runs import RUNS_DIR
-from .. import data
+from .. import data, launch
 from ..widgets import (
     DeferredEntryOption,
     JournalEntryOption,
@@ -130,7 +130,7 @@ class _Snapshot:
     has_run: bool = False
     run_id: str = ""
     status: str = data.UNKNOWN
-    stopping: bool = False  # selected run has a graceful stop pending (RUNNING only)
+    stopping: bool = False  # selected run has a stop request pending, either mode (RUNNING only)
     agent: data.ActiveAgent | None = None  # agent driving the selected run, live only
     state: RunState | None = None
     stories_mode: bool = False  # selected run is stories mode (source == "stories")
@@ -647,7 +647,7 @@ class DashboardScreen(Screen[None]):
             doc.set("tui", "runs_height", self.runs_height if self._left_frozen else None)
             doc.set("tui", "deferred_height", self.deferred_height if self._left_frozen else None)
             doc.set("tui", "tasks_height", self.tasks_height if self._detail_frozen else None)
-            doc.save(path)
+            doc.save(path, confine_root=self.project)
         except (OSError, tomlkit.exceptions.TOMLKitError) as e:
             self.notify(f"could not save layout: {e}", severity="warning")
 
@@ -730,7 +730,8 @@ class DashboardScreen(Screen[None]):
         if self._pending_run is not None and time.monotonic() > self._pending_deadline:
             self._pending_run = None
             self.notify(
-                "launch may have failed — attach to control session bmad-loop-ctl",
+                "launch may have failed — attach to control session "
+                f"{launch.ctl_session(self.project)}",
                 severity="error",
                 timeout=15,
             )
@@ -766,9 +767,10 @@ class DashboardScreen(Screen[None]):
                 snap.run_id = ctx.run_dir.name
                 snap.state = ctx.watcher.state()
                 snap.status = ctx.watcher.status()
-                # A graceful stop pending is the control file, meaningful while an
-                # engine is still around to consume it — RUNNING or UNKNOWN (an
-                # unverifiable pid still honors it, matching the CLI's != "dead").
+                # A pending stop is the control file's presence in either mode,
+                # meaningful while an engine is still around to consume it — RUNNING
+                # or UNKNOWN (an unverifiable pid still honors it, matching the CLI's
+                # != "dead").
                 snap.stopping = (
                     snap.status in (data.RUNNING, data.UNKNOWN) and ctx.watcher.stopping()
                 )

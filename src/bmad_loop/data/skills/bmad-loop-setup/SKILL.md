@@ -55,7 +55,7 @@ Skip this step entirely if `{project-root}/_bmad/` does not exist.
 
 ## Install the Orchestrator Tool
 
-The orchestrator is what spawns fresh coding CLI sessions through the selected adapter(s) to invoke `bmad-dev-auto` (the upstream dev primitive) for the dev pass — then re-invokes it on the `done` spec for the follow-up review pass — and `bmad-loop-sweep`, watches their hook signals, and verifies their artifacts. Installing it is therefore part of setup, not an optional extra.
+The orchestrator is what spawns fresh coding CLI sessions through the selected adapter(s) to invoke `bmad-build-auto` (the upstream dev primitive; `bmad-dev-auto` on pre-rename releases) for the dev pass — then re-invokes it on the `done` spec for the follow-up review pass — and `bmad-loop-sweep`, watches their hook signals, and verifies their artifacts. Installing it is therefore part of setup, not an optional extra.
 
 > **Why from Git?** The BMAD installer copies only skill directories into a project — it does not carry sibling files, so the tool can't ride along in the skill folder. The canonical source is <https://github.com/bmad-code-org/bmad-loop>. (The reverse holds, though: the tool's wheel **bundles** the skills, so `bmad-loop init` lays them down into a project's skill trees on its own — see step 3.)
 
@@ -123,7 +123,7 @@ Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), 
 
    `validate` exits non-zero when the project isn't fully ready (e.g. no `sprint-status.yaml` yet, or `bmad-sprint-planning` hasn't run). On a fresh project that is **expected** — report its findings to the user as a readiness checklist, not as an install failure.
 
-5. **Point the user at per-role adapter config.** `--cli` in step 3 only registers _hooks_ for each CLI. Which CLI actually **runs** each stage is governed by `{project-root}/.bmad-loop/policy.toml`, written from a template by `init`. The `[adapter] name` (default `claude`) applies to every stage; optional `[adapter.dev]`, `[adapter.review]`, and `[adapter.triage]` tables override individual stages (each takes its own `name` and `extra_args`). So a mixed setup — e.g. `claude` for dev, `codex` for review — needs both the hooks registered (step 3) **and** the role pointed at that CLI in `policy.toml`:
+5. **Point the user at per-role adapter config.** `--cli` in step 3 only registers _hooks_ for each CLI. Which CLI actually **runs** each stage is governed by `{project-root}/.bmad-loop/policy.toml`, written from a template by `init`. The `[adapter] name` (default `claude`) applies to every stage; optional `[adapter.dev]`, `[adapter.review]`, and `[adapter.triage]` tables override individual stages (each takes its own `name`, `model`, `effort` and `extra_args`). So a mixed setup — e.g. `claude` for dev, `codex` for review — needs both the hooks registered (step 3) **and** the role pointed at that CLI in `policy.toml`:
 
    ```toml
    [adapter]

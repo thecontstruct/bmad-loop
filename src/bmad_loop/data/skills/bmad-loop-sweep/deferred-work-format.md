@@ -1,13 +1,72 @@
 # Deferred Work Format
 
-Canonical entry format for `{implementation_artifacts}/deferred-work.md`. On the
-inner dev path the bmad-dev-auto session appends its own flat entries (review
-defers, multi-goal splits, token splits); the orchestrator owns the ledger and
-normalizes those flat entries into this canonical form on sweep, and a
-`bmad-loop sweep` migration rewrites freeform pre-DW-format content from older
-projects into it wholesale (see `./migration-mode.md`; the TUI displays such
-legacy items read-only until that happens). The file is append-only — never
-rewrite or delete existing entries.
+Canonical entry format for `{implementation_artifacts}/deferred-work.md`. The
+orchestrator owns this file, and two eras of dev session feed it:
+
+- **Current (BMAD-METHOD 6.10.1-next.33+).** The unattended primitive
+  `bmad-build-auto` writes nothing here: it records defer-triaged review findings
+  in its spec's frontmatter `deferred:` list, and after the session the
+  orchestrator harvests those into canonical entries below, carrying a
+  fingerprinted `origin:` that starts with `spec-deferred`, plus `source_spec:`.
+- **Legacy and attended.** Pre-rename primitives (`bmad-dev-auto`) and the
+  attended `bmad-build` append flat `- source_spec:` blocks directly into this
+  file; a `bmad-loop sweep --migrate` session normalizes them into the canonical
+  form, and rewrites freeform pre-DW-format content from older projects wholesale
+  (see `./migration-mode.md`; the TUI shows such legacy items read-only until
+  then).
+
+Either way this file stays the sweep's sole read surface. Multi-goal and token
+splits are a legacy/attended source only — the current unattended primitive does
+not split a multi-goal spec, it records a `multiple-goals` warning in the spec's
+`warnings:` and proceeds.
+
+The file is append-only — never rewrite or delete existing entries. The one
+sanctioned rewrite is operator-run archiving (below): closed entries move to
+`deferred-work-archive.md` — body preserved, with an `archived: <date>` marker
+appended after the status line — leaving a stub behind.
+
+## Archiving (`bmad-loop sweep --archive`)
+
+The operator may periodically move closed entries
+(`status: done <ISO date>`) to the sibling `deferred-work-archive.md`, leaving
+a stub in this file:
+
+```markdown
+### DW-7: Old closed item
+
+status: done 2026-05-25
+archived: 2026-08-24
+```
+
+Rules for sessions reading the ledger:
+
+- The stub's `status: done` line means what it always meant — the entry is
+  closed and not open work.
+- An `archived:` line marks content that lives in `deferred-work-archive.md`.
+  The full body (evidence, resolution, dates) is there, keyed by the same
+  DW- id — read the archive file for anything beyond the stub. An id may own
+  more than one block there once a reopened entry has been archived twice.
+  Narrow by the date on this line; when several blocks share it — one entry
+  closed, archived, reopened and archived again inside a single day — take the
+  **last** of them. The archive file is append-only, so for one id a later
+  block is a later closure.
+- An `archived-body:` line is that same pointer carried by an entry that was
+  archived and then **reopened** — the orchestrator writes it in place of the
+  `archived:` stamp, which would otherwise claim a live entry's body is
+  elsewhere. The entry is open work again and its `status:` says so, but the
+  body it carried before that close is still in the archive file — resolve
+  this line exactly as an `archived:` stamp above: narrow by its date, and take
+  the last of the blocks that share it. Reopening does not bring the body back, and a stub keeps neither `location:` nor `reason:`, so read that block
+  before triaging the entry. Never edit or drop the line.
+- The archive may be absent even when a stub or an `archived-body:` line
+  references it: only the ledger is seeded into an isolated unit worktree. That
+  is not an error — the fields the stub preserves are sufficient for dedupe.
+- Stubs keep load-bearing field lines (`gate:`, `origin:`/`source_spec:`,
+  resolution undo markers) — treat them exactly as if the entry were still
+  whole. Never edit or drop them when touching a stub.
+- When deduping against existing entries, a stub still counts: match on the
+  id and preserved `origin:`/`source_spec:` lines, and check the archive for
+  the full substance before appending.
 
 ## Before appending: dedupe check
 
@@ -50,9 +109,11 @@ an entry; entries written by hand do not need it.
 **Every field line is exactly one line, and so is the title.** The format is
 line-oriented: readers find each field by scanning for `<name>:` at the start of
 a line, and an entry ends at whichever comes first — the next `### DW-<n>`
-entry, any other `#` .. `######` heading, or a `- source_spec:` flat-append
-bullet. A value carrying a line break therefore does not wrap; it becomes new
-ledger content, and three things can follow:
+entry, any other `#` .. `######` heading (indented up to three spaces, and
+followed by a space, a tab or the end of the line; four spaces or a leading tab
+makes an indented code block, which ends nothing), or a `- source_spec:`
+flat-append bullet. A value carrying a line break therefore does not wrap; it
+becomes new ledger content, and three things can follow:
 
 - a break followed by `### ` mints an entry nobody filed;
 - a break before a `status:` line leaves one entry carrying two, so the ledger
@@ -71,6 +132,98 @@ for polish and nice-to-haves.
 
 When a deferred item is later completed, set its `status:` to `done` with the
 date (e.g. `status: done 2026-06-20`) — do not delete the entry.
+
+## Hard gates: `gate:`
+
+Some entries are not merely deferred — they **block** specific stories. An
+infrastructure leg nobody has wired yet is not a nice-to-have for the first story
+that consumes it; that story must not run at all until the entry lands. Say so
+with a `gate:` line naming the blocked story keys:
+
+```markdown
+### DW-1: wire the blob-storage credentials
+
+status: open
+gate: 3-2, 3-3
+```
+
+`gate:` is optional and most entries have none. Its value is a **comma-separated**
+list of story-key tokens; several `gate:` lines in one entry union, so an entry
+blocking three stories may list them on one line or on three. A token matches a
+story key when it **is** that key, or is its prefix at a key boundary — either a
+`-`, or the split-story suffix (one lowercase letter then `-`). So `3-2` gates the
+sprint key `3-2-invite-link-student-surface`, the stories-mode id `3-2`, and both
+halves of a split (`3-2a-…` / `3-2b-…`), but never `3-20-later-story`. The split
+arm matters because breakdown can split a story _after_ the gate was written, and
+a gate that quietly stops matching is worse than one that was never there. The
+prefix must end at a story **number** for the split arm to apply, so a word id
+like `auth` does not gate `authz-login`.
+
+Like `source_spec:`, a `gate:` line is never edited or dropped when an entry is
+otherwise touched: removing it un-gates the story silently, which is the exact
+failure this field exists to prevent. During a `bmad-loop sweep --migrate` that
+is enforced mechanically — the orchestrator refuses a rewrite that drops a token
+a pre-existing entry declared (#519); every other ledger edit is still held by
+this instruction alone.
+
+Until the entry lands, the gate is enforced twice. `bmad-loop validate` **fails**
+(`deferred.hard-gate`) for every story a token matches that the queue would
+actually dispatch — sprint-status stories at `backlog` / `ready-for-dev`, or
+manifest entries whose spec is not yet written or sits at `draft` /
+`ready-for-dev` / `in-progress` / `in-review`. A `blocked` manifest entry is not
+gated, nor is one the scheduler would stop on anyway (two specs matching one id,
+or a skeletal sentinel from a failed planning halt): the queue cannot reach that
+story, so a gate refusing it would report work held back that was never going to
+run. A `run` that never called `validate` **pauses** (`story-gate`) rather
+than dispatch a gated story. Two things clear it: closing the entry
+(`status: done <date>`), or removing the token because it no longer blocks that
+work. This is the one deferred-work check that gates rather than advises:
+everything else here is traceability that may be wrong, while this is work that
+must not start.
+
+**Only an explicit `done` retires a gate.** A status the format cannot read —
+`status: opne`, or an entry with no `status:` line — is not evidence the work
+landed, so the gate still holds. Write the status word exactly.
+
+A sweep is never gated by the ledger it is draining, whatever any entry's `gate:`
+says: closing the gating entry is what a sweep is for, so gating it would
+deadlock the gate against its own remedy.
+
+**Quoting the field is safe.** A `gate:` line inside a fenced code block is an
+example, not a declaration, so an entry that documents this convention gates
+nothing. This holds for a whole quoted entry too — heading, `status:` and `gate:`
+inside one fence, the shape shown above: the fenced heading starts no entry, and
+a quoted heading or bullet does not end the entry that quotes it, so a real
+`gate:` below the example keeps gating. One exception worth knowing when you
+write an entry: a fence you open and never close is not treated as a fence at
+all, because swallowing the rest of the entry could silently disable a real
+`gate:` line below it — and, at file scope, hide every entry after it. Close your
+fences.
+
+Four shapes declare a gate that nothing can enforce, and all four are reported as
+`deferred.hard-gate-unstructured` while the entry is unlanded:
+
+- a token nothing can match. It must look like a story key
+  (`[A-Za-z0-9][A-Za-z0-9._-]*`, no spaces) **and** be a shape a key can actually
+  take — alphanumeric segments joined by `-`, or a full sprint key. So a
+  space-separated `gate: 3-2 3-3` is one bad token rather than two good ones, and
+  `gate: 3.2` / `gate: 3_2` are rejected: no key spells its numbers that way.
+  Inside a sprint slug those characters are fine — `gate: 3-2-a_b` is a real gate;
+- a `gate:` line with nothing usable after the colon (`gate:`, `gate: ,`) — each
+  such line is reported, including one sitting beside a line that does name a
+  story, since the half that names nothing is the half you are wrong about;
+- a `gate:` that is not lowercase at the very start of its line — `Gate: 3-2`, or
+  a line that indents `gate: 3-2`. These are reported rather than read as
+  declarations: the field is a fixed spelling, and guessing at near-misses is how
+  a line that was never meant to gate ends up refusing a story;
+- prose declaring `HARD GATE:` — the convention that predates this field —
+  anywhere on a line of an entry that carries no `gate:` line. It is matched
+  mid-line because `reason:` prose is hard-wrapped, but never directly after a
+  quote character (`"`, `'`, `` ` ``, `«`, or a curly quote): an entry that merely
+  _cites_ the phrase stays silent, as does one that writes it without the colon.
+
+Each reads like a gate already in force while holding nothing back. Add or repair
+the `gate:` line to make it enforceable.
 
 ## Sweep annotations
 

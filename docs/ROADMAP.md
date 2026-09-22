@@ -3,13 +3,13 @@
 Forward-looking work for the orchestrator itself — design intent and rationale for features
 we've deliberately deferred, so the "why" survives between sessions.
 
-Status legend: **planned** (agreed, not started) · **exploring** (shape still open) · **blocked** (waiting on an external dependency).
+Status legend: **planned** (agreed, not started) · **in progress** (started; some pieces shipped, the headline goal not yet met) · **exploring** (shape still open) · **blocked** (waiting on an external dependency).
 
 ---
 
 ## Native Windows multiplexer backend
 
-**Status:** planned · **Foundation:** the full platform-seam series landed (multiplexer registry + `BaseTmuxBackend` + `ProcessHost` + hook interpreter + validate preflight, v0.7.6; availability-aware backend selection + `bmad-loop mux`, #87; out-of-tree backend discovery via `bmad_loop.mux_backends` entry points; original seam v0.7.0) · a first non-tmux-family, native-Windows-capable backend — **herdr** — ships end-to-end on POSIX as the external [bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr) (the win32 `agent.start` launch path is tracked there)
+**Status:** in progress — the platform seams and a native-Windows backend (`psmux`, held by a real-Windows live gate) have **shipped in-tree**; still open are the second tmux-family backend `tmux-windows` (#85), herdr's win32 launch path, and the open questions at the end of this section · **Foundation:** the full platform-seam series landed (multiplexer registry + `BaseTmuxBackend` + `ProcessHost` + hook interpreter + validate preflight, v0.7.6; availability-aware backend selection + `bmad-loop mux`, #87; out-of-tree backend discovery via `bmad_loop.mux_backends` entry points; original seam v0.7.0) · a first non-tmux-family, native-Windows-capable backend — **herdr** — ships end-to-end on POSIX as the external [bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr) (the win32 `agent.start` launch path is tracked there)
 
 The orchestrator no longer fuses tmux into the engine. All session/window/pane operations
 go through a single `TerminalMultiplexer` ABC (`src/bmad_loop/adapters/multiplexer.py`),
@@ -26,7 +26,7 @@ matching seam, `ProcessHost` (`src/bmad_loop/process_host.py`): `terminate` / `f
 `is_alive` / `identity` (a PID-reuse guard) plus `hook_interpreter()` (so hook registration
 never branches on platform), registered the same way (`register_process_host`,
 `BMAD_LOOP_PROCESS_HOST`); `WindowsProcessHost` already ships. `bmad-loop validate` runs a
-`_platform_preflight()` that reports the selected backend's readiness and names the process
+`_platform_preflight(project)` that reports the selected backend's readiness and names the process
 host — so a new OS surfaces in preflight by registering, not by a `validate` edit. The Unity
 plugin's `/proc`/`/tmp`/`cp -a`/symlink primitives degrade off Linux (with `psutil` from the
 optional `non-linux` extra) and its pid lifecycle now delegates to `ProcessHost`; everything is
@@ -40,8 +40,8 @@ psmux's tmux-compatible CLI through its own `psmux` binary, via pwsh) while
 `tmux-windows` (#85; drives the tmux-windows port) is still in flight — both subclass
 `BaseTmuxBackend` and both register for `win32`, which is why selection is
 availability-aware with discriminating `available()` probes (psmux →
-`which("psmux") and which("pwsh")` plus a version gate excluding releases ≤ 3.3.6, whose
-teardown can force-kill a recycled PID; tmux-windows →
+`which("psmux") and which("pwsh")` plus a version gate requiring psmux 3.3.8 or newer
+([why](multiplexer-backends.md#psmux-native-windows-experimental)); tmux-windows →
 `which("tmux") and not which("psmux")`) and an explicit `bmad-loop mux set <name>` tie-break.
 
 The third — **herdr** — has **shipped** end-to-end on POSIX (engine run path +
@@ -118,7 +118,7 @@ the same way deferred-work sweeps already run.
 
 **Approach (designed, not built):** a separate `bmad-loop retro` run type that mirrors the
 `SweepEngine` (`src/bmad_loop/sweep.py`) end-to-end — `RetroEngine`, a `retro` CLI command + resume
-branch, a retro-item intent fed to the `bmad-dev-auto` primitive, and `verify` helpers paralleling
+branch, a retro-item intent fed to the `bmad-build-auto` primitive, and `verify` helpers paralleling
 the bundle verifiers. Story runs stay untouched.
 
 **Why blocked:** retro-item _detail_ is scattered — some lives in the epic retro-doc Action-Items

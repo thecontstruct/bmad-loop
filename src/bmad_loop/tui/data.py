@@ -6,6 +6,11 @@ already writes atomically: state.json (os.replace), journal.jsonl
 textual — it is plain stdlib + core modules + pyte/rich, fully unit-testable,
 and the screens own the poll cadence.
 
+The run inventory itself (``discover_runs`` and its status/liveness closure) now
+lives in :mod:`bmad_loop.runs` — the core CLI's ``list`` needs it and must not
+drag pyte/rich in with it (#650). It is re-exported below, so ``data.<name>``
+stays the TUI-facing spelling.
+
 All readers are stat-gated: parse results are cached while the file's
 (mtime_ns, size, inode) is unchanged. Liveness is the exception — a dying engine
 changes no file, so the pid is re-checked on every call.
@@ -15,6 +20,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 import re
 from collections import deque
 from dataclasses import dataclass
@@ -27,171 +33,34 @@ from rich.style import Style
 from rich.text import Text
 
 from .. import bmadconfig, deferredwork, policy, sprintstatus, stories
-from ..adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
 from ..gates import ATTENTION_FILE
-from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state
+from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state, unreadable_line_entry
 from ..model import RunState
-from ..process_host import ProcessHostError
+from ..platform_util import resolve_or_lexical
+
+# Run-inventory names relocated to bmad_loop.runs (#650) and re-exported here so
+# tui.data stays the TUI-facing surface (`data.discover_runs`, `data.RUNNING`,
+# monkeypatched `data.liveness` in tests). Each pin is load-bearing: without it
+# ruff F401 autofix deletes the re-export and every `data.<name>` consumer breaks.
+from ..runs import CRASHED  # noqa: F401 — re-export
+from ..runs import FINISHED  # noqa: F401 — re-export
+from ..runs import INTERRUPTED  # noqa: F401 — re-export
+from ..runs import PAUSED  # noqa: F401 — re-export
+from ..runs import RUNNING  # noqa: F401 — re-export
+from ..runs import STOPPED  # noqa: F401 — re-export
+from ..runs import RunInfo  # noqa: F401 — re-export
+from ..runs import _header_cache  # noqa: F401 — re-export
+from ..runs import _session_liveness  # noqa: F401 — re-export
+from ..runs import discover_runs  # noqa: F401 — re-export
 from ..runs import (
     STOP_REQUEST_FILE,
+    UNKNOWN,
+    _classify,
+    _stat_sig,
+    _StatSig,
     list_run_dirs,
-    probe_liveness,
-    read_pid_identity,
-    session_name,
+    liveness,
 )
-
-# Run statuses shown by the dashboard.
-RUNNING = "running"
-PAUSED = "paused"
-FINISHED = "finished"
-STOPPED = "stopped"
-CRASHED = "crashed"
-INTERRUPTED = "interrupted"
-UNKNOWN = "unknown"
-
-_StatSig = tuple[int, int, int]
-
-
-def _stat_sig(path: Path) -> _StatSig | None:
-    try:
-        st = path.stat()
-    except OSError:
-        return None
-    # st_ino joins (mtime_ns, size): the engine rewrites state.json atomically
-    # (temp + os.replace), so every write lands on a fresh inode. That catches a
-    # same-size rewrite within one coarse mtime tick (e.g. WSL2 drvfs, or any fast
-    # rewrite on a low-resolution mtime) that (mtime_ns, size) alone would miss and
-    # serve stale from cache.
-    return (st.st_mtime_ns, st.st_size, st.st_ino)
-
-
-# ------------------------------------------------------------------ liveness
-
-
-def liveness(run_dir: Path) -> str:
-    """'alive' | 'dead' | 'unknown' for the engine that owns run_dir.
-
-    engine.pid is authoritative (written at run/sweep/resume start, never
-    deleted). Legacy runs without one fall back to the per-run agent session —
-    but that session only exists while an agent session runs, so its absence
-    proves nothing: 'unknown', never falsely dead. Pid checks are local-only;
-    runs on other hosts always come back 'unknown'.
-    """
-    pid, identity = read_pid_identity(run_dir)
-    if pid is None:
-        return _session_liveness(run_dir.name)
-    # Probe the pid we just read (shared body with runs.engine_liveness) rather than
-    # re-reading it, so a non-atomic pid rewrite can't split the two reads and flash
-    # a false 'dead' between "pid present" here and a re-read seeing an empty file.
-    try:
-        return probe_liveness(pid, identity)
-    except ProcessHostError:
-        # A misconfigured host (bad BMAD_LOOP_PROCESS_HOST) stays a hard error on
-        # CLI decision paths, but the display layer must degrade, not crash: the
-        # dashboard poll worker has no except and would take the whole app down.
-        return "unknown"
-
-
-def _session_liveness(run_id: str) -> str:
-    # An absent multiplexer / dead query proves nothing about a legacy run, so the
-    # only positive signal is a live session; everything else is 'unknown'.
-    mux = get_multiplexer()
-    if not mux_usable(mux):  # forced-aware, like every other observer gate
-        return "unknown"
-    try:
-        return "alive" if mux.has_session(session_name(run_id)) else "unknown"
-    except (OSError, MultiplexerError):
-        # The seam raises MultiplexerError (not OSError) on a backend failure; a
-        # dead query proves nothing about a legacy run, so degrade to 'unknown'
-        # rather than crashing the TUI poll.
-        return "unknown"
-
-
-def _classify(finished: bool, paused: bool, stopped: bool, crashed: bool, run_dir: Path) -> str:
-    if finished:
-        return FINISHED
-    if paused:
-        return PAUSED
-    # a deliberate stop leaves a dead pid — check it before liveness so it does
-    # not read as INTERRUPTED (a crash).
-    if stopped:
-        return STOPPED
-    # a recorded crash leaves a dead pid too — surface it as a distinct CRASHED
-    # before liveness, where it would otherwise read as a generic INTERRUPTED.
-    if crashed:
-        return CRASHED
-    live = liveness(run_dir)
-    if live == "alive":
-        return RUNNING
-    if live == "dead":
-        return INTERRUPTED
-    return UNKNOWN
-
-
-# ----------------------------------------------------------- run discovery
-
-
-@dataclass(frozen=True)
-class RunInfo:
-    run_id: str
-    run_dir: Path
-    run_type: str
-    started_at: str
-    status: str
-    paused_stage: str = ""  # RunState.paused_stage when PAUSED, else ""; drives the badge
-    stopping: bool = False  # a graceful stop is pending (control file present) while RUNNING
-
-
-# state.json path -> (stat sig, header fields tuple)
-_HeaderFields = tuple[str, str, bool, bool, bool, bool, str]
-_header_cache: dict[Path, tuple[_StatSig, _HeaderFields]] = {}
-
-
-def discover_runs(project: Path) -> list[RunInfo]:
-    """One RunInfo per run dir, oldest first; [] when the runs dir is missing.
-
-    Parses only the state.json header fields (cached on stat); a state file
-    that fails to parse yields status 'unknown' rather than crashing — it is
-    transient, the engine writes atomically.
-    """
-    out: list[RunInfo] = []
-    for run_dir in list_run_dirs(project):
-        state_path = run_dir / STATE_FILE
-        sig = _stat_sig(state_path)
-        cached = _header_cache.get(state_path)
-        if sig is not None and cached is not None and cached[0] == sig:
-            run_type, started_at, finished, paused, stopped, crashed, paused_stage = cached[1]
-        else:
-            try:
-                doc = json.loads(state_path.read_text(encoding="utf-8"))
-                run_type = str(doc.get("run_type", "story"))
-                started_at = str(doc.get("started_at", ""))
-                finished = bool(doc.get("finished", False))
-                paused = doc.get("paused_reason") is not None
-                stopped = bool(doc.get("stopped", False))
-                crashed = bool(doc.get("crashed", False))
-                paused_stage = str(doc.get("paused_stage") or "")
-            except (OSError, json.JSONDecodeError):
-                out.append(RunInfo(run_dir.name, run_dir, "?", "", UNKNOWN))
-                continue
-            if sig is not None:
-                _header_cache[state_path] = (
-                    sig,
-                    (run_type, started_at, finished, paused, stopped, crashed, paused_stage),
-                )
-        status = _classify(finished, paused, stopped, crashed, run_dir)
-        # paused_stage is advisory: only meaningful while the run is actually PAUSED
-        # (a resumed run keeps the last stage in state until it re-pauses/finishes).
-        stage = paused_stage if status == PAUSED else ""
-        # A pending graceful stop is the control file's presence, but only while an
-        # engine is still around to honor it — RUNNING or UNKNOWN (an unverifiable
-        # pid still consumes the file). The engine discards the file at the stop
-        # boundary, so a lingering file on an already-concluded run is not "stopping":
-        # STOPPED/FINISHED/CRASHED classify before liveness, so they never read UNKNOWN.
-        stopping = status in (RUNNING, UNKNOWN) and (run_dir / STOP_REQUEST_FILE).is_file()
-        out.append(RunInfo(run_dir.name, run_dir, run_type, started_at, status, stage, stopping))
-    return out
-
 
 # ------------------------------------------------------------- run watching
 
@@ -228,10 +97,13 @@ class RunWatcher:
         return _classify(state.finished, state.paused, state.stopped, state.crashed, self.run_dir)
 
     def stopping(self) -> bool:
-        """True when a graceful-stop request is pending for this run (its control
-        file is present) — a bare existence read for the run-header pending line,
-        mirroring runs.graceful_stop_requested. The caller gates on a RUNNING
-        status so a file lingering on a stopped run doesn't read as still-stopping."""
+        """True when a stop request of *either* mode is pending for this run (its
+        control file is present) — a bare existence read for the run-header pending
+        line, mirroring runs.graceful_stop_requested. Deliberately mode-blind: a run
+        with a hard request lodged (#319) is stopping too, and the request is on disk
+        only for the seconds it takes the engine to honor it. The caller gates on a
+        RUNNING status so a file lingering on a stopped run doesn't read as
+        still-stopping."""
         return (self.run_dir / STOP_REQUEST_FILE).is_file()
 
     def attention(self) -> str:
@@ -250,8 +122,19 @@ class JournalTail:
     """Incremental journal.jsonl reader.
 
     The byte offset only ever advances past complete lines, so a partially
-    flushed append is withheld until its newline lands. Truncation
-    (size < offset) resets to the start; unparseable lines are skipped.
+    flushed append is withheld until its newline lands — and ``Journal.append``'s
+    tail heal is what makes that newline arrive, on the fragment's own line,
+    rather than as the head of the next record. Truncation (size < offset) resets
+    to the start.
+
+    A COMPLETE line (one its newline has landed for) that will not parse is
+    reported as :func:`journal.unreadable_line_entry` in the position it occupied,
+    so a lost record is visible in the live pane rather than skipped. An
+    UNTERMINATED final line is not a marker here — it is still withheld, because
+    this reader cannot yet tell a torn record from one being written. That is the
+    one place this reader deliberately diverges from ``Journal.entries``, which
+    reads the file whole and so mints a marker for a trailing fragment
+    immediately: here the marker appears once the heal terminates the fragment.
     """
 
     def __init__(self, run_dir: Path):
@@ -283,6 +166,10 @@ class JournalTail:
             try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
+                # The shared minter, never a local dict: one shape for this reader and
+                # `Journal.entries`. Byte length off the RAW line, before the
+                # `errors="replace"` decode above, which can change the count.
+                entries.append(unreadable_line_entry(len(raw)))
                 continue
             if isinstance(entry, dict):
                 entries.append(entry)
@@ -688,17 +575,57 @@ def _open_session_start(journal_entries: list[dict[str, Any]]) -> dict[str, Any]
     session-start with no later matching session-end. None when every started
     session has ended (or none started). The task_id is tracked as a string so
     the session-end match is byte-identical to what active_task_id compared."""
+    entry, _ = _open_session_start_indexed(journal_entries)
+    return entry
+
+
+def _open_session_start_indexed(
+    journal_entries: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, int]:
+    """`_open_session_start` plus the entry's index in `journal_entries` (-1 when
+    None), so a caller can scan the entries that FOLLOW the open start — the
+    #680 idle events belong to a session only from its start onward, and a
+    `session-idle` left behind by an earlier session with a reused task id must
+    not be read as this one's."""
     open_entry: dict[str, Any] | None = None
+    open_index = -1
     active: str | None = None
-    for entry in journal_entries:
+    for index, entry in enumerate(journal_entries):
         kind = entry.get("kind")
         if kind == "session-start" and entry.get("task_id") is not None:
             active = str(entry["task_id"])
             open_entry = entry
+            open_index = index
         elif kind == "session-end" and str(entry.get("task_id")) == active:
             active = None
             open_entry = None
-    return open_entry
+            open_index = -1
+    return open_entry, open_index
+
+
+def _idle_since(journal_entries: list[dict[str, Any]], start: int, task_id: str) -> float | None:
+    """Wall timestamp the open session's current idle stretch began (#680), or
+    None when it is not idle: the `since_ts` of the last `session-idle` for
+    `task_id` after index `start`, unless a later `session-active` for the same
+    task closed it. Malformed or non-finite timestamps are ignored without
+    erasing an earlier valid stretch. Never raises on a malformed entry."""
+    since: float | None = None
+    for entry in journal_entries[start + 1 :]:
+        if str(entry.get("task_id")) != task_id:
+            continue
+        kind = entry.get("kind")
+        if kind == "session-idle":
+            raw = entry.get("since_ts")
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                try:
+                    stamp = float(raw)
+                except OverflowError:
+                    continue
+                if math.isfinite(stamp):
+                    since = stamp
+        elif kind == "session-active":
+            since = None
+    return since
 
 
 def active_task_id(run_dir: Path, journal_entries: list[dict[str, Any]]) -> str | None:
@@ -729,19 +656,28 @@ class ActiveAgent:
     role: str
     name: str
     model: str
+    # Wall timestamp the session's open idle stretch began (#680) — the `since_ts`
+    # of the last `session-idle` not closed by a later `session-active` — or None
+    # while the transcript is moving. The header renders `· idle <age>` from it
+    # only when set. APPENDED, so every positional construction stays valid.
+    idle_since: float | None = None
 
 
 def _story_key_from_task_id(task_id: str, role: str) -> str:
     """Recover the story key from a session task_id when the journal entry
     predates story-key stamping (#153 phase 1). The id is
-    ``safe_segment(f"{story_key}-{part}-{seq}")`` where ``part`` is the role, or
-    a workflow label for labeled plugin sessions — so peel the trailing
-    ``-{part}-{seq}``: drop the numeric seq, then the recorded role when it
-    matches (the common case), else one more ``-`` group (best-effort, since a
-    label is not recoverable from the entry)."""
+    ``safe_segment(f"{story_key}-{part}-{seq}{gen}")`` where ``part`` is the role, or
+    a workflow label for labeled plugin sessions, and ``gen`` is a ``-g<N>`` re-arm
+    generation suffix emitted only above zero (#705). Peel one optional terminal
+    generation suffix, then peel the trailing ``-{part}-{seq}``: drop the numeric
+    seq, then the recorded role when it matches (the common case), else one more
+    ``-`` group (best-effort, since a label is not recoverable from the entry).
+    Malformed shapes return the original task id unchanged."""
+    original = task_id
+    task_id = re.sub(r"-g[1-9][0-9]*\Z", "", task_id)
     head, sep, seq = task_id.rpartition("-")
     if not sep or not seq.isdigit():
-        return task_id  # not the expected shape — best we can do
+        return original  # not the expected shape — best we can do
     if role and head.endswith(f"-{role}"):
         return head[: -(len(role) + 1)]
     parent = head.rpartition("-")[0]
@@ -761,7 +697,7 @@ def active_agent(
     yields nothing trustworthy (no/empty snapshot) the agent is unknown -> None.
     Never raises on a malformed entry."""
     try:
-        entry = _open_session_start(journal_entries)
+        entry, start_index = _open_session_start_indexed(journal_entries)
         if entry is None:
             return None
         task_id = str(entry.get("task_id", ""))
@@ -777,7 +713,14 @@ def active_agent(
             name, model = resolved.name, resolved.model
         story_raw = entry.get("story_key")
         story_key = str(story_raw) if story_raw else _story_key_from_task_id(task_id, role)
-        return ActiveAgent(task_id=task_id, story_key=story_key, role=role, name=name, model=model)
+        return ActiveAgent(
+            task_id=task_id,
+            story_key=story_key,
+            role=role,
+            name=name,
+            model=model,
+            idle_since=_idle_since(journal_entries, start_index, task_id),
+        )
     except Exception:
         return None
 
@@ -811,7 +754,7 @@ _missed_cache: dict[Path, tuple[Any, list]] = {}
 def _project_paths(project: Path) -> bmadconfig.ProjectPaths | None:
     """BMAD artifact paths, stat-gated on config.yaml; None when the project
     is not initialized (or the config is unreadable)."""
-    project = project.resolve()
+    project = resolve_or_lexical(project)
     config_sig = _stat_sig(project / "_bmad" / "bmm" / "config.yaml")
     cached_paths = _paths_cache.get(project)
     if config_sig is not None and cached_paths is not None and cached_paths[0] == config_sig:
@@ -894,9 +837,13 @@ def deferred_entries(project: Path) -> list[DeferredItem] | None:
         return cached[1]
     items: list[DeferredItem] | None = None
     if sig is not None:
+        # OBSERVATION arm of the ledger-read contract (DW-146): the dashboard
+        # writes nothing and already degrades to `items = None` (rendered as
+        # unavailable). `UnicodeDecodeError` is a `ValueError`, so undecodable
+        # bytes escaped this arm and took the whole TUI refresh down instead.
         try:
             text = ledger_path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             items = None
         else:
             merged: list[tuple[int, DeferredItem]] = []
@@ -909,7 +856,7 @@ def deferred_entries(project: Path) -> list[DeferredItem] | None:
                             title=e.title,
                             status=e.status,
                             done=bool(e.status) and e.status.split()[0] == "done",
-                            severity=deferredwork.field_severity(e.body),
+                            severity=e.severity,
                             body=e.body,
                         ),
                     )
@@ -946,7 +893,7 @@ def pending_missed_decisions(project: Path) -> list:
     paths = _project_paths(project)
     if paths is None:
         return []
-    project = project.resolve()
+    project = paths.project
     sig = (
         _stat_sig(paths.deferred_work),
         _stat_sig(decisions.store_path(project)),

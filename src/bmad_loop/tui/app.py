@@ -1,8 +1,9 @@
 """`bmad-loop tui` application shell.
 
 Observer/launcher only: the TUI never runs engines in-process. Run control
-(r/s/e) launches detached bmad-loop processes in the bmad-loop-ctl tmux
-session via tui.launch. Dry runs are captured into a text modal; validate
+(r/s/e) launches detached bmad-loop processes in the control session via
+tui.launch (bmad-loop-ctl on tmux; a per-registry name on psmux, which the
+launch toasts print). Dry runs are captured into a text modal; validate
 renders its `--json` document into a findings modal (falling back to the text
 one), so the verdict is the document's `ok` rather than an exit code.
 The g binding opens the policy.toml settings editor.
@@ -15,7 +16,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from rich.text import Text
 from textual import work
@@ -23,9 +24,19 @@ from textual.app import App, SuspendNotSupported
 from textual.binding import Binding
 from tomlkit.exceptions import ParseError
 
-from .. import bmadconfig, decisions, devcontract, policy, resolve, runs, stories, verify
+from .. import (
+    bmadconfig,
+    decisions,
+    deferredwork,
+    devcontract,
+    policy,
+    resolve,
+    runs,
+    stories,
+    verify,
+)
 from ..adapters.multiplexer import MultiplexerError, mux_usable
-from ..journal import load_state
+from ..journal import load_state, state_lock
 from ..model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
@@ -33,8 +44,11 @@ from ..model import (
     PAUSE_SPEC_APPROVAL,
     PAUSE_STORY_CHECKPOINT,
     PAUSE_STORY_GATE,
+    Phase,
     RunState,
+    StoryTask,
 )
+from ..platform_util import LockUnavailableError, resolve_or_lexical
 from ..policy import POLICY_FILE
 from ..process_host import ProcessHostError
 from ..runs import RUNS_DIR, RearmError, StopRunError
@@ -45,6 +59,7 @@ from .screens.modals import (
     ConfirmResumeModal,
     DecisionModal,
     EscalationModal,
+    PauseReasonModal,
     SpecReviewModal,
     StartRunModal,
     StartSweepModal,
@@ -144,7 +159,7 @@ class BmadLoopApp(App[None]):
 
     def __init__(self, project: Path):
         super().__init__()
-        self.project = project.resolve()
+        self.project = resolve_or_lexical(project)
         self.sub_title = str(self.project)
         self._dashboard = DashboardScreen(self.project)
 
@@ -178,9 +193,32 @@ class BmadLoopApp(App[None]):
             return False, None
 
     def _guarded(self, go: Callable[[], None]) -> None:
-        """Pre-launch guard mirroring the CLI: the #414 isolation/repo_root conflict
-        refused first, then a clean worktree required, plus a confirm when another
-        engine is already live."""
+        """Pre-launch guard mirroring the CLI: the git support floor refused first,
+        then the #414 isolation/repo_root conflict, then a clean worktree required,
+        plus a confirm when another engine is already live."""
+        # First, in `cmd_run`'s own order, and for the reason that order exists: this
+        # is a fact about the HOST, so every other answer here would be advice about
+        # the wrong thing. Without it the operator got the generic "launch may have
+        # failed — attach to control session" toast the dashboard raises 10s later,
+        # which names neither git nor the floor and points at a pane to go read.
+        #
+        # `timeout_s` because this runs on the event loop — the same reason the
+        # commit-subject probe below carries one (`_commit_subject`) — and
+        # that bound is exactly why a `GitError` here FALLS THROUGH to launch instead
+        # of refusing: 5s is not the deadline the detached CLI applies, so a merely
+        # slow git would otherwise be refused by a toast on a host the CLI would run
+        # on. The guard never authorizes anything — `_reject_under_floor_git` fails
+        # closed on that same fault a moment later, in the process that matters —
+        # so declining to PRE-EMPT a refusal costs nothing but a slower message.
+        # Same disposition, same reasoning, as the unreadable-policy fall-through
+        # below: the guard cannot tell "fine" from "could not look".
+        try:
+            found = verify.git_below_floor(self.project, timeout_s=5)
+        except verify.GitError:
+            found = None
+        if found is not None:
+            self.notify(verify.under_floor_git_message(found), severity="error")
+            return
         # The detached CLI refuses this combination too, and it is the authority —
         # this only turns a pane that dies immediately into a toast. Ordered ahead of
         # the clean-tree gate for the same reason `cmd_run` orders it ahead: this one
@@ -288,7 +326,9 @@ class BmadLoopApp(App[None]):
             except launch.LaunchError as e:
                 self.notify(str(e), severity="error")
                 return
-            self.notify(f"run {run_id} launched (control session {launch.CTL_SESSION})")
+            self.notify(
+                f"run {run_id} launched (control session {launch.ctl_session(self.project)})"
+            )
             self._dashboard.expect_run(run_id)
 
         self._guarded(go)
@@ -321,7 +361,9 @@ class BmadLoopApp(App[None]):
             except launch.LaunchError as e:
                 self.notify(str(e), severity="error")
                 return
-            self.notify(f"sweep {run_id} launched (control session {launch.CTL_SESSION})")
+            self.notify(
+                f"sweep {run_id} launched (control session {launch.ctl_session(self.project)})"
+            )
             self._dashboard.expect_run(run_id)
 
         self._guarded(go)
@@ -357,26 +399,87 @@ class BmadLoopApp(App[None]):
         self.push_screen(DecisionModal(decision), on_choice)
 
     def _record_decision(self, decision: object, option: object) -> bool:
+        """Record one answered decision, answering whether `_walk_decisions` may
+        count it into `recorded N decision(s)`.
+
+        False means either a caught fault (which may follow a partial write) or
+        a ledger non-write. The toasts distinguish these by wording and severity;
+        the caller excludes both from its count and continues the walk.
+
+        An UNPUBLISHED operand is a third, orthogonal thing and does not touch the
+        boolean, in either of its lanes: a publish REFUSED before git ran
+        (DW-209/213), and a publish that reached git and FAILED (DW-225/226 — an
+        operand in no repository, a gitignored path). The operand list
+        `apply_pre_answer` commits is already gated on what that call wrote, so
+        either one means an answer that really landed on disk is missing from git
+        history — news worth a `warning` toast, but not a reason to stop counting
+        the answer as answered. Both arrive as the one `publish_note()` string,
+        which rides on the non-write toast where there is one and raises its own
+        otherwise.
+        """
         # decision/option cross the widget boundary as `object`; their runtime types
         # are the Decision/DecisionOption that apply_pre_answer and `.id` expect.
         try:
-            decisions.apply_pre_answer(
+            result = decisions.apply_pre_answer(
                 self.project,
                 decision,  # pyright: ignore[reportArgumentType]
                 option,  # pyright: ignore[reportArgumentType]
                 date=time.strftime("%Y-%m-%d"),
             )
-        except (OSError, bmadconfig.BmadConfigError, ValueError) as e:
-            # ValueError is the ledger writers' date precondition. It cannot fire
-            # from the strftime above, but an uncaught one here escapes into the
-            # Textual event loop and takes the dashboard down mid-walk — the
-            # per-decision notification is the right degradation for a modal the
-            # human is still stepping through.
+        except (
+            OSError,
+            bmadconfig.BmadConfigError,
+            ValueError,
+            runs.StateRootError,
+            deferredwork.LedgerReadError,
+        ) as e:
+            # ValueError is the ledger writers' date precondition; it cannot fire
+            # from the strftime above. LedgerReadError is the one that IS reachable
+            # from the ledger read itself (DW-146): the modal blocks on the human,
+            # so a ledger that goes undecodable while it is open raises out of
+            # `record_decision`'s locked `read_for_write`. That fault used to arrive
+            # as a `ValueError` (a `UnicodeDecodeError` is one) and was caught here;
+            # retyping it to a plain `Exception` — deliberately, so no `except
+            # OSError` can swallow it — dropped it out of this tuple, and naming it
+            # puts it back. StateRootError is reachable too: the ledger
+            # write now takes a cross-process lock whose sidecar lives under the
+            # state root (#286/#469), and an environment that names no usable root
+            # raises it — it is NOT an OSError, so the tuple has to say so.
+            # OSError covers the acquisition itself failing against a live holder.
+            # Every one of them uncaught here escapes into the Textual event loop
+            # and takes the dashboard down mid-walk — the per-decision
+            # notification is the right degradation for a modal the human is still
+            # stepping through, and the walk continues to the next decision.
             self.notify(
                 f"failed to record {decision.id}: {e}",  # pyright: ignore[reportAttributeAccessIssue]
                 severity="error",
             )
             return False
+        note = result.publish_note()
+        if not result.recorded:
+            # Report the persistence contract from apply_pre_answer, excluding
+            # the non-write from the walk's count. Path resolution can itself fail,
+            # so this toast does not distinguish missing files from retired ids.
+            saved = (
+                ""
+                if option.effect == "close"  # pyright: ignore[reportAttributeAccessIssue]
+                else "; your answer was saved to the pre-answer store"
+            )
+            unpublished = "" if note is None else f"; {note}"
+            self.notify(
+                f"{decision.id}: no decision line was written to the ledger{saved}{unpublished}",  # pyright: ignore[reportAttributeAccessIssue]
+                severity="warning",
+                markup=False,
+            )
+            return False
+        if note is not None:
+            # An otherwise-successful record whose written operand went
+            # unpublished. Its own toast, and the answer still counts.
+            self.notify(
+                f"{decision.id}: {note}",  # pyright: ignore[reportAttributeAccessIssue]
+                severity="warning",
+                markup=False,
+            )
         return True
 
     def action_resume_run(self) -> None:
@@ -415,7 +518,7 @@ class BmadLoopApp(App[None]):
             self.notify("no run selected", severity="warning")
             return
         session = runs.session_name(run_id)
-        win_id = launch.ctl_window_id(run_id)
+        win_id = launch.ctl_window_id(self.project, run_id)
         ok, agent_live = self._mux_guarded(lambda: launch.session_exists(session))
         if not ok:
             return
@@ -424,14 +527,14 @@ class BmadLoopApp(App[None]):
         # live agent session, falling back to the ctl window between sessions.
         if win_id is not None and (self._dashboard.decision_pending is not None or not agent_live):
             launch.select_ctl_window_id(win_id)
-            self._attach_to_target(launch.ctl_target(), return_window=win_id)
+            self._attach_to_target(launch.ctl_target(self.project), return_window=win_id)
             return
         elif agent_live:
             target = runs.session_target(run_id)
         else:
             self.notify(
                 f"nothing to attach: no live agent session ({session}) and no "
-                f"{launch.CTL_SESSION} window for this run (runs started outside "
+                f"{launch.ctl_session(self.project)} window for this run (runs started outside "
                 "the TUI have none)",
                 severity="warning",
                 timeout=10,
@@ -522,8 +625,18 @@ class BmadLoopApp(App[None]):
         if not win_id:
             self.notify("resolve launched but its window id was not captured", severity="error")
             return
+        if not launch.ctl_window_recorded(self.project, run_id, win_id):
+            # Not an error and not a reason to abort: this attach targets the id
+            # in hand, so the resolve session itself is reached correctly. What
+            # is lost is the record *later* verbs read, so `a`/`x` after this
+            # window is minted may answer an older one (#482's symptom).
+            self.notify(
+                "resolve launched but its window id was not recorded — "
+                "later attach/stop may target an older window for this run",
+                severity="warning",
+            )
         launch.select_ctl_window_id(win_id)
-        self._attach_to_target(launch.ctl_target(), return_window=win_id)
+        self._attach_to_target(launch.ctl_target(self.project), return_window=win_id)
 
     # -------------------------------------------------------- HITL pause review
 
@@ -565,12 +678,13 @@ class BmadLoopApp(App[None]):
         return run_id, run_dir, state
 
     def _review_plan_checkpoint(self, run_id: str, run_dir: Path, state: RunState) -> None:
-        spec_path, spec_text = self._paused_spec(state)
+        spec_path, spec_text, readable = self._paused_spec(state)
         modal = SpecReviewModal(
             title="plan checkpoint — review the planned spec before implementation",
             subtitle=self._story_subtitle(state),
             spec_path=spec_path,
             spec_text=spec_text,
+            unreadable=not readable,
             actions=[
                 ("approve", "Approve & resume", "primary"),
                 ("replan", "Request replan", "warning"),
@@ -584,26 +698,52 @@ class BmadLoopApp(App[None]):
                 if spec_path is None:
                     self.notify("no spec file to reset for replan", severity="error")
                     return
-                self._do_replan(run_id, spec_path)
+                self._do_replan(run_id, spec_path, self._paused_spec_root(state))
 
         self.push_screen(modal, done)
 
     def _review_gate(self, run_id: str, run_dir: Path, state: RunState) -> None:
-        labels = {
-            PAUSE_SPEC_APPROVAL: "spec-approval gate",
-            PAUSE_EPIC_BOUNDARY: "epic gate",
-            PAUSE_STORY_GATE: "story gate",
-        }
-        spec_path, spec_text = self._paused_spec(state)
+        label = widgets.pause_label(state.paused_stage or "")[0] or "gate"
+        spec_path, spec_text, readable = (
+            (None, "", True) if state.paused_stage == PAUSE_STORY_GATE else self._paused_spec(state)
+        )
+
+        def done(verb: str | None) -> None:
+            if verb == "resume":
+                self._do_resume(run_id)
+
+        if spec_path is None:
+            # Spec-less gates: story-gate fires before the story is registered in
+            # state.tasks (deliberate, so a resume re-picks and re-asks the ledger)
+            # and epic-boundary has no story key. The pause reason is the payload.
+            # A story gate is ALWAYS about the ledger, never a spec, so it takes
+            # this arm even when the task carries a spec_file (DW-243: a sweep
+            # bundle re-armed after a dev escalation keeps its spec_file, and its
+            # intent-regeneration refusal pauses at this stage) — the repair steer
+            # is in the reason, which the spec viewer would hide.
+            subtitle = (
+                self._story_subtitle(state)
+                if state.paused_story_key
+                else Text(f"run {run_id}", style="bold")
+            )
+            self.push_screen(
+                PauseReasonModal(
+                    title=f"{label} — pause reason",
+                    subtitle=subtitle,
+                    reason=state.paused_reason or "",
+                ),
+                done,
+            )
+            return
         modal = SpecReviewModal(
-            # paused_stage may be None; dict.get tolerates a None key (returns the default).
-            title=f"{labels.get(state.paused_stage, 'gate')} — review the finalized spec",  # pyright: ignore[reportArgumentType, reportCallIssue]
+            title=f"{label} — review the finalized spec",
             subtitle=self._story_subtitle(state),
             spec_path=spec_path,
             spec_text=spec_text,
+            unreadable=not readable,
             actions=[("resume", "Approve & resume", "primary")],
         )
-        self.push_screen(modal, lambda verb: self._do_resume(run_id) if verb == "resume" else None)
+        self.push_screen(modal, done)
 
     @staticmethod
     def _checkpoint_gate_line(review_cycle: int) -> str:
@@ -657,14 +797,24 @@ class BmadLoopApp(App[None]):
 
     def _review_escalation(self, run_id: str, run_dir: Path, state: RunState) -> None:
         story_key = state.paused_story_key or "?"
-        spec_path, spec_text = self._paused_spec(state)
+        task = state.tasks.get(story_key)
+        expected_generation = task.generation if task is not None else None
+        spec_path, spec_text, readable = self._paused_spec(state)
         title, description = self._story_context(state, story_key)
         restore_recorded = self._restore_recorded(run_dir, story_key)
         modal = EscalationModal(
             story_key=story_key,
             title=title,
             description=description,
+            # `_blocking_condition` reduces the read-failure body to "" like any
+            # other text without a halt block, so an unreadable spec would render
+            # "(no blocking condition recorded)" — indistinguishable from a spec that
+            # was read fine and simply halted without one. The verdict has to be
+            # carried in, and it also REFUSES both verbs: re-arm flips the spec's
+            # frontmatter, strips its result and re-stamps the baseline, which is not
+            # an action to take on evidence nobody could read.
             blocking=self._blocking_condition(spec_text),
+            unreadable=not readable,
             sentinel_kind=self._sentinel_kind(state, story_key),
             resolution_ready=resolve.resolution_path(run_dir, story_key).is_file(),
             engine_live=_engine_possibly_live(run_dir),
@@ -677,7 +827,13 @@ class BmadLoopApp(App[None]):
                     return
                 self._launch_resolve(run_id)
             elif verb == "rearm":
-                self._do_rearm(run_id, run_dir, story_key, restore_recorded=restore_recorded)
+                self._do_rearm(
+                    run_id,
+                    run_dir,
+                    story_key,
+                    restore_recorded=restore_recorded,
+                    expected_generation=expected_generation,
+                )
 
         self.push_screen(modal, done)
 
@@ -701,41 +857,91 @@ class BmadLoopApp(App[None]):
     def _do_resume(self, run_id: str) -> None:
         """Resume a paused run — the `bmad-loop resume` / `e` path, minus the
         confirm modal (the viewer was the confirmation). Guards tmux + a
-        possibly-live engine so an approve/continue can't double-drive."""
+        possibly-live engine so an approve/continue can't double-drive. No
+        control-alias gate here: this path mutates nothing before the launch,
+        and the launcher itself refuses at the mutation's chokepoint
+        (`launch.start_detached`) — the LaunchError lands in the except below."""
         if self._mux_missing():
             return
         run_dir = self.project / RUNS_DIR / run_id
         if _engine_possibly_live(run_dir):
             self.notify(f"run {run_id} may still be live — stop it first", severity="warning")
             return
+        # Surface the shared ledger refusal here before it disappears into the
+        # detached CLI window. The probe owns the wording and scope (DW-270).
+        refusal = runs.unreadable_sweep_ledger(self.project, run_dir)
+        if refusal is not None:
+            self.notify(refusal, severity="error", markup=False)
+            return
         try:
-            launch.resume_detached(self.project, run_id)
+            win_id = launch.resume_detached(self.project, run_id)
         except launch.LaunchError as e:
             self.notify(str(e), severity="error")
             return
-        self.notify(f"resume of {run_id} launched (control session {launch.CTL_SESSION})")
+        if not win_id:
+            # The resume itself is running; only the disambiguation record is
+            # lost, so `a`/`x` may target an older same-run_id window (#482's
+            # symptom). Warn instead of masking it behind the success toast.
+            # "not recorded", not "not captured": resume_detached reports the
+            # uncaptured id and the unwritten record through this one signal
+            # because they leave the operator in the same place.
+            self.notify(
+                "resume launched but its window id was not recorded — "
+                "attach/stop may target an older window for this run",
+                severity="warning",
+            )
+        self.notify(
+            f"resume of {run_id} launched (control session {launch.ctl_session(self.project)})"
+        )
 
-    def _do_replan(self, run_id: str, spec_path: Path) -> None:
+    def _do_replan(self, run_id: str, spec_path: Path, confine_root: Path) -> None:
         """Request-replan: reset the planned spec to draft + strip its Auto Run
         Result, then resume — the next dispatch re-enters step-02 planning. Uses
-        the same devcontract primitives the engine's repair path uses."""
+        the same devcontract primitives the engine's repair path uses.
+
+        `confine_root` arrives from the caller (`_paused_spec_root`) rather than being
+        `self.project` here: this method has no task in scope, and the root these two
+        writers validate against must be the SAME claim about which tree owns the spec
+        that `_paused_spec` anchored the path on. `runs.task_spec_root`'s docstring
+        carries the rationale — a `confine_root` that disagrees with the anchor is not
+        REFUSED, it silently drops both writes to the plain no-follow arm and loses the
+        confined arm's O_NOFOLLOW walk (#593) with no signal at all."""
         # Guard a possibly-live engine BEFORE mutating the spec — a draft-reset +
         # strip under a still-running session would race its writes (the rearm path
         # already checks liveness first; match it so replan can't corrupt a live
         # drive, and only then does _do_resume re-check before relaunching).
+        # The control-alias gate sits equally early: the child `bmad-loop resume`
+        # would refuse such a run anyway, and a spec rewritten ahead of that
+        # refusal is the mutate-then-refuse shape the CLI entry gates closed.
+        if self._blocked_by_control_alias(run_id):
+            return
         run_dir = self.project / RUNS_DIR / run_id
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
+        if not spec_path.is_file():
+            # `reset_spec_status` returns False for an ABSENT spec and for one with no
+            # frontmatter status alike, and the shared notice below blamed the
+            # frontmatter for both. Now that the path is re-anchored on the run's own
+            # tree, an absent spec is the signal that the ANCHORING is wrong, so it
+            # earns its own message naming the path actually consulted.
+            self.notify(f"replan: no spec at {spec_path} — not resuming", severity="error")
+            return
         try:
-            reset = devcontract.reset_spec_status(spec_path, "draft")
-            devcontract.strip_auto_run_result(spec_path)
-        except (OSError, verify.FrontmatterWriteError) as e:
+            reset = devcontract.reset_spec_for_replan(spec_path, confine_root=confine_root)
+        except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
             # FrontmatterWriteError is not an OSError: a spec whose `status:` is a
             # block scalar or a flow mapping reads fine and fails the WRITE. It
             # lands in the same notice as a permissions failure because it has the
             # same shape for the operator — the replan did not happen and the run
             # is not resumed — and because an uncaught raise inside a Textual
             # worker takes the dashboard down instead of saying so.
+            #
+            # UnicodeDecodeError is a ValueError, so neither sibling arm caught it and
+            # `reset_spec_status` decodes STRICTLY (`read_bytes().decode("utf-8")`).
+            # That raise became reachable when `_paused_spec` started degrading a
+            # non-UTF-8 spec in place instead of raising at render: the operator can now
+            # open the modal on one and press replan, which is precisely the event-loop
+            # crash the read-side fix exists to prevent.
             self.notify(f"replan failed: {e}", severity="error")
             return
         if not reset:
@@ -743,26 +949,239 @@ class BmadLoopApp(App[None]):
             # status, or is already draft), so the next dispatch would NOT re-enter
             # planning. Surface it instead of a misleading "reset" notice + resume.
             self.notify(
-                "replan: could not reset the plan to draft (no frontmatter status?) "
-                "— not resuming",
+                "replan: could not reset the plan to draft (no frontmatter status?) — not resuming",
                 severity="error",
             )
             return
         self.notify("plan reset to draft — the next dispatch re-plans")
         self._do_resume(run_id)
 
+    def _echo_rearm_events(self, run_dir: Path, before: list[dict[str, Any]] | None) -> None:
+        """Toast the re-arm records `cli._echo_rearm_events` prints, same table.
+
+        Reads through `runs.journal_entries_or_none`, shared with the CLI so the two
+        surfaces cannot drift on robustness the way they drifted on routing. Both ends
+        of the diff must be readable: a failed FIRST read degraded to `[]` would set the
+        watermark to zero and replay every historical record as a fresh toast, so an
+        unreadable journal costs the echo and keeps the gesture.
+
+        The table's `next_step` is deliberately dropped: it reads "... before
+        resuming", and this path resumes in the same gesture.
+
+        This is abort-only diagnostic recovery. A raised call has no authoritative
+        outcome, so this path must not infer a hold from partial journal residue.
+        """
+        after = runs.journal_entries_or_none(run_dir)
+        if before is None or after is None:
+            return
+        for entry in after[len(before) :]:
+            notice = runs.rearm_event_notice(entry)
+            if notice is None:
+                continue
+            severity, message, _next_step = notice
+            self.notify(message, severity="warning" if severity == "warning" else "information")
+
+    def _echo_rearm_notices(self, notices: tuple[runs.RearmNotice, ...]) -> None:
+        """Toast a successful re-arm's authoritative notices in append order."""
+        for notice in notices:
+            self.notify(
+                notice.message,
+                severity="warning" if notice.severity == "warning" else "information",
+            )
+
     def _do_rearm(
-        self, run_id: str, run_dir: Path, story_key: str, *, restore_recorded: bool = False
+        self,
+        run_id: str,
+        run_dir: Path,
+        story_key: str,
+        *,
+        restore_recorded: bool = False,
+        expected_generation: int | None = None,
     ) -> None:
         """Re-arm a resolved escalation + resume — the `resolve --no-interactive`
         path (rearm_escalation handles sentinel auto-delete-with-preservation)."""
+        # Ahead of rearm_escalation for the same reason cmd_resolve gates at
+        # entry: a run left re-armed-but-not-running by the child's refusal.
+        if self._blocked_by_control_alias(run_id):
+            return
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
+        # DW-204/DW-230: the same probe `cli.cmd_resume` and `cli.cmd_resolve` take,
+        # taken here beside the two gates above. The detached child this gesture ends
+        # in would refuse for the same reason, but only AFTER `rearm_escalation` has
+        # spent the escalation, and it would refuse into a pane nobody opens — so the
+        # refusal is raised here, on screen, with the escalation still armed. The
+        # probe answers or declines; this surface owns the channel (a toast, where the
+        # CLI prints to stderr). `_do_resume` also probes before launching so plain
+        # resume shows the refusal on the dashboard too (DW-270).
+        # Since DW-234 the probe refuses an OS-refused read too, with the same
+        # repair route the CLI prints, so there is nothing left to catch here.
+        refusal = runs.unreadable_sweep_ledger(self.project, run_dir)
+        if refusal is not None:
+            self.notify(refusal, severity="error")
+            return
+        # The LIVE isolation mode, read once and used twice below. `runs.rearm_escalation`
+        # requires it: how the re-drive WILL run is a policy question, and the recorded
+        # `task.worktree_path` answers only how the escalated attempt ran — the two part
+        # company on exactly the mid-run policy edit the conflict check below is also
+        # about.
+        #
+        # Unreadable REFUSES here, unlike the launch guard above and unlike this block's
+        # own previous disposition. That fall-through was correct while the policy fed
+        # one optional CHECK: "no conflict" and "could not look" are different answers
+        # and neither blocks a launch the detached CLI will re-read the same file for.
+        # It is not correct for an INPUT to a repair write. Without the mode this
+        # gesture cannot say which ref the re-drive reads, so it would flip the spec and
+        # then tell the operator to put the correction in a tree picked by a default —
+        # silently, and unrecoverably, since a re-arm consumes the escalation.
+        # `cli.cmd_resolve` raises on the same unreadable file before it re-arms.
         try:
-            runs.rearm_escalation(run_dir, story_key)
-        except RearmError as e:
+            isolation = policy.load(self.project / POLICY_FILE).scm.isolation
+        except (policy.PolicyError, OSError) as e:
+            self.notify(
+                f"cannot read policy.toml to determine the re-drive's isolation mode "
+                f"({e}) — fix it, then re-arm; the story is still escalated",
+                severity="error",
+            )
+            return
+        # Same seam as `cli.cmd_resolve`, for the same reason and at the same moment:
+        # `runs.rearm_escalation` reads the persisted code root back out of the run
+        # state, and only a process that has just read config.yaml can tell whether a
+        # `repo_root:` edit made while the run was paused has moved it. Resume re-stamps
+        # it, but this gesture re-arms BEFORE it resumes, so the mirror has to be aimed
+        # here or the re-arm advances the baseline in the tree the run has left.
+        try:
+            paths = bmadconfig.load_paths(self.project)
+        except (bmadconfig.BmadConfigError, OSError) as e:
+            paths = None
+            self.notify(
+                f"cannot read the project config to confirm the code root ({e}) — "
+                "re-arming against the root this run recorded",
+                severity="warning",
+            )
+        else:
+            # Same hoist as `cli.cmd_resolve`, for the same reason: this gesture
+            # re-arms and THEN resumes, so the isolation refusal the detached CLI makes
+            # in `_resume_paused_run` landed after the re-stamp had persisted the
+            # unsupported root and `rearm_escalation` had advanced the attempt baseline
+            # against it. The operator saw "re-armed <story>" and then a pane that
+            # refused, with the story no longer escalated for `resolve` to correct.
+            #
+            # Reads the mode hoisted above rather than loading policy.toml a second
+            # time: two reads of one file in one gesture can disagree under a concurrent
+            # edit, and the refusal must be about the same mode the re-arm is told.
+            conflict = bmadconfig.worktree_isolation_conflict(paths, isolation)
+            if conflict is not None:
+                self.notify(conflict, severity="error")
+                return
+        before_entries = runs.journal_entries_or_none(run_dir)
+        outcome: runs.RearmOutcome | None = None
+        contended = False
+        try:
+            # `blocking=False` because this runs ON the message loop — the reason
+            # `_guarded` and `_commit_subject` bound their git calls at `timeout_s=5`.
+            # `_do_rearm` carries no `@work`, and its only caller is the synchronous
+            # `push_screen` dismiss callback, so the acquisition happens inline: on
+            # POSIX a blocking wait is UNBOUNDED (`fcntl.flock` does not time out),
+            # and the rival that holds this lock is typically `cli._prepare_resume_locked`,
+            # which holds it across config, skills, profiles and a git preflight each
+            # bounded only by `[limits] git_timeout_s` (120s by default). The whole
+            # dashboard freezes for that span, and the `_engine_possibly_live` gate on
+            # the modal does not head it off: `resume` takes the lock FIRST and
+            # publishes its pid LAST, so for that entire window liveness still reads
+            # dead and only the lock objects (the same window `cmd_clean` documents).
+            #
+            # Refusing loses nothing a wait would have won, either: the post-lock
+            # liveness re-check below is what the waiter would reach, and against a
+            # rival resume it refuses anyway. So the wait's only product is the freeze.
+            with state_lock(run_dir, blocking=False):
+                # Repeat the liveness decision after exclusion.  Config/policy work
+                # above is deliberately lock-free; only this bounded restamp+re-arm
+                # mutation gesture is serialized.
+                if self._resolve_blocked_by_liveness(run_id, run_dir):
+                    return
+                fresh_state = load_state(run_dir)
+                fresh_task = fresh_state.tasks.get(story_key)
+                if (
+                    fresh_state.paused_stage != PAUSE_ESCALATION
+                    or fresh_task is None
+                    or fresh_task.phase != Phase.ESCALATED
+                ):
+                    self.notify(
+                        f"run {run_id} is no longer paused at escalation for {story_key} "
+                        "— not re-arming",
+                        severity="warning",
+                    )
+                    return
+                if expected_generation is not None and fresh_task.generation != expected_generation:
+                    self.notify(
+                        f"the escalation for {story_key} changed while its review was open "
+                        "— not re-arming",
+                        severity="warning",
+                    )
+                    return
+                if paths is not None:
+                    if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
+                        self.notify(moved, severity="warning")
+                outcome = runs.rearm_escalation(
+                    run_dir,
+                    story_key,
+                    isolated_redrive=isolation == "worktree",
+                    # The live project this dashboard was launched against, matching
+                    # `cli.cmd_resolve`: the re-arm's spec writes have to land in the tree
+                    # the operator is looking at, not in the one the run recorded at launch.
+                    # `self.project` rather than `paths.project` because the `load_paths`
+                    # arm above may have degraded without binding `paths` at all.
+                    project_root=self.project,
+                    # DW-11. This gesture runs no resolve session, so it accepted nothing:
+                    # the escalation watermark must not advance. A `resolution.json` on
+                    # disk is NOT evidence to the contrary here — `_restore_recorded`
+                    # already records the governing fact for this surface, that a stale
+                    # marker is indistinguishable from a fresh one, which is why this path
+                    # declines the restore latch too. Stamping on its presence would bury
+                    # escalations raised since the marker was written.
+                    resolution_recorded=False,
+                )
+        except LockUnavailableError:
+            # ORDER IS LOAD-BEARING: `LockUnavailableError` SUBCLASSES `OSError`, so
+            # this arm must precede the one below or contention is reported as
+            # "re-arm failed" — a fault the operator would go looking for — and the
+            # non-blocking acquire above buys nothing at all.
+            #
+            # Caught here and NOT folded into that arm for `cmd_clean`'s reason: a
+            # bare `except OSError` cannot tell "someone else has this run" from
+            # `platform_util.UnconfinedWriteError`, and filing a containment refusal
+            # as a benign "busy" is the exact fold those two classes exist to prevent.
+            contended = True
+            self.notify(
+                f"run {run_id}: run state locked by another process — not re-arming; "
+                "wait for it to finish, then re-arm",
+                severity="warning",
+            )
+            return
+        except (RearmError, OSError, runs.StateRootError) as e:
             self.notify(f"re-arm failed: {e}", severity="error")
             return
+        finally:
+            # In the `finally`, matching `cli.cmd_resolve`. `_stale_restore_residue`
+            # journals BEFORE the re-stamp block that raises `RearmError`, so on that
+            # path the records were already written and returning early threw them
+            # away — including the commits PAIR (`stale-restore-commits` when the probe
+            # answered, `rearm-commits-probe-failed` when it could not), whose whole
+            # point is that nothing else will tell the human. This surface used to
+            # `return` there while the CLI echoed, so the two DID drift on the abort
+            # path even after they were unified on routing — and an abort is when the
+            # residue matters most: the re-arm half-ran and the operator has to decide
+            # what to do with the tree.
+            #
+            # `not contended` because this recovery is for a gesture that RAN and
+            # aborted. A refused acquisition ran nothing, so every record appended
+            # between the read above and the refusal belongs to the HOLDER — echoing
+            # the rival's re-arm as this one's residue.
+            if outcome is None and not contended:
+                self._echo_rearm_events(run_dir, before_entries)
+        assert outcome is not None
+        self._echo_rearm_notices(outcome.notices)
         if restore_recorded:
             self.notify(
                 "recorded restore patch NOT honored — this re-arm re-drives from "
@@ -770,6 +1189,33 @@ class BmadLoopApp(App[None]):
                 severity="warning",
             )
         self.notify(f"re-armed {story_key}")
+        if outcome.hold_resume:
+            # The half of the gesture that still worked is kept: the story IS re-armed
+            # and persisted. What stops is the resume this surface folds in behind it,
+            # because the warning above proved the re-drive would read a spec it cannot
+            # route on and burn the escalation.
+            #
+            # The step is PROPAGATED from the record that held (`hold_next_step`) rather
+            # than hardcoded. Four records hold and their remedies differ — commit the
+            # spec, commit `SPEC.md` / `stories.yaml`, correct the spec in the MAIN
+            # checkout, or restore the recorded spec PATH — and the one literal this
+            # branch used to print was impossible to follow on two of them. The literal
+            # survives only as the fallback for a holding record whose render carries no
+            # step at all.
+            #
+            # Composed rather than concatenated: every `next_step` ends in "before
+            # resuming", which is true here (this hold is what stops the fold-in) but
+            # reads as a contradiction next to an imperative to resume. So the resume's
+            # absence leads, the step follows as the operator's own sentence, and the
+            # tail says the run is still there to resume from this screen once it is
+            # done — instead of ordering a resume in the same breath as a hold.
+            step = outcome.hold_next_step or "Commit the corrected spec before resuming"
+            self.notify(
+                f"not resuming in this gesture. {step} — the run stays paused and "
+                "resumable from this screen.",
+                severity="warning",
+            )
+            return
         self._do_resume(run_id)
 
     def _resolve_blocked_by_liveness(self, run_id: str, run_dir: Path) -> bool:
@@ -778,19 +1224,109 @@ class BmadLoopApp(App[None]):
             return True
         return False
 
+    def _blocked_by_control_alias(self, run_id: str) -> bool:
+        """Refuse to mutate persisted state for a run whose id aliases a
+        control session (`ctl`, `ctl-<16 hex>` — the CLI's resume/resolve
+        gates, mirrored): the launch it would end in is refused at the
+        mutation chokepoint (`launch.start_detached`), so a spec reset or an
+        escalation re-arm performed FIRST would strand the run in the mutated
+        state. Only the paths that mutate before launching need this —
+        `_do_replan` (spec draft-reset/strip) and `_do_rearm`
+        (rearm_escalation); plain resume/resolve mutate nothing early and are
+        covered by the launcher's own gate."""
+        if runs.run_id_aliases_control_session(run_id):
+            self.notify(
+                f"run {run_id}: its agent session name is the control session's own — "
+                "cannot be driven. Recover its work by hand, then `bmad-loop delete "
+                f"{run_id}`",
+                severity="error",
+            )
+            return True
+        return False
+
     # ---------------------------------------------------- pause-context readers
 
-    def _paused_spec(self, state: RunState) -> tuple[Path | None, str]:
-        """(spec path, spec text) for the paused story, or (None, "") when the
-        task has no spec file (e.g. an ambiguous-match escalation)."""
-        task = state.tasks.get(state.paused_story_key) if state.paused_story_key else None
+    def _paused_task(self, state: RunState) -> StoryTask | None:
+        """The paused story's task, or None when nothing is paused.
+
+        One lookup for both `_paused_spec` (which anchors the READ) and
+        `_paused_spec_root` (which supplies the destructive write's `confine_root`).
+        The whole point of routing both through `runs.task_spec_path`/`task_spec_root`
+        is that the anchor and the root must name one tree; two copies of the lookup
+        would let them drift on the very state that decides it."""
+        return state.tasks.get(state.paused_story_key) if state.paused_story_key else None
+
+    def _paused_spec(self, state: RunState) -> tuple[Path | None, str, bool]:
+        """(spec path, spec text, readable) for the paused story, or (None, "", True)
+        when the task has no spec file (e.g. an ambiguous-match escalation).
+
+        `readable` is False only when the spec could not be READ at the anchored path,
+        which is the signal that the anchoring is wrong. It is returned rather than left
+        for the renderer to infer, because the alternative is sniffing the body for the
+        failure sentence — the failure text and a spec that merely opens with the same
+        words are not distinguishable after the fact, and one of them must not disable
+        an operator's approve button.
+
+        The path is re-anchored through `runs.task_spec_path`, never `Path(...)` on the
+        raw value: `model.StoryTask._serialized_worktree_path` persists an isolated
+        unit's spec RELATIVE to the mounted worktree root and `from_dict` reads it back
+        raw, so a bare `Path(task.spec_file)` resolves against the TUI process cwd —
+        where the main checkout carries the same implementation-artifacts-relative
+        path and answers with the WRONG tree's copy of the story spec."""
+        task = self._paused_task(state)
         if task is None or not task.spec_file:
-            return None, ""
-        path = Path(task.spec_file)
+            return None, "", True
+        # `live_spec_path`, not `task_spec_path`: the anchor is carried onto the
+        # project this dashboard was launched against, the same mapping `_do_rearm`
+        # hands `rearm_escalation`. Anchored on the recorded `state.project` alone, a
+        # run opened from a moved project showed (and validated) the copy under the
+        # old tree — unreadable once that tree is gone, which refused the very re-arm
+        # the live mapping exists for; and when it still exists, the operator reviewed
+        # one spec and re-armed a different, unreviewed one.
+        path = runs.live_spec_path(task, state, self.project)
         try:
-            return path, path.read_text(encoding="utf-8")
-        except OSError:
-            return path, ""
+            # `errors="replace"` for the same reason `_commit_subject` uses it: a story
+            # spec is agent- or human-authored, so an odd byte is a fact about the file,
+            # not a reason to withhold it. Decoding strictly here cost the reviewer the
+            # WHOLE document at a gate whose only purpose is reading it — and, because
+            # every review surface calls this from the Textual event loop, an escaping
+            # UnicodeDecodeError (a ValueError, so no OSError arm catches it) took the
+            # dashboard down rather than rendering the fault.
+            return path, path.read_bytes().decode("utf-8", errors="replace"), True
+        except OSError as e:
+            # An absent spec at the ANCHORED path is the signal that the anchoring is
+            # wrong, so it must not reduce to "" — SpecReviewModal renders that as
+            # "(empty spec)", which is also what a present-but-blank spec renders as.
+            # Report the failure as the body so the two cases read differently, and
+            # keep this arm to ABSENCE now that a decode fault degrades in place.
+            return path, f"(spec could not be read — {e})", False
+
+    def _paused_spec_root(self, state: RunState) -> Path:
+        """The tree the paused story's spec is anchored on — and confined to.
+
+        The mirror of `_paused_spec`'s anchor, kept as a sibling so the three read-only
+        consumers keep the untouched two-value read. `_do_replan` WRITES the path
+        `_paused_spec` returned, and `runs.task_spec_root` is the single definition
+        backing both halves: an anchor and a `confine_root` that name different trees do
+        not refuse, they silently degrade the write (#593).
+
+        Both arms are carried onto the live project through the one mapping
+        `_paused_spec` uses for the path (`runs.rebase_recorded_project_path`), so the
+        two halves make one claim: the tree the operator opened the dashboard against,
+        spelled by moving the recorded anchor lexically — which for the recorded
+        project itself IS `self.project`. Spelling the no-task arm as `self.project`
+        directly would be the same answer by a second route, and the point of routing
+        both through the mapping is that they cannot drift. That arm is currently
+        unreachable from the write path — `_review_plan_checkpoint`'s `done()`
+        refuses a `None` `spec_path` before calling `_do_replan`, and `_paused_spec`
+        returns `None` on BOTH of its arms (no task, and a task carrying no
+        `spec_file`) — so this is about not leaving a second claim lying around for a
+        future caller, not a live bug. A task with an empty `spec_file` still answers
+        from `task_spec_root`, which needs no spec to name a tree."""
+        task = self._paused_task(state)
+        if task:
+            return runs.live_spec_root(task, state, self.project)
+        return runs.rebase_recorded_project_path(Path(state.project), state, self.project)
 
     def _story_subtitle(self, state: RunState) -> Text:
         key = state.paused_story_key or "?"
@@ -804,8 +1340,18 @@ class BmadLoopApp(App[None]):
         """(title, description) from stories.yaml in stories mode, else ("", "")."""
         if state.source != "stories" or not state.spec_folder:
             return "", ""
+        # `live_stories_root`, not `self.project` bare, for the reason `_sentinel_kind`
+        # states below: BOTH feed one `EscalationModal` — this supplies its title and
+        # description, that its sentinel indicator — so a manifest read from the main
+        # checkout beside a sentinel read from the mount is the same one-surface-two-trees
+        # defect the anchor exists to close. The no-task fallback is still the recorded
+        # `state.project`; what `live_stories_root` adds is the mapping `_do_rearm`
+        # writes through (`project_root=self.project`), so after a project move the
+        # manifest is read from the tree the re-arm clears the sentinel in, not from
+        # the launch-time spelling — absent once that tree is gone, stale while it stays.
+        root = runs.live_stories_root(state.tasks.get(key), state, self.project)
         try:
-            folder = stories.resolve_spec_folder(self.project, state.spec_folder)
+            folder = stories.resolve_spec_folder(root, state.spec_folder)
             entry = stories.load_stories(folder).get(key)
         except stories.StoriesError:
             return "", ""
@@ -814,11 +1360,33 @@ class BmadLoopApp(App[None]):
     def _sentinel_kind(self, state: RunState, key: str) -> str:
         if state.source != "stories" or not state.spec_folder:
             return ""
+        # Anchored on the tree the RUN owns, for the same reason `_paused_spec` is: the
+        # sentinel the engine wrote lives in the unit's mount under isolation
+        # (`stories_engine._stories_folder` IS the worktree during a driven story),
+        # while the main checkout carries the same layout and holds a stale twin or
+        # nothing. Both values feed ONE `EscalationModal` — the spec text through
+        # `_blocking_condition`, this through `sentinel_kind` — so anchoring them on
+        # different trees let a single modal disagree with itself and rendered a
+        # pre-planning sentinel wedge as an ordinary escalation.
+        #
+        # `live_stories_root`, not `task_spec_root`: the folder is located from the
+        # workspace root, and the latter's out-of-mount arm answers a confinement
+        # question about `spec_file` that would send this read to the main checkout
+        # while `_stories_folder` stayed on the mount. It also takes `None`, so the
+        # no-task fallback is not re-spelled here. And "live", for the same reason
+        # `_paused_spec` goes through `live_spec_path`: the re-arm clears the sentinel
+        # under `self.project`, so a scan anchored on the recorded `state.project`
+        # misses it after a project move (or keeps showing a cleared twin). A mount is
+        # spelled under the run dir INSIDE the project (`RUNS_DIR` is `.bmad-loop/runs`)
+        # and therefore rebases too — which is why `live_stories_root` probes the moved
+        # mount before falling back; the recorded spelling's own existence probe fails
+        # after the move and would drop this read onto the main checkout's stale twin.
+        root = runs.live_stories_root(state.tasks.get(key), state, self.project)
         # resolve_story_spec globs + reads frontmatter; a file removed mid-scan (a
         # re-arm clearing the sentinel while the viewer refreshes) can raise OSError.
         # Degrade to "" rather than let a race-window read crash the render.
         try:
-            folder = stories.resolve_spec_folder(self.project, state.spec_folder)
+            folder = stories.resolve_spec_folder(root, state.spec_folder)
             st = stories.resolve_story_spec(folder, key)
         except OSError:
             return ""
@@ -831,16 +1399,24 @@ class BmadLoopApp(App[None]):
         return spec_text[idx:].strip() if idx != -1 else ""
 
     def _commit_subject(self, sha: str) -> str:
+        # Through the chokepoint (#390): a timeout or failed spawn arrives as
+        # GitError/GitSpawnError instead of the raw subprocess pair, and taking
+        # bytes closes the strict-decode hole — text=True raised
+        # UnicodeDecodeError (a ValueError, caught by neither arm of the old
+        # guard) on a subject undecodable in the run's codec, crashing the
+        # checkpoint modal. Subject bytes are git's logOutputEncoding (UTF-8
+        # unless configured); replace so an odd byte degrades one label,
+        # never raises mid-render.
+        # timeout_s=5 keeps the pre-#390 deadline: this runs on the event loop
+        # (the checkpoint modal's build path), so a stalled git must surface as
+        # a missing subject in seconds, not a 120s frozen UI.
         try:
-            proc = subprocess.run(
-                ["git", "-C", str(self.project), "log", "-1", "--format=%s", sha],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError):
+            proc = verify.git_bytes(self.project, "log", "-1", "--format=%s", sha, timeout_s=5)
+        except verify.GitError:
             return ""
-        return proc.stdout.strip() if proc.returncode == 0 else ""
+        if proc.returncode != 0:
+            return ""
+        return proc.stdout.decode("utf-8", errors="replace").strip()
 
     # ------------------------------------------------------ stop / delete / archive
 
@@ -874,7 +1450,7 @@ class BmadLoopApp(App[None]):
     def _stop_run_worker(self, run_id: str, run_dir: Path) -> None:
         try:
             runs.stop_run(run_dir)
-            launch.kill_ctl_window(run_id)
+            launch.kill_ctl_window(self.project, run_id)
         except (OSError, StopRunError, ProcessHostError) as e:
             self.call_from_thread(self.notify, f"stop failed: {e}", severity="error")
             return
@@ -883,12 +1459,13 @@ class BmadLoopApp(App[None]):
     def action_graceful_stop_run(self) -> None:
         """Ask the selected live run to stop *gracefully*: finish the in-flight item
         (story dev/review/commit, or a sweep bundle through commit), then finalize
-        cleanly and stop — resumable, unlike the hard SIGTERM `x` delivers.
+        cleanly and stop — resumable, unlike the hard stop `x` delivers, which
+        abandons the in-flight item.
 
         Deliberately no `_mux_missing` gate: unlike `x` (which kills the agent
-        window) this touches no multiplexer — the request is a control file the
-        engine polls at item boundaries — so it must work even with the backend
-        down. The liveness gate is also deliberately looser than `x`'s: it rejects
+        window) this touches no multiplexer — the request rides the same control
+        file a hard stop uses, in its graceful mode, read by the engine at item
+        boundaries — so it must work even with the backend down. The liveness gate is also deliberately looser than `x`'s: it rejects
         only a *provably dead* engine, so an unverifiable (`unknown`) pid — a win32
         access-denied pid, a psmux backend, a run on another host — still lodges the
         request, matching `runs.request_graceful_stop`'s `requested-unverifiable`
@@ -910,7 +1487,8 @@ class BmadLoopApp(App[None]):
                 "graceful stop",
                 f"stop run {run_id} after the current item finishes?\n"
                 "the in-flight story/bundle completes through commit, then the run "
-                "finalizes and stops (resumable). `x` stops immediately instead.",
+                "finalizes and stops (resumable). `x` instead abandons the "
+                "in-flight item.",
                 confirm_label="graceful stop",
             ),
             done,
@@ -928,8 +1506,26 @@ class BmadLoopApp(App[None]):
         except runs.GracefulStopError as e:
             self.call_from_thread(self.notify, str(e), severity="error")
             return
+        except OSError as e:
+            # Mirrors the CLI's `stop --graceful` arm: the lodge does not roll
+            # back a failed write (see _create_stop_request), so a part-way
+            # failure can leave a graceful request standing — and a confined
+            # refusal (`UnconfinedWriteError`, #593) wrote nothing at all. Either
+            # way the worker must not raise: Textual workers default to
+            # exit_on_error=True, so an uncaught OSError here would take the
+            # whole dashboard down instead of reporting the refusal.
+            self.call_from_thread(
+                self.notify,
+                f"run {run_id}: stop request could not be written ({e}) — a graceful "
+                f"request may still be pending; check `bmad-loop status {run_id}` and "
+                f"use `bmad-loop stop {run_id} --cancel-graceful` to withdraw it",
+                severity="error",
+            )
+            return
         if outcome == "already-pending":
-            self.call_from_thread(self.notify, f"run {run_id} already has a graceful stop pending")
+            # Mode-neutral: the pending request may be a hard one, and this token
+            # cannot tell (#319) — same wording as the CLI's `stop --graceful`.
+            self.call_from_thread(self.notify, f"run {run_id} already has a stop request pending")
             return
         if outcome == "requested-unverifiable":
             self.call_from_thread(
@@ -978,8 +1574,11 @@ class BmadLoopApp(App[None]):
     @work(thread=True, group="lifecycle")
     def _delete_run_worker(self, run_id: str, run_dir: Path) -> None:
         try:
-            runs.delete_run(run_dir)
-        except OSError as e:
+            runs.delete_run(self.project, run_dir)
+        except (OSError, runs.StateRootError, runs.LiveEngineError, runs.LiveSessionError) as e:
+            # The modal's liveness sample is advisory. Surface authoritative
+            # lifecycle refusals and lock/removal failures here rather than letting
+            # them kill the worker thread or forgetting a run that still exists.
             self.call_from_thread(self.notify, f"delete failed: {e}", severity="error")
             return
         self.call_from_thread(self._dashboard.forget_run, run_id)
@@ -1015,7 +1614,9 @@ class BmadLoopApp(App[None]):
     def _archive_run_worker(self, run_id: str, run_dir: Path) -> None:
         try:
             dest = runs.archive_run(self.project, run_dir)
-        except OSError as e:
+        except (OSError, runs.StateRootError, runs.LiveEngineError, runs.LiveSessionError) as e:
+            # Same worker boundary as delete: report the authoritative transaction,
+            # not the earlier modal sample.
             self.call_from_thread(self.notify, f"archive failed: {e}", severity="error")
             return
         self.call_from_thread(self._dashboard.forget_run, run_id)
@@ -1041,24 +1642,79 @@ class BmadLoopApp(App[None]):
     @work(thread=True, group="lifecycle")
     def _cleanup_sessions_worker(self) -> None:
         # killed and unknown come from prune_sessions' single partition sample,
-        # so the warning below only ever names sessions that were actually pruned
-        killed, _live, unknown = runs.prune_sessions(self.project)
+        # so the warning below only ever names sessions that were actually pruned.
+        #
+        # Guarded for the same reason as the ctl-window arm below, with the
+        # opposite conclusion. This half is raiser-side too — the psmux backend
+        # refuses a registry root that would fail its pre-spawn absoluteness gate,
+        # and that raise is thrown before the tolerant listing wrapper can degrade
+        # it — and an escape from a worker thread takes the whole dashboard down
+        # (Textual's exit_on_error). Every CLI surface turns that same raise into
+        # one named error through main()'s backstop; a worker thread has none.
+        # But nothing has been killed yet, so there is no completed work to
+        # protect: toast and stop, rather than carry on reporting a sweep that
+        # never ran.
+        try:
+            killed, _live, unknown = runs.prune_sessions(self.project)
+        except (MultiplexerError, UnicodeError) as e:
+            self.call_from_thread(self.notify, f"session prune failed: {e}", severity="error")
+            return
         # prune_ctl_windows probes has_session on the shared ctl session, a
         # raiser-side call; on a worker thread the toast must be marshalled, and
         # notify() must not be called directly (see _mux_guarded — foreground only).
         try:
-            windows = launch.prune_ctl_windows(self.project)
-        except MultiplexerError as e:
+            windows, survived, unverifiable = launch.prune_ctl_windows(self.project)
+        except (MultiplexerError, UnicodeError) as e:
+            # UnicodeError: a strict-POSIX decode fault from a scan probe that
+            # does not normalize it to the seam type (#380) — the cli cleanup
+            # arm's twin; an escape here kills the worker thread instead.
             # prune_sessions already killed the agent sessions above; surface the
             # ctl-window failure but keep reporting that completed work (and the
             # unknown-pid warning) rather than swallowing it on an early return.
-            self.call_from_thread(self.notify, str(e), severity="error")
-            windows = []
+            # Named: a bare transport message next to a "removed N session(s), 0
+            # window(s)" toast reads as a successful window sweep.
+            self.call_from_thread(self.notify, f"ctl window prune failed: {e}", severity="error")
+            windows, survived, unverifiable = [], [], []
         if unknown:
             self.call_from_thread(
                 self.notify,
                 f"{len(unknown)} pruned session(s) had an unverifiable engine pid "
                 f"(may still be live): {', '.join(sorted(unknown))}",
+                severity="warning",
+            )
+        # The cli cleanup arm's stderr line, as a toast: the removal count below
+        # excludes sessions the migration pass declined to claim in a legacy
+        # registry, and a count that quietly excludes them reads as "all clean".
+        # Read after the prune, so it describes what is left standing. Silent on
+        # every platform without a registry namespace.
+        # One toast per registry, naming it: there is more than one legacy
+        # registry (psmux's default, and any root this process displaced), and
+        # the operator's next action is to open the one holding these.
+        for registry, names in runs.legacy_registry_leftovers(self.project).items():
+            self.call_from_thread(
+                self.notify,
+                f"{len(names)} session(s) left in {registry} (not migrated): "
+                f"{', '.join(names)} — see docs/multiplexer-backends.md before "
+                "removing any of them",
+                severity="warning",
+            )
+        # A kill that did not verifiably land gets its own toast rather than a
+        # silent subtraction from the count below (#435) — the count now reports
+        # only verified removals, so without this the windows would just vanish
+        # from the report. Kept apart because they are different claims: one is
+        # positive evidence the window is still there, the other is the absence
+        # of any evidence at all. Both are retried by the next cleanup.
+        if survived:
+            self.call_from_thread(
+                self.notify,
+                f"{len(survived)} ctl window(s) still open after the kill: {', '.join(survived)}",
+                severity="warning",
+            )
+        if unverifiable:
+            self.call_from_thread(
+                self.notify,
+                f"{len(unverifiable)} ctl window(s) kill attempted, outcome unverifiable: "
+                f"{', '.join(unverifiable)}",
                 severity="warning",
             )
         self.call_from_thread(
