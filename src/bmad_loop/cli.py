@@ -936,12 +936,18 @@ def cmd_validate(args: argparse.Namespace) -> int:
             # kind sends it as the per-prompt `variant`. The tmux generic family
             # has no channel for it — no profile flag, no hook field — so a stage
             # that sets it there runs at the provider default with nothing to show
-            # for it. Keyed on the bundled GENERIC kind, like the two checks above,
-            # because "cannot carry effort" is a fact about that family; an
-            # out-of-tree kind's capability is not knowable here, so it stays
-            # silent rather than assert one. Advisory: severity `problem` is
-            # validate's exit code, and an ignored knob does not make a run unrunnable.
-            if prof is not None and prof.adapter == adapter_registry.GENERIC and cfg.effort:
+            # for it. The bundled cursor-sdk kind is in the same position: the SDK
+            # takes effort only as part of the model id. Keyed on those bundled
+            # kinds, like the two checks above, because "cannot carry effort" is a
+            # fact about each family; an out-of-tree kind's capability is not
+            # knowable here, so it stays silent rather than assert one. Advisory:
+            # severity `problem` is validate's exit code, and an ignored knob does
+            # not make a run unrunnable.
+            if (
+                prof is not None
+                and prof.adapter in (adapter_registry.GENERIC, adapter_registry.CURSOR_SDK)
+                and cfg.effort
+            ):
                 report.warn(
                     "policy.effort-unsupported",
                     f"{role} effort {cfg.effort!r} is ignored by {prof.name}: "

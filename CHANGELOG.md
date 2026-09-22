@@ -14,7 +14,8 @@ breaking changes may land in a minor release.
   a new bundled adapter kind (`needs_mux = false`). The sidecar's NDJSON sentinel is the
   turn-end signal and carries token usage. Covers dev, review and triage; skills load from
   `.claude/skills/`. Env-fault scans read the sidecar's stderr (`logs/<task-id>.sidecar.err`),
-  never its event stream; no patterns are seeded.
+  never its event stream; no patterns are seeded. `effort` is ignored (the SDK encodes it in
+  the model id), so `validate` warns `policy.effort-unsupported` for a cursor-sdk stage.
 - Add `bmad-loop init --provision <kind>` to install an adapter kind's out-of-band runtime —
   today `cursor-sdk`'s npm-only `@cursor/sdk`, into `~/.bmad-loop/cursor-sdk`
   (`BMAD_LOOP_CURSOR_SDK_DIR` overrides). Opt-in, never called from a run. Backed by an

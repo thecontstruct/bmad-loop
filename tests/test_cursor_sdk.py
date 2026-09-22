@@ -14,13 +14,14 @@ logic, with no Node, no ``@cursor/sdk``, no API key and zero LLM tokens.
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import textwrap
 from pathlib import Path
 
 import pytest
-from conftest import install_bmad_config
+from conftest import install_bmad_config, write_sprint
 
 from bmad_loop import cli
 from bmad_loop import policy as policy_mod
@@ -683,6 +684,46 @@ def test_validate_surfaces_the_cursor_sdk_preflight(project, tmp_path, monkeypat
     assert "cursor-sdk: @cursor/sdk not found" in text
     assert "--provision cursor-sdk" in text
     assert "cursor-sdk: cursor_api_key is not set" in text
+
+
+def test_validate_warns_that_cursor_sdk_ignores_effort(project, capsys):
+    """The SDK takes reasoning effort only inside the model id, so `[adapter]
+    effort` on a cursor-sdk stage is a silently ignored knob — the same fact
+    `policy.effort-unsupported` states for the tmux family.
+
+    ABLATION: drop `CURSOR_SDK` from the kind tuple in `cmd_validate` and this
+    reddens."""
+    install_bmad_config(project)
+    _write_policy(project.project, CURSOR_POLICY + 'effort = "high"\n')
+
+    cli.main(["validate", "--project", str(project.project), "--json"])
+    findings = json.loads(capsys.readouterr().out)["findings"]
+
+    effort = [f for f in findings if f["check"] == "policy.effort-unsupported"]
+    assert effort and all(f["severity"] == "warning" for f in effort)
+    assert all("cursor-sdk" in f["message"] for f in effort)
+
+
+def test_dry_run_previews_the_sidecar_launch_not_an_argv(project, capsys):
+    """`_render_invocation` follows the adapter KIND. A cursor-sdk stage launches
+    `node cursor-sidecar.mjs` with the prompt in a file, so its preview is that
+    sequence — not the opencode server line nor a coding-CLI argv.
+
+    ABLATION: delete the `CURSOR_SDK` branch in `_render_invocation` and this
+    reddens (the argv fallback renders instead)."""
+    install_bmad_config(project)
+    _write_policy(project.project, CURSOR_POLICY + 'model = "composer-2.5"\n')
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = policy_mod.load(cli._policy_path(project.project))
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+
+    out = capsys.readouterr().out
+    dev = out[out.index("dev:") :]
+    assert dev.startswith("dev:    node <bmad-loop>/cursor-sidecar.mjs --cwd <worktree>")
+    assert "@cursor/sdk Agent.create" in dev
+    assert '") model=composer-2.5' in dev
 
 
 # --------------------------------------------------------------------------- #
