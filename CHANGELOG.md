@@ -19,8 +19,9 @@ breaking changes may land in a minor release.
   unattended session can answer, and `--force` alone does not clear it. Setting
   `[adapter] extra_args` replaces the bypass flags, so it must keep `--trust`. Trust is
   granted per launch, so `isolation = "worktree"` works. `usage_parser = "none"` pending a
-  transcript-schema probe. Experimental — verified against cursor-agent 2026.08.04, not yet
-  run through a full loop; finalize with `probe-adapter cursor`.
+  transcript-schema probe, so no token usage is recorded. Supported and E2E-verified on
+  cursor-agent 2026.09.02: `probe-adapter cursor --probe` captured both events with 0
+  warnings, and a one-story dev loop completed with a real commit.
 - Add a free-form `effort` key to `[adapter]` and every `[adapter.<stage>]` table,
   inherited like `model`; `opencode-http` sends it as the per-prompt `variant` on
   every turn, and `validate` warns (`policy.effort-unsupported`) when a tmux stage

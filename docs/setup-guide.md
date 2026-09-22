@@ -180,7 +180,7 @@ would not carry.
 ## Choosing which CLIs to drive
 
 The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`,
-`cursor` (Cursor's `cursor-agent`, experimental),
+`cursor` (Cursor's `cursor-agent`),
 `antigravity` (Google's `agy`, experimental — `isolation = "none"` only), and `opencode`
 (OpenCode ≥ 1.18 over HTTP/SSE, profile `opencode-http` — no tmux window; needs the
 `bmad-loop[opencode]` extra and `model` set as `provider/model`). You can pick more
