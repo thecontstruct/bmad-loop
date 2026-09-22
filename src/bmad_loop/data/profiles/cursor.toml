@@ -69,10 +69,7 @@ first_run_note = "run `cursor-agent login` once (or set CURSOR_API_KEY). Require
 # (.cursor/mcp.json) and the hook file itself. .cursor/hooks.json is also the
 # hook config_path — it is seeded first, then the relay is merged into it, so a
 # worktree keeps any hooks the project already had (see provision_worktree).
-seed_files = [
-  ".cursor/mcp.json",
-  ".cursor/hooks.json",
-]
+seed_files = [".cursor/mcp.json", ".cursor/hooks.json"]
 
 # No env_fault_patterns: no cursor-agent transport-failure line has been
 # captured, and on a pane capture that vocabulary is what a story implementing
