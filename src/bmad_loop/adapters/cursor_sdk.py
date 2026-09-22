@@ -50,14 +50,23 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
 from .. import envvars, runs
-from ..journal import LOGS_DIR
+from ..journal import LOGS_DIR, TASK_CYCLE_ARTIFACTS
 from ..model import TokenUsage
 from ..policy import Policy
-from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec
+from .base import (
+    CodingCLIAdapter,
+    SessionHandle,
+    SessionResult,
+    SessionSpec,
+    reset_task_prompt,
+    validate_adapter_artifact_paths,
+    validated_task_directory,
+)
 from .env_fault import EnvFaultMixin
 from .generic import (
     HEARTBEAT_INTERVAL_S,
     PROOF_OF_WORK_MIN_LOG_BYTES,
+    RESULT_FILE_ARTIFACTS,
     _DevSynthesisMixin,
     _ResultFileMixin,
 )
@@ -92,6 +101,11 @@ RESULT_GRACE_S = 15.0
 KILL_WAIT_S = 5.0
 #: npm install budget for :func:`provision_sdk`.
 PROVISION_TIMEOUT_S = 300.0
+#: Capacity of the ``session_id``-keyed usage stash. Same bound, same reasoning,
+#: as ``opencode_http.USAGE_STASH_CAP``: ``read_usage`` runs after ``run()``
+#: returns, so the stash cannot be evicted on the session lifecycle and is capped
+#: at its write site instead, far above the handful of sessions in flight.
+USAGE_STASH_CAP = 256
 _NODE_VERSION_RE = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
 
 
@@ -253,6 +267,8 @@ class _Sidecar:
     err_fh: IO[str] | None = None
     sentinel: dict[str, Any] | None = None
     spawn_error: str | None = None
+    #: SDK stream events seen before the sentinel — the #727 activity signal.
+    events: int = 0
 
 
 class CursorSdkAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
@@ -337,29 +353,38 @@ class CursorSdkAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         ]
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
-        task_dir = self.tasks_dir / spec.task_id
+        task_dir = validated_task_directory(self.tasks_dir, spec.task_id)
+        validate_adapter_artifact_paths(
+            task_dir, tuple(task_dir / name for name in RESULT_FILE_ARTIFACTS)
+        )
+        log_file = self.logs_dir / f"{spec.task_id}.log"
+        err_file = self.logs_dir / f"{spec.task_id}{self.ENV_FAULT_LOG_SUFFIX}"
+        validate_adapter_artifact_paths(self.logs_dir, (log_file, err_file))
         task_dir.mkdir(parents=True, exist_ok=True)
-        rendered = self.profile.render_prompt(spec.prompt)
+        reset_task_prompt(task_dir, self.profile.render_prompt(spec.prompt))
         prompt_file = task_dir / "prompt.txt"
-        prompt_file.write_text(rendered + "\n", encoding="utf-8")
         # Any result from a previous attempt on this task id would otherwise read
-        # as this session's, exactly as the tmux adapters guard against. This
-        # unlink is what makes the read-back below authoritative: the path is
-        # task-scoped, so anything at it afterwards was written by THIS session.
-        self._result_path(spec.task_id).unlink(missing_ok=True)
+        # as this session's, exactly as the other adapters guard against. This
+        # reset is what makes the read-back below authoritative: the paths are
+        # task-scoped, so anything at them afterwards was written by THIS session.
+        for artifact in TASK_CYCLE_ARTIFACTS:
+            (task_dir / artifact).unlink(missing_ok=True)
+        # A re-armed run reuses task ids. Both logs start fresh so the #194 tail
+        # scan cannot match a previous cycle's stderr and the #261 byte floor
+        # cannot count a previous cycle's stream.
+        log_file.unlink(missing_ok=True)
+        err_file.unlink(missing_ok=True)
         # Created empty before the process exists, for the same reason the tmux
         # adapter pre-creates its pane log: a session that dies on arrival must
         # report "rendered nothing" (False) to the proof-of-work gate rather than
         # "no such signal" (None), which the gate treats as inert.
-        (self.logs_dir / f"{spec.task_id}.log").touch()
+        log_file.touch()
         launched_ns = time.time_ns()
         lines: queue.Queue[str | None] = queue.Queue()
         err_fh: IO[str] | None = None
         try:
             argv = self._sidecar_argv(spec, self._ensure_sidecar_script(), prompt_file)
-            err_fh = (self.logs_dir / f"{spec.task_id}{self.ENV_FAULT_LOG_SUFFIX}").open(
-                "a", encoding="utf-8"
-            )
+            err_fh = err_file.open("a", encoding="utf-8")
             proc = subprocess.Popen(  # noqa: S603 — argv from the profile + run config
                 argv,
                 cwd=spec.cwd,
@@ -424,7 +449,14 @@ class CursorSdkAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 else "no sidecar was started"
             )
             self._note_resultless_stop(handle.task_id, "sidecar-never-ran", reason)
-            return self._final(handle, spec, "crashed", None, None)
+            return self._final(
+                handle,
+                spec,
+                "crashed",
+                None,
+                None,
+                produced_work=self._work_verdict(handle, False, False),
+            )
         deadline = time.monotonic() + spec.timeout_s
         # Wall-clock co-bound (#157): a host suspend freezes time.monotonic(),
         # silently extending the monotonic deadline by the nap's length. The
@@ -459,6 +491,7 @@ class CursorSdkAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     session_id=self._session_id(sidecar),
                     timeout_fired_at=time.time(),
                     timeout_expired_clock=expired,
+                    produced_work=self._streamed_work(handle, sidecar),
                 )
             # Hard-stop poll (#319). Return the verdict — never raise
             # `RunStopped` here: that would skip `run()`'s finally-kill. The
@@ -466,7 +499,11 @@ class CursorSdkAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             if self._hard_stop_requested():
                 self._note_lifecycle(handle.task_id, "stop-abort-fired")
                 self._terminate(sidecar)
-                return SessionResult(status="aborted", session_id=self._session_id(sidecar))
+                return SessionResult(
+                    status="aborted",
+                    session_id=self._session_id(sidecar),
+                    produced_work=self._streamed_work(handle, sidecar),
+                )
             now = time.monotonic()
             if last_heartbeat is None or now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
                 last_heartbeat = now
@@ -491,7 +528,7 @@ class CursorSdkAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         session_id = self._session_id(sidecar)
         usage = parse_usage(sentinel)
         if session_id is not None and usage is not None:
-            self._usage[session_id] = usage
+            self._stash_usage(session_id, usage)
         finished = sentinel is not None and sentinel.get("status") == "finished"
         if not finished:
             # No turn ever ended, so this is a crash — but the read-back still
@@ -501,7 +538,14 @@ class CursorSdkAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # unlink proves belongs to this session.
             detail = "no sentinel" if sentinel is None else f"status={sentinel.get('status')!r}"
             self._note_resultless_stop(handle.task_id, "sidecar-not-finished", detail)
-            return self._final(handle, spec, "crashed", session_id, None)
+            return self._final(
+                handle,
+                spec,
+                "crashed",
+                session_id,
+                None,
+                produced_work=self._streamed_work(handle, sidecar),
+            )
         # A clean sentinel is this transport's `Stop`: the turn genuinely ended,
         # so the artifact read-back may wait out the flush window, and a session
         # that produced none is a stall rather than a crash.
@@ -524,8 +568,21 @@ class CursorSdkAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             event = json.loads(line)
         except json.JSONDecodeError:
             return
-        if isinstance(event, dict) and event.get("type") == SENTINEL_TYPE:
+        if not isinstance(event, dict):
+            return
+        if event.get("type") == SENTINEL_TYPE:
             sidecar.sentinel = event
+        else:
+            sidecar.events += 1
+
+    def _streamed_work(self, handle: SessionHandle, sidecar: _Sidecar) -> bool:
+        """``SessionResult.produced_work`` for a non-completed exit (#727).
+
+        Activity is any SDK stream event ahead of the sentinel. A sidecar that
+        fails before the SDK streams anything (no ``@cursor/sdk``, a rejected API
+        key) emits only an error sentinel, so it reads as no work and the dev
+        decision pauses instead of relaunching into the same failure."""
+        return self._work_verdict(handle, False, sidecar.events > 0)
 
     def _log_evidence(self, handle: SessionHandle) -> bool | None:
         """Session-log half of the #261 proof-of-work gate (see
@@ -572,6 +629,21 @@ class CursorSdkAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         sidecar = self._sidecars.get(handle.task_id)
         if sidecar is not None:
             self._terminate(sidecar)
+
+    def run(self, spec: SessionSpec) -> SessionResult:
+        # Session-scoped retention (DW-106): the base `run()` has finished
+        # `_post_kill_reconcile`, the last reader of the Popen handle, by the time
+        # this `finally` drops it.
+        try:
+            return super().run(spec)
+        finally:
+            self._sidecars.pop(spec.task_id, None)
+
+    def _stash_usage(self, session_id: str, usage: TokenUsage) -> None:
+        if session_id not in self._usage:
+            while len(self._usage) >= USAGE_STASH_CAP:
+                del self._usage[next(iter(self._usage))]
+        self._usage[session_id] = usage
 
     def read_usage(self, result: SessionResult) -> TokenUsage | None:
         return self._usage.get(result.session_id) if result.session_id else None

@@ -3032,8 +3032,8 @@ def install_into(
     # 6. adapter-kind runtimes (`--provision`). Explicitly opt-in and never part
     # of a plain `init`: a provisioner installs software over the network. Kept
     # last so a failure here leaves a fully-initialized project behind — the hook
-    # relay, skills, policy and gitignore above are all already written, and the
-    # operator only has to re-run the provisioning step.
+    # registrations, skills, policy and gitignore above are all already written,
+    # and the operator only has to re-run the provisioning step.
     if provision and _provision_kinds(provision) != 0:
         return 1
 

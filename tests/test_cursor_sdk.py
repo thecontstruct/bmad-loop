@@ -342,13 +342,15 @@ def test_a_result_written_before_the_run_broke_still_counts(project, tmp_path, m
 
 
 def test_a_previous_attempts_result_is_unlinked_at_launch(project, tmp_path, monkeypatch):
-    """`tasks/<task_id>/result.json` is task-scoped, so a leftover from an earlier
-    attempt on the same id would read as this session's work. Cleared at launch,
-    exactly as the tmux adapters do — and that unlink is the whole basis for the
-    crash-path read-back above.
+    """`tasks/<task_id>/` artifacts are task-scoped, so a leftover from an earlier
+    attempt on the same id would read as this session's work. Every name in
+    `journal.TASK_CYCLE_ARTIFACTS` is cleared at launch, exactly as the other
+    adapters do — `escalation.json` included, which `resolve` reads back beside
+    `result.json` — and that reset is the whole basis for the crash-path
+    read-back above.
 
-    ABLATION: drop the `unlink(missing_ok=True)` in `start_session` and this
-    reddens — the stale artifact survives and the session reports `completed`."""
+    ABLATION: drop the `TASK_CYCLE_ARTIFACTS` loop in `start_session` and this
+    reddens — the stale artifacts survive and the session reports `completed`."""
     adapter = _adapter(project.project)
     _point_at(
         monkeypatch,
@@ -358,11 +360,122 @@ def test_a_previous_attempts_result_is_unlinked_at_launch(project, tmp_path, mon
     task_dir = adapter.tasks_dir / "t1"
     task_dir.mkdir(parents=True, exist_ok=True)
     (task_dir / "result.json").write_text(json.dumps({"status": "done"}), encoding="utf-8")
+    (task_dir / "escalation.json").write_text("{}", encoding="utf-8")
 
     result = adapter.run(_spec(project.project))
 
     assert result.status == "crashed"
     assert not (task_dir / "result.json").exists()
+    assert not (task_dir / "escalation.json").exists()
+
+
+def test_a_previous_cycles_logs_are_dropped_at_launch(project, tmp_path, monkeypatch):
+    """A re-armed run reuses task ids. The env-fault tail scan reads
+    `<task>.sidecar.err` and the #261 byte floor reads `<task>.log`, so a stale
+    copy of either would classify or credit THIS session with the previous one's
+    output.
+
+    ABLATION: drop either `unlink` before the `touch()` in `start_session` and
+    the matching row reddens."""
+    adapter = _adapter(project.project)
+    _point_at(monkeypatch, adapter, _fake_sidecar(tmp_path, ""))
+    (adapter.logs_dir / "t1.log").write_text("stale stream " * 64, encoding="utf-8")
+    (adapter.logs_dir / "t1.sidecar.err").write_text("stale: quota\n", encoding="utf-8")
+
+    adapter.run(_spec(project.project))
+
+    assert (adapter.logs_dir / "t1.log").read_text(encoding="utf-8") == ""
+    assert (adapter.logs_dir / "t1.sidecar.err").read_text(encoding="utf-8") == ""
+
+
+def test_an_unsafe_task_id_is_refused_before_anything_is_written(project, tmp_path, monkeypatch):
+    """The task id names files under `tasks/` and `logs/`, so one that is not a
+    single clean path segment is refused at the seam's shared boundary
+    (`base.validated_task_directory`), before any prompt or log is written.
+
+    ABLATION: replace `validated_task_directory(...)` with `self.tasks_dir /
+    spec.task_id` and this reddens — the session launches outside `tasks/`."""
+    from bmad_loop.adapters.base import AdapterTaskDirectoryError
+
+    adapter = _adapter(project.project)
+    _point_at(monkeypatch, adapter, _fake_sidecar(tmp_path, SENTINEL_OK))
+
+    with pytest.raises(AdapterTaskDirectoryError):
+        adapter.start_session(_spec(project.project, task_id="../escape"))
+    assert not (adapter.run_dir / "escape").exists()
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ('emit({"type": "__sidecar_result__", "status": "error"})', False),
+        ('emit({"type": "assistant", "text": "x"})', True),
+        ('print("node: a warning, not an event")', False),
+    ],
+)
+def test_a_crash_reports_whether_the_sdk_streamed_any_work(
+    project, tmp_path, monkeypatch, body, expected
+):
+    """#727: a non-completed session carries `produced_work`, which `decide_dev`
+    reads to PAUSE instead of relaunching into the same wall. A sidecar that
+    dies before the SDK streams anything — the rejected-key and missing-runtime
+    cases emit only an error sentinel — did no work; any stream event is work;
+    a stdout line that is not a JSON event is neither.
+
+    ABLATION: stamp `produced_work=True` in the crash arm of
+    `wait_for_completion` and the two False rows redden."""
+    adapter = _adapter(project.project)
+    _point_at(monkeypatch, adapter, _fake_sidecar(tmp_path, body))
+
+    result = adapter.run(_spec(project.project))
+
+    assert result.status == "crashed"
+    assert result.produced_work is expected
+
+
+def test_a_timeout_after_streamed_events_still_reports_work(project, tmp_path, monkeypatch):
+    adapter = _adapter(project.project)
+    _point_at(
+        monkeypatch,
+        adapter,
+        _fake_sidecar(
+            tmp_path, 'import time\nemit({"type": "thinking", "text": "x"})\ntime.sleep(60)\n'
+        ),
+    )
+    adapter.poll_tick_s = 0.05
+
+    result = adapter.run(_spec(project.project, timeout_s=0.6))
+
+    assert result.status == "timeout"
+    assert result.produced_work is True
+
+
+def test_run_drops_the_sidecar_but_keeps_its_usage(project, tmp_path, monkeypatch):
+    """Retention is session-scoped (DW-106): `run()` drops the task's Popen
+    handle once `_post_kill_reconcile` is done with it. Usage is keyed by
+    session id and read AFTER `run()` returns, so it stays, bounded instead by
+    `USAGE_STASH_CAP` at its write site.
+
+    ABLATION: delete the `run()` override and the first assert reddens."""
+    adapter = _adapter(project.project)
+    _point_at(monkeypatch, adapter, _fake_sidecar(tmp_path, SENTINEL_OK))
+
+    result = adapter.run(_spec(project.project))
+
+    assert "t1" not in adapter._sidecars
+    assert adapter.read_usage(result) is not None
+
+
+def test_the_usage_stash_is_capacity_bounded(project, monkeypatch):
+    monkeypatch.setattr(cursor_sdk, "USAGE_STASH_CAP", 2)
+    adapter = _adapter(project.project)
+    usage = parse_usage({"usage": {"inputTokens": 1}})
+    assert usage is not None
+
+    for session_id in ("a", "b", "a", "c"):
+        adapter._stash_usage(session_id, usage)
+
+    assert list(adapter._usage) == ["b", "c"]
 
 
 def test_a_sidecar_that_never_started_reports_no_proof_of_work(project, tmp_path, monkeypatch):
@@ -646,7 +759,8 @@ def test_init_provision_runs_the_kinds_installer(tmp_path, monkeypatch, capsys):
     assert cli.main(["init", "--project", str(tmp_path), "--provision", "cursor-sdk"]) == 0
 
     assert "@cursor/sdk installed at /x" in capsys.readouterr().out
-    assert (tmp_path / ".bmad-loop" / "bmad_loop_hook.py").is_file()
+    settings = json.loads((tmp_path / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert "Stop" in settings["hooks"]
 
 
 def test_init_provision_of_a_kind_with_no_runtime_fails_naming_the_offer(tmp_path, capsys):
