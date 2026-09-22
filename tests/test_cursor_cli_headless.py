@@ -810,28 +810,18 @@ def test_adapter_kind_bypasses_the_multiplexer(project, monkeypatch):
 # ---------------------------------------------------------------------- init
 
 
-def test_init_seeds_the_skill_tree_and_writes_no_hook_relay(tmp_path):
-    """A hookless-only init has nothing to relay, so the script is not written.
+def test_init_seeds_the_skill_tree_and_registers_no_hooks(tmp_path, capsys):
+    """A hookless profile has no hook config to merge a relay command into, so
+    init seeds only its skill tree under `.cursor/`.
 
-    Ablation: drop the `any(not profile.hookless ...)` guard in `install_into`
-    and the relay reappears, failing the second assertion."""
+    Ablation: drop the `profile.hookless` early return in `_register_hooks` and
+    init exits 1 trying to register hooks the profile does not have."""
     from bmad_loop import cli
 
     assert cli.main(["init", "--project", str(tmp_path), "--cli", "cursor-cli-headless"]) == 0
+    assert "no hooks needed (cursor-cli-headless): hookless transport" in capsys.readouterr().out
     assert (tmp_path / ".cursor" / "skills" / "bmad-loop-sweep" / "SKILL.md").is_file()
-    assert not (tmp_path / ".bmad-loop" / "bmad_loop_hook.py").exists()
-
-
-def test_init_still_writes_the_relay_when_a_hook_driven_cli_is_selected(tmp_path):
-    """The guard is "no hook-driven profile selected", not "cursor was selected":
-    mixing a hookless CLI with a hook-driven one must still install the relay."""
-    from bmad_loop import cli
-
-    rc = cli.main(
-        ["init", "--project", str(tmp_path), "--cli", "cursor-cli-headless", "--cli", "claude"]
-    )
-    assert rc == 0
-    assert (tmp_path / ".bmad-loop" / "bmad_loop_hook.py").is_file()
+    assert sorted(p.name for p in (tmp_path / ".cursor").iterdir()) == ["skills"]
 
 
 # ------------------------------------------------------------------ preview
