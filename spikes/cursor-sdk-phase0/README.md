@@ -18,7 +18,7 @@ Everything in the SDK-local design depends on "yes".
   stdout, then a `__sidecar_result__` sentinel line with terminal status + token usage.
 - `gate-check.mjs` — spawns the sidecar (as the adapter would), tells the agent to
   write `tasks/spike-task/result.json`, and verifies the file + schema. Writes
-  `gate-result.json`.
+  `gate-result.json` (gitignored). The recorded 2026-07-08 PASS lives in the PR description.
 
 ## Run
 
