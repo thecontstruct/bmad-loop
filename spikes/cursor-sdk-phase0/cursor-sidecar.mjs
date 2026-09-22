@@ -10,22 +10,22 @@
 //
 // Exit code: 0 on run status "finished", 2 otherwise, 1 on setup/transport error.
 
-import { readFileSync } from "node:fs";
+import { readFileSync } from 'node:fs';
 
-const SENTINEL = "__sidecar_result__";
+const SENTINEL = '__sidecar_result__';
 const MAX_FIELD = 4000; // truncate oversized tool args/results in the echoed stream
 
 function parseArgs(argv) {
-  const out = { cwd: process.cwd(), model: "composer-2.5", prompt: null, timeoutMs: 600000 };
+  const out = { cwd: process.cwd(), model: 'composer-2.5', prompt: null, timeoutMs: 600000 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => argv[++i];
-    if (a === "--cwd") out.cwd = next();
-    else if (a === "--model") out.model = next();
-    else if (a === "--prompt") out.prompt = next();
-    else if (a === "--prompt-file") out.prompt = readFileSync(next(), "utf8");
-    else if (a === "--timeout-ms") out.timeoutMs = Number(next());
-    else if (!a.startsWith("--") && out.prompt == null) out.prompt = a;
+    if (a === '--cwd') out.cwd = next();
+    else if (a === '--model') out.model = next();
+    else if (a === '--prompt') out.prompt = next();
+    else if (a === '--prompt-file') out.prompt = readFileSync(next(), 'utf8');
+    else if (a === '--timeout-ms') out.timeoutMs = Number(next());
+    else if (!a.startsWith('--') && out.prompt == null) out.prompt = a;
   }
   return out;
 }
@@ -34,35 +34,35 @@ function emit(obj) {
   let line;
   try {
     line = JSON.stringify(obj, (_k, v) => {
-      if (typeof v === "string" && v.length > MAX_FIELD) return v.slice(0, MAX_FIELD) + "…[truncated]";
+      if (typeof v === 'string' && v.length > MAX_FIELD) return v.slice(0, MAX_FIELD) + '…[truncated]';
       return v;
     });
   } catch {
-    line = JSON.stringify({ type: "__unserializable", keys: Object.keys(obj ?? {}) });
+    line = JSON.stringify({ type: '__unserializable', keys: Object.keys(obj ?? {}) });
   }
-  process.stdout.write(line + "\n");
+  process.stdout.write(line + '\n');
 }
 
 function log(...args) {
-  process.stderr.write(`[sidecar] ${args.join(" ")}\n`);
+  process.stderr.write(`[sidecar] ${args.join(' ')}\n`);
 }
 
 const opts = parseArgs(process.argv.slice(2));
 
 if (!process.env.CURSOR_API_KEY) {
-  log("FATAL: CURSOR_API_KEY is not set");
+  log('FATAL: CURSOR_API_KEY is not set');
   process.exit(1);
 }
 if (!opts.prompt) {
-  log("FATAL: no prompt (use --prompt, --prompt-file, or a positional arg)");
+  log('FATAL: no prompt (use --prompt, --prompt-file, or a positional arg)');
   process.exit(1);
 }
 
 let Agent;
 try {
-  ({ Agent } = await import("@cursor/sdk"));
+  ({ Agent } = await import('@cursor/sdk'));
 } catch (err) {
-  log("FATAL: cannot import @cursor/sdk — run `npm install` in this dir first.", String(err));
+  log('FATAL: cannot import @cursor/sdk — run `npm install` in this dir first.', String(err));
   process.exit(1);
 }
 
@@ -79,7 +79,7 @@ try {
   log(`agent created: ${agent.agentId}`);
 
   const run = await agent.send(opts.prompt);
-  log(`run started: ${run.id ?? "(no id)"}`);
+  log(`run started: ${run.id ?? '(no id)'}`);
 
   timer = setTimeout(() => {
     log(`FATAL: timeout after ${opts.timeoutMs}ms — cancelling run`);
@@ -100,16 +100,16 @@ try {
     runId: result.id,
     durationMs: result.durationMs ?? null,
     usage: result.usage ?? null,
-    resultText: typeof result.result === "string" ? result.result.slice(0, MAX_FIELD) : null,
+    resultText: typeof result.result === 'string' ? result.result.slice(0, MAX_FIELD) : null,
     error: result.error ?? null,
   });
 
-  log(`run finished: status=${result.status} usage=${result.usage ? result.usage.totalTokens + " tok" : "n/a"}`);
-  process.exitCode = result.status === "finished" ? 0 : 2;
+  log(`run finished: status=${result.status} usage=${result.usage ? result.usage.totalTokens + ' tok' : 'n/a'}`);
+  process.exitCode = result.status === 'finished' ? 0 : 2;
 } catch (err) {
   clearTimeout(timer);
-  log("FATAL: run failed:", err?.stack || String(err));
-  emit({ type: SENTINEL, status: "error", error: { message: String(err?.message || err) } });
+  log('FATAL: run failed:', err?.stack || String(err));
+  emit({ type: SENTINEL, status: 'error', error: { message: String(err?.message || err) } });
   process.exitCode = 1;
 } finally {
   try {
