@@ -1,0 +1,17 @@
+{
+  "name": "cursor-sdk-phase0",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Throwaway Phase-0 spike: prove @cursor/sdk local runtime can back a bmad-loop provider.",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "sidecar": "node cursor-sidecar.mjs",
+    "gate": "node gate-check.mjs"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.23"
+  }
+}
