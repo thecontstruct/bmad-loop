@@ -1413,7 +1413,7 @@ source = "sprint-status"     # sprint-status | stories
 spec_folder = ""
 
 [adapter]
-name = "claude"              # claude | codex | gemini | copilot | cursor | antigravity | opencode-http (alias: opencode) | <custom .bmad-loop/profiles/*.toml>
+name = "cursor"              # claude | codex | gemini | copilot | cursor | antigravity | opencode-http (alias: opencode) | <custom .bmad-loop/profiles/*.toml>
 model = ""                   # empty = CLI default model (opencode-http wants "provider/model")
 effort = ""                  # reasoning effort, free-form (e.g. "high", "max"); empty = provider default.
                              # Sent by opencode-http as the per-prompt `variant`; the tmux CLIs ignore it
@@ -1431,14 +1431,13 @@ cleanup_session_on_finish = true  # kill the run's tmux session when it finishes
 # switches client falls back to that profile's defaults instead (model, effort
 # and extra_args are client-specific). Stage tables must come after the
 # [adapter] keys above.
-# [adapter.dev]
-# model = "opus"
-# [adapter.review]
-# name = "codex"
-# model = "gpt-5-codex"
-# stop_without_result_nudges = 5     # e.g. a multi-turn review needs more nudges than dev
+# cursor-agent model ids — list with `cursor-agent models`
+[adapter.dev]
+model = "composer-2.5-fast"
+[adapter.review]
+model = "claude-opus-5-5-high"
 # [adapter.triage]
-# model = "opus"
+# model = "composer-2.5-fast"
 # With an opencode-http base, effort tunes reasoning per stage (opencode-http
 # only — a tmux CLI ignores it and `bmad-loop validate` warns):
 # [adapter.review]
