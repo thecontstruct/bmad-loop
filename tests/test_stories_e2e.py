@@ -57,6 +57,7 @@ spawn and reap their own short-lived children, but run no tmux or orchestrator s
 from __future__ import annotations
 
 import errno
+import inspect
 import json
 import os
 import shlex
@@ -78,7 +79,9 @@ from conftest import (
     bind_recorded_child,
     install_build_auto_skill,
     install_dev_base_skills,
+    install_sweep_skill,
     kill_recorded_child,
+    needs_pidfd,
     preflight_pidfd_support,
     proc_starttime,
     real_mux_e2e,
@@ -101,10 +104,13 @@ from bmad_loop.install import (
 # has no %N and macOS ships no setsid utility, so skipping honestly beats failing.
 HAVE_TMUX = sys.platform.startswith("linux") and shutil.which("tmux") is not None
 # A LIST, not a single mark: every real-tmux test here joins the serialized real-mux
-# xdist group (DW-95). The local-process identity rows below inherit the same marks.
+# xdist group (DW-95) and runs on its own private tmux server (DW-561), so a leaked
+# session never reaches the default one. The local-process identity rows below
+# inherit the same marks.
 pytestmark = [
     pytest.mark.skipif(not HAVE_TMUX, reason="stories E2E needs real tmux on Linux"),
     real_mux_e2e,
+    pytest.mark.usefixtures("private_tmux_server"),
 ]
 
 # The fake CLI: reads the story id + spec folder from the session env (as the real
@@ -237,6 +243,41 @@ sleep 30
 # FAKE_CLI in nothing else.
 LEGACY_EVENTS_FAKE_CLI = FAKE_CLI.replace('ed="$BMAD_LOOP_EVENTS_DIR"', 'ed="$rd/events"')
 
+# The same script with a nested coding CLI launched inside the session (#767): the
+# child inherits BMAD_LOOP_TASK_ID/BMAD_LOOP_EVENTS_DIR, so its own SessionStart,
+# Stop and SessionEnd land in the parent's stream, before the parent has written a
+# result. Fresh timestamps (and a pause so they reach the watcher as their own ticks)
+# order every child event ahead of the parent's Stop, which is re-stamped too, so the
+# parent's completion cannot overtake them in one poll. Each event is published by a
+# rename, as the real relay does: SignalWatcher consumes a `.json` name on first
+# sight, so a poll landing mid-`printf` would drop a truncated child SessionStart for
+# good and no foreign crumb would follow. The parent's own SessionStart is renamed
+# into place too: dropped the same way, it leaves the child's start as the first
+# one, which the attribution admits as the launched session's — again no crumb.
+_PARENT_START_PUBLISHED = """    "$ts" "$tid" > "$ed/$ts-$tid-SessionStart.json.tmp"
+mv "$ed/$ts-$tid-SessionStart.json.tmp" "$ed/$ts-$tid-SessionStart.json"
+"""
+_NESTED_CHILD_EVENTS = r"""
+for kind in SessionStart Stop SessionEnd; do
+    cts=$(date +%s%N)
+    printf '{"ts": %s, "event": "%s", "task_id": "%s", "session_id": "child-1"}' \
+        "$cts" "$kind" "$tid" > "$ed/$cts-$tid-$kind.json.tmp"
+    mv "$ed/$cts-$tid-$kind.json.tmp" "$ed/$cts-$tid-$kind.json"
+done
+sleep 2
+"""
+_PARENT_START = """    "$ts" "$tid" > "$ed/$ts-$tid-SessionStart.json"
+"""
+_STORY_STOP_TS = """write_done                       # normal fresh dispatch
+fi
+
+ts2=$(( ts + 1 ))
+"""
+assert FAKE_CLI.count(_PARENT_START) == 1 and FAKE_CLI.count(_STORY_STOP_TS) == 1
+NESTED_CHILD_FAKE_CLI = FAKE_CLI.replace(
+    _PARENT_START, _PARENT_START_PUBLISHED + _NESTED_CHILD_EVENTS
+).replace(_STORY_STOP_TS, _STORY_STOP_TS.replace("$(( ts + 1 ))", "$(date +%s%N)"))
+
 PROFILE_TOML = """\
 name = "fakestories"
 binary = "{binary}"
@@ -286,6 +327,58 @@ idfile="$rd/tasks/$tid/fake-child.pid"
     + RECORD_CHILD_IDENTITY_SH
     + r"""wait "$child"
 """
+)
+
+# Claude Code's API-error turn end (#865): SessionStart, then a `StopFailure` event
+# carrying the relay's `stop_error` / `stop_message` keys instead of any Stop — so
+# only the adapter's StopFailure branch can end the session before the timeout.
+# Derived from TIMEOUT_FAKE_CLI: the inserted block exits before its sleep-child
+# tail ever runs, so no child identity is recorded and there is nothing to reap.
+_STOP_FAILURE_EVENT = r"""ts2=$(( ts + 1 ))
+printf '{"ts": %s, "event": "StopFailure", "task_id": "%s", "session_id": "fake-1", "stop_error": "billing_error", "stop_message": "Credit balance is too low"}' \
+    "$ts2" "$tid" > "$ed/$ts2-$tid-StopFailure.json"
+sleep 30
+exit 0
+"""
+assert TIMEOUT_FAKE_CLI.count(_PARENT_START) == 1
+STOP_FAILURE_FAKE_CLI = TIMEOUT_FAKE_CLI.replace(_PARENT_START, _PARENT_START + _STOP_FAILURE_EVENT)
+# #959: the CLI's window dies right after the StopFailure (as when an operator's own
+# StopFailure hook kills it to rotate accounts). The watcher's 1 s poll reads the
+# event only after the window is gone, so the stall re-probe finds it dead.
+assert STOP_FAILURE_FAKE_CLI.count("sleep 30\nexit 0\n") == 1
+STOP_FAILURE_DIES_FAKE_CLI = STOP_FAILURE_FAKE_CLI.replace("sleep 30\nexit 0\n", "exit 0\n")
+
+# #959 usage-limit relaunch: FAKE_CLI with a launch counter in the run dir. Every
+# launch records the `BMAD_LOOP_USAGE_RELAUNCH` it got; launch 1 then ends its turn
+# on a `rate_limit` StopFailure whose message matches no usage pattern (the profile
+# declares none) and sleeps, so only relaunch mode's at-once exit ends it in time.
+# Launch 2 falls through to FAKE_CLI's sprint path and completes the story.
+_RELAUNCH_ONCE = r"""n=$(cat "$rd/fake-launches" 2>/dev/null || echo 0)
+n=$(( n + 1 ))
+printf '%s' "$n" > "$rd/fake-launches"
+printf '%s' "${BMAD_LOOP_USAGE_RELAUNCH-unset}" > "$rd/tasks/$tid/usage-relaunch.txt"
+if [ "$n" = 1 ]; then
+    ts2=$(( ts + 1 ))
+    printf '{"ts": %s, "event": "StopFailure", "task_id": "%s", "session_id": "fake-1", "stop_error": "rate_limit", "stop_message": "API Error: 429 Too Many Requests"}' \
+        "$ts2" "$tid" > "$ed/$ts2-$tid-StopFailure.json"
+    sleep 30
+    exit 0
+fi
+"""
+USAGE_RELAUNCH_FAKE_CLI = FAKE_CLI.replace(_PARENT_START, _PARENT_START + _RELAUNCH_ONCE)
+
+# PROFILE_TOML with the canonical StopFailure mapped and one account error, as
+# claude's own profile maps it.
+_PROFILE_EVENTS = 'events = {{ SessionStart = "SessionStart", Stop = "Stop" }}\n'
+assert PROFILE_TOML.count(_PROFILE_EVENTS) == 1
+STOP_FAILURE_PROFILE_TOML = PROFILE_TOML.replace(
+    _PROFILE_EVENTS,
+    'events = {{ SessionStart = "SessionStart", Stop = "Stop", StopFailure = "StopFailure" }}\n'
+    "\n[hooks.stop_failure_types]\n"
+    'billing_error = "account"\n',
+)
+USAGE_RELAUNCH_PROFILE_TOML = STOP_FAILURE_PROFILE_TOML.replace(
+    'billing_error = "account"\n', 'billing_error = "account"\nrate_limit = "rate_limit"\n'
 )
 
 # DW-159: publication must not precede the session transition. `$!` names the child
@@ -429,6 +522,42 @@ for _fake in (DETACHED_WRITER_FAKE_CLI, PUBLICATION_FAULT_FAKE_CLI):
     assert _fake.index(AWAIT_DETACHED_SESSION_SH) < _fake.index(RECORD_CHILD_IDENTITY_SH)
 del _fake
 
+# #772: the sprint branch as bmad-build-auto behaves with review ON. The dev leg leaves
+# its own work committed, as the real skill's finalization does. The review leg (routed
+# on the review prompt's ledger hands-off clause, ahead of the spec-status routing: a
+# review re-invokes the skill on the `done` spec) finalizes like step-04: it writes its
+# result, commits the files it owns (its spec and the reviewed code), then HALTs
+# `blocked` — "finalization left repository dirty" — if ANYTHING else is left over. The
+# engine's own uncommitted ledger bookkeeping is exactly that leftover.
+_SPRINT_STATUS_READ = """    [ -f "$spec" ] && status=$(sed -n 's/^status:[[:space:]]*//p' "$spec" | head -1 | tr -d "'\\" ")
+"""
+_REVIEW_FINALIZE = r"""    if printf '%s' "$prompt" | grep -qF "deferred-work ledger entries"; then
+        printf -- '---\ntitle: %s\nstatus: done\nbaseline_commit: %s\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\n- Status: done\n\nSummary: reviewed.\n' \
+            "$story" "$baseline" > "$spec"
+        git add -- "$spec" src.txt
+        git diff --cached --quiet || git commit -q -m "review: $story"
+        if [ -n "$(git status --porcelain)" ]; then
+            printf -- '---\ntitle: %s\nstatus: blocked\nbaseline_commit: %s\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\n- Status: blocked\n\nfinalization left repository dirty\n' \
+                "$story" "$baseline" > "$spec"
+        fi
+        ts2=$(( ts + 1 ))
+        printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \
+            "$ts2" "$tid" > "$ed/$ts2-$tid-Stop.json"
+        sleep 30
+        exit 0
+    fi
+"""
+_SPRINT_DEV_DONE = r"""Summary: sprint.\n' \
+            "$story" "$baseline" > "$spec"
+"""
+assert FAKE_CLI.count(_SPRINT_STATUS_READ) == 1 and FAKE_CLI.count(_SPRINT_DEV_DONE) == 1
+REVIEW_FINALIZE_FAKE_CLI = FAKE_CLI.replace(
+    _SPRINT_STATUS_READ, _SPRINT_STATUS_READ + _REVIEW_FINALIZE
+).replace(
+    _SPRINT_DEV_DONE,
+    _SPRINT_DEV_DONE + '        git add -A\n        git commit -q -m "dev: $story"\n',
+)
+
 
 def _git(root: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True)
@@ -529,7 +658,11 @@ def _scaffold_renderer(
 
 
 def _scaffold_sprint(
-    root: Path, story_key: str, fake_cli: str = FAKE_CLI, extra_policy: str = ""
+    root: Path,
+    story_key: str,
+    fake_cli: str = FAKE_CLI,
+    extra_policy: str = "",
+    profile_toml: str = PROFILE_TOML,
 ) -> None:
     """A committed, clean SPRINT-mode sandbox carrying the SAME new folder+id-
     capable bmad-dev-auto skill stub as `_scaffold` (with the folder+id dispatch
@@ -537,7 +670,7 @@ def _scaffold_sprint(
     the default sprint path. sprint-status.yaml holds one ready-for-dev story; the
     policy has NO [stories] section, so the run is plain sprint mode. ``fake_cli``
     swaps the CLI script (e.g. a never-Stop timeout fake); ``extra_policy`` appends
-    to policy.toml (e.g. a [limits] block)."""
+    to policy.toml (e.g. a [limits] block); ``profile_toml`` swaps the profile."""
     root.mkdir(parents=True, exist_ok=True)
     (root / "src.txt").write_text("original\n", encoding="utf-8")
     (root / ".gitignore").write_text(".bmad-loop/runs/\n", encoding="utf-8")
@@ -576,7 +709,7 @@ def _scaffold_sprint(
     profiles = root / ".bmad-loop" / "profiles"
     profiles.mkdir(parents=True)
     (profiles / "fakestories.toml").write_text(
-        PROFILE_TOML.format(binary=str(fake)), encoding="utf-8"
+        profile_toml.format(binary=str(fake)), encoding="utf-8"
     )
     (root / ".bmad-loop" / "policy.toml").write_text(
         '[adapter]\nname = "fakestories"\n\n'
@@ -616,6 +749,8 @@ def _scaffold_sweep(root: Path) -> None:
 
     # the SAME folder+id-capable skill stubs the other scaffolds install
     install_dev_base_skills(root, folder_id=True)  # tree matches PROFILE_TOML's skill_tree
+    # the triage session dispatches `/bmad-loop-sweep`, as `bmad-loop init` lays it down
+    install_sweep_skill(root)
 
     # canonical DW-format ledger (no legacy content → migration is skipped)
     (impl / "deferred-work.md").write_text(
@@ -722,7 +857,7 @@ def test_e2e_two_story_happy_path(tmp_path):
     assert _commit_count(root) == base + 2
 
 
-def test_e2e_two_story_happy_path_build_auto(tmp_path):
+def test_e2e_two_story_happy_path_build_auto(tmp_path, private_tmux_server):
     """Scenario 9, the post-rename twin of the happy path (BMAD-METHOD #2651):
     the project carries ONLY `bmad-build-auto`, so the real CLI has to resolve the
     invoked primitive off disk. The fake routes on env vars and spec status and
@@ -748,7 +883,7 @@ def test_e2e_two_story_happy_path_build_auto(tmp_path):
     # A FINISHED run tears down its mux session (`cleanup_session_on_finish`); the
     # suite's one real-tmux pin of that — the timeout row now pauses (#727) and a
     # pause keeps the session for resume by design.
-    assert not _tmux_has_session(f"bmad-loop-{run_id}")
+    assert not _tmux_has_session(private_tmux_server, f"bmad-loop-{run_id}")
     dispatched = [
         p.read_text(encoding="utf-8") for p in (run_dir / "tasks").glob("*/fake-prompt.txt")
     ]
@@ -1166,6 +1301,7 @@ def test_recorded_child_rejects_malformed_zero_and_non_ascii_identities(tmp_path
         recorded_child(pid_file)
 
 
+@needs_pidfd
 def test_reap_identity_binds_a_live_child(tmp_path):
     proc, starttime = _live_child()
     try:
@@ -1190,17 +1326,21 @@ def test_reap_identity_returns_none_for_a_reaped_child():
 
 
 def test_reap_identity_refuses_a_start_time_mismatch(monkeypatch):
+    # Capability-free: the refusal happens before any pidfd call, so the spy may stand
+    # in for an attribute this Python build does not have (raising=False).
     proc, starttime = _live_child()
     try:
         opened: list[int] = []
-        real_open = os.pidfd_open
+        real_open = getattr(os, "pidfd_open", None)
 
         def spy_open(pid: int) -> int:
             opened.append(pid)
+            if real_open is None:
+                raise ProcessLookupError(pid)  # the recorded call already fails the row
             return real_open(pid)
 
         with monkeypatch.context() as patch:
-            patch.setattr(os, "pidfd_open", spy_open)
+            patch.setattr(os, "pidfd_open", spy_open, raising=False)
             assert bind_recorded_child(proc.pid, str(int(starttime) + 1)) is None
         assert opened == [], "a mismatched process must not be bound"
         assert proc.poll() is None, "a mismatched process must not be signalled"
@@ -1208,6 +1348,7 @@ def test_reap_identity_refuses_a_start_time_mismatch(monkeypatch):
         _reap(proc)
 
 
+@needs_pidfd
 def test_reap_identity_closes_the_fd_when_the_pid_is_recycled_around_the_bind(monkeypatch):
     proc, starttime = _live_child()
     try:
@@ -1231,6 +1372,7 @@ def test_reap_identity_closes_the_fd_when_the_pid_is_recycled_around_the_bind(mo
         _reap(proc)
 
 
+@needs_pidfd
 def test_reap_identity_closes_the_fd_when_reauthentication_raises(monkeypatch):
     proc, starttime = _live_child()
     try:
@@ -1263,6 +1405,7 @@ def test_reap_identity_closes_the_fd_when_reauthentication_raises(monkeypatch):
 
 
 def test_reap_identity_returns_none_when_pidfd_open_loses_the_process(monkeypatch):
+    # Capability-free: the fake is the only pidfd_open this row calls (raising=False).
     proc, starttime = _live_child()
     try:
 
@@ -1270,7 +1413,7 @@ def test_reap_identity_returns_none_when_pidfd_open_loses_the_process(monkeypatc
             raise ProcessLookupError
 
         with monkeypatch.context() as patch:
-            patch.setattr(os, "pidfd_open", disappeared)
+            patch.setattr(os, "pidfd_open", disappeared, raising=False)
             assert bind_recorded_child(proc.pid, starttime) is None
         assert proc.poll() is None, "the simulated open race must not signal the child"
     finally:
@@ -1297,6 +1440,7 @@ def test_proc_starttime_propagates_non_disappearance_and_malformed_failures(monk
             proc_starttime(123)
 
 
+@needs_pidfd
 def test_kill_recorded_child_actually_kills_through_the_fd():
     proc, starttime = _live_child()
     try:
@@ -1308,6 +1452,7 @@ def test_kill_recorded_child_actually_kills_through_the_fd():
         _reap(proc)
 
 
+@needs_pidfd
 def test_kill_recorded_child_propagates_signal_failure_and_closes_fd(monkeypatch):
     proc, starttime = _live_child()
     try:
@@ -1329,6 +1474,7 @@ def test_kill_recorded_child_propagates_signal_failure_and_closes_fd(monkeypatch
         _reap(proc)
 
 
+@needs_pidfd
 def test_kill_recorded_child_ignores_disappearance_and_closes_fd(monkeypatch):
     fd = os.pidfd_open(os.getpid())
 
@@ -1364,6 +1510,7 @@ def test_live_child_reaps_its_process_when_identity_observation_fails(monkeypatc
     assert spawned[0].poll() == -signal.SIGKILL
 
 
+@needs_pidfd
 def test_reap_identity_fails_loudly_when_pidfd_is_unsupported(monkeypatch):
     proc, starttime = _live_child()
     try:
@@ -1429,6 +1576,7 @@ def test_recorded_children_swept_leaves_a_clean_block_alone(tmp_path):
         _reap(proc)
 
 
+@needs_pidfd
 def test_recorded_children_swept_reaps_a_recorded_child_and_reraises(tmp_path):
     proc, starttime = _live_child()
     try:
@@ -1441,6 +1589,7 @@ def test_recorded_children_swept_reaps_a_recorded_child_and_reraises(tmp_path):
         _reap(proc)
 
 
+@needs_pidfd
 def test_recorded_children_swept_warns_past_a_malformed_identity_and_keeps_sweeping(tmp_path):
     """One unparseable file must not end the sweep, nor get its number signalled.
 
@@ -1467,6 +1616,7 @@ def test_recorded_children_swept_warns_past_a_malformed_identity_and_keeps_sweep
         _reap(survivor)
 
 
+@needs_pidfd
 def test_recorded_children_swept_never_signals_a_stale_start_time(tmp_path):
     """A start-time mismatch refuses the bind — silently, since nothing failed to parse.
 
@@ -1492,7 +1642,9 @@ def test_recorded_children_swept_never_signals_a_stale_start_time(tmp_path):
 def test_recorded_children_swept_warns_when_the_bind_itself_fails(tmp_path, monkeypatch):
     """The OSError arm: a parseable identity whose bind raises something that is NOT
     proven disappearance. Without this row the handler could narrow to AssertionError
-    alone and every other sweeper row would stay green."""
+    alone and every other sweeper row would stay green.
+
+    Capability-free: the fake is the only pidfd_open the sweep reaches (raising=False)."""
     proc, starttime = _live_child()
     try:
         pid_file = _plant_recorded_identity(tmp_path, f"{proc.pid} {starttime}\n")
@@ -1501,7 +1653,7 @@ def test_recorded_children_swept_warns_when_the_bind_itself_fails(tmp_path, monk
             raise OSError(errno.ENOSYS, "pidfd_open not supported")
 
         with monkeypatch.context() as patch:
-            patch.setattr(os, "pidfd_open", unsupported)
+            patch.setattr(os, "pidfd_open", unsupported, raising=False)
             with pytest.warns(UserWarning, match="unauthenticated survivor") as record:
                 with pytest.raises(RuntimeError, match="pre-bind boom"):
                     with recorded_children_swept(tmp_path):
@@ -1512,6 +1664,7 @@ def test_recorded_children_swept_warns_when_the_bind_itself_fails(tmp_path, monk
         _reap(proc)
 
 
+@needs_pidfd
 def test_recorded_children_swept_warns_past_undecodable_bytes_and_keeps_sweeping(tmp_path):
     """A non-UTF-8 record raises UnicodeDecodeError out of `read_text`, not
     AssertionError — a handler listing only parse-shaped types would let it REPLACE
@@ -1532,6 +1685,7 @@ def test_recorded_children_swept_warns_past_undecodable_bytes_and_keeps_sweeping
         _reap(doomed)
 
 
+@needs_pidfd
 def test_recorded_children_swept_keeps_the_original_error_when_warnings_are_errors(tmp_path):
     doomed, doomed_start = _live_child()
     try:
@@ -1547,6 +1701,7 @@ def test_recorded_children_swept_keeps_the_original_error_when_warnings_are_erro
         _reap(doomed)
 
 
+@needs_pidfd
 def test_recorded_children_swept_warns_past_signal_failure_and_keeps_sweeping(
     tmp_path, monkeypatch
 ):
@@ -1580,6 +1735,7 @@ def test_recorded_children_swept_warns_past_signal_failure_and_keeps_sweeping(
         _reap(doomed)
 
 
+@needs_pidfd
 def test_recorded_children_swept_preserves_partial_glob_results(tmp_path, monkeypatch):
     doomed, doomed_start = _live_child()
     try:
@@ -1609,6 +1765,16 @@ def test_recorded_children_swept_is_a_noop_without_identity_files(tmp_path):
             raise RuntimeError("pre-bind boom")
 
 
+def _drive_surface(name: str, tmp_path: Path, monkeypatch, socket: Path) -> None:
+    """Call a reap surface directly, live-assertion off, handing it the private tmux
+    socket only when its signature takes one."""
+    surface = globals()[name]
+    takes_socket = "private_tmux_server" in inspect.signature(surface).parameters
+    surface(
+        tmp_path, monkeypatch, False, **({"private_tmux_server": socket} if takes_socket else {})
+    )
+
+
 @pytest.mark.parametrize(
     "surface_name",
     [
@@ -1617,7 +1783,9 @@ def test_recorded_children_swept_is_a_noop_without_identity_files(tmp_path):
         "test_e2e_detached_writer_publication_fault_still_reaped",
     ],
 )
-def test_reap_e2e_preflight_failure_prevents_run(tmp_path, monkeypatch, surface_name):
+def test_reap_e2e_preflight_failure_prevents_run(
+    tmp_path, monkeypatch, private_tmux_server, surface_name
+):
     run_called = False
 
     def unsupported() -> None:
@@ -1633,7 +1801,7 @@ def test_reap_e2e_preflight_failure_prevents_run(tmp_path, monkeypatch, surface_
         patch.setattr(sys.modules[__name__], "preflight_pidfd_support", unsupported)
         patch.setattr(sys.modules[__name__], "_run", unexpected_run)
         with pytest.raises(OSError, match="pidfd unavailable"):
-            globals()[surface_name](tmp_path, monkeypatch, False)
+            _drive_surface(surface_name, tmp_path, monkeypatch, private_tmux_server)
     assert not run_called
 
 
@@ -1644,7 +1812,10 @@ def test_reap_e2e_preflight_failure_prevents_run(tmp_path, monkeypatch, surface_
         "test_e2e_detached_writer_reaped_before_worktree_teardown",
     ],
 )
-def test_reap_e2e_sweeps_a_recorded_child_when_the_run_fails(tmp_path, monkeypatch, surface_name):
+@needs_pidfd
+def test_reap_e2e_sweeps_a_recorded_child_when_the_run_fails(
+    tmp_path, monkeypatch, private_tmux_server, surface_name
+):
     """DW-137: a failure anywhere in the pre-bind window must not leak the child.
 
     Both surfaces spawn their fake child inside `_run` but can only bind a pidfd after
@@ -1663,12 +1834,13 @@ def test_reap_e2e_sweeps_a_recorded_child_when_the_run_fails(tmp_path, monkeypat
             patch.setattr(sys.modules[__name__], "_scaffold_sprint", lambda *_a, **_kw: None)
             patch.setattr(sys.modules[__name__], "_run", failing_run)
             with pytest.raises(RuntimeError, match="run refused"):
-                globals()[surface_name](tmp_path, monkeypatch, False)
+                _drive_surface(surface_name, tmp_path, monkeypatch, private_tmux_server)
         assert proc.wait(timeout=10) == -signal.SIGKILL
     finally:
         _reap(proc)
 
 
+@needs_pidfd
 def test_recorded_children_swept_sweeps_only_the_named_channel(tmp_path):
     observed, observed_start = _live_child()
     recorded, recorded_start = _live_child()
@@ -1687,6 +1859,7 @@ def test_recorded_children_swept_sweeps_only_the_named_channel(tmp_path):
         _reap(recorded)
 
 
+@needs_pidfd
 def test_reap_e2e_sweeps_an_observed_child_when_the_run_fails(tmp_path, monkeypatch):
     proc, starttime = _live_child()
     try:
@@ -1709,13 +1882,14 @@ def test_reap_e2e_sweeps_an_observed_child_when_the_run_fails(tmp_path, monkeypa
         _reap(proc)
 
 
-def _tmux_has_session(name: str) -> bool:
-    return subprocess.run(["tmux", "has-session", "-t", name], capture_output=True).returncode == 0
+def _tmux_has_session(socket: Path, name: str) -> bool:
+    argv = ["tmux", "-S", str(socket), "has-session", "-t", name]
+    return subprocess.run(argv, capture_output=True).returncode == 0
 
 
-def _tmux_window_names(session: str) -> list[str]:
+def _tmux_window_names(socket: Path, session: str) -> list[str]:
     out = subprocess.run(
-        ["tmux", "list-windows", "-t", f"={session}", "-F", "#{window_name}"],
+        ["tmux", "-S", str(socket), "list-windows", "-t", f"={session}", "-F", "#{window_name}"],
         capture_output=True,
         text=True,
     )
@@ -1725,7 +1899,10 @@ def _tmux_window_names(session: str) -> list[str]:
 @pytest.mark.parametrize(
     "force_live_reap_assertion", [False, True], ids=["reaped", "live-assertion"]
 )
-def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_assertion):
+@needs_pidfd
+def test_e2e_session_timeout_teardown(
+    tmp_path, monkeypatch, force_live_reap_assertion, private_tmux_server
+):
     """#157 end to end through the real binary + real tmux: a dev session wedged
     forever (SessionStart, then sleep — never a Stop) is bounded only by the
     session timeout, and the fix makes that firing timely and observable. The
@@ -1843,8 +2020,8 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_ass
         ), state
         assert end.get("produced_work") is False, end
         session_name = f"bmad-loop-{run_id}"
-        assert _tmux_has_session(session_name)
-        windows = _tmux_window_names(session_name)
+        assert _tmux_has_session(private_tmux_server, session_name)
+        windows = _tmux_window_names(private_tmux_server, session_name)
         assert task_id[-40:] not in windows and len(windows) == 1, windows
         if shutil.which("pgrep"):
             pg = subprocess.run(["pgrep", "-af", "fake-cli.sh"], capture_output=True, text=True)
@@ -1887,7 +2064,9 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_ass
             # The paused run left its session for a resume that never comes.
             if run_id is not None:
                 subprocess.run(
-                    ["tmux", "kill-session", "-t", f"=bmad-loop-{run_id}"], capture_output=True
+                    ["tmux", "-S", str(private_tmux_server), "kill-session"]
+                    + ["-t", f"=bmad-loop-{run_id}"],
+                    capture_output=True,
                 )
 
     if force_live_reap_assertion:
@@ -1895,9 +2074,197 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_ass
         assert injected_exit == -signal.SIGKILL
 
 
+def test_e2e_stop_failure_account_error_pauses_uncharged(
+    tmp_path, monkeypatch, private_tmux_server
+):
+    """#865 end to end through the real binary + real tmux, zero tokens: a turn that
+    ends on an account API error fires `StopFailure(billing_error)` and never a Stop.
+    The adapter ends the session parked at the event — no stall grace, no nudge —
+    and the engine PAUSEs with a reason naming the error, without charging a retry:
+    two dev attempts are allowed and exactly one session ran. The session-end
+    journal carries `stop_failure`, and the agent window is torn down. The 120 s
+    session timeout is far beyond the run's bound, so only the StopFailure exit can
+    end the session in time."""
+    root = tmp_path / "sbx"
+    story = "1-1-stopfail"
+    _scaffold_sprint(
+        root,
+        story,
+        fake_cli=STOP_FAILURE_FAKE_CLI,
+        extra_policy="\n[limits]\nmax_dev_attempts = 2\nteardown_grace_s = 5\n",
+        profile_toml=STOP_FAILURE_PROFILE_TOML,
+    )
+    # inherited by the `bmad-loop run` subprocess (_run passes no env=)
+    monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", "120")
+    run_id: str | None = None
+    try:
+        proc = _run(root, "run", timeout=90)
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+        run_id = _run_id(root)
+        run_dir = root / ".bmad-loop" / "runs" / run_id
+
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        assert state.get("paused_stage") == "escalation", state
+        reason = str(state.get("paused_reason", ""))
+        assert reason.startswith("parked: dev session stalled (StopFailure(billing_error)"), reason
+        assert "Credit balance is too low" in reason, reason
+
+        journal = [
+            json.loads(ln)
+            for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        # uncharged: the pause did not spend the second attempt on a retry
+        ends = [j for j in journal if j["kind"] == "session-end"]
+        assert len(ends) == 1, [j["kind"] for j in journal]
+        [end] = ends
+        assert end["status"] == "stalled", end
+        assert end["parked"] is True, end
+        assert end["stop_failure"] == "billing_error", end
+        decisions = [j for j in journal if j["kind"] == "dev-decision"]
+        assert [d["action"] for d in decisions] == ["pause"], decisions
+        assert state["tasks"][story]["attempt"] == 1, state["tasks"][story]
+
+        # the agent window is gone; the paused run keeps only its root shell window
+        session_name = f"bmad-loop-{run_id}"
+        windows = _tmux_window_names(private_tmux_server, session_name)
+        assert end["task_id"][-40:] not in windows and len(windows) == 1, windows
+    finally:
+        # The paused run left its session for a resume that never comes.
+        if run_id is not None:
+            subprocess.run(
+                ["tmux", "-S", str(private_tmux_server), "kill-session"]
+                + ["-t", f"=bmad-loop-{run_id}"],
+                capture_output=True,
+            )
+
+
+def test_e2e_stop_failure_then_window_death_pauses_uncharged(
+    tmp_path, monkeypatch, private_tmux_server
+):
+    """#959 end to end through the real binary + real tmux, zero tokens: the CLI
+    fires `StopFailure(billing_error)` and its window dies at once. The session
+    ends `crashed`, but the latched account error labels it parked, so the engine
+    PAUSEs uncharged instead of retrying: two dev attempts are allowed and exactly
+    one session ran."""
+    root = tmp_path / "sbx"
+    story = "1-1-stopfail-dies"
+    _scaffold_sprint(
+        root,
+        story,
+        fake_cli=STOP_FAILURE_DIES_FAKE_CLI,
+        extra_policy="\n[limits]\nmax_dev_attempts = 2\nteardown_grace_s = 5\n",
+        profile_toml=STOP_FAILURE_PROFILE_TOML,
+    )
+    # inherited by the `bmad-loop run` subprocess (_run passes no env=)
+    monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", "120")
+    run_id: str | None = None
+    try:
+        proc = _run(root, "run", timeout=90)
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+        run_id = _run_id(root)
+        run_dir = root / ".bmad-loop" / "runs" / run_id
+
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        assert state.get("paused_stage") == "escalation", state
+        reason = str(state.get("paused_reason", ""))
+        assert reason.startswith("parked: dev session crashed (StopFailure(billing_error)"), reason
+
+        journal = [
+            json.loads(ln)
+            for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        ends = [j for j in journal if j["kind"] == "session-end"]
+        assert len(ends) == 1, [j["kind"] for j in journal]
+        [end] = ends
+        assert end["status"] == "crashed", end
+        assert end["parked"] is True, end
+        assert end["stop_failure"] == "billing_error", end
+        decisions = [j for j in journal if j["kind"] == "dev-decision"]
+        assert [d["action"] for d in decisions] == ["pause"], decisions
+        assert state["tasks"][story]["attempt"] == 1, state["tasks"][story]
+    finally:
+        # The paused run left its session for a resume that never comes.
+        if run_id is not None:
+            subprocess.run(
+                ["tmux", "-S", str(private_tmux_server), "kill-session"]
+                + ["-t", f"=bmad-loop-{run_id}"],
+                capture_output=True,
+            )
+
+
+def test_e2e_usage_limit_relaunch_is_uncharged(tmp_path, monkeypatch, private_tmux_server):
+    """#959 end to end through the real binary + real tmux, zero tokens: in
+    `usage_limit_action = "relaunch"` mode, a `rate_limit` StopFailure matching no
+    usage pattern ends dev session 1 at the event, usage-limited. The engine
+    relaunches the story without charging an attempt (one attempt allowed, two
+    sessions ran), session 2 gets `BMAD_LOOP_USAGE_RELAUNCH=1` and completes the
+    story. The 120 s session timeout is far beyond the run's bound, so only the
+    relaunch-mode exit can end session 1 in time."""
+    root = tmp_path / "sbx"
+    story = "1-1-relaunch"
+    _scaffold_sprint(
+        root,
+        story,
+        fake_cli=USAGE_RELAUNCH_FAKE_CLI,
+        extra_policy=(
+            "\n[limits]\nmax_dev_attempts = 1\nteardown_grace_s = 5\n"
+            'usage_limit_action = "relaunch"\n'
+        ),
+        profile_toml=USAGE_RELAUNCH_PROFILE_TOML,
+    )
+    # inherited by the `bmad-loop run` subprocess (_run passes no env=)
+    monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", "120")
+    run_id: str | None = None
+    try:
+        proc = _run(root, "run", timeout=120)
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+        run_id = _run_id(root)
+        run_dir = root / ".bmad-loop" / "runs" / run_id
+
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        assert state.get("paused_stage") is None, state
+        task = state["tasks"][story]
+        assert task["attempt"] == 2, task
+        assert task["dev_usage_relaunches"] == 1, task
+        assert task["phase"] == "done", task
+        assert _sprint_status(root, story) == "done"
+
+        journal = [
+            json.loads(ln)
+            for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        ends = [j for j in journal if j["kind"] == "session-end"]
+        assert [e["status"] for e in ends] == ["stalled", "completed"], ends
+        assert ends[0]["stop_failure"] == "rate_limit", ends[0]
+        decisions = [j for j in journal if j["kind"] == "dev-decision"]
+        assert decisions[0]["action"] == "retry", decisions
+        assert decisions[0]["uncharged"] is True, decisions
+        assert decisions[0]["usage_relaunches"] == 1, decisions
+        assert not any(j["kind"] == "story-deferred" for j in journal), journal
+
+        seen = {
+            e["task_id"]: (run_dir / "tasks" / e["task_id"] / "usage-relaunch.txt").read_text(
+                encoding="utf-8"
+            )
+            for e in ends
+        }
+        assert [seen[e["task_id"]] for e in ends] == ["unset", "1"], seen
+    finally:
+        if run_id is not None:
+            subprocess.run(
+                ["tmux", "-S", str(private_tmux_server), "kill-session"]
+                + ["-t", f"=bmad-loop-{run_id}"],
+                capture_output=True,
+            )
+
+
 @pytest.mark.parametrize(
     "force_live_reap_assertion", [False, True], ids=["reaped", "live-assertion"]
 )
+@needs_pidfd
 def test_e2e_detached_writer_reaped_before_worktree_teardown(
     tmp_path, monkeypatch, force_live_reap_assertion
 ):
@@ -2029,6 +2396,7 @@ def test_e2e_detached_writer_reaped_before_worktree_teardown(
 @pytest.mark.parametrize(
     "force_live_reap_assertion", [False, True], ids=["reaped", "live-assertion"]
 )
+@needs_pidfd
 def test_e2e_detached_writer_publication_fault_still_reaped(
     tmp_path, monkeypatch, force_live_reap_assertion
 ):
@@ -2230,6 +2598,59 @@ def test_e2e_sweep_intent_gap_patch_restore(tmp_path):
     assert any(str(spec) in p for p in prompts)
 
 
+def test_e2e_sweep_review_finalizes_clean_over_engine_ledger_bookkeeping(tmp_path):
+    """#772 through the real CLI and real tmux, zero tokens. A sweep bundle with
+    review ON: the dev leg commits its own work, then the engine closes DW-1 in the
+    tracked ledger — uncommitted, for the squash. The review fake finalizes like
+    bmad-build-auto's step-04: it commits the files it owns and HALTs `blocked`
+    ("finalization left repository dirty") on anything left over. The engine now
+    commits its ledger bookkeeping right before the review launches, so the review
+    finishes `done`, the bundle lands, and no escalation is raised.
+
+    Ablation: drop `commit_engine_ledger=True` at the review launch (engine.py) and
+    the review HALTs on the dirty ledger — the run escalates and the bundle never
+    reaches done."""
+    assert REVIEW_FINALIZE_FAKE_CLI != FAKE_CLI, "the review splice did not take"
+    root = tmp_path / "sbx"
+    _scaffold_sweep(root)
+    (root / ".bmad-loop" / "fake-cli.sh").write_text(REVIEW_FINALIZE_FAKE_CLI, encoding="utf-8")
+    (root / ".bmad-loop" / "policy.toml").write_text(
+        '[adapter]\nname = "fakestories"\n\n'
+        '[review]\nenabled = true\ntrigger = "always"\n\n'
+        '[gates]\nmode = "none"\n',
+        encoding="utf-8",
+    )
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "review on, finalizing fake")
+    story = "dw-fix"  # triage names the bundle "fix" → task key dw-fix
+    spec = root / "_bmad-output" / "implementation-artifacts" / f"spec-{story}.md"
+
+    proc = _run(root, "sweep", "--no-prompt")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+
+    run_dir = root / ".bmad-loop" / "runs" / _run_id(root)
+    rows = [
+        json.loads(ln)
+        for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+        if ln.strip()
+    ]
+    kinds = [r["kind"] for r in rows]
+    # premise: a review session really ran on the finalizing fake
+    prompts = [p.read_text(encoding="utf-8") for p in (run_dir / "tasks").glob("*/fake-prompt.txt")]
+    assert any("deferred-work ledger entries" in p for p in prompts), prompts
+    assert "story-escalated" not in kinds, [r for r in rows if r["kind"] == "story-escalated"]
+    review_commits = [
+        r for r in rows if r["kind"] == "engine-ledger-commit" and r.get("site") == "review"
+    ]
+    assert review_commits, kinds
+    assert all(r["story_key"] == story for r in review_commits)
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["tasks"][story]["phase"] == "done", state["tasks"][story]
+    assert not state.get("paused_stage"), state
+    assert "status: done" in spec.read_text(encoding="utf-8")
+    assert _dw_status(root, "DW-1").startswith("done")
+
+
 def test_e2e_a_relay_that_only_knows_the_legacy_events_dir_still_completes(tmp_path):
     """The #494 version-skew guard, through the real CLI and real tmux.
 
@@ -2263,6 +2684,154 @@ def test_e2e_a_relay_that_only_knows_the_legacy_events_dir_still_completes(tmp_p
     run_id = _run_id(root)
     assert list((root / ".bmad-loop" / "runs" / run_id / "events").glob("*.json"))
     assert not list(runs.events_dir_for(root, run_id).glob("*.json"))
+
+
+def test_e2e_nested_child_cli_events_do_not_end_the_parent(tmp_path):
+    """A nested coding CLI started from inside the session writes its own
+    SessionStart, Stop and SessionEnd into the parent's event stream before the
+    parent has finished (#767). Through the real CLI and real tmux, the child's
+    announced start marks it foreign: its SessionEnd must not crash the story and
+    its Stop must not complete it early. Only the parent's own Stop does. The
+    profile maps SessionEnd here (as claude.toml does) so the child's SessionEnd
+    really reaches the wait loop.
+
+    Ablation guard: make `SessionAttribution.admit` always admit and the
+    `foreign-hook-event-ignored` assertion fails. The outcome assertions alone do
+    NOT catch that ablation: the child's SessionEnd then crashes the session, but
+    a crash is graded on the artifact read back within RESULT_GRACE_S (15 s), and
+    the parent's spec lands inside it, so the story still reaches `done`."""
+    assert NESTED_CHILD_FAKE_CLI != FAKE_CLI, "the child splice did not take"
+    session_end_profile = PROFILE_TOML.replace(
+        'Stop = "Stop" }', 'Stop = "Stop", SessionEnd = "SessionEnd" }'
+    )
+    assert session_end_profile != PROFILE_TOML, "the SessionEnd mapping did not take"
+
+    root = tmp_path / "sbx"
+    _scaffold(root, [_entry("1")])
+    fake = root / ".bmad-loop" / "fake-cli.sh"
+    fake.write_text(NESTED_CHILD_FAKE_CLI, encoding="utf-8")
+    (root / ".bmad-loop" / "profiles" / "fakestories.toml").write_text(
+        session_end_profile.format(binary=str(fake)), encoding="utf-8"
+    )
+    _git(root, "commit", "-q", "-am", "nested-child fake")
+    base = _commit_count(root)
+
+    proc = _run(root, "run")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert _status(root, "1") == "done"
+    assert _commit_count(root) == base + 1
+
+    run_id = _run_id(root)
+    lifecycle = root / ".bmad-loop" / "runs" / run_id / "tasks"
+    crumbs = [
+        json.loads(line)
+        for path in lifecycle.glob("*/session-lifecycle.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    ignored = [c for c in crumbs if c["event"] == "foreign-hook-event-ignored"]
+    assert [(c["foreign_session_id"], c["hook_event"]) for c in ignored] == [
+        ("child-1", "SessionStart")
+    ]
+
+
+# DW-507: the real relay, not `printf`, writes this variant's hook events, so each
+# carries the relay's `lineage` tag computed from the REAL pane process tree the
+# tmux launch prelude produced. The parent fires its SessionStart and Stop through
+# a non-exec'ing `sh -c '<relay> relay <Event> && true'` wrapper, the shape a hook
+# host gives the registered command; a nested child script (a separate file whose
+# cmdline holds neither relay marker nor event name) fires an ID-LESS Stop through
+# the same relay once the 5 s launch window has passed.
+_FAKE_SESSION_START = """printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \\
+    "$ts" "$tid" > "$ed/$ts-$tid-SessionStart.json"
+"""
+_FAKE_STORY_STOP = """ts2=$(( ts + 1 ))
+printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \\
+    "$ts2" "$tid" > "$ed/$ts2-$tid-Stop.json"
+sleep 30
+"""
+assert FAKE_CLI.count(_FAKE_SESSION_START) == 1 and FAKE_CLI.endswith(_FAKE_STORY_STOP)
+_VENV_RELAY = Path(sys.executable).parent / "bmad-loop"
+
+
+def _relay_call(relay: Path, event: str, payload: str) -> str:
+    """A shell line piping `payload` into `<relay> relay <event>` behind a
+    non-exec'ing `sh -c` wrapper (the trailing `&& true` keeps it a list)."""
+    inner = f"{shlex.quote(str(relay))} relay {event} && true"
+    return f"printf '%s' {shlex.quote(payload)} | sh -c {shlex.quote(inner)}\n"
+
+
+def _lineage_fake_cli(relay: Path, nested_child: Path) -> str:
+    start = _relay_call(relay, "SessionStart", '{"session_id": "fake-1"}')
+    child = (
+        "# past the relays' 5 s launch window, so only lineage can call the child's\n"
+        "# tool shell foreign, then the nested child's id-less Stop\n"
+        f"sleep 6\n{shlex.quote(str(nested_child))}\nsleep 2\n"
+    )
+    stop = _relay_call(relay, "Stop", '{"session_id": "fake-1"}') + "sleep 30\n"
+    fake = FAKE_CLI.replace(_FAKE_SESSION_START, start + child)
+    return fake[: -len(_FAKE_STORY_STOP)] + stop
+
+
+@pytest.mark.skipif(not _VENV_RELAY.is_file(), reason="no bmad-loop console script beside python")
+def test_e2e_relay_lineage_drops_a_nested_childs_id_less_stop(tmp_path):
+    """DW-507 end to end, zero tokens: the real tmux launch prelude records the
+    launched pid, the REAL relay tags every event from the real process tree,
+    and attribution acts on it. The parent's first SessionStart reads `match`,
+    so lineage is trusted; the nested child's id-less Stop reads `mismatch` and
+    is dropped (the #767 rules alone admit any id-less event, so it would have
+    completed the session before the parent wrote its spec); the parent's own
+    Stop, fired after the launch window through a real wrapper, reads `match`
+    and completes the story.
+
+    Ablation guards: drop the prelude from `_window_launch` and every tag is
+    `unknown` (the lineage assert fails); delete the trusted-mismatch check in
+    `SessionAttribution.admit` and the `foreign-hook-event-ignored` assert
+    fails. The outcome asserts alone do NOT catch the latter: the child's Stop
+    then ends the wait result-less, but the Stop read-back grace outlasts the
+    parent's spec write, so the story still reaches `done`."""
+    nested_dir = tmp_path / "nested"
+    nested_dir.mkdir()
+    nested_child = nested_dir / "child.sh"
+    nested_child.write_text(
+        "#!/bin/sh\n" + _relay_call(_VENV_RELAY, "Stop", "{}"), encoding="utf-8"
+    )
+    os.chmod(nested_child, 0o755)
+    fake_text = _lineage_fake_cli(_VENV_RELAY, nested_child)
+    assert '"event": "SessionStart"' not in fake_text, "the start splice did not take"
+
+    root = tmp_path / "sbx"
+    _scaffold(root, [_entry("1")])
+    fake = root / ".bmad-loop" / "fake-cli.sh"
+    fake.write_text(fake_text, encoding="utf-8")
+    _git(root, "commit", "-q", "-am", "lineage fake")
+    base = _commit_count(root)
+
+    proc = _run(root, "run")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert _status(root, "1") == "done"
+    assert _commit_count(root) == base + 1
+
+    run_id = _run_id(root)
+    recorded = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(runs.events_dir_for(root, run_id).glob("*.json"))
+    ]
+    tags = [(e["event"], e["session_id"], e["lineage"]) for e in recorded]
+    assert tags == [
+        ("SessionStart", "fake-1", "match"),
+        ("Stop", None, "mismatch"),
+        ("Stop", "fake-1", "match"),
+    ], tags
+
+    lifecycle = root / ".bmad-loop" / "runs" / run_id / "tasks"
+    crumbs = [
+        json.loads(line)
+        for path in lifecycle.glob("*/session-lifecycle.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert not [c for c in crumbs if c["event"] == "hook-lineage-untrusted"]
+    ignored = [c for c in crumbs if c["event"] == "foreign-hook-event-ignored"]
+    assert [(c["foreign_session_id"], c["hook_event"]) for c in ignored] == [(None, "Stop")]
 
 
 def test_e2e_sprint_mode_regression(tmp_path):

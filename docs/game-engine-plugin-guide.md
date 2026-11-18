@@ -38,24 +38,38 @@ A project-local plugin with the **same name** overrides the bundled one. The
 plugin's directory is its `{scripts}` dir, so its manifest and helper scripts sit
 together.
 
-Enable it in `.bmad-loop/policy.toml`:
+How you switch it on depends on where it lives
+([trust](plugin-authoring-guide.md#trust--safety)):
+
+- **Bundled** (the shipped `unity`): list it in `[plugins] enabled`, as below.
+- **Project-local** (your own engine plugin, or a copy of `unity` under
+  `.bmad-loop/plugins/unity/`): `[plugins] enabled` does **not** cover it. Review
+  the folder, then grant it with `bmad-loop plugins enable <name>`. The grant
+  pins the sha256 of the whole directory, so after each edit run
+  `bmad-loop plugins accept <name>`, or the next launch fails. A project name
+  listed in `enabled` without a grant also fails startup, and a refused override
+  of `unity` never falls back to the bundled copy.
+
+Enable the bundled plugin and configure it in `.bmad-loop/policy.toml`:
 
 ```toml
 [plugins]
-enabled = ["unity"]          # or your engine's name
+enabled = ["unity"]          # bundled plugins only
 
 [plugins.unity]
 editor_mode = "shared"
 mcp = "ivanmurzak"
 ```
 
-> **Legacy `[engine]` still works.** A pre-migration `[engine] name = "unity"`
-> block loads with a deprecation warning, folded into the `[plugins]` allowlist
-> plus a `[plugins.unity]` table. The _policy block_ is the only thing folded,
-> though — project-local plugin overrides are now discovered under
-> `.bmad-loop/plugins/<name>/`, so move an old `.bmad-loop/engines/unity/`
-> override dir to `.bmad-loop/plugins/unity/`. Migrate to `[plugins]` when
-> convenient.
+> **An `[engine]` block is not read.** A named `[engine] name = "unity"` block
+> fails to load, and the error names the migration: `[plugins] enabled = ["unity"]`
+> plus a `[plugins.unity]` table carrying `editor_mode`, `mcp`, `unity_path`,
+> `ready_timeout_sec` and `ready_grace_sec`. An empty-name `[engine]` block enables
+> nothing; it loads with a `bmad-loop: warning:` line on stderr (and a
+> `policy.deprecated` warning in `validate`) telling you to delete it. Project-local
+> plugin overrides are discovered under `.bmad-loop/plugins/<name>/`, so move an old
+> `.bmad-loop/engines/unity/` override dir to `.bmad-loop/plugins/unity/`, and grant
+> it there with `bmad-loop plugins enable unity`.
 
 ## Mapping the Editor lifecycle onto hook stages
 
@@ -80,7 +94,10 @@ command still **runs** — best-effort, even when a unit pauses or escalates, so
 managed Editor never outlives its worktree and a rollback is never stalled by a
 wedged Editor. The Unity plugin uses `pre_rollback` to save + close open scenes
 before the reset, so a shared Editor holding a dirty scene never raises the
-run-freezing "scene changed on disk" modal.
+run-freezing "scene changed on disk" modal. `post_rollback` fires once for every
+`pre_rollback` — also when the rollback pauses for manual recovery or fails
+part-way (`ctx.rollback_outcome` / `BMAD_LOOP_ROLLBACK_OUTCOME` is `paused` or
+`failed` rather than `completed`) — so a quiesce is always followed by its refresh.
 
 You can implement these as **declarative** `[hooks.<stage>]` shell commands (the
 smallest thing that works), or as an **in-process** `[python]` module when you need
@@ -187,12 +204,15 @@ while time.time() < deadline:
 sys.exit(1)                                       # never came up → unit deferred
 ```
 
-Then enable it — and keep `[scm] isolation = "none"` (the default) for `shared`:
+Then grant it — it is a project plugin, so this replaces `[plugins] enabled` —
+and keep `[scm] isolation = "none"` (the default) for `shared`:
 
-```toml
-[plugins]
-enabled = ["godot"]
+```bash
+bmad-loop plugins enable godot
 ```
+
+Until it is granted, a run notes that `godot` is not granted and runs without it.
+Edit either file afterwards and run `bmad-loop plugins accept godot`.
 
 That's a complete engine plugin. To give each unit its own Editor, add
 `[hooks.pre_worktree_setup]` + `[hooks.pre_worktree_teardown]` and switch
@@ -201,11 +221,11 @@ port-isolation and seeding mechanics. If you need the `editor_mode`↔isolation
 validation or MCP agent routing the Unity plugin does, reach for a `[python]`
 module (see the [authoring guide](plugin-authoring-guide.md#in-process-hooks)).
 
-> A **declarative** engine plugin activates as soon as its folder is present (the
-> declarative trust tier). For an engine that's usually what you want. If you'd
-> rather require explicit opt-in via `[plugins] enabled`, give the plugin a
-> `[python]` module — that's trust-gated and won't run until listed. The bundled
-> Unity plugin is in-process for exactly this reason.
+> A **project** engine plugin, declarative or not, activates only once it is
+> granted, and it then runs from a verified out-of-tree snapshot of the bytes you
+> granted. A **bundled** declarative plugin activates as soon as it is discovered;
+> the bundled Unity plugin ships a `[python]` module, so it stays inert until
+> `unity` is in `[plugins] enabled`.
 
 ## Reference: the bundled Unity plugin
 
@@ -315,14 +335,16 @@ the reset**. At `pre_rollback` (before `verify.safe_rollback` runs `git reset
 untitled scene so **no tracked `.unity` file is open** when the reset rewrites it —
 closing the "changed on disk" dialog's window before it can open. At
 `post_rollback` it refreshes assets so the Editor drops its stale in-memory copies
-and re-imports the reverted tree. The first call doubles as a **wedge probe**: if
-the Editor is already unresponsive it fails fast and the quiesce is skipped, at the
-cost of one call timeout rather than the whole budget. Every call carries both the
-CLI's own `--timeout` and a subprocess-level kill, and the plugin hard-kills the
-whole helper past `quiesce_timeout_sec` — so a wedged Editor can **never stall the
-rollback**. The quiesce logs to stderr and writes no journal events of its own —
-the rollback's journal marker remains `rollback-auto`. Disable with
-`quiesce_on_rollback = false`.
+and re-imports the reverted tree — including after a paused or failed rollback,
+where the tree may be only partially reset (the refresh is harmless there).
+
+The first call doubles as a **wedge probe**: if the Editor is already unresponsive it
+fails fast and the quiesce is skipped, at the cost of one call timeout rather than
+the whole budget. Every call carries both the CLI's own `--timeout` and a
+subprocess-level kill, and the plugin hard-kills the whole helper past
+`quiesce_timeout_sec` — so a wedged Editor can **never stall the rollback**. The
+quiesce logs to stderr and writes no journal events of its own — the rollback's
+journal marker remains `rollback-auto`. Disable with `quiesce_on_rollback = false`.
 
 ### 3. Prompt-fact injection (`pre_session`)
 

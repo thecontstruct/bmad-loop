@@ -21,8 +21,11 @@ from __future__ import annotations
 import bisect
 import json
 import math
+import os
 import re
+import time
 from collections import deque
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,11 +35,29 @@ from rich.color import ColorParseError
 from rich.style import Style
 from rich.text import Text
 
-from .. import bmadconfig, deferredwork, policy, sprintstatus, stories
+from .. import (
+    bmadconfig,
+    deferredwork,
+    initiativechain,
+    parked,
+    policy,
+    sprintstatus,
+    stories,
+    ticketmodel,
+    tickettree,
+    worksource,
+)
 from ..gates import ATTENTION_FILE
 from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state, unreadable_line_entry
 from ..model import RunState
-from ..platform_util import resolve_or_lexical
+from ..platform_util import (
+    UnconfinedWriteError,
+    is_link_like,
+    recorded_root_identity,
+    require_root_pinned,
+    resolve_or_lexical,
+    stale_device_record,
+)
 
 # Run-inventory names relocated to bmad_loop.runs (#650) and re-exported here so
 # tui.data stays the TUI-facing surface (`data.discover_runs`, `data.RUNNING`,
@@ -60,32 +81,104 @@ from ..runs import (
     _StatSig,
     list_run_dirs,
     liveness,
+    paths_for_state,
+    rebase_recorded_project_path,
+    tree_pin,
 )
 
 # ------------------------------------------------------------- run watching
 
 
+def _describe(exc: BaseException) -> str:
+    """``<Class>: <message>`` — the operator-facing spelling of a folded fault."""
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _classified_sig(path: Path) -> tuple[_StatSig | None, str | None]:
+    """``(sig, fault)``: ``(sig, None)`` for a present file, ``(None, None)`` for
+    genuine absence, ``(None, "<Class>: <msg>")`` for a stat that failed for any
+    other reason. ``_stat_sig`` folds the last two into one ``None``; the readers
+    below must tell "not there" (reset / nothing to show) from "could not look"
+    (keep position, flag it)."""
+    try:
+        st = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None, None
+    except OSError as e:
+        return None, _describe(e)
+    return (st.st_mtime_ns, st.st_size, st.st_ino), None
+
+
 class RunWatcher:
     """Stat-gated views of one run dir. Never raises on missing or mid-write
-    files: state() keeps returning the last good parse."""
+    files: state() keeps returning the last good parse.
+
+    Keeping the last good parse is not the same as presenting it as current
+    (DW-472): ``state_fault`` names why the state shown is stale — a state.json
+    that will not parse, or one that has gone or cannot be stat'd after a good
+    read — and clears on the next good parse, or when the last good read's file
+    stats back unchanged. It is published only once the SAME
+    signature has failed on two consecutive looks: a mid-write file is re-stat'd
+    every poll (``_state_sig`` is not advanced on a failure), and a writer still
+    working changes the signature, so a torn read that the next write heals never
+    flags; one the file is still sitting in a poll later is not torn, it is
+    broken. ``attention_fault`` does the same for ATTENTION (DW-475), without the
+    two-look rule — that file is appended, never parsed, so there is no torn read
+    to forgive.
+
+    Every reload after the first good parse is pinned to that parse
+    (``load_state(pin=...)``): a run dir or ``runs/`` swapped for a link to another
+    tree raises ``UnconfinedReadError``, an ``OSError``, so the watcher keeps the
+    last good state and ``state_fault`` names the refusal rather than showing the
+    foreign record. The first read has nothing to pin to and reads by path."""
 
     def __init__(self, run_dir: Path):
         self.run_dir = run_dir
         self._state_sig: _StatSig | None = None
         self._state: RunState | None = None
+        self.state_fault: str | None = None
+        # (signature, why) of the last failed look, awaiting its confirming repeat
+        self._suspect: tuple[_StatSig | None, str] | None = None
         self._attention_sig: _StatSig | None = None
         self._attention = ""
+        self.attention_fault: str | None = None
 
     def state(self) -> RunState | None:
-        sig = _stat_sig(self.run_dir / STATE_FILE)
-        if sig is None or sig == self._state_sig:
+        sig, stat_fault = _classified_sig(self.run_dir / STATE_FILE)
+        if sig is None:
+            # Before the first write there is nothing to be stale; after a good read,
+            # a state.json that vanished or cannot be stat'd leaves that read stale.
+            if self._state is not None:
+                self._note_state_fault(
+                    None,
+                    (
+                        f"state.json cannot be stat'd ({stat_fault})"
+                        if stat_fault
+                        else "state.json is gone"
+                    ),
+                )
+            return self._state
+        if sig == self._state_sig:
+            # The last good read's own file is back unchanged, so it is current again.
+            # A finished or paused run never rewrites state.json: waiting for a fresh
+            # parse to clear the flag would leave a recovered header stale forever.
+            self._suspect = None
+            self.state_fault = None
             return self._state
         try:
-            self._state = load_state(self.run_dir)
-            self._state_sig = sig
-        except (OSError, json.JSONDecodeError, KeyError, ValueError):
-            pass  # keep last good
+            self._state = load_state(self.run_dir, pin=self._state)
+        except (OSError, json.JSONDecodeError, KeyError, ValueError) as e:
+            self._note_state_fault(sig, f"state.json unreadable ({_describe(e)})")
+            return self._state  # keep last good — flagged once the fault persists
+        self._state_sig = sig
+        self._suspect = None
+        self.state_fault = None
         return self._state
+
+    def _note_state_fault(self, sig: _StatSig | None, why: str) -> None:
+        if self._suspect is not None and self._suspect[0] == sig:
+            self.state_fault = why
+        self._suspect = (sig, why)
 
     def liveness(self) -> str:
         return liveness(self.run_dir)
@@ -107,14 +200,25 @@ class RunWatcher:
         return (self.run_dir / STOP_REQUEST_FILE).is_file()
 
     def attention(self) -> str:
+        """ATTENTION's text, last good read kept across a fault — which
+        ``attention_fault`` then names until a read succeeds (DW-475). Absence is
+        no fault: the engine writes the file only when it has something to say."""
         path = self.run_dir / ATTENTION_FILE
-        sig = _stat_sig(path)
-        if sig is not None and sig != self._attention_sig:
+        sig, fault = _classified_sig(path)
+        if fault is not None:
+            self.attention_fault = f"ATTENTION cannot be stat'd ({fault})"
+            return self._attention
+        if sig is None:
+            self.attention_fault = None
+            return self._attention
+        if sig != self._attention_sig:
             try:
                 self._attention = path.read_text(encoding="utf-8")
                 self._attention_sig = sig
-            except OSError:
-                pass
+            except (OSError, UnicodeDecodeError) as e:
+                self.attention_fault = f"ATTENTION unreadable ({_describe(e)})"
+                return self._attention
+        self.attention_fault = None
         return self._attention
 
 
@@ -135,14 +239,58 @@ class JournalTail:
     one place this reader deliberately diverges from ``Journal.entries``, which
     reads the file whole and so mints a marker for a trailing fragment
     immediately: here the marker appears once the heal terminates the fragment.
+
+    An observer, so it never refuses: unlike a pinned ``Journal.entries`` it reads
+    by path and keeps returning entries. Given the run's held state
+    (``read_new(pin=state)``), a run dir that no longer ``lstat``s as the directory
+    ``state.run_dir_identity`` records (a renumbered ``st_dev`` alone excepted, as
+    the writers except it), or — with or without a record — a run dir or
+    ``journal.jsonl`` that is a link leaves ``fault`` naming the swap — the rows shown may be another tree's. It writes nothing.
     """
 
     def __init__(self, run_dir: Path):
         self.path = run_dir / JOURNAL_FILE
         self._offset = 0
+        # Why the last look at the journal failed, or None (DW-475). A stat or read
+        # FAULT keeps the offset — only genuine absence or a shrink (truncation /
+        # rewrite) restarts from zero — so recovering re-reads nothing twice.
+        self.fault: str | None = None
 
-    def read_new(self) -> list[dict[str, Any]]:
-        sig = _stat_sig(self.path)
+    def read_new(self, *, pin: RunState | None = None) -> list[dict[str, Any]]:
+        entries = self._read_new()
+        if self.fault is None:
+            self.fault = self._swap_fault(pin)
+        return entries
+
+    def _swap_fault(self, pin: RunState | None) -> str | None:
+        """Why the journal read by path may not be this run's, or None. Check only:
+        the read already happened, and observation degrades rather than refusing."""
+        if pin is None:
+            return None
+        run_dir = self.path.parent
+        if not run_dir.exists() and not run_dir.is_symlink():
+            return None  # gone, not swapped: the stat above already reads it as absent
+        record = pin.run_dir_identity
+        if record is not None and not stale_device_record(run_dir, record):
+            try:
+                require_root_pinned(run_dir, recorded_root_identity(record))
+            except UnconfinedWriteError:
+                return (
+                    f"run dir is no longer the directory this run recorded ({run_dir}) "
+                    "— journal rows may be from another tree"
+                )
+        if is_link_like(run_dir):
+            return f"run dir is a link ({run_dir}) — journal rows may be from another tree"
+        if is_link_like(self.path):
+            return "journal.jsonl is a link — journal rows may be from another file"
+        return None
+
+    def _read_new(self) -> list[dict[str, Any]]:
+        sig, fault = _classified_sig(self.path)
+        if fault is not None:
+            self.fault = f"journal.jsonl cannot be stat'd ({fault})"
+            return []
+        self.fault = None
         if sig is None:
             self._offset = 0
             return []
@@ -151,9 +299,16 @@ class JournalTail:
             self._offset = 0
         if size == self._offset:
             return []
-        with self.path.open("rb") as f:
-            f.seek(self._offset)
-            chunk = f.read(size - self._offset)
+        try:
+            with self.path.open("rb") as f:
+                f.seek(self._offset)
+                chunk = f.read(size - self._offset)
+        except (FileNotFoundError, NotADirectoryError):
+            self._offset = 0  # gone between the stat and the open: absence
+            return []
+        except OSError as e:
+            self.fault = f"journal.jsonl unreadable ({_describe(e)})"
+            return []
         complete = chunk.rfind(b"\n") + 1
         if complete == 0:
             return []
@@ -422,6 +577,10 @@ class LogView:
         # place and the render collapses to the final frame. A consumer surfaces
         # this so a fullscreen capture isn't mistaken for the whole session.
         self.altscreen_seen = False
+        # Why the cold-open prefix scan could not run, or None (DW-475). A False
+        # `altscreen_seen` then means "not looked", not "not fullscreen", and the
+        # consumer must say so rather than present the tail as the whole session.
+        self.altscreen_scan_fault: str | None = None
         self._reset_screen()
 
     def _reset_screen(self) -> None:
@@ -436,13 +595,15 @@ class LogView:
         self._render_len = 0
         # A truncation restart re-reads from scratch, so re-detect altscreen too.
         self.altscreen_seen = False
+        self.altscreen_scan_fault = None
 
     def _scan_prefix_for_altscreen(self, end: int) -> None:
         """One-time scan of bytes [0, end) for an altscreen switch marker, in
         overlapping windows so a marker straddling a window boundary still
         matches. `end` is the caller-bounded scan ceiling (see
         _ALTSCREEN_PREFIX_SCAN_CAP), not necessarily the full prefix. Sets
-        altscreen_seen; best-effort, never raises."""
+        altscreen_seen; best-effort, never raises — a read fault is recorded in
+        altscreen_scan_fault instead."""
         overlap = max(len(m) for m in _ALTSCREEN_MARKERS) - 1
         window = 1 << 20
         try:
@@ -459,7 +620,8 @@ class LogView:
                     if not buf:
                         return
                     pos += window
-        except OSError:
+        except OSError as e:
+            self.altscreen_scan_fault = _describe(e)
             return
 
     def read_new(self) -> bool:
@@ -579,28 +741,13 @@ def _open_session_start(journal_entries: list[dict[str, Any]]) -> dict[str, Any]
     return entry
 
 
-def _open_session_start_indexed(
-    journal_entries: list[dict[str, Any]],
-) -> tuple[dict[str, Any] | None, int]:
-    """`_open_session_start` plus the entry's index in `journal_entries` (-1 when
-    None), so a caller can scan the entries that FOLLOW the open start — the
-    #680 idle events belong to a session only from its start onward, and a
-    `session-idle` left behind by an earlier session with a reused task id must
-    not be read as this one's."""
-    open_entry: dict[str, Any] | None = None
-    open_index = -1
-    active: str | None = None
-    for index, entry in enumerate(journal_entries):
-        kind = entry.get("kind")
-        if kind == "session-start" and entry.get("task_id") is not None:
-            active = str(entry["task_id"])
-            open_entry = entry
-            open_index = index
-        elif kind == "session-end" and str(entry.get("task_id")) == active:
-            active = None
-            open_entry = None
-            open_index = -1
-    return open_entry, open_index
+# The open-session scoping and the parked-prompt projection (#855) live in the
+# stdlib-only `bmad_loop.parked`, so the core answer path reads the same answer
+# without pyte/rich; re-exported here under the TUI-facing spellings. A park, like
+# the #680 idle events, belongs to a session only from its start onward.
+_open_session_start_indexed = parked.open_session_start_indexed
+_parked_prompt = parked.parked_prompt
+ParkedPrompt = parked.ParkedPrompt
 
 
 def _idle_since(journal_entries: list[dict[str, Any]], start: int, task_id: str) -> float | None:
@@ -628,6 +775,75 @@ def _idle_since(journal_entries: list[dict[str, Any]], start: int, task_id: str)
     return since
 
 
+def _reported_model(journal_entries: list[dict[str, Any]], start: int, task_id: str) -> str | None:
+    """The model the open session's CLI reported on its hook (#859), or None:
+    the non-empty string `model` of the last `session-model` for `task_id` after
+    index `start`. None when the CLI sent none, the row predates the session or
+    belongs to another task. Never raises on a malformed entry."""
+    reported: str | None = None
+    for entry in journal_entries[start + 1 :]:
+        if str(entry.get("task_id")) != task_id or entry.get("kind") != "session-model":
+            continue
+        raw = entry.get("model")
+        if isinstance(raw, str) and raw:
+            reported = raw
+    return reported
+
+
+def _idle_tool(journal_entries: list[dict[str, Any]], start: int, task_id: str) -> str | None:
+    """The tool call the open session's current idle stretch is waiting on, or
+    None: the string `in_tool` of the last `session-idle` for `task_id` after
+    index `start` — a closed slug the adapter chose — unless a later
+    `session-active` for the same task closed the stretch. None too when that
+    `session-idle` carries no `in_tool` (a CLI that cannot tell) or a non-string
+    one. `_idle_since`'s walk; never raises on a malformed entry."""
+    tool: str | None = None
+    for entry in journal_entries[start + 1 :]:
+        if str(entry.get("task_id")) != task_id:
+            continue
+        kind = entry.get("kind")
+        if kind == "session-idle":
+            raw = entry.get("in_tool")
+            tool = raw if isinstance(raw, str) else None
+        elif kind == "session-active":
+            tool = None
+    return tool
+
+
+def _quota_wait(
+    journal_entries: list[dict[str, Any]], start: int, task_id: str
+) -> tuple[float | None, str | None]:
+    """The open session's usage-limit quota wait (DW-396, #610): ``(since,
+    resets_at)`` from the last `quota-wait-started` for `task_id` after index
+    `start` — its journal `ts` and its string `resets_at` (None when the wait
+    line named no reset) — or ``(None, None)`` when no wait is open: a later
+    `quota-wait-ended` for the same task closes it, and a wait can re-open
+    after one ends, so the latest wins. A `quota-wait-started` without a finite
+    numeric `ts` is skipped without erasing an earlier open wait, as
+    `_idle_since` skips a malformed stamp. Never raises on a malformed entry."""
+    since: float | None = None
+    resets: str | None = None
+    for entry in journal_entries[start + 1 :]:
+        if str(entry.get("task_id")) != task_id:
+            continue
+        kind = entry.get("kind")
+        if kind == "quota-wait-started":
+            raw = entry.get("ts")
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                try:
+                    stamp = float(raw)
+                except OverflowError:
+                    continue
+                if math.isfinite(stamp):
+                    since = stamp
+                    raw_resets = entry.get("resets_at")
+                    resets = raw_resets if isinstance(raw_resets, str) and raw_resets else None
+        elif kind == "quota-wait-ended":
+            since = None
+            resets = None
+    return since, resets
+
+
 def active_task_id(run_dir: Path, journal_entries: list[dict[str, Any]]) -> str | None:
     """Task whose agent session is currently open: the last session-start
     without a later session-end. Falls back to the newest file in logs/ —
@@ -641,8 +857,26 @@ def active_task_id(run_dir: Path, journal_entries: list[dict[str, Any]]) -> str 
             key=lambda p: p.stat().st_mtime_ns,
         )
     except OSError:
+        # Safe fold: this is only the fallback GUESS at which log to show; the next poll
+        # re-guesses, and a logs/ that cannot be listed holds nothing LogView could show.
         return None
     return logs[-1].stem if logs else None
+
+
+@dataclass(frozen=True)
+class UnreadableAgent:
+    """An open session whose agent identity could not be derived (DW-474): a
+    malformed journal entry or policy snapshot. The header shows it as such
+    rather than dropping the agent line, which reads as "no session open"."""
+
+    error: str
+
+
+# What the body of `active_agent` can raise on malformed journal data or a
+# malformed snapshot: a non-dict entry (AttributeError), a missing or ill-typed
+# field (KeyError / TypeError), a bad value (ValueError). Anything else is a
+# programming error and propagates.
+_MALFORMED_AGENT_FAULTS = (AttributeError, KeyError, TypeError, ValueError)
 
 
 @dataclass(frozen=True)
@@ -661,6 +895,38 @@ class ActiveAgent:
     # while the transcript is moving. The header renders `· idle <age>` from it
     # only when set. APPENDED, so every positional construction stays valid.
     idle_since: float | None = None
+    # The tool call that open idle stretch is waiting on — its `session-idle`'s
+    # `in_tool` slug (a Claude built-in name, `mcp`, `other`, `none`, `unknown`)
+    # — or None when no stretch is open or the CLI cannot tell. The header
+    # appends `· in <tool>` from it unless it is `none`. APPENDED, like
+    # `idle_since`.
+    idle_tool: str | None = None
+    # Wall timestamp the session's open usage-limit quota wait began (DW-396) —
+    # the journal `ts` of the last `quota-wait-started` not closed by a later
+    # `quota-wait-ended` — or None when no wait is open. The header renders
+    # `· quota wait <age>` from it IN PLACE OF the idle notice: the transcript
+    # sits still by design while the CLI waits out a usage-window reset, so the
+    # session is neither idle nor stuck. APPENDED, like `idle_since`.
+    quota_wait_since: float | None = None
+    # That open wait's parsed reset (#610): ISO-8601, or the raw clause text
+    # when it did not resolve; None when the wait line named none. The header
+    # appends `· resets <time>` from it. APPENDED.
+    quota_resets_at: str | None = None
+    # The open session's live permission prompt (#855) — the newest
+    # `session-parked` not closed by a later `session-unparked` or
+    # `parked-answered` — split into its journal `ts`, the
+    # CLI's epoch auto-deny deadline (None when its countdown was not parsed) and
+    # the mux pane target it waits in. All None when no prompt is open. The
+    # header renders `· parked on permission prompt <age>` from `parked_since`
+    # AHEAD of the quota and idle notices, and the Log pane notes it. APPENDED.
+    parked_since: float | None = None
+    parked_auto_deny_at: float | None = None
+    parked_pane: str | None = None
+    # The model the session's CLI reported on its first SessionStart hook (#859)
+    # — the latest `session-model` row's `model` for this task — or None when the
+    # CLI sent none. The agent line shows it in place of the configured `model`
+    # when set. APPENDED.
+    reported_model: str | None = None
 
 
 def _story_key_from_task_id(task_id: str, role: str) -> str:
@@ -686,7 +952,7 @@ def _story_key_from_task_id(task_id: str, role: str) -> str:
 
 def active_agent(
     journal_entries: list[dict[str, Any]], policy_snapshot: dict[str, Any] | None
-) -> ActiveAgent | None:
+) -> ActiveAgent | UnreadableAgent | None:
     """The agent currently driving the run, or None when no session is open.
 
     Journal-only: unlike :func:`active_task_id` there is no logs/ fallback — a
@@ -695,7 +961,10 @@ def active_agent(
     directly. For an older, unstamped entry the run's persisted
     ``policy_snapshot`` is rebuilt and resolved for the entry's role; when that
     yields nothing trustworthy (no/empty snapshot) the agent is unknown -> None.
-    Never raises on a malformed entry."""
+    Never raises on a malformed entry: that answers :class:`UnreadableAgent`
+    carrying the fault (DW-474), never ``None`` — which means no session is open.
+    Only the malformed-data faults are caught; any other exception is a bug and
+    propagates."""
     try:
         entry, start_index = _open_session_start_indexed(journal_entries)
         if entry is None:
@@ -713,6 +982,8 @@ def active_agent(
             name, model = resolved.name, resolved.model
         story_raw = entry.get("story_key")
         story_key = str(story_raw) if story_raw else _story_key_from_task_id(task_id, role)
+        quota_since, quota_resets = _quota_wait(journal_entries, start_index, task_id)
+        park = _parked_prompt(journal_entries, start_index, task_id)
         return ActiveAgent(
             task_id=task_id,
             story_key=story_key,
@@ -720,9 +991,38 @@ def active_agent(
             name=name,
             model=model,
             idle_since=_idle_since(journal_entries, start_index, task_id),
+            idle_tool=_idle_tool(journal_entries, start_index, task_id),
+            quota_wait_since=quota_since,
+            quota_resets_at=quota_resets,
+            parked_since=park.since if park else None,
+            parked_auto_deny_at=park.auto_deny_at if park else None,
+            parked_pane=park.pane if park else None,
+            reported_model=_reported_model(journal_entries, start_index, task_id),
         )
-    except Exception:
-        return None
+    except _MALFORMED_AGENT_FAULTS as e:
+        return UnreadableAgent(error=f"malformed session-start or snapshot: {_describe(e)}")
+
+
+@dataclass(frozen=True)
+class SweepOutcomes:
+    """The run's auto-sweep ledger (#501): triggers whose child sweep was
+    delivered, and triggers refused with their closed ``SWEEP_REFUSED_*`` slug.
+    Disjoint here, though not on disk: a child that started then failed is
+    latched into ``sweeps_triggered`` AND recorded ``failed`` (model.py), and
+    that trigger was not delivered — so it lands in ``refused`` only."""
+
+    triggered: tuple[str, ...] = ()
+    refused: tuple[tuple[str, str], ...] = ()
+
+
+def sweep_outcomes(state: RunState) -> SweepOutcomes:
+    """Project ``sweeps_triggered``/``sweeps_refused`` off the parsed state.json —
+    the same RunState ``status``, ``status --json`` and ``diagnose`` read — in
+    file order. A pre-#501 state.json carries neither key and reads empty."""
+    return SweepOutcomes(
+        triggered=tuple(t for t in state.sweeps_triggered if t not in state.sweeps_refused),
+        refused=tuple(state.sweeps_refused.items()),
+    )
 
 
 def pending_decision(journal_entries: list[dict[str, Any]]) -> tuple[str, str] | None:
@@ -747,8 +1047,15 @@ _sprint_cache: dict[Path, tuple[_StatSig | None, sprintstatus.SprintStatus | Non
 # deferred-work.md path -> (sig or None for missing, items or None)
 _deferred_cache: dict[Path, tuple[_StatSig | None, list[DeferredItem] | None]] = {}
 # project root -> (signature, pending decisions) — invalidated when the ledger,
-# pre-answer store, or the set of run dirs changes
-_missed_cache: dict[Path, tuple[Any, list]] = {}
+# pre-answer store, or the set of run dirs changes. Answers only: a fault is never
+# cached, so the next rescan retries it.
+_missed_cache: dict[Path, tuple[Any, MissedDecisions]] = {}
+# project spelling as asked -> why `_project_paths` last answered None for it
+_paths_fault: dict[Path, str] = {}
+# the same two, for the tickets-mode resolution (`want_tickets`): a mixed v6/v7
+# install answers v6 paths without it and v7 paths with it
+_tickets_paths_cache: dict[Path, tuple[tuple[object, ...], bmadconfig.ProjectPaths]] = {}
+_tickets_paths_fault: dict[Path, str] = {}
 
 
 def _config_source_sig(path: Path) -> object:
@@ -765,22 +1072,38 @@ def _config_source_sig(path: Path) -> object:
     return ((st.st_mtime_ns, st.st_size, st.st_ino, st.st_mode), _stat_sig(path))
 
 
-def _project_paths(project: Path) -> bmadconfig.ProjectPaths | None:
+def _project_paths(project: Path, *, want_tickets: bool = False) -> bmadconfig.ProjectPaths | None:
     """BMAD artifact paths, stat-gated on every config source `load_paths` reads
-    (the four central TOML layers and the legacy config.yaml), so an edit to any
-    of them is seen on the next call; None when the project is not initialized
-    (or the config is unreadable)."""
+    (the four central TOML layers, the legacy config.yaml and the v7 marker that
+    picks the era), so an edit to any of them is seen on the next call; None when
+    the project is not initialized (or the config is unreadable) — why is left in
+    ``_paths_fault`` (``_tickets_paths_fault`` under ``want_tickets``) under the
+    spelling asked, for a caller that must say so rather than answer empty.
+    ``want_tickets`` resolves as a tickets run does, so a mixed install answers v7."""
+    asked = project
     project = resolve_or_lexical(project)
-    sources = (*bmadconfig.CENTRAL_LAYERS_REL, bmadconfig.LEGACY_CONFIG_REL)
+    cache, faults = (
+        (_tickets_paths_cache, _tickets_paths_fault)
+        if want_tickets
+        else (_paths_cache, _paths_fault)
+    )
+    sources = (
+        *bmadconfig.CENTRAL_LAYERS_REL,
+        bmadconfig.LEGACY_CONFIG_REL,
+        bmadconfig.V7_MARKER_REL,
+    )
     config_sigs = tuple(_config_source_sig(project / rel) for rel in sources)
-    cached_paths = _paths_cache.get(project)
+    cached_paths = cache.get(project)
     if cached_paths is not None and cached_paths[0] == config_sigs:
+        faults.pop(asked, None)
         return cached_paths[1]
     try:
-        paths = bmadconfig.load_paths(project)
-    except (bmadconfig.BmadConfigError, OSError):
+        paths = bmadconfig.load_paths(project, want_tickets=want_tickets)
+    except (bmadconfig.BmadConfigError, OSError) as e:
+        faults[asked] = _describe(e)
         return None
-    _paths_cache[project] = (config_sigs, paths)
+    faults.pop(asked, None)
+    cache[project] = (config_sigs, paths)
     return paths
 
 
@@ -824,6 +1147,304 @@ def stories_overview(project: Path, spec_folder: str) -> list[stories.StoryRow] 
         return stories.story_rows(folder)
     except stories.StoriesError:
         return None
+
+
+def _stories_board(project: Path, state: RunState) -> list[stories.StoryRow] | None:
+    return stories_overview(project, state.spec_folder)
+
+
+@dataclass(frozen=True)
+class ChainChild:
+    """One child of a parent initiative on the start-run preview, in build order:
+    its status as a prerequisite (:func:`~bmad_loop.initiativechain.prerequisite_status`),
+    its closed and total ticket counts (0 and 0 without a folder), its tag
+    (:func:`_chain_tag`), and each prerequisite it still waits on with that
+    prerequisite's status."""
+
+    slug: str
+    status: str
+    closed: int
+    total: int
+    tag: str
+    waiting_on: tuple[initiativechain.WaitingOn, ...]
+
+
+@dataclass(frozen=True)
+class TicketsBoard:
+    """The tickets-mode board for one initiative: ``tickets.py status``'s rows in
+    the script's order, or why the tree could not be read. A read that failed
+    carries ``fault`` (and no rows), never an empty board that would read as "no
+    tickets". ``initiative`` is the one the board was read for (``""`` when there
+    was none to read).
+
+    On a parent initiative (the start-run preview only) ``parent`` names it and
+    ``children`` lists its children in build order; the rows are those of the
+    child a run would build first (``initiative``), or, when no child can start,
+    there are none, ``initiative`` is ``""`` and ``chain_end`` says why
+    (:data:`~bmad_loop.initiativechain.ChainEnd`). A fault reading that child's
+    board keeps ``children``."""
+
+    rows: tuple[ticketmodel.TicketRow, ...]
+    fault: str | None
+    initiative: str
+    parent: str = ""
+    children: tuple[ChainChild, ...] = ()
+    chain_end: str | None = None
+
+
+# A board read that failed is retried after this long even when no file changed:
+# a timeout or a busy store lock clears on its own, so a fault kept until the
+# next edit could outlive its cause. An answer is kept until a file changes.
+TICKETS_FAULT_RETRY_S = 30.0
+
+# (project, initiative, initiative folder, parent the tree is pinned to or None)
+# -> (tree signature, board, monotonic time of the read)
+_tickets_cache: dict[tuple[Path, str, Path, str | None], tuple[object, TicketsBoard, float]] = {}
+
+
+def _tickets_tree_sig(project: Path, folder: Path) -> object:
+    """What a ``tickets.py status`` answer depends on, as one comparable value:
+    the ``(path, mtime_ns, size)`` of ``tickets.toml`` and every ``*.md`` in the
+    initiative folder and its subfolders (four levels, enough for either tree
+    layout: ``tickets/epic-x/tickets/*.md`` in the current one, ``epic-x/*.md`` in
+    the flat one), plus the config layers ``active_initiative`` is read
+    from, the script itself and the ``config_utils.py`` it execs. Read with
+    ``scandir``; a folder that cannot be listed or a file that cannot be stat'ed
+    is part of the signature too."""
+    files: list[tuple[str, object, object]] = []
+    pending: list[tuple[Path, int]] = [(folder, 1)]
+    while pending:
+        here, depth = pending.pop()
+        try:
+            with os.scandir(here) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir():
+                            if depth < 4:
+                                pending.append((Path(entry.path), depth + 1))
+                            continue
+                        if entry.name != "tickets.toml" and not entry.name.endswith(".md"):
+                            continue
+                        st = entry.stat()
+                    except OSError as e:
+                        files.append((entry.path, "error", e.errno))
+                        continue
+                    files.append((entry.path, st.st_mtime_ns, st.st_size))
+        except OSError as e:
+            files.append((str(here), "unlistable", e.errno))
+    sources = (
+        *bmadconfig.V7_CENTRAL_LAYERS_REL,
+        bmadconfig.V7_MARKER_REL,
+        bmadconfig.V7_CONFIG_UTILS_REL,
+    )
+    return (
+        tuple(sorted(files, key=lambda f: f[0])),
+        tuple(_config_source_sig(project / rel) for rel in sources),
+    )
+
+
+def _board_ticket_tree(
+    project: Path, initiative: str, *, folder: Path | None = None
+) -> tickettree.TicketTreeLike:
+    """The tree the board reads: the project's installed ``tickets.py``, pinned
+    to ``initiative`` so a switched ``active_initiative`` reads as a fault, not
+    as another initiative's board, through a parent's child ``folder`` when
+    given. A seam: tests swap in a ``FakeTicketTree``."""
+    return tickettree.TicketTree(project, pinned_initiative=initiative, folder=folder)
+
+
+def _parent_view(project: Path, parent: str, folder: Path) -> ticketmodel.ParentView:
+    """``tickets.py next <folder>`` on the parent initiative ``parent``, pinned to
+    it: its children, which are ready and what each waits on."""
+    return tickettree.TicketTree(project, pinned_initiative=parent).parent_next(folder)
+
+
+def initiative_board(
+    project: Path, initiative: str, folder: Path, *, parent: str | None = None
+) -> TicketsBoard:
+    """``initiative``'s board, stat-gated on :func:`_tickets_tree_sig`: the
+    script is spawned only when that signature changes (or a cached fault is
+    older than :data:`TICKETS_FAULT_RETRY_S`). ``tickets.py`` is project code (it
+    imports the project's ``config_utils``) and may run for seconds, so call this
+    from a worker thread, never the UI thread.
+
+    With ``parent``, ``initiative`` is a child of that parent initiative: the
+    tree is pinned to the parent (the live ``[core] active_initiative`` names it)
+    and reads through ``folder``, as a chained run's tree does
+    (:func:`~bmad_loop.runs.tree_pin`). Without, it is pinned to ``initiative``
+    and reads the active initiative."""
+    key = (project, initiative, folder, parent)
+    sig = _tickets_tree_sig(project, folder)  # before the read: an edit mid-read re-reads
+    cached = _tickets_cache.get(key)
+    if cached is not None and cached[0] == sig:
+        board = cached[1]
+        if board.fault is None or time.monotonic() - cached[2] < TICKETS_FAULT_RETRY_S:
+            return board
+    try:
+        if parent is None:
+            tree = _board_ticket_tree(project, initiative, folder=None)
+        else:
+            tree = _board_ticket_tree(project, parent, folder=folder)
+        view = tree.status()
+    except tickettree.TicketsError as e:
+        board = TicketsBoard((), f"tickets.py {e.kind}: {e}", initiative)
+    else:
+        board = TicketsBoard(view.tickets, None, initiative)
+    _tickets_cache[key] = (sig, board, time.monotonic())
+    return board
+
+
+def tickets_overview(project: Path, state: RunState) -> TicketsBoard:
+    """The tickets-mode board for a run: the tree of the initiative it pinned
+    (``RunState.initiative`` and ``initiative_folder``), read as
+    :func:`initiative_board` reads it — off the UI thread. The recorded folder
+    moves with a renamed project (:func:`~bmad_loop.runs.rebase_recorded_project_path`),
+    so the signature watches the tree the script reads. A run with no pinned
+    initiative has no tree to read and says so in ``fault``.
+
+    A chained child run (``RunState.parent_initiative`` set) is pinned and read
+    as ``bmad-loop status`` reads it (``runs.recorded_tree_pin`` in the main
+    checkout): :func:`~bmad_loop.runs.tree_pin` over the live paths re-rooted on
+    the child (:func:`~bmad_loop.runs.paths_for_state`), from the stat-gated
+    tickets-mode paths. A config that cannot be read, or no longer names the
+    parent, is the board's ``fault``."""
+    if not state.initiative or not state.initiative_folder:
+        return TicketsBoard((), "this run pinned no initiative", state.initiative)
+    if state.parent_initiative is not None:
+        return _chained_run_board(project, state)
+    folder = Path(state.initiative_folder)
+    if not folder.is_absolute():
+        folder = project / folder
+    folder = rebase_recorded_project_path(folder, state, project)
+    return initiative_board(project, state.initiative, folder)
+
+
+def _chained_run_board(project: Path, state: RunState) -> TicketsBoard:
+    """:func:`tickets_overview` for a chained child run (see there)."""
+    paths = _project_paths(project, want_tickets=True)
+    if paths is None:
+        why = _tickets_paths_fault.get(project, "the project is not initialized")
+        return TicketsBoard((), f"BMAD config unreadable: {why}", state.initiative)
+    try:
+        pin, folder = tree_pin(state, paths_for_state(paths, state))
+    except (bmadconfig.BmadConfigError, ValueError) as e:
+        return TicketsBoard((), str(e), state.initiative)
+    if pin is None or folder is None:  # tree_pin always roots a chained run on its child
+        return TicketsBoard((), "this run pinned no initiative", state.initiative)
+    return initiative_board(project, state.initiative, folder, parent=pin)
+
+
+def project_tickets_overview(project: Path) -> TicketsBoard:
+    """The board a new tickets run would start from: the project's live ``[core]
+    active_initiative``. A project that is not v7, or names no initiative, says
+    so in ``fault``. Resolves as ``bmad-loop run`` does in tickets mode, so a mixed
+    v6/v7 install previews its v7 initiative. Spawns like :func:`initiative_board`
+    — off the UI thread.
+
+    A parent initiative (its ``tickets.toml`` lists ``[[initiative]]`` children,
+    read as ``bmad-loop run`` detects one) previews as its chain:
+    :func:`_parent_board`. A ``tickets.toml`` that cannot be read is a fault."""
+    from .. import install  # lazy: pulls the adapters; keep this module import-light
+
+    paths = _project_paths(project, want_tickets=True)
+    if paths is None:
+        why = _tickets_paths_fault.get(project, "the project is not initialized")
+        return TicketsBoard((), f"BMAD config unreadable: {why}", "")
+    if paths.era != "v7" or paths.initiative_folder is None or not paths.active_initiative:
+        return TicketsBoard((), "no v7 active initiative ([core] active_initiative)", "")
+    children, breakdown, fault = install._initiative_children(paths.initiative_folder)
+    if fault:
+        return TicketsBoard((), f"cannot read {breakdown}: {fault}", "")
+    if children is not None:
+        return _parent_board(project, paths)
+    return initiative_board(project, paths.active_initiative, paths.initiative_folder)
+
+
+def _chain_tag(child: ticketmodel.ChildInitiative, pick: initiativechain.ChildPick) -> str:
+    """The start-run preview's tag for one child of a parent initiative, read from
+    the re-judged child (``pick.children``): ``first ready`` (the child
+    :func:`_parent_board` shows the board of), ``closes first`` (drained, so a run
+    marks it done before its first pick), ``done``/``dropped``, ``waiting``,
+    ``no folder``, or ``ready``."""
+    if pick.child is not None and child.slug == pick.child.slug:
+        return "first ready"
+    if child.slug in pick.closed:
+        return "closes first"
+    if child.status in ("done", "dropped"):
+        return child.status
+    if not child.ready:
+        return "waiting"
+    if child.folder is None:
+        return "no folder"
+    return "ready"
+
+
+def _parent_board(project: Path, paths: bmadconfig.ProjectPaths) -> TicketsBoard:
+    """The start-run preview of the parent active initiative ``paths`` name: its
+    children (``tickets.py next <parent>``, pinned to the parent) and the board of
+    the first ready child once a run has closed every drained child, as it does
+    before its first pick (:func:`~bmad_loop.initiativechain.next_child_after_close`),
+    read through that child's folder with the tree pinned to the parent. Each
+    child's tag and waits come from the re-judged view; its status and counts
+    are the tree as it reads now.
+
+    An approximation of the chain ``bmad-loop run`` builds: its pick also passes
+    over a ready child whose fresh pick dispatches nothing, and it leaves open a
+    drained child whose fresh pick still finds work, which takes a
+    ``next``/``status`` read per child; ``run --dry-run`` prints that prediction."""
+    parent = paths.active_initiative
+    folder = paths.initiative_folder
+    assert parent and folder is not None  # project_tickets_overview
+    try:
+        view = _parent_view(project, parent, folder)
+    except tickettree.TicketsError as e:
+        return TicketsBoard((), f"tickets.py {e.kind}: {e}", "", parent=parent)
+    pick = initiativechain.next_child_after_close(view)
+    children = tuple(
+        ChainChild(
+            slug=c.slug,
+            status=initiativechain.prerequisite_status(view, c.slug),
+            closed=initiativechain.closed_tickets(c),
+            total=c.counts.get("total", 0),
+            tag=_chain_tag(c, pick),
+            waiting_on=tuple(w for w in pick.waiting_on if w.slug == c.slug),
+        )
+        for c in pick.children
+    )
+    if pick.child is None:
+        return TicketsBoard((), None, "", parent=parent, children=children, chain_end=pick.end)
+    slug = pick.child.slug
+    try:
+        child_folder = paths.with_initiative(slug).initiative_folder
+    except ValueError as e:
+        return TicketsBoard(
+            (), f"initiative chain {parent}: {e}", slug, parent=parent, children=children
+        )
+    assert child_folder is not None  # with_initiative
+    board = initiative_board(project, slug, child_folder, parent=parent)
+    return TicketsBoard(board.rows, board.fault, slug, parent=parent, children=children)
+
+
+def _tickets_board(project: Path, state: RunState) -> TicketsBoard:
+    return tickets_overview(project, state)
+
+
+BoardLoader = Callable[[Path, RunState], "list[stories.StoryRow] | TicketsBoard | None"]
+
+
+BOARD_LOADERS: Mapping[str, BoardLoader | None] = {
+    worksource.SOURCE_SPRINT: None,
+    worksource.SOURCE_STORIES: _stories_board,
+    worksource.SOURCE_TICKETS: _tickets_board,
+}
+"""The per-run board each work source shows in the dashboard's board slot, keyed
+by ``RunState.source``. ``None`` means the source has no per-run board: the slot
+shows the project-level sprint tree (:func:`sprint_overview`, painted on rescan).
+A source this table does not carry is shown as sprint, as before the registry.
+A loader returns stories rows (the stories board) or a :class:`TicketsBoard`
+(the tickets board); the dashboard picks the widget by that type.
+One row per ``worksource.SOURCES`` (``tests/test_worksource.py`` holds it
+exhaustive)."""
 
 
 @dataclass(frozen=True)
@@ -899,28 +1520,59 @@ def deferred_entries(project: Path) -> list[DeferredItem] | None:
     return items
 
 
-def pending_missed_decisions(project: Path) -> list:
+@dataclass(frozen=True)
+class MissedDecisions:
+    """:func:`pending_missed_decisions`' answer. ``fault`` is None for a real
+    answer (``items`` may then be empty: nothing is pending); otherwise it names
+    why nothing could be read, and ``items`` is empty because nothing was — not
+    because nothing is pending (DW-473). ``ledger`` is the deferred-work ledger
+    ``items`` were listed from, for :func:`decisions.apply_pre_answer`'s
+    ``listed_ledger``."""
+
+    items: list[Any]
+    fault: str | None = None
+    ledger: Path | None = None
+
+
+def pending_missed_decisions(project: Path) -> MissedDecisions:
     """Deferred-work decisions earlier sweeps surfaced but no one answered (a
     list of sweep.Decision). Cached on a signature of the ledger, the pre-answer
     store, and the set of run dirs — a new sweep (new run dir) or an answer
-    (store/ledger change) invalidates it. Empty when the project is unavailable."""
+    (store/ledger change) invalidates it.
+
+    Never raises. A project whose BMAD config cannot be loaded, a read that
+    raises, and a ledger that exists but cannot be read each answer a
+    ``fault`` (DW-473) — the last because ``decisions.pending_missed_decisions``
+    reads an unreadable ledger as "no open ids" and answers ``[]``, the same
+    probe ``cmd_decisions`` makes. So does an incomplete run listing (DW-468):
+    the triage caches of a run that cannot be read are missing from the answer.
+    A fault is not cached: the next call retries."""
     from .. import decisions  # lazy: pulls sweep; keep this module import-light
 
     paths = _project_paths(project)
     if paths is None:
-        return []
+        why = _paths_fault.get(project, "BMAD config unavailable")
+        return MissedDecisions([], fault=f"BMAD config cannot be loaded ({why})")
     project = paths.project
+    run_dirs, listing_fault = list_run_dirs(project)
+    if listing_fault is not None:
+        return MissedDecisions([], fault=f"run listing incomplete ({listing_fault})")
     sig = (
+        paths.deferred_work,
         _stat_sig(paths.deferred_work),
-        _stat_sig(decisions.store_path(project)),
-        tuple(d.name for d in list_run_dirs(project)),
+        _stat_sig(decisions.store_path(project, decisions.store_scope(paths))),
+        tuple(d.name for d in run_dirs),
     )
     cached = _missed_cache.get(project)
     if cached is not None and cached[0] == sig:
         return cached[1]
     try:
-        result = decisions.pending_missed_decisions(project)
-    except (bmadconfig.BmadConfigError, OSError):
-        result = []
+        items = decisions.pending_missed_decisions(project, paths)
+    except (bmadconfig.BmadConfigError, OSError) as e:
+        return MissedDecisions([], fault=_describe(e))
+    _, ledger_fault = deferredwork.read_for_observation(paths.deferred_work)
+    if ledger_fault is not None:
+        return MissedDecisions([], fault=f"deferred-work ledger unreadable ({ledger_fault})")
+    result = MissedDecisions(items, ledger=paths.deferred_work)
     _missed_cache[project] = (sig, result)
     return result

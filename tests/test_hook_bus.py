@@ -27,6 +27,7 @@ from conftest import (
     write_sprint,
 )
 
+from bmad_loop import childrun
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
 from bmad_loop.escalation import critical_escalations
@@ -109,6 +110,100 @@ def test_command_results_are_readonly_observation_data():
     assert c.command_results == (result,)
     with pytest.raises(AttributeError):
         c.command_results = ()
+
+
+def test_verification_reused_is_readonly_and_defaults_to_false():
+    assert ctx().verification_reused is False
+    assert ctx("post_review_verify").verification_reused is False
+    c = ctx(
+        "post_review_verify",
+        verification_stage="dev",
+        verification_sequence=1,
+        verification_reused=True,
+    )
+    assert c.verification_reused is True
+    assert (c.verification_stage, c.verification_sequence) == ("dev", 1)
+    with pytest.raises(AttributeError):
+        c.verification_reused = False  # type: ignore[misc]
+
+
+def test_delivery_id_is_readonly_and_defaults_to_none():
+    assert ctx().delivery_id is None
+    c = ctx("post_migrate", delivery_id="abc123")
+    assert c.delivery_id == "abc123"
+    with pytest.raises(AttributeError):
+        c.delivery_id = "forged"  # type: ignore[misc]
+
+
+def test_declarative_env_carries_delivery_id_only_when_set():
+    seen: list[dict[str, str]] = []
+
+    def runner(cmd, *, cwd, env, timeout):
+        seen.append(dict(env))
+        return 0, ""
+
+    bus = HookBus(registry_of(declarative("post_migrate")), runner=runner)
+    bus.emit("post_migrate", ctx("post_migrate", delivery_id="deadbeef"))
+    bus.emit("post_migrate", ctx("post_migrate"))
+    assert seen[0]["BMAD_LOOP_DELIVERY_ID"] == "deadbeef"
+    assert "BMAD_LOOP_DELIVERY_ID" not in seen[1]
+
+
+def test_inactive_plugins_never_dispatch():
+    # trust is the registry's verdict, read through LoadedPlugin.active: an
+    # untrusted plugin (an un-enabled builtin [python]) contributes no hook, no
+    # active stage, no live-plugin name — its declarative hooks included
+    ran: list[str] = []
+
+    def runner(cmd, *, cwd, env, timeout):
+        ran.append(cmd)
+        return 0, ""
+
+    gated = LoadedPlugin(
+        manifest=manifest("gated", hooks=(HookSpec(stage="pre_story", cmd="X"),)), trusted=False
+    )
+    bus = HookBus(registry_of(gated), runner=runner)
+    assert not bus.active("pre_story") and bus.active_plugins() == []
+    bus.emit("pre_story", ctx("pre_story"))
+    assert ran == []
+
+
+def test_declarative_env_disables_bytecode(monkeypatch):
+    # a Python hook must never write __pycache__ into its (snapshot) dir — even
+    # when the operator's own environment allows bytecode writes
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+    seen: list[dict[str, str]] = []
+
+    def runner(cmd, *, cwd, env, timeout):
+        seen.append(dict(env))
+        return 0, ""
+
+    bus = HookBus(registry_of(declarative("pre_story")), runner=runner)
+    bus.emit("pre_story", ctx("pre_story"))
+    assert seen[0]["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
+def test_rollback_outcome_is_readonly_and_defaults_to_none():
+    assert ctx().rollback_outcome is None
+    assert ctx("pre_rollback").rollback_outcome is None
+    c = ctx("post_rollback", rollback_outcome="paused")
+    assert c.rollback_outcome == "paused"
+    with pytest.raises(AttributeError):
+        c.rollback_outcome = "completed"  # type: ignore[misc]
+
+
+def test_declarative_env_carries_rollback_outcome_only_when_set():
+    seen: list[dict[str, str]] = []
+
+    def runner(cmd, *, cwd, env, timeout):
+        seen.append(dict(env))
+        return 0, ""
+
+    bus = HookBus(registry_of(declarative("post_rollback")), runner=runner)
+    bus.emit("post_rollback", ctx("post_rollback", rollback_outcome="failed"))
+    bus.emit("post_rollback", ctx("post_rollback"))
+    assert seen[0]["BMAD_LOOP_ROLLBACK_OUTCOME"] == "failed"
+    assert "BMAD_LOOP_ROLLBACK_OUTCOME" not in seen[1]
 
 
 def test_a_plugin_cannot_erase_a_critical_escalation_through_result_json():
@@ -399,6 +494,56 @@ def test_real_subprocess_runner_replaces_undecodable_output(tmp_path):
     assert "before" in out and "after" in out
 
 
+@pytest.mark.parametrize("fail_closed", [False, True])
+def test_interrupted_declarative_hook_is_neither_error_nor_veto(fail_closed):
+    """A hook whose tree a hard stop killed (DW-353) journals
+    `plugin-hook-interrupted` and re-raises for the engine to stop on — never a
+    `plugin-hook-error`, and never a defer veto, even under `fail_closed`.
+
+    Ablation: drop the `except ChildInterrupted` arm and the ChildInterrupted
+    still propagates but the `plugin-hook-interrupted` record is missing; catch
+    it as `_HookError` instead and the fail_closed row vetoes and does not raise."""
+
+    def interrupted(*_a, **_k):
+        raise childrun.ChildInterrupted("hook interrupted by a hard stop request: X")
+
+    journal = _FakeJournal()
+    c = ctx()
+    bus = HookBus(
+        registry_of(declarative("pre_story", blocking=True, fail_closed=fail_closed)),
+        journal,
+        runner=interrupted,
+    )
+
+    with pytest.raises(childrun.ChildInterrupted):
+        bus.emit("pre_story", c)
+
+    assert journal.entries == [
+        {"kind": "plugin-hook-interrupted", "plugin": "d", "stage": "pre_story"}
+    ]
+    assert not c.vetoed
+
+
+def test_real_subprocess_runner_raises_child_interrupted_on_hard_stop(tmp_path):
+    """Through the real transport: a pending hard stop surfaces as
+    `ChildInterrupted`, not as `_HookError` (which fail_closed would turn into a
+    veto)."""
+    token = childrun.install_stop_probe(lambda: True)
+    try:
+        with pytest.raises(childrun.ChildInterrupted):
+            _run_subprocess("exit 0", cwd=str(tmp_path), env={}, timeout=10)
+    finally:
+        childrun.reset_stop_probe(token)
+
+
+def test_real_subprocess_runner_timeout_is_a_hook_error(tmp_path):
+    """The timeout leg keeps its shape through the new runner."""
+    script = tmp_path / "hang.py"
+    script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    with pytest.raises(_HookError, match="timed out after 1s"):
+        _run_subprocess(f'"{sys.executable}" "{script}"', cwd=str(tmp_path), env={}, timeout=1)
+
+
 def test_shared_persists_across_stages():
     class P(Plugin):
         def on_pre_dev_phase(self, c):
@@ -409,6 +554,85 @@ def test_shared_persists_across_stages():
     for _ in range(3):
         bus.emit("pre_dev_phase", HookContext("pre_dev_phase", shared=shared))
     assert shared == {"count": 3}
+
+
+# --------------------------------------------------- writer-dispatch callback
+
+
+def _writer_bus(*loaded: LoadedPlugin, events: list) -> HookBus:
+    def runner(cmd, *, cwd, env, timeout):
+        events.append(("hook", env["BMAD_LOOP_PLUGIN"]))
+        return 0, ""
+
+    return HookBus(
+        registry_of(*loaded),
+        runner=runner,
+        on_writer_dispatch=lambda plugin, stage: events.append(("void", plugin, stage)),
+    )
+
+
+def test_writer_dispatch_fires_only_for_bound_active_non_read_only_plugins():
+    """The callback names exactly the plugin about to dispatch that is not
+    ``read_only``, before its hook runs: a read-only plugin, a plugin not bound
+    to the stage and an inactive (untrusted) one dispatch nothing to announce."""
+    writer = declarative("pre_story", name="writer")
+    reader = LoadedPlugin(
+        manifest=manifest("reader", read_only=True, hooks=(HookSpec(stage="pre_story", cmd="X"),))
+    )
+    unbound = declarative("post_commit", name="unbound")
+    inactive = LoadedPlugin(
+        manifest=manifest("inactive", hooks=(HookSpec(stage="pre_story", cmd="X"),)),
+        trusted=False,
+    )
+    events: list = []
+    _writer_bus(writer, reader, unbound, inactive, events=events).emit("pre_story", ctx())
+    assert events == [("void", "writer", "pre_story"), ("hook", "writer"), ("hook", "reader")]
+
+
+def test_writer_dispatch_fires_once_per_plugin_per_emit():
+    """A plugin with both a declarative hook and an ``on_<stage>`` method for the
+    stage announces once, and again on the next emit."""
+    calls: list = []
+
+    class P(Plugin):
+        def on_pre_story(self, c):
+            calls.append("py")
+
+    m = manifest("both", hooks=(HookSpec(stage="pre_story", cmd="X"),))
+    events: list = []
+    bus = _writer_bus(LoadedPlugin(manifest=m, instance=P(m, {})), events=events)
+    bus.emit("pre_story", ctx())
+    bus.emit("pre_story", ctx())
+    assert [e for e in events if e[0] == "void"] == [("void", "both", "pre_story")] * 2
+    assert calls == ["py", "py"]
+
+
+def test_writer_dispatch_covers_python_hooks_and_honours_read_only():
+    class P(Plugin):
+        def on_pre_story(self, c):
+            pass
+
+    events: list = []
+    writer = py_plugin(P, "pywriter")
+    m = manifest("pyreader", read_only=True)
+    reader = LoadedPlugin(manifest=m, instance=P(m, {}))
+    _writer_bus(writer, reader, events=events).emit("pre_story", ctx())
+    assert events == [("void", "pywriter", "pre_story")]
+
+
+def test_writer_dispatch_skips_a_bus_disabled_plugin():
+    """An instance the bus disabled after it raised dispatches nothing more, so it
+    announces nothing more."""
+
+    class Boom(Plugin):
+        def on_pre_story(self, c):
+            raise RuntimeError("x")
+
+    events: list = []
+    bus = _writer_bus(py_plugin(Boom, "boom"), events=events)
+    bus.emit("pre_story", ctx())
+    bus.emit("pre_story", ctx())
+    assert events == [("void", "boom", "pre_story")]
 
 
 # ====================================================== engine integration
@@ -496,8 +720,9 @@ def test_post_dev_verify_reaches_a_real_plugin_through_the_bus(project, monkeypa
     registered plugin, so the plumbing itself is covered end to end.
 
     Ablation: drop `command_results`, `verification_stage` or
-    `verification_sequence` from the engine's `post_dev_verify` emit and the
-    plugin observes that field's default (`()` / `None`) instead.
+    `verification_sequence` from the engine's `post_dev_verify` (or
+    `post_review_verify`) emit and the plugin observes that field's default
+    (`()` / `None`) instead.
     """
     from bmad_loop import verify
 
@@ -505,6 +730,9 @@ def test_post_dev_verify_reaches_a_real_plugin_through_the_bus(project, monkeypa
 
     class P(Plugin):
         def on_post_dev_verify(self, c):
+            seen.append((c.verification_stage, c.verification_sequence, c.command_results))
+
+        def on_post_review_verify(self, c):
             seen.append((c.verification_stage, c.verification_sequence, c.command_results))
 
     result = verify.CommandResult("pytest -q", 0, "tail", "out", "err")
@@ -518,18 +746,20 @@ def test_post_dev_verify_reaches_a_real_plugin_through_the_bus(project, monkeypa
     summary = engine.run()
 
     assert summary.done == 1
-    assert seen == [("dev", 1, (result,))]
-    # and the keys the plugin was handed are the ones its journal record carries,
-    # which is the correlation the whole surface exists for. Scoped to the dev
-    # stage: the review gate journals its own pass now, and that one deliberately
-    # reaches no plugin — the single `seen` entry above is the other half of that.
-    (entry,) = [
-        e
-        for e in engine.journal.entries()
-        if e["kind"] == "verify-command-result" and e["verification_stage"] == "dev"
-    ]
-    assert entry["verification_sequence"] == 1
-    assert entry["story_key"] == "1-1-a" and entry["command"] == "pytest -q"
+    # the dev pass on `post_dev_verify`, then the review gate's own pass on
+    # `post_review_verify` (DW-357), sharing the story's one sequence counter
+    assert seen == [("dev", 1, (result,)), ("review", 2, (result,))]
+    # and the keys the plugin was handed are the ones its journal records carry,
+    # which is the correlation the whole surface exists for.
+    for stage, sequence, _ in seen:
+        (entry,) = [
+            e
+            for e in engine.journal.entries()
+            if e["kind"] == "verify-command-result"
+            and e["verification_stage"] == stage
+            and e["verification_sequence"] == sequence
+        ]
+        assert entry["story_key"] == "1-1-a" and entry["command"] == "pytest -q"
 
 
 def _resume_committing(project, engine, registry):
@@ -644,6 +874,47 @@ def test_veto_pause_routes_to_escalation(project):
     engine, _ = make_engine(project, one_story(project), registry_of(py_plugin(P, "vp")))
     summary = engine.run()
     assert summary.paused and summary.escalated == 1
+
+
+@pytest.mark.parametrize(
+    ("action", "row", "phase"),
+    [("pause", "story-escalated", Phase.ESCALATED), ("defer", "story-deferred", Phase.DEFERRED)],
+)
+def test_host_loss_in_veto_notify_leaves_the_veto_on_disk(project, monkeypatch, action, row, phase):
+    """DW-629. A pre-story `pause` or `defer` veto journals its row, then notifies.
+    `_vetoed` saves the terminal phase before the notify, so a host loss inside a
+    slow notify command leaves ESCALATED / DEFERRED on disk, not the last save.
+
+    The test snapshots `state.json` inside the notify, because `run()`'s `finally`
+    save would otherwise persist the in-memory phase and hide the boundary.
+
+    Ablation, performed: move the arm's `self._save()` back below `gates.notify`
+    and the snapshot no longer records the vetoed phase."""
+    from bmad_loop import gates
+
+    class HostLoss(BaseException):
+        pass
+
+    class P(Plugin):
+        def on_pre_story(self, c):
+            c.veto(action, "halt the line")
+
+    engine, adapter = make_engine(project, one_story(project), registry_of(py_plugin(P, "vh")))
+    state_file = engine.run_dir / "state.json"
+    durable: list[bytes] = []
+
+    def host_dies_in_notify(*_args, **_kwargs):
+        if not durable and any(e["kind"] == row for e in engine.journal.entries()):
+            durable.append(state_file.read_bytes())
+            raise HostLoss
+
+    monkeypatch.setattr(gates, "notify", host_dies_in_notify)
+    with pytest.raises(HostLoss):
+        engine.run()
+    state_file.write_bytes(durable[0])
+
+    assert adapter.sessions == []
+    assert load_state(engine.run_dir).tasks["1-1-a"].phase == phase
 
 
 def test_session_veto_retries_then_defers(project):

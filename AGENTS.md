@@ -1,6 +1,6 @@
 # AGENTS.md — bmad-loop
 
-bmad-loop is a deterministic Python orchestrator that drives unattended BMAD-method dev loops by spawning coding-CLI sessions (claude, codex, gemini, copilot, antigravity, opencode) inside terminal multiplexers (tmux; psmux on Windows). **The control loop contains no LLM calls — hard rule.** Orchestration is deterministic Python; LLMs run only inside disposable coding-CLI sessions. Never move orchestration into an LLM. User-facing overview: [README.md](README.md); behavior reference: [docs/FEATURES.md](docs/FEATURES.md).
+bmad-loop is a deterministic Python orchestrator that drives unattended BMAD-method dev loops by spawning coding-CLI sessions (claude, codex, gemini, copilot, antigravity, opencode) inside terminal multiplexers (tmux; psmux on Windows). **The control loop contains no LLM calls — hard rule.** Orchestration is deterministic Python; LLMs run only inside disposable coding-CLI sessions. Never move orchestration into an LLM. User-facing overview: [README.md](README.md); feature catalog: [docs/FEATURES.md](docs/FEATURES.md); config/CLI/run-state facts: [docs/reference/](docs/README.md#reference).
 
 ## Dev environment
 
@@ -24,11 +24,11 @@ Things that break silently. Never violate; when in doubt, read the named module'
 
 - No LLM calls in the orchestrator control loop.
 - Sessions complete only on hook Stop events or window death — never on LLM prose. Never add another completion path. Post-session state is re-verified deterministically (`verify.py`).
-- `sprintstatus.advance()` is the orchestrator's sole write path to sprint-status.yaml (internally serialized cross-process since #469; the dev skill flips only spec frontmatter; the engine mirrors it onto the board pre-verify). Legal phase transitions live only in `statemachine.py`.
+- `sprintstatus.advance()` is the orchestrator's sole write path to sprint-status.yaml (internally serialized cross-process; the dev skill flips only spec frontmatter; the engine mirrors it onto the board pre-verify). Legal phase transitions live only in `statemachine.py`. `TicketTree.mark` is the orchestrator's sole write path to a ticket plan's `status`/`blocked_*` in tickets mode, and `TicketTree.restore_preimage` the sole byte-exact restore of a pre-image captured by the same transaction; legal plan transitions live in `statemachine.py`; the build skill writes plan status itself and bmad-loop never marks while a session for that ticket is live. `TicketTree.mark_initiative_done` is the sole write path to a child initiative file's `status` (transition in `statemachine.py`): only for a drained child of a chained run, never while a session for that child is live.
 - All git subprocess calls in `src/bmad_loop` go through the `_run_git` chokepoint in `verify.py` (timeouts, `LC_ALL=C`) — no bare subprocess git; `tests/test_portability_guard.py` enforces it. Tests, `scripts/`, and CI workflows deliberately spawn their own git: a harness must not depend on the artifact it validates.
 - Every new policy field needs an entry in `src/bmad_loop/data/settings/core.toml` (a sync test enforces defaults/options match `policy.py`). New core env vars register in `envvars.py`; plugin-owned env-var families stay with their plugin.
-- Version strings are stamped only by `scripts/sync_version.py` from `src/bmad_loop/__init__.py` — never hand-edit pyproject.toml, module.yaml, marketplace.json, or uv.lock versions.
-- Canonical module skills live in `src/bmad_loop/data/skills/`; their copies in the gitignored `.claude/skills/` and `.agents/skills/` are seeded forks (`scripts/seed_skills.py`) — editing a fork loses work on reseed (drift-tested locally; the test skips in CI). Other skills in those dirs are BMAD-installed, not seeded. (The `.agents/` directory is unrelated to this file.)
+- Version strings are stamped only by `scripts/sync_version.py` from `src/bmad_loop/__init__.py` — never hand-edit pyproject.toml, module.yaml, marketplace.json, bmod.toml, or uv.lock versions.
+- Canonical module skills live in the repo-root `skills/` (Vercel `skills` CLI discovery path; the wheel maps them to `bmad_loop/data/skills` via `force-include`, and `install.skills_root()` resolves either — never read them via `resources.files` directly); their copies in the gitignored `.claude/skills/` and `.agents/skills/` are seeded forks (`scripts/seed_skills.py`) — editing a fork loses work on reseed (drift-tested locally; the test skips in CI). Other skills in those dirs are BMAD-installed, not seeded. (The `.agents/` directory is unrelated to this file.)
 - `bmad-loop <cmd> --json` output is a schema-versioned contract (`machine.py`): one JSON object on stdout, nothing else.
 - `ExitCode` allocation is closed (`cli.py`): OK=0, FAILURE=1, USAGE=2, INTERRUPTED=130; 3–129 and 131+ stay unallocated.
 - tmux/POSIX argv construction is quarantined in `adapters/tmux_base.py` + `tmux_backend.py`; `tests/test_portability_guard.py` enforces it.
@@ -36,31 +36,35 @@ Things that break silently. Never violate; when in doubt, read the named module'
 
 ## Architecture
 
-Two orthogonal seams: **which CLI** (adapter axis: `adapters/base.py` `CodingCLIAdapter`, TOML profiles in `src/bmad_loop/data/profiles/`, user overlay `.bmad-loop/profiles/*.toml` — a new coding CLI is a TOML profile plus `bmad-loop probe-adapter`, not Python; a CLI needing its own adapter **class** registers one in `adapters/registry.py` (`register_adapter`, `bmad_loop.adapters` entry point), selected by the profile's `adapter` field) and **which transport** (mux axis: `adapters/multiplexer.py` `TerminalMultiplexer` registry; selection: `BMAD_LOOP_MUX_BACKEND` env > policy `[mux] backend` > platform default > first available match > fallback — full 5-step precedence in [docs/multiplexer-backends.md](docs/multiplexer-backends.md)).
+Two orthogonal seams:
 
-| Module                                     | Role                                                                                        |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------- |
-| `cli.py`                                   | argparse CLI, all `cmd_*` handlers; injectable `engine_cls`/`make_adapters` seams           |
-| `engine.py`                                | `Engine` — the deterministic control loop                                                   |
-| `worktree_flow.py`, `recovery_flow.py`     | engine collaborators: worktree isolation/merge; rollback + recovery-ref preservation        |
-| `sweep.py`, `stories_engine.py`            | deferred-work sweep run type; stories.yaml mode                                             |
-| `statemachine.py`, `model.py`, `policy.py` | pure typed core (pyright-strict): transitions, data model, policy.toml → frozen dataclasses |
-| `verify.py`                                | deterministic post-session verification; `_run_git` chokepoint                              |
-| `machine.py`, `documents.py`               | `--json` contract; read-model projections                                                   |
-| `adapters/`                                | coding-CLI adapters + mux backends (see seams above)                                        |
-| `tui/`                                     | Textual dashboard (`tui` extra); observer/launcher only — never runs engines in-process     |
-| `plugins/`                                 | manifest-driven extension layer (`plugin.toml`, trust tiers, hook bus)                      |
+- **Which CLI** (adapter axis): `adapters/base.py` `CodingCLIAdapter`, TOML profiles in `src/bmad_loop/data/profiles/`, user overlay `.bmad-loop/profiles/*.toml`. A new coding CLI is a TOML profile plus `bmad-loop probe-adapter`, not Python. A CLI needing its own adapter **class** registers one in `adapters/registry.py` (`register_adapter`, `bmad_loop.adapters` entry point), selected by the profile's `adapter` field.
+- **Which transport** (mux axis): `adapters/multiplexer.py` `TerminalMultiplexer` registry. Selection: `BMAD_LOOP_MUX_BACKEND` env > policy `[mux] backend` > platform default > first available match > fallback — full 5-step precedence in [docs/multiplexer-backends.md](docs/multiplexer-backends.md).
 
-28 further leaf modules — read the module docstring before assuming. Deeper maps: [docs/FEATURES.md](docs/FEATURES.md), [docs/adapter-authoring-guide.md](docs/adapter-authoring-guide.md), [docs/multiplexer-backends.md](docs/multiplexer-backends.md).
+| Module                                               | Role                                                                                        |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `cli.py`                                             | argparse CLI, all `cmd_*` handlers; injectable `engine_cls`/`make_adapters` seams           |
+| `engine.py`                                          | `Engine` — the deterministic control loop                                                   |
+| `worktree_flow.py`, `recovery_flow.py`               | engine collaborators: worktree isolation/merge; rollback + recovery-ref preservation        |
+| `sweep.py`, `stories_engine.py`, `tickets_engine.py` | deferred-work sweep run type; stories.yaml mode; BMAD v7 ticket-tree mode                   |
+| `statemachine.py`, `model.py`, `policy.py`           | pure typed core (pyright-strict): transitions, data model, policy.toml → frozen dataclasses |
+| `verify.py`                                          | deterministic post-session verification; `_run_git` chokepoint                              |
+| `machine.py`, `documents.py`                         | `--json` contract; read-model projections                                                   |
+| `adapters/`                                          | coding-CLI adapters + mux backends (see seams above)                                        |
+| `tui/`                                               | Textual dashboard (`tui` extra); observer/launcher only — never runs engines in-process     |
+| `plugins/`                                           | manifest-driven extension layer (`plugin.toml`, trust tiers, hook bus)                      |
+
+43 further leaf modules — read the module docstring before assuming. Deeper maps: [docs/FEATURES.md](docs/FEATURES.md), [docs/adapter-authoring-guide.md](docs/adapter-authoring-guide.md), [docs/multiplexer-backends.md](docs/multiplexer-backends.md).
 
 ## Testing
 
 - Flat `tests/` mirrors src modules by name; `asyncio_mode=auto`; no custom markers.
 - Use the conftest sandbox fixtures (`project` copies a session-scoped template repo per test — never hand-roll temp repos or touch the template). Mock adapter drives engine tests without tmux or an LLM; caveat: it exercises the generic adapter path only.
 - Pin the backend with the `force_tmux_backend` fixture when asserting tmux argv through the mux seam.
-- E2E gates: `tests/test_stories_e2e.py` (real tmux on Linux + a scripted fake-claude profile, zero LLM tokens), `tests/test_opencode_live.py` (zero-token invariant — never sends a prompt), and `tests/test_psmux_live.py` (real psmux on Windows, parked windows only, zero tokens). Never "fix" these to call real CLIs.
+- E2E gates: `tests/test_stories_e2e.py` (real tmux on Linux + a scripted fake-claude profile, zero LLM tokens), `tests/test_opencode_live.py` (zero-token invariant — never sends a prompt), `tests/test_psmux_live.py` (real psmux on Windows, parked windows only, zero tokens), and `tests/test_tickets_e2e.py` (real tmux on Linux, the vendored v7 `tickets.py` + a scripted fake build-auto, zero tokens). Never "fix" these to call real CLIs.
 - Ablation rule: for any test asserting "X is refused/absent", delete the gating code and confirm the test FAILS before trusting it — negative assertions pass for every reason a value could be absent.
 - New behavior lands with a test at the lowest layer that can catch its regression: pure-core unit > seam > sandbox E2E.
+- Windows CI shards each leg with `--ci-shard I/N` (digest-assigned function families and xdist groups; `tests/perf_report.py`) and its `test (windows, …)` aggregator fails on any test run in no shard or two. Never select CI tests by hand-kept lists; the psmux gate stays a separate serial job.
 - Full strategy — layer taxonomy, fixture/ablation doctrine, guard inventory, flake policy: [docs/testing.md](docs/testing.md).
 
 ## Repo hygiene
@@ -69,6 +73,7 @@ Two orthogonal seams: **which CLI** (adapter axis: `adapters/base.py` `CodingCLI
   - Every entry lands under `## [Unreleased]`, and only under the six Keep a Changelog subsections — `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`.
   - A release **promotes** that section: `## [Unreleased]` is renamed to `## [X.Y.Z] — <ISO date>` and a fresh empty `## [Unreleased]` opens above it. The release never authors a new version section from the git log, and never leaves a populated `Unreleased` behind — `scripts/release.py prepare` refuses both, and `release.py check` (CI job `version-sync`) holds the reopened heading and its `compare/v<version>...HEAD` link.
 - Never commit session notes, probe records, or run artifacts. Durable facts belong in docstrings; records in git history.
+- Docs describe current behavior: no tracker refs or history outside CHANGELOG/ADRs; FEATURES.md is a feature catalog (format in its Overview); `tests/test_docs_hygiene.py` enforces it.
 - Review non-convergence is evidence about the approach, not just a defect queue — escalate rather than grind.
 
 ## Engineering doctrine
@@ -79,13 +84,20 @@ These rules apply to code you are already touching — do not initiate refactors
 - Split by responsibility, never by line count: a cohesive state machine stays whole (`statemachine.py`); size thresholds are review heuristics, not lint gates.
 - Strict typing lives in the pure core, not the I/O edges (the staged pyright config in pyproject.toml is deliberate). Do NOT ratchet ruff stricter than CI — the `[tool.ruff.lint]` comment documents why.
 - Fail loud at boundaries: typed escalation over bare except; observation may degrade, repair writes must raise.
+  A degrade must be visible: journal it, or count it where an operator or durable record can see it (journal, `heartbeat.json`, a `SessionResult` field the engine journals, CLI/TUI output), and never fold a fault silently into a healthy-looking empty value (`None`, `[]`, `False`, `""`) that a caller cannot tell from a real answer.
 
 ## Docs index
 
 | Doc                                                                | Read when                                               |
 | ------------------------------------------------------------------ | ------------------------------------------------------- |
 | [docs/setup-guide.md](docs/setup-guide.md)                         | installing/initializing a target project                |
-| [docs/FEATURES.md](docs/FEATURES.md)                               | any behavior or policy question                         |
+| [docs/FEATURES.md](docs/FEATURES.md)                               | what the tool does — feature catalog                    |
+| [docs/reference/configuration.md](docs/reference/configuration.md) | a policy key, default, or env var                       |
+| [docs/reference/cli.md](docs/reference/cli.md)                     | a subcommand, flag, `--json` shape, or exit code        |
+| [docs/reference/run-state.md](docs/reference/run-state.md)         | run/task dir layout, sessions, stop, cleanup scope      |
+| [docs/sweep-guide.md](docs/sweep-guide.md)                         | running sweeps, answering decisions, ledger recovery    |
+| [docs/tickets-guide.md](docs/tickets-guide.md)                     | BMAD v7 tickets mode: pauses, store layouts, marks      |
+| [docs/escalations-guide.md](docs/escalations-guide.md)             | recovering a paused or escalated run (`resolve`)        |
 | [docs/tui-guide.md](docs/tui-guide.md)                             | TUI work                                                |
 | [docs/adapter-authoring-guide.md](docs/adapter-authoring-guide.md) | adding/finalizing a coding-CLI profile or adapter class |
 | [docs/multiplexer-backends.md](docs/multiplexer-backends.md)       | mux backend selection/porting                           |

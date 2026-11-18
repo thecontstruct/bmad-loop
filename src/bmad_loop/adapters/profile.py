@@ -33,24 +33,43 @@ profile state a TOML author would have been refused.
 from __future__ import annotations
 
 import importlib.metadata
+import re
+import string
+import sys
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from importlib import resources
 from importlib.resources.abc import Traversable
-from pathlib import Path
+from pathlib import Path, PurePath
 
 import regex
 
 from ..platform_util import (
     has_parent_ref,
     is_absolute_path,
+    names_home_ref,
     names_tree_root,
     names_win32_alias,
 )
-from ..policy import PROFILE_ALIASES
+from ..policy import PERMISSION_MODES, PROFILE_ALIASES
+from ..skill_locate import PRECEDENCES, UserSkillRoot, UserSkillsSpec, prompt_skill
 from .entrypoints import record_load_error
+from .multiplexer import ALLOWED_KEYS
 
-USAGE_PARSERS = {"claude-jsonl", "codex-rollout", "gemini-chat", "copilot-events", "none"}
+USAGE_PARSERS = {
+    "claude-jsonl",
+    "codex-rollout",
+    "gemini-chat",
+    "copilot-events",
+    "antigravity-transcript",
+    "none",
+}
+# The subagent transcript tree a usage parser's CLI writes beside its session
+# transcript, for profiles that leave `subagent_transcript_dir` unset. Mirrors
+# the subagent anchor tokens.tally already sums (`<stem>/subagents`, walked
+# recursively); "{stem}" is the transcript's filename stem.
+SUBAGENT_TRANSCRIPT_DIR_DEFAULTS = {"claude-jsonl": "{stem}/subagents"}
 HOOK_DIALECTS = {
     "claude-settings-json",
     "codex-hooks-json",
@@ -62,7 +81,45 @@ HOOK_DIALECTS = {
     # no hook config is ever written, so config_path/events must stay empty.
     "none",
 }
-CANONICAL_EVENTS = {"SessionStart", "Stop", "SessionEnd", "PreCompact"}
+# Parked-session kinds (DW-348): the CLI is waiting on a human — a permission,
+# idle or quota prompt. A parked event never completes a session; the generic
+# adapter latches it and, only where the stall logic would otherwise type a wake
+# nudge into the pane, withholds the nudge and ends the session as parked
+# (`SessionResult.parked`). A profile reaches these either by mapping a native
+# event straight to one, or through the `Notification` carrier plus
+# `hooks.notification_types` (native subtype -> parked kind).
+PARKED_EVENTS = frozenset({"PermissionPrompt", "IdlePrompt", "QuotaPrompt"})
+# `StopFailure` is Claude Code's turn-ended-on-an-API-error event: it fires
+# INSTEAD of `Stop`, so it is never a completion. It is not a parked kind — the
+# profile's `hooks.stop_failure_types` maps its native `error` value onto one of
+# STOP_FAILURE_ACTIONS, the closed set the generic adapter knows how to act on.
+# `account-fatal` is `account` for an error no relaunch or account switch can fix
+# (a wrong model name, a broken cloud credential): the adapter ends the session
+# parked exactly as for `account`, but usage-relaunch mode never relaunches it.
+CANONICAL_EVENTS = {
+    "SessionStart",
+    "Stop",
+    "SessionEnd",
+    "PreCompact",
+    "Notification",
+    "StopFailure",
+} | set(PARKED_EVENTS)
+STOP_FAILURE_ACTIONS = frozenset({"transient", "rate_limit", "account", "account-fatal", "ignore"})
+# A CLI version as `hooks.event_min_versions` spells it and `--version` prints
+# it: the first dotted MAJOR.MINOR.PATCH triple.
+_CLI_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def parse_cli_version(text: str) -> tuple[int, int, int] | None:
+    """The first ``X.Y.Z`` in ``text`` as an int triple, or None when there is
+    none. Claude Code prints ``2.1.316 (Claude Code)``."""
+    match = _CLI_VERSION_RE.search(text)
+    if match is None:
+        return None
+    major, minor, patch = (int(group) for group in match.groups())
+    return major, minor, patch
+
+
 USER_PROFILES_REL = Path(".bmad-loop") / "profiles"
 
 # Legacy adapter names from older policy.toml files, plus friendly short names.
@@ -93,6 +150,114 @@ class HookSpec:
     dialect: str
     config_path: str  # project-relative, e.g. ".claude/settings.json"
     events: dict[str, str]  # native event name -> canonical event name
+    # Subtypes of the canonical `Notification` carrier that mean "parked on a
+    # human" (DW-348): the relay forwards the payload's `notification_type`, and
+    # this table maps it onto a PARKED_EVENTS kind — e.g. claude's
+    # `permission_prompt` -> `PermissionPrompt`. An unmapped subtype is ignored.
+    # Non-empty requires some native event mapped to `Notification`. APPENDED
+    # with a default so every positional HookSpec construction stays valid.
+    notification_types: dict[str, str] = field(default_factory=dict)
+    # Values of the canonical `StopFailure` event's `error` field (the relay
+    # forwards it as `stop_error`) -> an action in STOP_FAILURE_ACTIONS — e.g.
+    # claude's `billing_error` -> `account`. An unmapped value is crumbed and
+    # otherwise ignored. Non-empty requires some native event mapped to
+    # `StopFailure`. APPENDED with a default so every positional HookSpec
+    # construction stays valid.
+    stop_failure_types: dict[str, str] = field(default_factory=dict)
+    # Native events the CLI added in a later release -> the minimum CLI version
+    # ("X.Y.Z") that knows them (#865). Hook registration (`init`, worktree
+    # provisioning, `probe-adapter`) probes `<binary> --version` and leaves a gated
+    # event out below its floor or when the version cannot be read, because an
+    # older CLI may reject its WHOLE hook config over one unknown event key —
+    # Claude Code before 2.1.78 drops the entire settings file, Stop relay
+    # included. Keys must be mapped in `events`, and a Stop carrier can never be
+    # gated. APPENDED with a default, like the tables above.
+    event_min_versions: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class WorkspaceTrustSpec:
+    """Where a CLI records the workspaces it trusts (DW-390).
+
+    Some CLIs gate every workspace on an exact-path allowlist in a home-level
+    settings file (agy: ``~/.gemini/antigravity-cli/settings.json``
+    ``trustedWorkspaces``), so a freshly provisioned worktree blocks on an
+    interactive trust dialog no spawned session can answer. Declaring the file
+    and its top-level list key lets :mod:`bmad_loop.workspace_trust` extend the
+    grant the operator already gave the project root to each unit worktree.
+
+    ``settings_path`` must be ``~/``-anchored (home-relative, no ``..``, no
+    Windows-alias component) and ``key`` names ONE top-level key — never a nested
+    path. Both are validated in :func:`_validate_profile`, so both profile routes
+    enforce the same shape."""
+
+    settings_path: str  # "~/"-prefixed, e.g. "~/.gemini/antigravity-cli/settings.json"
+    key: str  # a top-level key holding a list of path strings
+
+
+@dataclass(frozen=True)
+class ParkedAnswersSpec:
+    """The keys that answer a parked permission prompt from the dashboard (#855).
+
+    ``approve`` / ``deny`` are named keys (each one of
+    :data:`~.multiplexer.ALLOWED_KEYS`) pressed in order with no implicit Enter.
+    ``approve_guard`` / ``deny_guard`` are regexes that must ALL match a fresh
+    capture of the visible pane before that choice's keys are sent: the same
+    keys answer other dialogs differently (Enter on Claude Code's bypass startup
+    dialog chooses "No, exit"), so a screen that is not plainly the prompt sends
+    nothing. Both guard lists are non-empty and compile; validated in
+    :func:`_validate_profile`."""
+
+    approve: tuple[str, ...]
+    deny: tuple[str, ...]
+    approve_guard: tuple[str, ...]
+    deny_guard: tuple[str, ...]
+
+
+# The `sys.platform` values a `[permission_modes.<mode>]` table may name.
+PERMISSION_MODE_PLATFORMS = frozenset({"linux", "darwin", "win32"})
+
+# The placeholders a `linked_worktree_args` entry may carry (DW-599), each
+# rendered as a TOML basic string, quotes included, of the resolved path.
+LINKED_WORKTREE_PLACEHOLDERS = ("{gitdir}", "{common_dir}")
+_LINKED_WORKTREE_PLACEHOLDER_RE = regex.compile(
+    "|".join(regex.escape(p) for p in LINKED_WORKTREE_PLACEHOLDERS)
+)
+
+
+@dataclass(frozen=True)
+class PermissionModeSpec:
+    """The launch args of one non-bypass ``adapter.permission_mode`` (#727).
+
+    ``args`` stand in for ``bypass_args`` when the mode is selected
+    (:meth:`CLIProfile.for_permission_mode`), so ``extra_args`` replaces them
+    exactly as it replaces ``bypass_args``. ``platforms`` names the
+    ``sys.platform`` values the mapping is known to work on; empty = every
+    platform. ``linked_worktree_args`` (DW-599) are appended after ``args`` when
+    the session's cwd is a linked worktree, with :data:`LINKED_WORKTREE_PLACEHOLDERS`
+    filled in, for a sandbox that must be granted that worktree's gitdir and
+    common dir explicitly. Mode names, args and platforms are validated in
+    :func:`_validate_profile`."""
+
+    args: tuple[str, ...]
+    platforms: tuple[str, ...] = ()
+    linked_worktree_args: tuple[str, ...] = ()
+
+
+def toml_basic_string(value: str) -> str:
+    """``value`` as a TOML basic string, quotes included. Raises ValueError for a
+    value TOML cannot carry: a lone surrogate (a non-UTF-8 path byte under
+    ``os.fsdecode``) has no TOML spelling."""
+    value.encode("utf-8")  # UnicodeEncodeError (a ValueError) on a lone surrogate
+    out: list[str] = []
+    for ch in value:
+        if ch in '"\\':
+            out.append("\\" + ch)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
 @dataclass(frozen=True)
@@ -174,6 +339,17 @@ class CLIProfile:
     # across every tracked file. Override/extend via a project profile in
     # .bmad-loop/profiles/.
     env_fault_patterns: tuple[str, ...] = ()
+    # Patterns matched line-by-line, then across 2-3 wrapped rows
+    # (`panematch.match_rows`), against the ANSI-stripped VISIBLE pane
+    # (`mux.capture_pane`), only at the moment a stall wake nudge is about to be
+    # typed into it (DW-350). A match means the CLI is parked on a prompt only a
+    # human should answer — the nudge's trailing Enter could confirm it (#727:
+    # Enter chose "No, exit" on Claude Code's Bypass Permissions dialog) — so the
+    # nudge is withheld and the session ends as parked instead. Same evidentiary
+    # bar as env_fault_patterns: seed only lines captured from the CLI's own
+    # screen, with single-character classes so the profile line does not match
+    # itself. Compiled and validated at parse time; empty = inert.
+    parked_prompt_patterns: tuple[str, ...] = ()
     # Did this profile ship INSIDE the package (bmad_loop/data/profiles/*.toml)?
     # Provenance, not configuration: it is stamped by `load_profiles` at the one
     # place that knows which directory a file came from, and no TOML key sets it —
@@ -192,6 +368,90 @@ class CLIProfile:
     # Provenance is that boundary; it answers "who wrote this", which is the
     # question actually being asked.
     packaged: bool = False
+    # Home-level workspace-trust allowlist this CLI gates sessions on (DW-390);
+    # None = the CLI has none, and provisioning never reads or writes under `~`.
+    # APPENDED with a default so every positional CLIProfile construction stays
+    # valid.
+    workspace_trust: WorkspaceTrustSpec | None = None
+    # The CLI's launch flag for a caller-chosen session id (DW-505), e.g. claude's
+    # "--session-id". When set, the generic adapter mints a UUID4 per launch,
+    # appends `[session_id_flag, uuid]` to the launched argv and pins hook-event
+    # attribution to it (signals.SessionAttribution), so a nested child's
+    # SessionEnd is foreign even when the child never announced a SessionStart
+    # (DW-508). "" = off: attribution learns the id from the first SessionStart.
+    # An argv flag, so it is part of runsetup.config_digest's launch surface.
+    # APPENDED after workspace_trust for the same positional-compatibility reason.
+    session_id_flag: str = ""
+    # Template, relative to the transcript's directory, of the subagent transcript
+    # tree the CLI writes beside the session transcript ("{stem}" = the
+    # transcript's filename stem). The idle notice stat-walks it recursively and
+    # counts its writes as session activity — never read, never usage. None =
+    # derive from usage_parser (SUBAGENT_TRANSCRIPT_DIR_DEFAULTS); "" = off.
+    # APPENDED after session_id_flag for the same positional-compatibility reason.
+    subagent_transcript_dir: str | None = None
+    # Patterns naming a subscription/usage limit the CLI is stopped behind (#610),
+    # matched line-by-line (then across 2-3 wrapped rows) against the
+    # ANSI-stripped VISIBLE pane at the same live
+    # decision points as parked_prompt_patterns (stall-grace expiry, and once when
+    # the session timeout fires) and, as ordinary env-fault families, against the
+    # post-mortem log tail. Two lists, disjoint by contract — "usage-limited" means
+    # either one matched:
+    #   usage_limit_patterns: the CLI is BLOCKED and will not continue by itself
+    #     (credit exhaustion); pause now, an operator must act.
+    #   usage_wait_patterns: the CLI is blocked but WAITING for a reset it then
+    #     continues from on its own (a session-window limit).
+    # A LIVE pane sighting exempts the verdict from the #764 token veto (the line is
+    # on screen now, so it is not a stale match from earlier in the session); a
+    # tail-only match is still subject to it. opencode-http has no pane: its live
+    # sighting is a provider-error line it formats from a typed SSE frame for the
+    # session while it runs (DW-592), matched against these same two lists. Same
+    # evidentiary bar as env_fault_patterns: seed only lines captured live from the
+    # CLI (its own screen, or the adapter's record of the CLI's own events, as
+    # opencode's provider-error line is), with the run cited, and single-character
+    # classes so the profile line does not match itself. Compiled and validated at
+    # parse time; empty = inert.
+    # APPENDED after subagent_transcript_dir for the same positional-compatibility
+    # reason.
+    usage_limit_patterns: tuple[str, ...] = ()
+    usage_wait_patterns: tuple[str, ...] = ()
+    # The CLI's auto-deny countdown on a permission prompt it will answer "no"
+    # to by itself. Matched (then across 2-3 wrapped rows) against the visible
+    # pane once when a PermissionPrompt latches (and once more on the next tick
+    # when nothing matched), never on a timer; each pattern names groups `min`
+    # and `sec`, read into the `auto_deny_at` of the `session-parked` journal
+    # event. Same evidentiary bar as usage_limit_patterns. Compiled and
+    # validated at parse time; empty = no deadline is ever read. APPENDED after
+    # usage_wait_patterns for the same positional-compatibility reason.
+    auto_deny_patterns: tuple[str, ...] = ()
+    # The keys that answer a parked permission prompt from the TUI (#855); None =
+    # the CLI offers no answer keys and the operator attaches to answer. APPENDED
+    # after auto_deny_patterns for the same positional-compatibility reason.
+    parked_answers: ParkedAnswersSpec | None = None
+    # Non-bypass `adapter.permission_mode` mappings, keyed by mode name (#727);
+    # a mode absent here is refused for this CLI. APPENDED after parked_answers
+    # for the same positional-compatibility reason.
+    permission_modes: dict[str, PermissionModeSpec] = field(default_factory=dict)
+    # The selected mode's `linked_worktree_args` (DW-599), set beside
+    # `bypass_args` by `for_permission_mode`; empty under bypass. APPENDED after
+    # permission_modes for the same positional-compatibility reason.
+    linked_worktree_args: tuple[str, ...] = ()
+    # Template, relative to a conversation folder, of the file a parent writes
+    # when it spawns a subagent conversation ("{session_id}" = the child's id),
+    # e.g. agy's ".system_generated/subagents/{session_id}.json" (DW-548). When
+    # set, a Stop whose transcript sits in a folder named by its session id is a
+    # CHILD's, and is dropped, if any sibling folder holds that file. Stat-only;
+    # None = off. APPENDED after linked_worktree_args for the same
+    # positional-compatibility reason.
+    subagent_spawn_marker: str | None = None
+    # More project-relative skill trees the CLI also reads, after `skill_tree`,
+    # in the order it reads them. APPENDED after subagent_spawn_marker for the
+    # same positional-compatibility reason.
+    extra_skill_trees: tuple[str, ...] = ()
+    # The home-relative skill folders the CLI natively loads (`[user_skills]`),
+    # resolved by `bmad_loop.skill_locate`. None = the CLI declares none: no
+    # user-root resolution, shadow check or hint — the safe default for overlay
+    # and entry-point profiles. APPENDED last for the same reason.
+    user_skills: UserSkillsSpec | None = None
 
     @property
     def hookless(self) -> bool:
@@ -200,17 +460,128 @@ class CLIProfile:
         validate, or git-exclude."""
         return self.hooks.dialect == "none"
 
-    def render_prompt(self, prompt: str) -> str:
+    @property
+    def subagent_transcript_root(self) -> str:
+        """The effective subagent-tree template: the declared
+        `subagent_transcript_dir`, else the usage parser's default, else "" (off)."""
+        if self.subagent_transcript_dir is not None:
+            return self.subagent_transcript_dir
+        return SUBAGENT_TRANSCRIPT_DIR_DEFAULTS.get(self.usage_parser, "")
+
+    def render_prompt(self, prompt: str, *, skill_dir: str | None = None) -> str:
         """Render the engine's canonical "/skill args" prompt for this CLI.
 
         Placeholders: {prompt} = the canonical string, {skill} = the leading
-        slash-command name without "/", {args} = everything after it.
+        slash-command name without "/", {args} = everything after it, {skill_dir}
+        = the folder holding the skill's SKILL.md — ``skill_dir`` when the engine
+        located it outside the primary tree (an extra tree, or the absolute folder
+        in a user root), else ``<skill_tree>/<skill>``.
         """
-        skill, args = "", prompt
-        if prompt.startswith("/"):
-            head, _, rest = prompt[1:].partition(" ")
-            skill, args = head, rest.strip()
-        return self.prompt_template.format(prompt=prompt, skill=skill, args=args)
+        skill, args = prompt_skill(prompt)
+        if skill_dir is None:
+            skill_dir = f"{self.skill_tree}/{skill}"
+        return self.prompt_template.format(
+            prompt=prompt, skill=skill, args=args, skill_dir=skill_dir
+        )
+
+    def for_permission_mode(self, mode: str, platform: str = sys.platform) -> CLIProfile:
+        """This profile with ``bypass_args`` set to ``mode``'s launch args.
+
+        ``"bypass"`` returns the profile unchanged. Any other mode swaps in its
+        ``[permission_modes.<mode>]`` args, so every reader of ``bypass_args``
+        (the launched argv, the config digest, :meth:`missing_bypass_tokens`)
+        sees the effective permission args with no second code path. Raises
+        :class:`ProfileError` when the profile has no mapping for ``mode`` or
+        the mapping excludes ``platform``. The mode's ``linked_worktree_args``
+        ride along the same way, for the adapter to fill in per session."""
+        if mode == "bypass":
+            return self
+        spec = self.permission_modes.get(mode)
+        if spec is None:
+            raise ProfileError(
+                f"profile {self.name!r} has no permission_mode {mode!r} mapping "
+                f'(no [permission_modes.{mode}] table); use permission_mode = "bypass" '
+                "or another profile"
+            )
+        if spec.platforms and platform not in spec.platforms:
+            raise ProfileError(
+                f"profile {self.name!r} maps permission_mode {mode!r} only on "
+                f"{', '.join(spec.platforms)}, not {platform}"
+            )
+        return replace(self, bypass_args=spec.args, linked_worktree_args=spec.linked_worktree_args)
+
+    def render_linked_worktree_args(
+        self, gitdir: PurePath, common_dir: PurePath
+    ) -> tuple[str, ...]:
+        """``linked_worktree_args`` with each placeholder replaced by its path as a
+        TOML basic string. Raises ValueError for a path TOML cannot carry."""
+        values = {
+            "{gitdir}": toml_basic_string(str(gitdir)),
+            "{common_dir}": toml_basic_string(str(common_dir)),
+        }
+        # One pass, so a path that itself spells a placeholder is not rewritten.
+        return tuple(
+            _LINKED_WORKTREE_PLACEHOLDER_RE.sub(lambda m: values[m.group()], arg)
+            for arg in self.linked_worktree_args
+        )
+
+    def missing_bypass_tokens(self, extra_args: tuple[str, ...] | None) -> tuple[str, ...]:
+        """The permission args (``bypass_args``) a policy ``extra_args`` override
+        drops (DW-349).
+
+        The replace rule (``GenericAdapter.interactive_argv``): a non-None
+        ``extra_args`` REPLACES ``bypass_args`` rather than extending it, so any
+        permission token that is not an exact element of ``launch_args + extra_args``
+        is absent from the launched argv. On a profile resolved by
+        :meth:`for_permission_mode` these are that mode's args. ``None`` means
+        "inherit the profile's permission args" and drops nothing; ``()`` is an explicit override and drops
+        them all. Order kept, duplicates collapsed."""
+        if extra_args is None:
+            return ()
+        present = {*self.launch_args, *extra_args}
+        return tuple(t for t in dict.fromkeys(self.bypass_args) if t not in present)
+
+
+def _check_linked_worktree_args(
+    args: tuple[str, ...], where: str, fail: Callable[[str], ProfileError]
+) -> None:
+    """Non-empty strings, and at least one placeholder across the list: an arg
+    with no path in it belongs in the mode's ``args``."""
+    if not args:
+        return
+    if not all(isinstance(a, str) and a for a in args):
+        raise fail(f"{where} must list non-empty strings")
+    if not any(p in a for a in args for p in LINKED_WORKTREE_PLACEHOLDERS):
+        raise fail(f"{where} must use at least one of {', '.join(LINKED_WORKTREE_PLACEHOLDERS)}")
+
+
+_ENV_VAR_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _home_relative_bad(path: str) -> bool:
+    """True unless ``path`` is ``~/<something inside home>``.
+
+    Home-anchored and nothing else: the target lives outside the project, so
+    the confinement is "under ~", and the remainder must name something inside
+    home — not home itself, not an absolute path smuggled after the prefix
+    (`~//etc/passwd` joins to `/etc/passwd`), not a `..` climb out."""
+    rest = path[2:]
+    return (
+        not path.startswith("~/")
+        or names_tree_root(rest)
+        or is_absolute_path(rest)
+        or has_parent_ref(rest)
+    )
+
+
+def _tree_key(path: str) -> str:
+    """A spelling-insensitive key for comparing two declared folders: separators
+    unified, empty and `.` components and a trailing slash dropped."""
+    return "/".join(p for p in path.replace("\\", "/").split("/") if p not in ("", "."))
+
+
+def _same_tree(a: str, b: str) -> bool:
+    return _tree_key(a) == _tree_key(b)
 
 
 def _validate_profile(profile: CLIProfile, source: str) -> None:
@@ -246,8 +617,17 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     if hooks.dialect == "none":
         # hookless: nothing is ever registered, so a config_path or events map
         # is a contradiction — reject rather than silently ignore.
-        if hooks.config_path or hooks.events:
-            raise fail('hookless profiles (dialect = "none") must not set hooks.config_path/events')
+        if (
+            hooks.config_path
+            or hooks.events
+            or hooks.notification_types
+            or hooks.stop_failure_types
+            or hooks.event_min_versions
+        ):
+            raise fail(
+                'hookless profiles (dialect = "none") must not set hooks.config_path/'
+                "events/notification_types/stop_failure_types/event_min_versions"
+            )
     else:
         if (
             names_tree_root(hooks.config_path)
@@ -257,6 +637,11 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
             # `names_tree_root("")` is True, so this arm also carries the
             # "a real dialect must name a config_path at all" case.
             raise fail("hooks.config_path must be a project-relative path")
+        if names_home_ref(hooks.config_path):
+            raise fail(
+                "hooks.config_path must not start with '~': a leading '~' is not expanded; "
+                "hook config paths must be project-relative"
+            )
         if names_win32_alias(hooks.config_path):
             raise fail(
                 "hooks.config_path must not name a Windows device or end a component "
@@ -269,6 +654,48 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
             raise fail(
                 f"hooks.events values must be canonical {sorted(CANONICAL_EVENTS)}: got {bad}"
             )
+        if hooks.notification_types:
+            bad_kinds = sorted(set(hooks.notification_types.values()) - PARKED_EVENTS)
+            if bad_kinds:
+                raise fail(
+                    "hooks.notification_types values must be parked kinds "
+                    f"{sorted(PARKED_EVENTS)}: got {bad_kinds}"
+                )
+            if "Notification" not in hooks.events.values():
+                raise fail(
+                    "hooks.notification_types needs a native event mapped to the "
+                    "canonical 'Notification' carrier in hooks.events"
+                )
+        if hooks.stop_failure_types:
+            bad_actions = sorted(set(hooks.stop_failure_types.values()) - STOP_FAILURE_ACTIONS)
+            if bad_actions:
+                raise fail(
+                    "hooks.stop_failure_types values must be actions "
+                    f"{sorted(STOP_FAILURE_ACTIONS)}: got {bad_actions}"
+                )
+            if "StopFailure" not in hooks.events.values():
+                raise fail(
+                    "hooks.stop_failure_types needs a native event mapped to the "
+                    "canonical 'StopFailure' event in hooks.events"
+                )
+        for native, floor in hooks.event_min_versions.items():
+            canonical = hooks.events.get(native)
+            if canonical is None:
+                raise fail(
+                    f"hooks.event_min_versions names {native!r}, which hooks.events " "does not map"
+                )
+            if canonical == "Stop":
+                # The completion signal: gating it out would leave every session to
+                # end on the stall path.
+                raise fail(
+                    f"hooks.event_min_versions must not gate {native!r}: it carries "
+                    "the canonical 'Stop' completion event"
+                )
+            if parse_cli_version(floor) is None:
+                raise fail(
+                    f"hooks.event_min_versions[{native!r}] must be an X.Y.Z version: "
+                    f"got {floor!r}"
+                )
 
     # Shape only — membership against the registered kinds is deliberately NOT
     # checked here (see the module docstring): that set is open-ended and lives in
@@ -334,6 +761,94 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
             "drives this CLI over its own transport."
         )
 
+    # "" = off. Otherwise ONE option token: the adapter appends it and the minted
+    # id as two argv elements, so whitespace (which could never be one flag) or a
+    # non-option word (which a CLI reads as a positional — the prompt slot) is a
+    # profile error, not a launch surprise. A hookless profile has no hook events
+    # to attribute, so a pin there is a contradiction.
+    flag = profile.session_id_flag
+    if flag:
+        # No `=`: the id is passed as the NEXT argv element, so `--session-id=`
+        # would launch as the two tokens `--session-id=` `<uuid>`.
+        if (
+            not flag.startswith("-")
+            or flag.strip("-") == ""
+            or "=" in flag
+            or any(c.isspace() for c in flag)
+        ):
+            raise fail(
+                "session_id_flag must be one option token starting with '-', with no "
+                "whitespace and no '=' (the id is passed as the next argument, e.g. "
+                f'"--session-id"), or "" for none: got {flag!r}'
+            )
+        if profile.hookless:
+            raise fail(
+                'hookless profiles (dialect = "none") must not set session_id_flag: '
+                "it pins hook-event attribution, and a hookless profile has no hook events"
+            )
+
+    # Only an explicit non-empty template is checked: None derives from a known
+    # usage_parser, "" is off. "{stem}" is required — a tree shared by sibling
+    # sessions would let another session's writes mask this one's idleness — and
+    # the rendered path must stay under the transcript's directory.
+    subdir = profile.subagent_transcript_dir
+    if subdir:
+        # TOML accepts a "\u0000" escape; the rendered path would make the
+        # tree walk raise ValueError, not the OSError it degrades.
+        if "\0" in subdir:
+            raise fail(f"subagent_transcript_dir must not contain a NUL character: got {subdir!r}")
+        try:
+            parts = list(string.Formatter().parse(subdir))
+        except ValueError as e:
+            raise fail(f"subagent_transcript_dir is not a valid template: {e}: got {subdir!r}")
+        fields = [(name, spec, conv) for _, name, spec, conv in parts if name is not None]
+        if not fields or any(name != "stem" or spec or conv for name, spec, conv in fields):
+            raise fail(
+                'subagent_transcript_dir must use exactly the placeholder "{stem}" (the '
+                "transcript's filename stem), with no other field, format spec or "
+                f"conversion: got {subdir!r}"
+            )
+        if is_absolute_path(subdir) or has_parent_ref(subdir):
+            raise fail(
+                "subagent_transcript_dir must be a relative path under the transcript's "
+                f"directory, with no '..': got {subdir!r}"
+            )
+        if profile.hookless:
+            raise fail(
+                'hookless profiles (dialect = "none") must not set subagent_transcript_dir: '
+                "it extends the transcript idle notice, and a hookless profile has no "
+                "transcript path"
+            )
+
+    # Same shape rules as subagent_transcript_dir, keyed on "{session_id}": the
+    # marker names one child, so a template without the id would read every
+    # Stop as a child's once any subagent was spawned.
+    marker = profile.subagent_spawn_marker
+    if marker:
+        if "\0" in marker:
+            raise fail(f"subagent_spawn_marker must not contain a NUL character: got {marker!r}")
+        try:
+            parts = list(string.Formatter().parse(marker))
+        except ValueError as e:
+            raise fail(f"subagent_spawn_marker is not a valid template: {e}: got {marker!r}")
+        fields = [(name, spec, conv) for _, name, spec, conv in parts if name is not None]
+        if not fields or any(name != "session_id" or spec or conv for name, spec, conv in fields):
+            raise fail(
+                'subagent_spawn_marker must use exactly the placeholder "{session_id}" (the '
+                "child conversation's id), with no other field, format spec or conversion: "
+                f"got {marker!r}"
+            )
+        if is_absolute_path(marker) or has_parent_ref(marker):
+            raise fail(
+                "subagent_spawn_marker must be a relative path under a conversation "
+                f"folder, with no '..': got {marker!r}"
+            )
+        if profile.hookless:
+            raise fail(
+                'hookless profiles (dialect = "none") must not set subagent_spawn_marker: '
+                "it drops a child's Stop hook, and a hookless profile has no hook events"
+            )
+
     if profile.usage_parser not in USAGE_PARSERS:
         raise fail(
             f"usage_parser must be one of {sorted(USAGE_PARSERS)}: got {profile.usage_parser!r}"
@@ -353,6 +868,12 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     ):
         raise fail("skill_tree must be a project-relative path")
 
+    if names_home_ref(profile.skill_tree):
+        raise fail(
+            "skill_tree must not start with '~': a leading '~' is not expanded; "
+            f"skill trees must be project-relative: got {profile.skill_tree!r}"
+        )
+
     if names_win32_alias(profile.skill_tree):
         raise fail(
             "skill_tree must not name a Windows device or end a component in a period or space"
@@ -365,17 +886,168 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     for seed in profile.seed_files:
         if names_tree_root(seed) or is_absolute_path(seed) or has_parent_ref(seed):
             raise fail(f"seed_files entries must be project-relative paths: got {seed!r}")
+        if names_home_ref(seed):
+            raise fail(
+                "seed_files entries must not start with '~': a leading '~' is not "
+                f"expanded; seed files must be project-relative: got {seed!r}"
+            )
         if names_win32_alias(seed):
             raise fail(
                 "seed_files entries must not name a Windows device or end a component "
                 f"in a period or space: got {seed!r}"
             )
 
+    for extra in profile.extra_skill_trees:
+        if names_tree_root(extra) or is_absolute_path(extra) or has_parent_ref(extra):
+            raise fail(f"extra_skill_trees entries must be project-relative paths: got {extra!r}")
+        if names_home_ref(extra):
+            raise fail(
+                "extra_skill_trees entries must not start with '~': a leading '~' is not "
+                f"expanded; skill trees must be project-relative: got {extra!r}"
+            )
+        if names_win32_alias(extra):
+            raise fail(
+                "extra_skill_trees entries must not name a Windows device or end a "
+                f"component in a period or space: got {extra!r}"
+            )
+        # An extra tree reaches the prompt as {skill_dir} ("<tree>/<skill>") and is
+        # outside the config digest, so it must never read as a command-line option.
+        if extra.startswith("-"):
+            raise fail(
+                "extra_skill_trees entries must not start with '-': the rendered "
+                f"{{skill_dir}} would read as a command-line option: got {extra!r}"
+            )
+        if _same_tree(extra, profile.skill_tree):
+            raise fail(f"extra_skill_trees entries must differ from skill_tree: got {extra!r}")
+    if len({_tree_key(t) for t in profile.extra_skill_trees}) != len(profile.extra_skill_trees):
+        raise fail(f"extra_skill_trees has duplicate entries: {list(profile.extra_skill_trees)}")
+
+    user_skills = profile.user_skills
+    if user_skills is not None:
+        if user_skills.precedence not in PRECEDENCES:
+            raise fail(
+                f"user_skills.precedence must be one of {sorted(PRECEDENCES)}: "
+                f"got {user_skills.precedence!r}"
+            )
+        seen: set[str] = set()
+        for root in user_skills.roots:
+            if _home_relative_bad(root.path):
+                raise fail(
+                    "user_skills root path must be a '~/'-prefixed path inside the home "
+                    f"directory: got {root.path!r}"
+                )
+            if names_win32_alias(root.path[2:]):
+                raise fail(
+                    "user_skills root path must not name a Windows device or end a "
+                    f"component in a period or space: got {root.path!r}"
+                )
+            for var in root.disabled_by:
+                if not _ENV_VAR_NAME_RE.fullmatch(var):
+                    raise fail(
+                        "user_skills root disabled_by entries must be environment variable "
+                        f"names ([A-Za-z_][A-Za-z0-9_]*): got {var!r} for {root.path!r}"
+                    )
+            key = _tree_key(root.path)
+            if key in seen:
+                raise fail(f"user_skills has duplicate roots: got {root.path!r} twice")
+            seen.add(key)
+
+    trust = profile.workspace_trust
+    if trust is not None:
+        settings_path = trust.settings_path
+        rest = settings_path[2:]
+        if _home_relative_bad(settings_path):
+            raise fail(
+                "workspace_trust.settings_path must be a '~/'-prefixed path inside the "
+                f"home directory: got {settings_path!r}"
+            )
+        if names_win32_alias(rest):
+            raise fail(
+                "workspace_trust.settings_path must not name a Windows device or end a "
+                f"component in a period or space: got {settings_path!r}"
+            )
+        if not trust.key.strip() or trust.key != trust.key.strip():
+            raise fail(
+                "workspace_trust.key must name one top-level key (non-empty, no "
+                f"surrounding whitespace): got {trust.key!r}"
+            )
+
     for pattern in profile.env_fault_patterns:
         try:
             regex.compile(pattern)  # same engine the adapter matches with (timeout-guarded)
-        except regex.error as e:
+        except (regex.error, RecursionError) as e:
             raise fail(f"env_fault_patterns entry is not a valid regex: {pattern!r} ({e})") from e
+
+    for pattern in profile.parked_prompt_patterns:
+        try:
+            regex.compile(pattern)  # same engine the stall gate matches with (timeout-guarded)
+        except (regex.error, RecursionError) as e:
+            raise fail(
+                f"parked_prompt_patterns entry is not a valid regex: {pattern!r} ({e})"
+            ) from e
+
+    for field_name in ("usage_limit_patterns", "usage_wait_patterns"):
+        for pattern in getattr(profile, field_name):
+            try:
+                regex.compile(pattern)  # same engine the usage gate matches with (timeout-guarded)
+            except (regex.error, RecursionError) as e:
+                raise fail(f"{field_name} entry is not a valid regex: {pattern!r} ({e})") from e
+
+    for pattern in profile.auto_deny_patterns:
+        try:
+            compiled = regex.compile(pattern)  # same engine the parked notice matches with
+        except (regex.error, RecursionError) as e:
+            raise fail(f"auto_deny_patterns entry is not a valid regex: {pattern!r} ({e})") from e
+        missing = sorted({"min", "sec"} - compiled.groupindex.keys())
+        if missing:
+            raise fail(
+                f"auto_deny_patterns entry must name groups 'min' and 'sec': {pattern!r} "
+                f"(missing {', '.join(missing)})"
+            )
+
+    for mode, spec in profile.permission_modes.items():
+        if mode == "bypass" or mode not in PERMISSION_MODES:
+            raise fail(
+                f"permission_modes.{mode}: unknown mode (one of "
+                f"{sorted(PERMISSION_MODES - {'bypass'})}; bypass is bypass_args)"
+            )
+        if not spec.args or not all(isinstance(a, str) and a for a in spec.args):
+            raise fail(f"permission_modes.{mode}.args must list at least one non-empty string")
+        bad = [p for p in spec.platforms if p not in PERMISSION_MODE_PLATFORMS]
+        if bad:
+            raise fail(
+                f"permission_modes.{mode}.platforms must name values from "
+                f"{sorted(PERMISSION_MODE_PLATFORMS)}: got {bad!r}"
+            )
+        _check_linked_worktree_args(
+            spec.linked_worktree_args, f"permission_modes.{mode}.linked_worktree_args", fail
+        )
+    # A provider-built profile may set the resolved field directly.
+    _check_linked_worktree_args(profile.linked_worktree_args, "linked_worktree_args", fail)
+
+    answers = profile.parked_answers
+    if answers is not None:
+        for field_name in ("approve", "deny"):
+            keys = getattr(answers, field_name)
+            bad = [key for key in keys if key not in ALLOWED_KEYS]
+            if not keys or bad:
+                raise fail(
+                    f"parked_answers.{field_name} must list named keys from "
+                    f"{sorted(ALLOWED_KEYS)}: got {list(keys)!r}"
+                )
+        for field_name in ("approve_guard", "deny_guard"):
+            guards = getattr(answers, field_name)
+            # Empty would let the keys out on any screen, the one thing a guard
+            # exists to stop.
+            if not guards:
+                raise fail(f"parked_answers.{field_name} must list at least one pattern")
+            for pattern in guards:
+                try:
+                    regex.compile(pattern)  # same engine the answer guard matches with
+                except (regex.error, RecursionError) as e:
+                    raise fail(
+                        f"parked_answers.{field_name} entry is not a valid regex: {pattern!r} ({e})"
+                    ) from e
 
 
 def _legacy_adapter_default(dialect: str) -> str:
@@ -429,6 +1101,118 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     events_d = hooks_d.get("events", {})
     if not isinstance(events_d, dict):
         raise fail("hooks.events must map native event names to canonical ones")
+    notification_d = hooks_d.get("notification_types", {})
+    if not isinstance(notification_d, dict) or not all(
+        isinstance(v, str) for v in notification_d.values()
+    ):
+        raise fail("hooks.notification_types must map notification subtypes to parked kinds")
+    stop_failure_d = hooks_d.get("stop_failure_types", {})
+    if not isinstance(stop_failure_d, dict) or not all(
+        isinstance(v, str) for v in stop_failure_d.values()
+    ):
+        raise fail("hooks.stop_failure_types must map StopFailure error values to actions")
+    min_versions_d = hooks_d.get("event_min_versions", {})
+    if not isinstance(min_versions_d, dict) or not all(
+        isinstance(v, str) for v in min_versions_d.values()
+    ):
+        raise fail("hooks.event_min_versions must map native event names to versions")
+
+    # Optional table; SHAPE here (a table of two strings), values in
+    # `_validate_profile`. A bare `str()` coercion would turn an array into the
+    # literal "['x']" and carry it to the filesystem as a path.
+    trust_d = doc.get("workspace_trust")
+    workspace_trust: WorkspaceTrustSpec | None = None
+    if trust_d is not None:
+        if not isinstance(trust_d, dict):
+            raise fail("workspace_trust must be a table")
+        unknown = sorted(set(trust_d) - {"settings_path", "key"})
+        if unknown:
+            raise fail(f"workspace_trust has unknown keys: {unknown}")
+        settings_path, key = trust_d.get("settings_path"), trust_d.get("key")
+        if not isinstance(settings_path, str) or not isinstance(key, str):
+            raise fail("workspace_trust.settings_path and workspace_trust.key must be strings")
+        workspace_trust = WorkspaceTrustSpec(settings_path=settings_path, key=key)
+
+    # `[user_skills]`: shape only, like workspace_trust. A root is a bare
+    # "~/..." string or a `{ path, disabled_by }` table; values (the `~/`
+    # confinement, variable names, precedence, duplicates) in `_validate_profile`.
+    user_d = doc.get("user_skills")
+    user_skills: UserSkillsSpec | None = None
+    if user_d is not None:
+        if not isinstance(user_d, dict):
+            raise fail("user_skills must be a table")
+        unknown = sorted(set(user_d) - {"precedence", "roots"})
+        if unknown:
+            raise fail(f"user_skills has unknown keys: {unknown}")
+        precedence = user_d.get("precedence", UserSkillsSpec.precedence)
+        if not isinstance(precedence, str):
+            raise fail(f"user_skills.precedence must be a string: got {type(precedence).__name__}")
+        raw_roots = user_d.get("roots", [])
+        if not isinstance(raw_roots, list):
+            raise fail("user_skills.roots must be a list")
+        roots: list[UserSkillRoot] = []
+        for raw_root in raw_roots:
+            if isinstance(raw_root, str):
+                roots.append(UserSkillRoot(path=raw_root))
+                continue
+            if not isinstance(raw_root, dict):
+                raise fail(
+                    'user_skills.roots entries must be "~/..." strings or '
+                    "{ path, disabled_by } tables"
+                )
+            unknown = sorted(set(raw_root) - {"path", "disabled_by"})
+            if unknown:
+                raise fail(f"user_skills.roots entry has unknown keys: {unknown}")
+            root_path = raw_root.get("path")
+            if not isinstance(root_path, str):
+                raise fail("user_skills.roots entry path must be a string")
+            disabled_by = raw_root.get("disabled_by", [])
+            if not isinstance(disabled_by, list) or not all(
+                isinstance(x, str) for x in disabled_by
+            ):
+                raise fail("user_skills.roots entry disabled_by must be a list of strings")
+            roots.append(UserSkillRoot(path=root_path, disabled_by=tuple(disabled_by)))
+        user_skills = UserSkillsSpec(precedence=precedence, roots=tuple(roots))
+
+    # Same shape-only rule as workspace_trust: four string lists, values in
+    # `_validate_profile`.
+    answers_d = doc.get("parked_answers")
+    parked_answers: ParkedAnswersSpec | None = None
+    if answers_d is not None:
+        if not isinstance(answers_d, dict):
+            raise fail("parked_answers must be a table")
+        answer_keys = ("approve", "deny", "approve_guard", "deny_guard")
+        unknown = sorted(set(answers_d) - set(answer_keys))
+        if unknown:
+            raise fail(f"parked_answers has unknown keys: {unknown}")
+        lists: dict[str, tuple[str, ...]] = {}
+        for key in answer_keys:
+            raw = answers_d.get(key, [])
+            if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+                raise fail(f"parked_answers.{key} must be a list of strings")
+            lists[key] = tuple(raw)
+        parked_answers = ParkedAnswersSpec(**lists)
+
+    # `[permission_modes.<mode>]` tables of string lists; mode names and
+    # values are checked in `_validate_profile`.
+    modes_d = doc.get("permission_modes", {})
+    if not isinstance(modes_d, dict):
+        raise fail("permission_modes must be a table of [permission_modes.<mode>] tables")
+    permission_modes: dict[str, PermissionModeSpec] = {}
+    for mode, spec_d in modes_d.items():
+        if not isinstance(spec_d, dict):
+            raise fail(f"permission_modes.{mode} must be a table")
+        mode_keys = ("args", "platforms", "linked_worktree_args")
+        unknown = sorted(set(spec_d) - set(mode_keys))
+        if unknown:
+            raise fail(f"permission_modes.{mode} has unknown keys: {unknown}")
+        mode_lists: dict[str, tuple[str, ...]] = {}
+        for key in mode_keys:
+            raw = spec_d.get(key, [])
+            if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+                raise fail(f"permission_modes.{mode}.{key} must be a list of strings")
+            mode_lists[key] = tuple(raw)
+        permission_modes[mode] = PermissionModeSpec(**mode_lists)
 
     # A dedicated shape check rather than the `str()` coercion the neighbouring
     # scalars get, because `adapter` has no parse-time membership test to land in
@@ -442,6 +1226,23 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     if not isinstance(raw_adapter, str):
         raise fail(f"adapter must be a string: got {type(raw_adapter).__name__}")
 
+    # Same rule as `adapter`: an argv token, so a TOML array or number must not be
+    # `str()`-coerced into a flag the CLI is then launched with.
+    raw_session_id_flag = doc.get("session_id_flag", "")
+    if not isinstance(raw_session_id_flag, str):
+        raise fail(f"session_id_flag must be a string: got {type(raw_session_id_flag).__name__}")
+
+    # None (absent) is meaningful — it derives the default from usage_parser — so
+    # it is kept, and anything present must already be a string.
+    raw_subagent_dir = doc.get("subagent_transcript_dir")
+    if raw_subagent_dir is not None and not isinstance(raw_subagent_dir, str):
+        raise fail(
+            f"subagent_transcript_dir must be a string: got {type(raw_subagent_dir).__name__}"
+        )
+    raw_spawn_marker = doc.get("subagent_spawn_marker")
+    if raw_spawn_marker is not None and not isinstance(raw_spawn_marker, str):
+        raise fail(f"subagent_spawn_marker must be a string: got {type(raw_spawn_marker).__name__}")
+
     profile = CLIProfile(
         name=str(doc.get("name", "")).strip(),
         binary=str(doc.get("binary", "")).strip(),
@@ -449,6 +1250,9 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
             dialect=str(hooks_d.get("dialect", "")),
             config_path=str(hooks_d.get("config_path", "")),
             events={str(k): str(v) for k, v in events_d.items()},
+            notification_types={str(k): v for k, v in notification_d.items()},
+            stop_failure_types={str(k): v for k, v in stop_failure_d.items()},
+            event_min_versions={str(k): v for k, v in min_versions_d.items()},
         ),
         adapter=raw_adapter.strip(),
         skill_tree=str(doc.get("skill_tree", ".claude/skills")),
@@ -456,6 +1260,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         launch_args=str_list("launch_args"),
         bypass_args=str_list("bypass_args"),
         model_flag=str(doc.get("model_flag", "--model")),
+        session_id_flag=raw_session_id_flag,
         env={str(k): str(v) for k, v in doc.get("env", {}).items()},
         usage_parser=str(doc.get("usage_parser", "none")),
         # `float()`/`int()` are the raw coercions `_load_toml`'s CONVERSION_FAULTS
@@ -469,6 +1274,17 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         first_run_note=str(doc.get("first_run_note", "")),
         seed_files=str_list("seed_files"),
         env_fault_patterns=str_list("env_fault_patterns"),
+        parked_prompt_patterns=str_list("parked_prompt_patterns"),
+        usage_limit_patterns=str_list("usage_limit_patterns"),
+        usage_wait_patterns=str_list("usage_wait_patterns"),
+        auto_deny_patterns=str_list("auto_deny_patterns"),
+        workspace_trust=workspace_trust,
+        subagent_transcript_dir=raw_subagent_dir,
+        parked_answers=parked_answers,
+        permission_modes=permission_modes,
+        subagent_spawn_marker=raw_spawn_marker,
+        extra_skill_trees=str_list("extra_skill_trees"),
+        user_skills=user_skills,
     )
     _validate_profile(profile, source)
     return profile

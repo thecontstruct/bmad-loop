@@ -17,21 +17,24 @@ from __future__ import annotations
 import ast
 import errno
 import functools
+import hashlib
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tomllib
-from dataclasses import replace
+import warnings
+from dataclasses import fields, replace
 from pathlib import Path
 
 import conftest
 import pytest
 from conftest import make_git_noisy
 
-from bmad_loop import bmadconfig, verify
+from bmad_loop import bmadconfig, envvars, verify
 
 
 def test_template_drops_sample_hooks_but_keeps_hooks_dir_and_exclude(project):
@@ -57,6 +60,211 @@ def test_template_drops_sample_hooks_but_keeps_hooks_dir_and_exclude(project):
     assert list(hooks.glob("*.sample")) == []
     assert hooks.is_dir()
     assert (git_dir / "info" / "exclude").is_file()
+
+
+def test_state_roots_are_independent(_state_root_allocator, tmp_path):
+    """Every root is a distinct, freshly created, empty directory, and a write into one
+    is invisible in any other — including this test's own autouse root.
+
+    Ablation target: make `StateRootAllocator.allocate` hand back one fixed child (an
+    `exist_ok=True` mkdir of a constant name) and the distinctness and cross-write
+    assertions fail; point `_isolate_state_root` back at `tmp_path_factory.mktemp` and
+    the own-root assertion fails, because that root no longer lives under the
+    worker's allocator."""
+    own = Path(os.environ[envvars.STATE_DIR])
+    assert own.is_dir()
+    assert own.is_relative_to(
+        _state_root_allocator.base
+    ), "the autouse state root is not drawn from the per-worker allocator"
+
+    allocator = conftest.StateRootAllocator(tmp_path / "base")
+    allocator.base.mkdir()
+    first, second = allocator.allocate(), allocator.allocate()
+    live = _state_root_allocator.allocate()
+    roots = [own, first, second, live]
+    assert len({r.resolve() for r in roots}) == len(roots)
+    for root in (first, second, live):
+        assert root.is_dir()
+        assert list(root.iterdir()) == []
+
+    (first / "runs" / "RID").mkdir(parents=True)
+    (first / "runs" / "RID" / "state.json").write_text("first\n", encoding="utf-8")
+    (second / "marker").write_text("second\n", encoding="utf-8")
+
+    assert sorted(p.relative_to(first).as_posix() for p in first.rglob("*")) == [
+        "runs",
+        "runs/RID",
+        "runs/RID/state.json",
+    ]
+    assert [p.name for p in second.iterdir()] == ["marker"]
+    assert (second / "marker").read_text(encoding="utf-8") == "second\n"
+    assert list(live.iterdir()) == []
+    assert not (own / "marker").exists()
+    assert not (own / "runs" / "RID").exists()
+
+
+def test_state_allocation_does_not_rescan_prior_roots(tmp_path, tmp_path_factory):
+    """Allocation cost is a constant number of directory operations: no listing of the
+    roots already handed out, one `mkdir` per root plus one per bucket, and no
+    directory holding more than one bucket's worth of entries.
+
+    Counted, not timed: a wall-clock threshold would be both flaky and blind on a fast
+    disk. The control half proves the counter can see a scan at all — pytest's own
+    numbered `mktemp`, the allocation this replaced, lists its parent every call.
+
+    Ablation target: derive `allocate`'s index from `len(list(self.base.iterdir()))`
+    (or any other listing) and the zero-listing assertion fails; drop the bucketing and
+    the fanout assertion does."""
+    allocator = conftest.StateRootAllocator(tmp_path / "base")
+    allocator.base.mkdir()
+    size = conftest.StateRootAllocator.BUCKET_SIZE
+    count = 3 * size + 5
+    buckets = -(-count // size)
+
+    listings: list[str] = []
+    mkdirs: list[Path] = []
+    real_scandir, real_listdir, real_mkdir = os.scandir, os.listdir, Path.mkdir
+
+    def scandir(path=".", *args, **kwargs):
+        listings.append(str(path))
+        return real_scandir(path, *args, **kwargs)
+
+    def listdir(path=".", *args, **kwargs):
+        listings.append(str(path))
+        return real_listdir(path, *args, **kwargs)
+
+    def mkdir(self, *args, **kwargs):
+        mkdirs.append(self)
+        return real_mkdir(self, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "scandir", scandir)
+        mp.setattr(os, "listdir", listdir)
+        mp.setattr(Path, "mkdir", mkdir)
+        roots = [allocator.allocate() for _ in range(count)]
+        allocation_listings, allocation_mkdirs = list(listings), len(mkdirs)
+        tmp_path_factory.mktemp("rescan-control")
+        control_listings = len(listings) - len(allocation_listings)
+
+    assert control_listings >= 1, "the listing counter cannot see pytest's own scan"
+    assert allocation_listings == []
+    assert allocation_mkdirs == count + buckets
+    assert len(set(roots)) == count
+    assert all(root.is_dir() for root in roots)
+    assert len(list(allocator.base.iterdir())) == buckets
+    assert max(len(list(b.iterdir())) for b in allocator.base.iterdir()) == size
+
+
+@pytest.mark.parametrize("operator", ["operator-state-root", None], ids=["set", "unset"])
+def test_state_root_override_is_restored(tmp_path, operator):
+    """`point_state_root` — the whole body of the autouse fixture — changes exactly one
+    variable, and only through the monkeypatch it is handed, so undoing that monkeypatch
+    restores the operator's own value or its absence. HOME and every other variable
+    are left as they were.
+
+    Driven with its own MonkeyPatch pair rather than the test's `monkeypatch`: the
+    restoration happens at teardown, where no assertion in the test body can see it.
+
+    Ablation target: write `os.environ[envvars.STATE_DIR]` directly in
+    `point_state_root` and both rows fail on the restored value."""
+    allocator = conftest.StateRootAllocator(tmp_path / "base")
+    allocator.base.mkdir()
+    with pytest.MonkeyPatch.context() as operator_env:
+        if operator is None:
+            operator_env.delenv(envvars.STATE_DIR, raising=False)
+        else:
+            operator_env.setenv(envvars.STATE_DIR, operator)
+        before = dict(os.environ)
+
+        fixture_mp = pytest.MonkeyPatch()
+        try:
+            root = conftest.point_state_root(fixture_mp, allocator)
+            during = dict(os.environ)
+        finally:
+            fixture_mp.undo()
+        after = dict(os.environ)
+
+    changed = {k for k in before.keys() | during.keys() if before.get(k) != during.get(k)}
+    assert changed == {envvars.STATE_DIR}
+    assert during[envvars.STATE_DIR] == str(root)
+    assert root.is_dir()
+    assert after.get(envvars.STATE_DIR) == operator
+    assert after == before
+
+
+def _project_shape(paths: bmadconfig.ProjectPaths) -> dict[str, str]:
+    """Every path-valued member as a project-relative spelling (the v7 era fields
+    are strings, and `initiative_folder` is None on v6)."""
+    root = paths.project.resolve()
+    members = {f.name: getattr(paths, f.name) for f in fields(paths)}
+    return {
+        name: value.resolve().relative_to(root).as_posix()
+        for name, value in members.items()
+        if isinstance(value, Path)
+    }
+
+
+def _files_outside_git(root: Path) -> list[tuple[str, bytes | None]]:
+    return sorted(
+        (p.relative_to(root).as_posix(), p.read_bytes() if p.is_file() else None)
+        for p in root.rglob("*")
+        if ".git" not in p.relative_to(root).parts
+    )
+
+
+def test_project_tree_matches_project_paths_without_git(project_tree, _project_template, tmp_path):
+    """`project_tree` is `project` minus the repository: same `ProjectPaths` shape, same
+    sandbox name, byte-identical working files — and no `.git` at all.
+
+    Compared against a fresh copy of the real template rather than the `project`
+    fixture, because both fixtures claim `tmp_path / "sandbox"` and cannot coexist.
+
+    Ablation target: seed an extra file in `_project_template` only (after the shared
+    `seed_project_files` call) and the file comparison fails — the two fixtures would
+    describe different projects."""
+    real = conftest.copy_project(_project_template, tmp_path / "real" / "sandbox")
+
+    assert project_tree.project == tmp_path / "sandbox"
+    assert project_tree.project.name == real.project.name
+    assert _project_shape(project_tree) == _project_shape(real)
+    assert project_tree.implementation_artifacts.is_dir()
+    assert project_tree.planning_artifacts.is_dir()
+    assert _files_outside_git(project_tree.project) == _files_outside_git(real.project)
+    assert (real.project / ".git").is_dir()
+    assert not (project_tree.project / ".git").exists()
+
+
+def test_project_copies_keep_independent_index_refs_and_hooks(project, _project_template, tmp_path):
+    """Two sandbox copies share no Git state: a commit, a new branch, a staged change
+    and an installed hook in one leave the other copy and the template untouched.
+
+    Ablation target: make `copy_project` link instead of copy
+    (`shutil.copytree(..., copy_function=os.link)`) and the same-file assertions fail
+    before any mutation is even attempted."""
+    other = conftest.copy_project(_project_template, tmp_path / "other" / "sandbox")
+    a_git, b_git, t_git = (p / ".git" for p in (project.project, other.project, _project_template))
+    assert a_git.is_dir() and b_git.is_dir(), "a copy's .git must be its own directory"
+    for rel in ("index", "HEAD", "config", "refs/heads/main"):
+        for x, y in ((a_git, b_git), (a_git, t_git), (b_git, t_git)):
+            assert not os.path.samefile(x / rel, y / rel), f"{rel} is shared: {x} / {y}"
+    head = conftest.git(_project_template, "rev-parse", "HEAD")
+
+    (project.project / "src.txt").write_text("changed\n", encoding="utf-8")
+    conftest.git(project.project, "add", "src.txt")
+    conftest.git(project.project, "commit", "-q", "-m", "mutate a")
+    conftest.git(project.project, "branch", "side")
+    (project.project / "staged.txt").write_text("staged\n", encoding="utf-8")
+    conftest.git(project.project, "add", "staged.txt")
+    (a_git / "hooks" / "pre-commit").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    assert conftest.git(project.project, "rev-parse", "HEAD") != head
+
+    for repo in (other.project, _project_template):
+        assert conftest.git(repo, "rev-parse", "HEAD") == head
+        assert conftest.git(repo, "branch", "--list", "side") == ""
+        assert conftest.git(repo, "status", "--porcelain") == ""
+        assert conftest.git(repo, "ls-files") == ".gitignore\nsrc.txt"
+        assert not (repo / ".git" / "hooks" / "pre-commit").exists()
+        assert (repo / "src.txt").read_text(encoding="utf-8") == "original\n"
 
 
 def test_plant_root_markers_refuses_physical_aliases(tmp_path):
@@ -144,10 +352,12 @@ def test_scripted_verify_runner_refuses_the_wrong_canonical_cwd(tmp_path):
 
 
 def test_nested_repo_root_paths_round_trips_committed_config_and_conflict(project):
-    """The nested fixture is a production-loadable config, not a hand-built snapshot.
+    """The nested fixture is a production-loadable config, not a hand-built snapshot,
+    and it is the layout worktree isolation SUPPORTS (DW-379): the project lies inside
+    `repo_root`, so neither isolation mode is refused.
 
-    Ablation: short-circuit `worktree_isolation_conflict` for the worktree mode
-    and this row fails because the divergent loaded config is no longer refused.
+    Ablation: widen `worktree_isolation_conflict` back to "any `repo_root` override"
+    and this row fails because the nested loaded config is refused again.
     """
     paths = conftest.nested_repo_root_paths(project)
 
@@ -157,9 +367,9 @@ def test_nested_repo_root_paths_round_trips_committed_config_and_conflict(projec
     assert paths.project.parent == paths.repo_root
     config_rel = (paths.project / conftest.BMAD_CONFIG_REL).relative_to(paths.repo_root)
     assert conftest.git(paths.repo_root, "ls-files", "--error-unmatch", config_rel.as_posix())
+    assert paths.repo_root != paths.project, "premise: the roots really diverge"
     assert bmadconfig.worktree_isolation_conflict(paths, "none") is None
-    conflict = bmadconfig.worktree_isolation_conflict(paths, "worktree")
-    assert conflict is not None and "not supported" in conflict
+    assert bmadconfig.worktree_isolation_conflict(paths, "worktree") is None
 
 
 def test_nested_repo_root_paths_canonicalizes_a_dotdot_input(project):
@@ -617,33 +827,6 @@ def test_opencode_gate_refuses_a_binary_that_cannot_be_launched(monkeypatch, err
     assert len(calls) == 1
 
 
-def test_opencode_gate_answers_win32_without_touching_the_host(monkeypatch):
-    """The win32 early-out, which nothing else in the suite grades.
-
-    opencode-on-Windows is unverified for this adapter (README adapter table),
-    so the answer there is False by policy — and it has to be reached before the
-    PATH lookup and before the probe, because Windows CI should pay for
-    neither. Poisoning both `shutil.which` and `subprocess.run` is how the
-    ordering is asserted rather than just the return value: either one being
-    reached is an `AssertionError`.
-
-    Ablation target: delete the `if sys.platform == "win32": return False` early
-    return and this test fails alone, on the `AssertionError` the poisoned
-    `shutil.which` raises. The other three rows all pin `platform` to "linux" to
-    stay host-independent, so they stay GREEN under that same mutation — which
-    is the whole reason this row exists: without it, deleting the early return
-    leaves this file, and the suite, entirely green."""
-
-    def refuse(*args, **kwargs):
-        raise AssertionError("win32 must answer before any PATH lookup or probe")
-
-    monkeypatch.setattr(conftest.sys, "platform", "win32")
-    monkeypatch.setattr(conftest.shutil, "which", refuse)
-    monkeypatch.setattr(conftest.subprocess, "run", refuse)
-
-    assert not conftest.opencode_runs()
-
-
 # --- DW-95: the real-tmux xdist grouping guard --------------------------------
 #
 # Real-tmux E2Es are the suite's only wall-clock-sensitive tests, and the fix for
@@ -1006,7 +1189,9 @@ def _scan_reap_deadlines(src: str, rel: str) -> tuple[dict[str, int], list[str]]
     Unlike the SessionSpec scan this does NOT flag a gated test holding zero sites:
     most stories E2Es have no poll deadline at all. `_reap_inventory_offenders` is
     what keeps a scan that found nothing from passing vacuously. Subprocess `timeout=`
-    budgets in that file are a separate scope and are not inspected here.
+    budgets, the `teardown_s < 15.0` teardown-gap assertion and the
+    `time.time() - hb["ts"] < 120` heartbeat-freshness assertion in that file are
+    separate scopes and are not inspected by any of the three scanners.
 
     KNOWN BLIND SPOTS, deliberately not closed — the shape above is matched literally,
     so every one of these scans CLEAN and would carry a bare budget past the guard:
@@ -1398,9 +1583,12 @@ def test_detach_ceiling_detector_reads_an_annotated_assignment():
 
 
 def _scan_tests() -> list[tuple[str, str, bool]]:
+    """Scan EVERY `test_*.py` module, resolving conftest's shared gates once for all of
+    them rather than letting each `_scan_source` call fall back to its own lookup."""
+    conftest_gates = _conftest_gate_names()
     found: list[tuple[str, str, bool]] = []
     for path in sorted(_TESTS_DIR.glob("test_*.py")):
-        found.extend(_scan_source(path.read_text(encoding="utf-8"), path.name))
+        found.extend(_scan_source(path.read_text(encoding="utf-8"), path.name, conftest_gates))
     return found
 
 
@@ -1466,8 +1654,12 @@ def _declares_loadgroup(addopts: object) -> bool:
 _OTHER_DEFS = "<other>"  # explicit catch-all; a module omitting it refuses unexplained defs
 _EXPECTED_E2E_DEF_COUNTS: dict[str, dict[str, int]] = {
     "test_generic_tmux.py": {"test_tmux_": 6},
+    "test_tui_launch_tmux_e2e.py": {"test_e2e_": 2},
+    "test_tmux_locale_e2e.py": {"test_e2e_": 1},
+    "test_tmux_server_config_e2e.py": {"test_e2e_": 1},
+    "test_launch_probe.py": {"test_e2e_": 1},
     "test_stories_e2e.py": {
-        "test_e2e_": 16,
+        "test_e2e_": 22,
         "test_reap_e2e_": 3,
         # Not asserted, and deliberately so — see the residual note above. Today these are
         # the local-process identity harness defs: `test_detach_gate_*`,
@@ -1475,6 +1667,8 @@ _EXPECTED_E2E_DEF_COUNTS: dict[str, dict[str, int]] = {
         # `test_reap_identity_*`, `test_recorded_*`.
         _OTHER_DEFS: 28,
     },
+    "test_tickets_e2e.py": {"test_e2e_tickets_": 17},
+    "test_conftest.py": {"test_private_tmux_": 1},
 }
 
 
@@ -1612,6 +1806,195 @@ def test_every_real_tmux_e2e_joins_the_serialized_xdist_group():
     )
     counts = _e2e_def_count_offenders(found)
     assert not counts, "\n".join(counts)
+
+
+# ------------------------------------------------- private tmux server (DW-561)
+PRIVATE_TMUX_FIXTURE = "private_tmux_server"
+PRIVATE_TMUX_CONTEXT = "private_tmux_socket"
+
+
+def _on_private_tmux_server(stmt: ast.FunctionDef | ast.AsyncFunctionDef, marks) -> bool:
+    """Whether a test def runs on a private tmux server: it requests the fixture as an
+    argument, carries a `usefixtures` mark naming it, or enters the context manager
+    itself (the conftest row that pins the context manager's own teardown)."""
+    args = [*stmt.args.posonlyargs, *stmt.args.args, *stmt.args.kwonlyargs]
+    if any(a.arg == PRIVATE_TMUX_FIXTURE for a in args):
+        return True
+    for mark in marks:
+        if not isinstance(mark, ast.Call):
+            continue
+        head = _dotted(mark.func)
+        if head is None or head.rsplit(".", 1)[-1] != "usefixtures":
+            continue
+        if any(isinstance(a, ast.Constant) and a.value == PRIVATE_TMUX_FIXTURE for a in mark.args):
+            return True
+    return any(
+        isinstance(item.context_expr, ast.Call)
+        and (_dotted(item.context_expr.func) or "").rsplit(".", 1)[-1] == PRIVATE_TMUX_CONTEXT
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.With)
+        for item in node.items
+    )
+
+
+def _private_tmux_offenders(src: str, rel: str) -> list[str]:
+    """Every tmux-gated test def in one source that does not run on a private server.
+    Gating is `_scan_source`'s own reading, so the two guards agree on what is real-tmux."""
+    gated = {name for _rel, name, _grouped in _scan_source(src, rel)}
+    tree = ast.parse(src, filename=rel)
+    module_marks = _module_pytestmark(tree)
+    return [
+        f"{rel}::{stmt.name}"
+        for stmt, own_marks in _iter_test_defs(tree.body, [])
+        if stmt.name in gated and not _on_private_tmux_server(stmt, [*own_marks, *module_marks])
+    ]
+
+
+def test_every_real_tmux_e2e_runs_on_a_private_tmux_server():
+    """The live scan: no real-tmux test may reach the developer's default tmux server
+    (DW-561). A server left in a deleted sandbox cwd crashes every later pane, and a
+    kill aimed at the default server ends whatever session runs the suite."""
+    offenders: list[str] = []
+    for path in sorted(_TESTS_DIR.glob("test_*.py")):
+        offenders.extend(_private_tmux_offenders(path.read_text(encoding="utf-8"), path.name))
+    assert offenders == [], (
+        f"these real-tmux tests do not request `{PRIVATE_TMUX_FIXTURE}` (as an argument or "
+        f"through `pytest.mark.usefixtures`): {offenders}"
+    )
+    # Non-vacuous: both stories-style E2E modules opt in module-wide.
+    for rel in ("test_stories_e2e.py", "test_tickets_e2e.py"):
+        tree = ast.parse((_TESTS_DIR / rel).read_text(encoding="utf-8"), filename=rel)
+        assert any(
+            isinstance(m, ast.Call)
+            and _dotted(m.func) == "pytest.mark.usefixtures"
+            and [a.value for a in m.args if isinstance(a, ast.Constant)] == [PRIVATE_TMUX_FIXTURE]
+            for m in _module_pytestmark(tree)
+        ), f"{rel}'s pytestmark lost usefixtures({PRIVATE_TMUX_FIXTURE!r})"
+
+
+_PRIVATE_PROBE_HEAD = (
+    "import pytest\n"
+    "from conftest import real_mux_e2e\n"
+    '@pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")\n'
+    "@real_mux_e2e\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("source", "offenders"),
+    [
+        (_PRIVATE_PROBE_HEAD + "def test_spawns(tmp_path):\n    pass\n", ["probe.py::test_spawns"]),
+        (_PRIVATE_PROBE_HEAD + "def test_spawns(tmp_path, private_tmux_server):\n    pass\n", []),
+        (
+            _PRIVATE_PROBE_HEAD
+            + '@pytest.mark.usefixtures("private_tmux_server")\ndef test_spawns():\n    pass\n',
+            [],
+        ),
+        (
+            'import pytest\npytestmark = [pytest.mark.usefixtures("private_tmux_server")]\n'
+            + _PRIVATE_PROBE_HEAD
+            + "def test_spawns():\n    pass\n",
+            [],
+        ),
+        (
+            _PRIVATE_PROBE_HEAD
+            + '@pytest.mark.usefixtures("other")\ndef test_spawns():\n    pass\n',
+            ["probe.py::test_spawns"],
+        ),
+        (
+            _PRIVATE_PROBE_HEAD
+            + "def test_spawns(tmp_path):\n"
+            + "    with conftest.private_tmux_socket(tmp_path) as socket:\n        pass\n",
+            [],
+        ),
+        (
+            _PRIVATE_PROBE_HEAD
+            + "def test_spawns(tmp_path):\n    conftest.private_tmux_socket(tmp_path)\n",
+            ["probe.py::test_spawns"],
+        ),
+        ("def test_no_tmux(tmp_path):\n    pass\n", []),
+    ],
+    ids=[
+        "unprotected",
+        "argument",
+        "own-mark",
+        "module-mark",
+        "other-fixture",
+        "entered-context",
+        "unentered-context",
+        "ungated",
+    ],
+)
+def test_private_server_guard_grades_known_sources(source, offenders):
+    assert _private_tmux_offenders(source, "probe.py") == offenders
+
+
+def _tmux_has_session(socket: Path, name: str) -> bool:
+    argv = ["tmux", "-S", str(socket), "has-session", "-t", f"={name}"]
+    return subprocess.run(argv, capture_output=True).returncode == 0
+
+
+@pytest.mark.skipif(
+    not (sys.platform.startswith("linux") and shutil.which("tmux")),
+    reason="needs real tmux on Linux",
+)
+@conftest.real_mux_e2e
+def test_private_tmux_socket_keeps_sessions_off_the_default_server(tmp_path_factory):
+    """A session started inside `private_tmux_socket` lands on the private socket and
+    not on the default one, and on exit the private server is gone.
+
+    The default socket is only ever PROBED here (`has-session`), never killed.
+    Ablation: delete the `TMUX_TMPDIR` redirect and the session lands on the default
+    server, so the private-socket probe fails (a `sleep` session leaks there for 30s;
+    nothing is killed); delete the teardown `kill-server` and the context manager's
+    own survivor check raises. Run either ablation under a throwaway server root:
+    `env -u TMUX -u TMUX_PANE TMUX_TMPDIR=$(mktemp -d) uv run pytest ...`."""
+    default = conftest.private_tmux_socket_path(Path(os.environ.get("TMUX_TMPDIR") or "/tmp"))
+    base = tmp_path_factory.mktemp("tmux")
+    name = f"dw561-{os.getpid()}-{base.name}"
+    with conftest.private_tmux_socket(base) as socket:
+        assert socket == conftest.private_tmux_socket_path(base)
+        subprocess.run(["tmux", "new-session", "-d", "-s", name, "sleep 30"], check=True)
+        assert _tmux_has_session(socket, name)
+        assert not _tmux_has_session(default, name)
+    assert not _tmux_has_session(socket, name)
+    listing = subprocess.run(["tmux", "-S", str(socket), "list-sessions"], capture_output=True)
+    assert listing.returncode != 0, listing
+
+
+def test_live_e2e_scan_reads_shared_gates_once(monkeypatch):
+    """The live scan resolves conftest's shared gates ONCE and hands that one set to
+    every module it scans — and still scans every `test_*.py` module.
+
+    `_scan_source` is replaced by a recorder, so this row reads the tree without
+    re-parsing it: the parse cost is the live guard's own, and doubling it here would
+    tax exactly the runtime this structure exists to bound.
+
+    Ablation target: stop passing `conftest_gates` from `_scan_tests` and the recorded
+    gates read `None` while the lookup count climbs to one per module; narrow the glob
+    and the module inventory assertion fails."""
+    module = sys.modules[__name__]
+    lookups: list[None] = []
+    scanned: list[tuple[str, frozenset[str] | None]] = []
+    real_gates = _conftest_gate_names
+
+    def counted_gates() -> frozenset[str]:
+        lookups.append(None)
+        return real_gates()
+
+    def recording_scan(src, rel, conftest_gates=None):
+        assert src, f"{rel} was handed to the scan empty"
+        scanned.append((rel, conftest_gates))
+        return []
+
+    monkeypatch.setattr(module, "_conftest_gate_names", counted_gates)
+    monkeypatch.setattr(module, "_scan_source", recording_scan)
+
+    assert _scan_tests() == []
+
+    assert len(lookups) == 1
+    assert [rel for rel, _gates in scanned] == sorted(p.name for p in _TESTS_DIR.glob("test_*.py"))
+    assert {gates for _rel, gates in scanned} == {real_gates()}
 
 
 def test_the_unexplained_stem_is_claimed_by_no_declared_prefix():
@@ -1812,6 +2195,25 @@ def test_pyproject_addopts_selects_the_loadgroup_scheduler():
         "pyproject.toml's [tool.pytest.ini_options] must pass `--dist loadgroup`; "
         f"without it every xdist_group mark is silently inert (got {addopts!r})"
     )
+
+
+@pytest.mark.parametrize("category", [DeprecationWarning, PendingDeprecationWarning])
+def test_pyproject_filterwarnings_turns_deprecations_into_errors(request, category):
+    """DW-370: without the `filterwarnings` posture a new deprecation — first-party,
+    a dependency's, or one a new Python leg introduces — is a line in the warnings
+    summary and the matrix stays green. Asserted twice: the loaded ini carries the
+    entry, and a warning emitted inside a test actually raises, which is the fact that
+    matters (a later blanket `ignore` would leave the entry present but inert).
+
+    Ablation: delete the pyproject `filterwarnings` line and the `getini` assert fails;
+    keep it but append a blanket `"ignore::DeprecationWarning"` after it and the
+    `DeprecationWarning` row fails on `pytest.raises` (DID NOT RAISE)."""
+    entry = f"error::{category.__name__}"
+    assert entry in request.config.getini(
+        "filterwarnings"
+    ), f"pyproject.toml's [tool.pytest.ini_options] filterwarnings must carry {entry!r}"
+    with pytest.raises(category):
+        warnings.warn("DW-370 posture probe", category, stacklevel=1)
 
 
 _MECHANISM_MODULE = """
@@ -2167,3 +2569,185 @@ def test_guard_cannot_see_a_gate_whose_reason_is_not_a_literal():
     Pinned as a row so the gap is a known boundary rather than a silent surprise — if
     it ever needs closing, this row is the one that changes."""
     assert _scan_source(_NON_LITERAL_REASON, "probe.py") == []
+
+
+# --- The v7 sandbox (`install_bmad_v7`, `project_v7`) ------------------------------
+# Real-spawn budget of the vendored tickets.py in this file: 1
+# (`test_project_v7_next_lists_build_order`). The Windows leg sits at its time budget,
+# so further premise rows read the tree from disk instead of spawning the script.
+
+
+def test_vendored_bmad_v7_matches_pin():
+    """Every vendored upstream file hashes to its `PIN.toml` sha256, and the pin
+    lists exactly the files the fixture folder holds, so a re-vendor that forgets to
+    re-pin, a line-ending conversion on checkout (the `-text` attribute), or a
+    formatter touching the bytes (the trunk and ruff excludes) all fail here."""
+    pin = tomllib.loads((conftest.V7_FIXTURE / "PIN.toml").read_text(encoding="utf-8"))
+    assert pin["source_repo"] == "https://github.com/bmad-code-org/BMAD-METHOD"
+    assert re.fullmatch(r"[0-9a-f]{40}", pin["commit"])
+    listed = {f["path"]: f for f in pin["files"]}
+    on_disk = {p.name for p in conftest.V7_FIXTURE.iterdir()} - {"PIN.toml"}
+    assert set(listed) == on_disk == {"tickets.py", "config_utils.py", "LICENSE-BMAD-METHOD"}
+    for name, entry in listed.items():
+        digest = hashlib.sha256((conftest.V7_FIXTURE / name).read_bytes()).hexdigest()
+        assert digest == entry["sha256"], f"{name} drifted from {entry['upstream_path']}"
+
+
+@pytest.mark.parametrize("flat", [False, True], ids=["tickets", "flat"])
+def test_write_ticket_tree_writes_the_tickets_folder_layout(tmp_path, flat):
+    """`write_ticket_tree` and `write_plan` write upstream's `tickets/` layout: the
+    initiative and epic files at their folders' tops, each breakdown, leaf and plan
+    in its container's `tickets/` folder. ``flat`` writes the preview layout, every
+    breakdown beside its container's file. Read from disk, no spawn."""
+    layout = conftest.v7_layout(tmp_path / "sandbox")
+    conftest.write_ticket_tree(layout, conftest.DEFAULT_TREE, flat=flat)
+    plan = conftest.write_plan(layout, "epic-cart", "story-cart-model-plan", 1, "built", flat=flat)
+
+    init = layout.initiative_folder
+    sub = Path() if flat else Path("tickets")
+    cart, checkout = init / sub / "epic-cart", init / sub / "epic-checkout"
+    expected = {
+        init / f"{layout.initiative}.md",
+        init / sub / "tickets.toml",
+        cart / "epic-cart.md",
+        cart / sub / "tickets.toml",
+        cart / sub / "story-cart-model-plan.md",
+        checkout / "epic-checkout.md",
+        checkout / sub / "tickets.toml",
+        checkout / sub / "story-checkout-form.md",
+    }
+    assert {p for p in init.rglob("*") if p.is_file()} == expected
+    assert plan == cart / sub / "story-cart-model-plan.md"
+    assert (init / "tickets").exists() is not flat
+
+
+def _rows(doc: dict, group: str) -> list[dict]:
+    rows = doc[group]
+    assert isinstance(rows, list)
+    return rows
+
+
+def test_project_v7_next_lists_build_order(project_v7):
+    """The real vendored `next` accepts the fixture tree as a valid v7 initiative: 1.1
+    is the only ready ticket, 1.2 waits on it, epic 2 is gated on epic 1's closure,
+    and nothing is reported as a problem, drift or an order warning. Each DEFAULT_TREE
+    flag reaches the row it was written for, so the tree really carries one ticket of
+    each kind. One real spawn."""
+    doc = conftest.run_tickets(project_v7, "next")
+
+    assert doc["store"] == "repo" and doc["folder"] == project_v7.initiative
+    assert [r["ref"] for r in _rows(doc, "ready_to_start")] == ["1.1"]
+    blocked = {r["ref"]: r for r in _rows(doc, "blocked")}
+    assert list(blocked) == ["1.2", "2.1", "2.2"]
+    assert blocked["1.2"]["waiting_on"] == [1]
+    assert blocked["2.1"]["gated_by"] == blocked["2.2"]["gated_by"] == ["epic-cart"]
+    for group in ("ready_to_refine", "in_progress", "unpinned_after", "undeclared_after"):
+        assert doc[group] == [], group
+    assert doc["order_conflict"] == [] and "problems" not in doc
+    rows = {r["ref"]: r for group in ("ready_to_start", "blocked") for r in _rows(doc, group)}
+    assert not any("drift" in r for r in rows.values())
+    one_one, one_two, two_one, two_two = (rows[k] for k in ("1.1", "1.2", "2.1", "2.2"))
+    assert one_one["plan_checkpoint"] and one_one["done_checkpoint"] and not one_one["refined"]
+    assert one_two["hitl"] is True
+    assert two_one["plan_checkpoint"] and two_one["refined"] is True
+    assert two_two["type"] == "bug" and two_two["refine"] is True and two_two["refined"] is False
+
+
+def test_project_v7_template_is_clean_and_ignores_user_toml(project_v7):
+    """A `project_v7` copy is a committed, clean v7 install: the scripts sit at their
+    installed paths byte-identical to the vendored pin, the tree is tracked (layout
+    T1), and the personal config layer that names the active initiative is on disk but
+    gitignored, as `bmad setup` leaves it.
+
+    Ablation target: drop `_bmad/custom/*.user.toml` from `V7_GITIGNORE` and the
+    clean-status and ignored assertions both fail."""
+    root = project_v7.project
+    assert conftest.git(root, "status", "--porcelain") == ""
+    tracked = set(conftest.git(root, "ls-files").splitlines())
+    user = conftest.V7_USER_CONFIG_REL.as_posix()
+    assert user not in tracked
+    assert conftest.git(root, "check-ignore", user) == user
+    user_doc = tomllib.loads((root / user).read_text(encoding="utf-8"))
+    assert user_doc["core"]["active_initiative"] == project_v7.initiative
+    rel_tree = project_v7.initiative_folder.relative_to(root).as_posix()
+    for rel in (
+        conftest.V7_TICKETS_REL.as_posix(),
+        conftest.V7_CONFIG_UTILS_REL.as_posix(),
+        conftest.V7_STORE_CONFIG_REL.as_posix(),
+        "_bmad/config.toml",
+        ".claude/skills/bmod-method/bmod.toml",
+        f"{rel_tree}/tickets/tickets.toml",
+        f"{rel_tree}/tickets/epic-cart/tickets/tickets.toml",
+    ):
+        assert rel in tracked, rel
+    for installed, vendored in (
+        (conftest.V7_TICKETS_REL, "tickets.py"),
+        (conftest.V7_CONFIG_UTILS_REL, "config_utils.py"),
+    ):
+        assert (root / installed).read_bytes() == (conftest.V7_FIXTURE / vendored).read_bytes()
+    assert project_v7.tickets_script == root / conftest.V7_TICKETS_REL
+    assert ".bmad-loop/runs/" in (root / ".gitignore").read_text(encoding="utf-8").splitlines()
+
+
+def _module_level_mux_binders(src: Path) -> set[str]:
+    """Dotted names of `src/bmad_loop` modules whose import-time code (module
+    body, including top-level `if`/`try` blocks, never a function or class body)
+    binds `get_multiplexer` from the multiplexer module."""
+    found: set[str] = set()
+
+    def binds(stmts: list[ast.stmt]) -> bool:
+        for node in stmts:
+            if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("multiplexer"):
+                if any(alias.name == "get_multiplexer" for alias in node.names):
+                    return True
+            elif isinstance(node, ast.With):
+                if binds(node.body):
+                    return True
+            elif isinstance(node, ast.If | ast.Try | ast.TryStar):
+                handlers = [] if isinstance(node, ast.If) else [h.body for h in node.handlers]
+                tail = [] if isinstance(node, ast.If) else [node.finalbody]
+                if any(binds(b) for b in (node.body, node.orelse, *handlers, *tail)):
+                    return True
+        return False
+
+    for path in sorted(src.rglob("*.py")):
+        if binds(ast.parse(path.read_text(encoding="utf-8")).body):
+            rel = path.relative_to(src.parent).with_suffix("")
+            found.add(".".join(rel.parts).removesuffix(".__init__"))
+    return found
+
+
+def test_conftest_preloads_every_module_level_mux_binder():
+    """DW-566: a module that binds `get_multiplexer` at import keeps whatever the
+    name held then, and a test patching `multiplexer.get_multiplexer` restores
+    only that module. So each such module must be imported by conftest, before
+    any patch can stand, or the first test on a worker to import it leaks its
+    stand-in into every later one. The load check runs in a fresh interpreter
+    that imports conftest alone: in this process collection has already imported
+    the binders through the test modules, which would mask a missing loop.
+    Ablation: drop `bmad_loop.tui.launch` from `_MUX_BINDING_MODULES` and the set
+    comparison fails; replace the import loop with `pass` and the load check fails."""
+    tests_dir = Path(__file__).resolve().parent
+    src = tests_dir.parent / "src" / "bmad_loop"
+    assert set(conftest._MUX_BINDING_MODULES) == _module_level_mux_binders(src)
+
+    probe = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(tests_dir)!r})\n"
+        "import conftest\n"
+        "from bmad_loop.adapters import multiplexer as mux_mod\n"
+        "for name in conftest._MUX_BINDING_MODULES:\n"
+        "    mod = sys.modules.get(name)\n"
+        "    if mod is None:\n"
+        "        # only the `tui` extra may be absent\n"
+        "        ok = name == 'bmad_loop.tui.app' and 'textual' not in sys.modules\n"
+        "    else:\n"
+        "        ok = mod.get_multiplexer is mux_mod.get_multiplexer\n"
+        "    if not ok:\n"
+        "        print(name)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "", f"not bound to the real get_multiplexer after conftest: {proc.stdout}"

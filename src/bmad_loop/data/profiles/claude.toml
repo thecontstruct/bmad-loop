@@ -4,6 +4,11 @@ binary = "claude"
 prompt_template = "{prompt}"
 bypass_args = ["--permission-mode", "bypassPermissions"]
 model_flag = "--model"
+# Caller-chosen session id (DW-505): the adapter mints a UUID4 per launch and pins
+# hook-event attribution to it, so a nested child's SessionEnd is foreign even
+# without a SessionStart (DW-508). Probed on Claude Code 2.1.284 (zero-token tmux
+# probe, 2026-09-28): SessionStart's session_id equals the --session-id value.
+session_id_flag = "--session-id"
 usage_parser = "claude-jsonl"
 first_run_note = "run `claude` once in the project to accept workspace trust and hooks approval"
 skill_tree = ".claude/skills"
@@ -26,13 +31,22 @@ seed_files = [
 # The scanned file is a tmux pane capture, so it carries THE MODEL'S OWN OUTPUT:
 # an assertion, an acceptance criterion or a doc bullet that merely writes ABOUT
 # a provider error lands in the scanned bytes. So every alternative below
-# reproduces one COMPLETE Claude Code error sentence rather than a framing token
-# plus a loose cause — a paraphrase cannot reach it. Every one is a captured line:
+# reproduces the whole FIRST sentence of one captured Claude Code error message
+# rather than a framing token plus a loose cause — a paraphrase cannot reach it.
+# Each is a first-sentence PREFIX match: nothing anchors the sentence's end or
+# requires the rest of the message, so a line that quotes that first sentence
+# verbatim still matches. Every one is a captured line:
 #   * `API Error` … `Unable to connect to API` — #194's evidence, run
 #     20260718-191419-44e7 on this adapter.
 #   * `API Error` … `Connection closed mid-response`, and the 5xx pair
 #     (`529 Overloaded` / `500 Internal server error`) — Claude Code transcript
-#     entries structurally tagged "isApiErrorMessage": true.
+#     entries structurally tagged "isApiErrorMessage": true. The `closed`
+#     sentence is what older Claude Code builds wrote; it stays for them.
+#   * `API Error` … `Connection lost mid-response` — what Claude Code 2.1.317
+#     prints for a transport drop mid-stream (its binary carries only this
+#     wording), captured 2026-11-02 by scripts/capture_claude_stopfailure.py:
+#     tests/fixtures/claude-stopfailure/mid-response-cut.pipe-pane.log. The same
+#     capture re-confirms the 5xx pair's first sentences.
 #
 # The 5xx statuses are ENUMERATED, not ranged. A `5[0-9][0-9]` range admits 100
 # codes against either reason phrase when exactly two pairings were ever
@@ -47,17 +61,106 @@ seed_files = [
 # configuration as a provider outage (#507). Pinned by
 # test_shipped_patterns_do_not_match_their_own_profile_line.
 #
-# No usage-limit / quota cause is seeded: no captured Claude Code quota line
-# exists, and on a pane capture that vocabulary is what a story IMPLEMENTING
-# rate limiting prints all day. Seed one only from a captured line, citing the
-# run it came from — the bar test_unseeded_profiles_stay_inert states.
+# No usage-limit / quota cause is seeded HERE: on a pane capture that vocabulary
+# is what a story IMPLEMENTING rate limiting prints all day. The two captured
+# Claude Code usage-limit sentences live in their own class below
+# (usage_limit_patterns / usage_wait_patterns), which is looked at on the live
+# pane and is exempt from the token veto only there. Seed any further one only
+# from a captured line, citing the run it came from — the bar
+# test_unseeded_profiles_stay_inert states.
 #
 # To disable or extend, copy this profile into .bmad-loop/profiles/ and edit.
 env_fault_patterns = [
   "API Error: Unable to connect t[o] API",
   "API Error: Connection closed mid-respons[e]",
+  "API Error: Connection lost mid-respons[e]",
   "API Error: (5[2]9 Overloaded|5[0]0 Internal server error)",
 ]
+
+# Parked-prompt patterns (DW-350): regexes matched line-by-line against the
+# ANSI-stripped VISIBLE pane (`capture-pane -p`), consulted only at the instant a
+# stall wake nudge is about to be typed. When no single row matches, runs of 2-3
+# adjacent rows are joined and tried too, so a line a narrow pane wrapped still
+# matches (the footer wraps below 33 columns). A match withholds the nudge — its
+# trailing Enter can ANSWER the prompt (#727: it confirmed "No, exit" on the
+# Bypass Permissions dialog) — and ends the session as parked, which pauses the
+# run for a human instead of retrying.
+#
+# Same evidentiary bar as env_fault_patterns above: seed only lines captured from
+# the CLI's own screen. Both entries are from #727's captured pane (Claude Code
+# 2.1.246, run 20260826-114252-3da1) — the dialog's heading and its footer. The
+# footer is also the workspace trust prompt's, captured parked for 80 s (Claude
+# Code 2.1.284, DW-339: tests/fixtures/claude-trust-prompt-parked.pipe-pane.log),
+# so that one entry labels both dialogs. The single-character classes (`mod[e]`,
+# `t[o]`) keep each pattern from matching its own line here, so a session that
+# prints or diffs this profile does not read as parked; pinned by the
+# parked-pattern tests in tests/test_profile.py.
+parked_prompt_patterns = [
+  "WARNING: Claude Code running in Bypass Permissions mod[e]",
+  "Enter to confirm · Esc t[o] cancel",
+]
+
+# Usage-limit patterns (#610): regexes matched line-by-line against the
+# ANSI-stripped VISIBLE pane at stall-grace expiry and when the session timeout
+# fires, and across 2-3 wrapped rows when no single row matches. A live match withholds the stall nudge and ends the session parked with
+# a usage-limit pause reason, exempt from the token veto (the line is on screen
+# now); the same patterns also scan the post-mortem log tail as ordinary
+# env-fault families, where the veto still applies (a limit the session
+# recovered from must not excuse a later real stall).
+#
+# usage_limit_patterns — BLOCKED, no auto-continue: credit exhaustion, the pane
+# line `You're out of usage credit` + `s. Run /usage-credits to keep using
+# <model> or /model to switch models.`, captured on psmux/Windows 11 (bmad-loop
+# 0.11.1) in runs 20260907-084618-824f (dev-1 and review-1) and
+# 20260907-090132-98e3 (dev-1 and dev-2). The model name is deliberately left
+# out of the anchor: it is whatever model the operator runs, so pinning it would
+# miss the next capture.
+#
+# usage_wait_patterns — blocked but WAITING for a reset Claude Code then
+# continues from on its own (autoContinueAtUsageLimit): the session-window
+# limit, the pane line `You've hit your session limi` + `t · resets <time>`,
+# optionally followed by a ` (<Area/City>)` zone. Captured twice: the 2026-09-07
+# psmux/Windows capture (zone suffix present) and run 20260913-165153-b850 on
+# macOS/tmux (no zone). The anchor stops at the `· resets` separator, which both
+# captures share. The same pane prints an advisory family thirteen times for
+# every two real hits — `You've used <N>% of your session` + ` limit · resets`
+# — from a session that is still working; `hit your` versus `used <N>% of your`
+# is what separates them, so the advisory can never reach this anchor.
+#
+# Both seeds keep ASCII apostrophes (both reports pasted ANSI-stripped logs), and
+# the single-character classes (`credit[s]`, `[.]`, `limi[t]`) keep each pattern
+# from matching its own line here — pinned, with the corpus, in
+# tests/test_env_fault_patterns.py. `[.]` rather than a backslash escape: a TOML
+# basic string rejects that escape.
+usage_limit_patterns = ["You're out of usage credit[s][.] Run /usage-credits"]
+usage_wait_patterns = ["You've hit your session limi[t] · resets"]
+
+# Auto-deny countdown: the line Claude Code prints above a permission prompt on
+# an unattended session, read once when a PermissionPrompt latches into the
+# `session-parked` journal event's `auto_deny_at`. Captured in the #855 report
+# (Claude Code 2.1.288, tmux 3.7c/macOS) as `⚠ Claude Code will automatically
+# deny this reques` + `t in 2:00, to avoid blocking progress on an unattended
+# session`. `reques[t]` keeps the pattern from matching its own line here, as
+# the usage seeds above do. A literal (single-quoted) string, so a regex escape
+# never needs doubling. The named groups `min` and `sec` are required.
+auto_deny_patterns = [
+  'automatically deny this reques[t] in (?P<min>[0-9]+):(?P<sec>[0-9]{2})',
+]
+
+# Answer keys for a parked permission prompt, offered in the TUI as Y (approve)
+# and N (deny). The keys go out only when a fresh capture of the visible pane
+# matches EVERY guard of that choice: Enter confirms whatever option is focused
+# (on the bypass startup dialog that is "No, exit") and Escape there exits
+# Claude, so both choices require the prompt's own question, and approve also
+# requires the focus marker on option 1. Guards come from the screen captured
+# in the #855 report (the question line, then the focused option 1 "Yes" over
+# option 2 "No"); the `[d]` and `[.]` brackets keep each pattern from matching
+# its own line here.
+[parked_answers]
+approve = ["Enter"]
+deny = ["Escape"]
+approve_guard = ['Do you want to procee[d]\?', '❯ 1[.] Yes']
+deny_guard = ['Do you want to procee[d]\?']
 
 # Force Claude Code's classic (inline/scrollback) renderer. The fullscreen TUI
 # (research preview, alt-screen ?1049h like vim/htop) repaints in place, so the
@@ -82,4 +185,125 @@ CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1"
 [hooks]
 dialect = "claude-settings-json"
 config_path = ".claude/settings.json"
-events = { SessionStart = "SessionStart", Stop = "Stop", SessionEnd = "SessionEnd", PreCompact = "PreCompact" }
+events = { SessionStart = "SessionStart", Stop = "Stop", SessionEnd = "SessionEnd", PreCompact = "PreCompact", Notification = "Notification", StopFailure = "StopFailure" }
+
+# Parked-session signals (DW-348): the relay forwards each Notification payload's
+# `notification_type`, and these subtypes mean the CLI is waiting on a human. The
+# adapter latches one and, where the stall logic would otherwise type a wake
+# nudge, withholds it and ends the session as parked (a Stop clears the latch).
+#
+# `idle_prompt` fires ~60 s after EVERY finished turn, so a dev/review/workflow session
+# that ends a turn without a result and then sits idle re-latches after its Stop
+# and PAUSES as parked at stall-grace expiry instead of receiving the stall wake
+# nudge. That is intended. To restore the wake nudge, copy this profile into
+# .bmad-loop/profiles/ and drop the `idle_prompt` line below.
+#
+# Subtypes verified 2026-09-24 against code.claude.com/docs/en/hooks (12
+# documented) and re-checked 2026-09-27; `quota_auto_resume_fired` means the CLI
+# already resumed. `elicitation_dialog` / `elicitation_url_dialog` are an MCP
+# server's form or open-this-URL dialog, gated like `permission_prompt` (fired
+# after ~6 s without typing): a blocking dialog on this session's screen, so they
+# map to PermissionPrompt (DW-434). `agent_needs_input` stays unmapped: one
+# subtype covers two triggers, and the payload does not say which. One is a
+# DIFFERENT (background) session waiting while agent view is open, so mapping it
+# would pause a session that is still working. The other, this session asking an
+# agent-team teammate's terminal-setup question, needs experimental agent teams,
+# which bmad-loop does not enable. Map it in an overlay if your sessions run
+# agent teams. `auth_success`, `agent_completed` and the `elicitation_complete` /
+# `elicitation_response` follow-ups are not waits. Unmapped subtypes are ignored;
+# an overlay may map them to a parked kind.
+[hooks.notification_types]
+permission_prompt = "PermissionPrompt"
+idle_prompt = "IdlePrompt"
+quota_auto_resume_stale = "QuotaPrompt"
+quota_auto_resume_disabled = "QuotaPrompt"
+elicitation_dialog = "PermissionPrompt"
+elicitation_url_dialog = "PermissionPrompt"
+
+# StopFailure signals (#865): when an API error ends a turn, Claude Code fires
+# `StopFailure` INSTEAD of `Stop`, so the turn never reports a completion. The
+# relay forwards the payload's `error`, `error_details` and
+# `last_assistant_message` (the rendered API error, not the model's prose), and
+# this table maps the `error` value onto an adapter action: `transient` gets the
+# stop nudge at once, `account` ends the session parked (an uncharged pause),
+# `account-fatal` ends it parked the same way, `rate_limit` is split by its
+# message, `ignore` does nothing. An unmapped value is crumbed and otherwise
+# ignored. StopFailure is never a completion event.
+#
+# Values verified 2026-10-30 against code.claude.com/docs/en/hooks.md (12
+# documented) and the Claude Code 2.1.316 build, which adds an undocumented
+# `verification_required`; a missing `error` reads as `unknown`. Payloads
+# captured 2026-11-02 on 2.1.317 (scripts/capture_claude_stopfailure.py, zero
+# tokens; tests/fixtures/claude-stopfailure/): 529/500/mid-response cut report
+# `server_error` (a 529 is NOT `overloaded`), a truncated stream `unknown`, a 429
+# `rate_limit`, a 401 `authentication_failed`, a 402 `billing_error`;
+# `error_details` was absent from every payload. The event needs
+# Claude Code 2.1.78 or newer, and an older CLI must never see it: 2.1.77 checks
+# `hooks` keys against a fixed event list and skips the WHOLE settings file on
+# an unknown one, Stop relay included (npm bundle, checked 2026-10-31). Hence
+# `[hooks.event_min_versions]` below — registration probes `claude --version` and
+# leaves StopFailure out (with a warning) below 2.1.78 or on an unreadable
+# version; re-run `bmad-loop init` after upgrading. Residual risk: DOWNGRADING
+# Claude Code after init keeps the entry until init runs again.
+#
+# `rate_limit` is ambiguous: an ordinary 429 and a subscription usage limit share
+# it, so the adapter matches the message against this profile's usage patterns.
+# `invalid_request` mostly means a context-shape failure (prompt too long,
+# compaction thrashing, a mismatched tool history) that a fresh session fixes —
+# not an account error. `unknown` also covers model-output failures (a malformed
+# tool call, an empty completion). `model_not_found` (a wrong model name) and
+# `cloud_credential_error` (a broken cloud-provider credential) map to
+# `account-fatal`, not `account`: under `usage_limit_action = "relaunch"` an
+# `account` error is relaunched, but no relaunch or account switch fixes these,
+# so they always pause for the operator.
+[hooks.stop_failure_types]
+overloaded = "transient"
+server_error = "transient"
+unknown = "transient"
+max_output_tokens = "transient"
+invalid_request = "transient"
+rate_limit = "rate_limit"
+billing_error = "account"
+authentication_failed = "account"
+oauth_org_not_allowed = "account"
+account_on_hold = "account"
+verification_required = "account"
+cloud_credential_error = "account-fatal"
+model_not_found = "account-fatal"
+
+# Native events an older Claude Code does not know -> the first version that
+# does (see StopFailure signals above for why the gate exists).
+[hooks.event_min_versions]
+StopFailure = "2.1.78"
+
+# `adapter.permission_mode = "sandboxed"` (#727): never prompt, deny instead.
+# `dontAsk` denies every tool call no allow rule covers, back to the model as an
+# error with no dialog; `Edit(/**)` (anchored at the working dir, and covering
+# Write) lets the session edit the project; `--settings` turns on the Bash
+# sandbox (bubblewrap on Linux, Seatbelt on macOS), refuses to start without it
+# and drops the unsandboxed retry. Sandboxed Bash is auto-allowed, so git
+# add/commit work (the sandbox lets git write .git, except hooks/ and config),
+# network is denied, and project hook settings still fire. AskUserQuestion is
+# denied outright. Per code.claude.com/docs/en/permission-modes, /permissions and
+# /sandboxing; live-checked 2026-10-27 on Claude Code 2.1.311 in a repo and in a
+# linked worktree. No native-Windows sandbox, hence the platform list.
+[permission_modes.sandboxed]
+args = [
+  "--permission-mode",
+  "dontAsk",
+  "--allowedTools",
+  "Edit(/**)",
+  "--disallowedTools",
+  "AskUserQuestion",
+  "--settings",
+  '{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false}}',
+]
+platforms = ["linux", "darwin"]
+
+# The home-relative skill folders Claude Code loads on its own, read only with
+# `[skills] user_roots = true` (see bmad_loop.skill_locate). Personal skills beat
+# project skills on a name clash, and CLAUDE_CONFIG_DIR moves the personal folder
+# away from ~/.claude. Source: https://code.claude.com/docs/en/skills (2026-11-15).
+[user_skills]
+precedence = "user"
+roots = [{ path = "~/.claude/skills", disabled_by = ["CLAUDE_CONFIG_DIR"] }]

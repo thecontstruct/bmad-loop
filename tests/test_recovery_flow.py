@@ -8,6 +8,7 @@ under a real Engine stays covered by test_engine.py.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
 import stat
@@ -17,7 +18,12 @@ from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
-from conftest import NUL_PATH_RESOLVE_FAULTS, git, refuse_to_resolve
+from conftest import (
+    NUL_PATH_RESOLVE_FAULTS,
+    assert_multiline_notice_keeps_its_lines,
+    git,
+    refuse_to_resolve,
+)
 
 from bmad_loop import platform_util, recovery_flow, verify
 from bmad_loop.bmadconfig import ProjectPaths
@@ -182,6 +188,12 @@ def test_owned_spec_normalization_forced_fallback_refuses_before_writer(tmp_path
         "set_frontmatter_status",
         lambda *args, **kwargs: writer_calls.append((args, kwargs)),
     )
+    anchored_calls: list[tuple] = []
+    monkeypatch.setattr(
+        verify,
+        "set_frontmatter_status_anchored",
+        lambda *args, **kwargs: anchored_calls.append((args, kwargs)),
+    )
 
     with pytest.raises(_OwnedSpecAuthorityError, match="restoration is unavailable") as excinfo:
         RecoveryFlow._normalize_attempt_owned_spec(
@@ -192,6 +204,7 @@ def test_owned_spec_normalization_forced_fallback_refuses_before_writer(tmp_path
 
     assert excinfo.value.safe_restoration_unavailable is True
     assert writer_calls == []
+    assert anchored_calls == []  # the refusal precedes the anchored writer too
     assert spec.read_bytes() == original
 
 
@@ -290,12 +303,6 @@ def test_owned_spec_restore_validates_missing_target_spelling_before_write(
     spec = tmp_path.resolve() / "missing.md"
     writes: list[Path] = []
     refuse_to_resolve(monkeypatch, spec, error=resolve_fault)
-    monkeypatch.setattr(
-        recovery_flow,
-        "atomic_write_bytes_confined",
-        lambda path, *_args, **_kwargs: writes.append(path),
-        raising=False,
-    )
     monkeypatch.setattr(
         recovery_flow,
         "atomic_write_bytes_at",
@@ -1264,18 +1271,21 @@ def _make_flow(
     journal: _RecordingJournal | None = None,
     run_dir: Path | None = None,
     dev_attempt_dispatched: bool = True,
+    spec_confine_root=None,
+    owned_plan=None,
 ):
     """Build a RecoveryFlow wired to recording stubs. The returned flow carries a
     ``.calls`` namespace tallying the injected callbacks for assertions. ``paths``
     defaults to the workspace root (so the flow reads as "main checkout"); pass a
     different ``repo_root`` to simulate a mounted unit worktree."""
-    calls = SimpleNamespace(saves=0, emits=[], pauses=[], escalates=[])
+    calls = SimpleNamespace(saves=0, emits=[], emit_fields=[], pauses=[], escalates=[])
 
     def _save() -> None:
         calls.saves += 1
 
     def _emit(stage, task=None, **fields):
         calls.emits.append(stage)
+        calls.emit_fields.append((stage, dict(fields)))
         return None
 
     def _escalate(task, reason) -> None:
@@ -1298,6 +1308,8 @@ def _make_flow(
         escalate=_escalate,
         escalation_pause=_pause,
         dev_attempt_dispatched=lambda task: dev_attempt_dispatched,
+        spec_confine_root=spec_confine_root,
+        owned_plan=owned_plan,
     )
     flow.calls = calls
     return flow
@@ -1330,6 +1342,33 @@ def _status(spec: Path) -> str:
     return verify.status_of(verify.read_frontmatter(spec))
 
 
+def _assert_owned_spec_notice_contract(notice: str, task: StoryTask, flow: RecoveryFlow) -> None:
+    """DW-321: the owned-spec notice names the attempt baseline and the convergent
+    step for the task's shape — a plain attempt resets to baseline and loses
+    differing tracked spec edits; a latched re-drive that resume rolls back
+    automatically keeps the approved spec under the artifact folders and resets
+    only the other residue. A re-drive with rollback off (and not armed) gets the
+    plain step: keeping a dirty spec there would only pause again. The notice never
+    names `task.preserve_ref`: an early pause can still hold an earlier attempt's
+    ref. (Every spec these tests bind lives under the artifact folders.)"""
+    assert task.baseline_commit is not None
+    short = task.baseline_commit[:12]
+    assert f"the attempt baseline `{short}`" in notice
+    assert "branch my-rescue HEAD" in notice
+    assert "review/remove leftover untracked files" in notice
+    assert "already parked" not in notice
+    if task.resolved_redrive and (task.rearmed or flow.policy.scm.rollback_on_failure):
+        assert "survives resume's reset" in notice
+        assert "pauses again" not in notice
+        assert "reset --hard" not in notice
+        assert "Resume will not adopt them." not in notice
+    else:
+        assert f"reset --hard {short}`" in notice
+        assert "Resume will not adopt them." in notice
+        assert "resume cannot carry the kept edits" in notice
+        assert "survives resume's reset" not in notice
+
+
 def _assert_owned_spec_manual_adoption_pause(
     flow: RecoveryFlow,
     task: StoryTask,
@@ -1343,7 +1382,13 @@ def _assert_owned_spec_manual_adoption_pause(
     assert flow.calls.saves == 1
     assert len(flow.calls.pauses) == 1
     assert "manual adoption is required" in flow.calls.pauses[0][0]
+    _assert_owned_spec_notice_contract(flow.calls.pauses[0][0], task, flow)
     assert flow.journal.events().count("rollback-owned-spec-manual-required") == 1
+    assert_multiline_notice_keeps_its_lines(
+        flow.run_dir,
+        f"ACTION REQUIRED: recover attempt-owned spec for {task.story_key}",
+        flow.calls.pauses[0][0],
+    )
     status_guidance = (
         f"; the adopted spec must have lifecycle status {expected_status!r}"
         if expected_status is not None
@@ -1358,6 +1403,14 @@ def _assert_owned_spec_manual_adoption_pause(
             f"{status_guidance}; manual adoption is required"
         ),
     }
+
+
+# DW-322: a rollback that paused after `pre_rollback` still delivers exactly one
+# paired `post_rollback`, labelled with how it ended.
+_PAUSED_ROLLBACK_EMITS = [
+    ("pre_rollback", {}),
+    ("post_rollback", {"rollback_outcome": "paused"}),
+]
 
 
 # --------------------------------------------------------------- protected paths
@@ -1420,9 +1473,120 @@ def test_rollback_auto_resets_when_flag_on(project):
     flow.rollback_or_pause(task)  # must NOT raise
 
     assert rev_parse_head(repo) == task.baseline_commit  # reset to baseline
-    assert flow.calls.emits == ["pre_rollback", "post_rollback"]
+    assert flow.calls.emit_fields == [
+        ("pre_rollback", {}),
+        ("post_rollback", {"rollback_outcome": "completed"}),
+    ]
     assert flow.calls.pauses == []
     assert "rollback-auto" in flow.journal.events()
+
+
+def test_rollback_preserve_failure_pause_still_emits_post_rollback(project, monkeypatch):
+    """DW-322: a preservation-failure pause raised after `pre_rollback` still
+    delivers the paired `post_rollback`, labelled "paused", and the pause itself
+    propagates unchanged. Ablation: delete the `finally` emit and the emit list
+    loses its post_rollback."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    _commit_something(repo)
+
+    def no_ref(*a, **k):
+        raise GitError("branch creation failed")
+
+    monkeypatch.setattr(verify, "preserve_commits", no_ref)
+
+    with pytest.raises(_Pause, match="could not be auto-preserved"):
+        flow.rollback_or_pause(task)
+
+    assert len(flow.calls.pauses) == 1
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
+    assert rev_parse_head(repo) != task.baseline_commit  # reset refused
+
+
+def test_owned_spec_pause_notice_without_recorded_baseline(project):
+    """DW-321 fallback: with no recorded `baseline_commit` the notice still gives
+    the return-to-baseline step, in words rather than a (missing) sha."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws)
+    task = _task(repo)
+    task.baseline_commit = None
+
+    with pytest.raises(_Pause):
+        flow.pause_for_owned_spec_recovery(task, str(repo / "spec.md"), "boom")
+
+    notice = flow.calls.pauses[0][0]
+    assert "the commit the attempt started from (not recorded)" in notice
+    assert "reset --hard" not in notice
+    assert "Resume will not adopt them." in notice
+    assert flow.calls.emits == []  # the pause itself emits no rollback stage
+
+
+@pytest.mark.parametrize(
+    ("rearmed", "rollback_on", "under_artifacts", "keeps"),
+    [
+        (False, True, True, True),
+        (True, False, True, True),
+        (False, False, True, False),
+        (False, True, False, False),
+    ],
+    ids=["rollback-on", "armed-unwind", "rollback-off", "outside-artifacts"],
+)
+def test_redrive_owned_spec_notice_keeps_spec_only_when_resume_reset_preserves_it(
+    project, rearmed, rollback_on, under_artifacts, keeps
+):
+    """DW-321: a re-drive's notice says to keep the approved spec in place only
+    when resume will auto-recover (armed unwind or rollback on) and the spec lies
+    under the artifact folders that reset preserves. Otherwise keeping it would
+    either pause again (rollback off) or be reset anyway (outside the folders), so
+    the notice falls back to the plain reset-to-baseline step."""
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=rollback_on)
+    )
+    task = _task(repo)
+    task.resolved_redrive = True
+    task.rearmed = rearmed
+    task.preserve_ref = "refs/bmad-loop/preserve/earlier-attempt"
+    folder = project.implementation_artifacts if under_artifacts else repo / "specs"
+    spec = str(folder / "spec-1-1-a.md")
+
+    with pytest.raises(_Pause):
+        flow.pause_for_owned_spec_recovery(task, spec, "boom")
+
+    notice = flow.calls.pauses[0][0]
+    assert ("survives resume's reset" in notice) is keeps
+    assert ("Resume will not adopt them." in notice) is not keeps
+    assert "earlier-attempt" not in notice  # never names a possibly stale ref
+
+
+def test_rollback_unexpected_error_emits_failed_post_rollback(project, monkeypatch):
+    """DW-322: an unexpected error escaping the reset after `pre_rollback` still
+    delivers `post_rollback` labelled "failed" (not "paused": no pause was
+    raised), and the original exception propagates as the very same object."""
+    repo = project.project
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(rollback_on_failure=True))
+    task = _task(repo)
+    (repo / "src.txt").write_text("uncommitted attempt\n")
+    boom = OSError(28, "No space left on device")
+
+    def exploding_rollback(*a, **k):
+        raise boom
+
+    monkeypatch.setattr(verify, "safe_rollback", exploding_rollback)
+
+    with pytest.raises(OSError) as excinfo:
+        flow.rollback_or_pause(task)
+
+    assert excinfo.value is boom
+    assert flow.calls.pauses == []
+    assert flow.calls.emit_fields == [
+        ("pre_rollback", {}),
+        ("post_rollback", {"rollback_outcome": "failed"}),
+    ]
 
 
 def test_rollback_off_pauses_and_leaves_tree(project):
@@ -1909,13 +2073,90 @@ def test_plain_forced_fallback_pauses_after_completed_baseline_reset(project, mo
     assert source.read_text() == "original\n"
     assert spec.read_bytes() == baseline
     assert "rollback-auto" in flow.journal.events()
-    assert flow.calls.emits == ["pre_rollback"]
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     _assert_owned_spec_manual_adoption_pause(
         flow,
         task,
         spec,
         stage="after the baseline reset",
     )
+
+
+@pytest.mark.parametrize("rollback_on_resume", [True, False], ids=["rollback-on", "rollback-off"])
+def test_plain_owned_spec_pause_resume_does_not_adopt_differing_tracked_spec(
+    project, monkeypatch, rollback_on_resume
+):
+    """DW-321 behaviour behind the notice: after an owned-spec pause on a plain
+    attempt, an approved edit to the tracked spec that differs from the baseline
+    is attempt residue on resume — reset to baseline with rollback on, a fresh
+    manual-rollback pause with it off. Never adopted."""
+    repo = project.project
+    spec = _tracked_spec(project)
+    baseline = spec.read_bytes()
+    operator = baseline.replace(b"baseline intent", b"operator input outside HEAD")
+    spec.write_bytes(operator)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    task.dispatched_spec_snapshot = operator
+    (repo / "src.txt").write_text("failed child sibling\n")
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+    monkeypatch.setattr(recovery_flow, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+
+    with pytest.raises(_Pause, match="needs manual recovery"):
+        flow.rollback_or_pause(task)
+    _assert_owned_spec_notice_contract(flow.calls.pauses[0][0], task, flow)
+
+    approved = baseline.replace(b"baseline intent", b"operator-approved edit")
+    spec.write_bytes(approved)
+    flow.policy = _policy(rollback_on_failure=rollback_on_resume)
+    auto_before = flow.journal.events().count("rollback-auto")
+
+    if rollback_on_resume:
+        flow.rollback_or_pause(task)
+        assert spec.read_bytes() == baseline
+        assert flow.journal.events().count("rollback-auto") == auto_before + 1
+        assert len(flow.calls.pauses) == 1
+    else:
+        with pytest.raises(_Pause, match="manual rollback"):
+            flow.rollback_or_pause(task)
+        assert spec.read_bytes() == approved  # left for the operator, not adopted
+        assert "rollback-manual-required" in flow.journal.events()
+        assert flow.journal.events().count("rollback-auto") == auto_before
+        assert len(flow.calls.pauses) == 2
+
+
+def test_post_rollback_emit_failure_cannot_mask_a_propagating_pause(project, monkeypatch):
+    """DW-322: while a pause propagates, a failing `post_rollback` emit (context
+    build, journal write) is suppressed so the pause itself still reaches the
+    caller. Ablation: drop the suppression and the emit's OSError replaces it."""
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+    task = _task(repo)
+    _commit_something(repo)
+    recorded = flow._emit
+
+    def failing_emit(stage, task=None, **fields):
+        recorded(stage, task, **fields)
+        if stage == "post_rollback":
+            raise OSError(28, "No space left on device")
+
+    flow._emit = failing_emit
+
+    def no_ref(*a, **k):
+        raise GitError("branch creation failed")
+
+    monkeypatch.setattr(verify, "preserve_commits", no_ref)
+
+    with pytest.raises(_Pause, match="could not be auto-preserved"):
+        flow.rollback_or_pause(task)
+
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
 
 
 @requires_descriptor_restoration
@@ -2133,7 +2374,7 @@ def test_latched_redrive_forced_fallback_pauses_after_preservation(project, monk
     assert git(repo, "show", f"{task.preserve_ref}:{rel}").encode() == child.rstrip(b"\n")
     assert "attempt-worktree-preserved" in flow.journal.events()
     assert "rollback-owned-spec-restored" not in flow.journal.events()
-    assert "post_rollback" not in flow.calls.emits
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     _assert_owned_spec_manual_adoption_pause(
         flow,
         task,
@@ -2175,7 +2416,7 @@ def test_latched_redrive_forced_fallback_pauses_after_completed_baseline_reset(
     # newline-normalized rather than raw.
     assert spec.read_bytes().replace(b"\r\n", b"\n") == corrected
     assert "rollback-auto" in flow.journal.events()
-    assert flow.calls.emits == ["pre_rollback"]
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     _assert_owned_spec_manual_adoption_pause(
         flow,
         task,
@@ -2295,7 +2536,7 @@ def test_plain_git_invisible_snapshot_forced_fallback_pauses_before_reset(
     assert task.preserve_ref is not None
     assert git(repo, "show", f"{task.preserve_ref}:{rel}").encode() == child.rstrip(b"\n")
     assert "rollback-owned-spec-restored" not in flow.journal.events()
-    assert "post_rollback" not in flow.calls.emits
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     _assert_owned_spec_manual_adoption_pause(
         flow,
         task,
@@ -2387,7 +2628,7 @@ def test_latched_redrive_index_only_forced_fallback_pauses_after_preservation(
         assert task.preserve_ref is not None
         assert "attempt-worktree-preserved" in flow.journal.events()
     assert "rollback-owned-spec-restored" not in flow.journal.events()
-    assert "post_rollback" not in flow.calls.emits
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     _assert_owned_spec_manual_adoption_pause(
         flow,
         task,
@@ -2499,8 +2740,10 @@ def test_plain_normalization_restore_revalidates_parent_authority(project, tmp_p
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
 
-    def retarget_after_normalize(path, target_status, *, confine_root):
-        RecoveryFlow._normalize_attempt_owned_spec(path, target_status, confine_root=confine_root)
+    def retarget_after_normalize(path, target_status, *, confine_root, root_identity=None):
+        RecoveryFlow._normalize_attempt_owned_spec(
+            path, target_status, confine_root=confine_root, root_identity=root_identity
+        )
         path.unlink()
         parent.rmdir()
         parent.symlink_to(victim_parent, target_is_directory=True)
@@ -2662,7 +2905,7 @@ def test_resolved_cause_forced_fallback_pauses_after_completed_reset(project, mo
     # only its line endings may differ under `core.autocrlf=true`.
     assert spec.read_bytes().replace(b"\r\n", b"\n") == remaining
     assert "rollback-auto" in flow.journal.events()
-    assert flow.calls.emits == ["pre_rollback"]
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     _assert_owned_spec_manual_adoption_pause(
         flow,
         task,
@@ -2778,6 +3021,122 @@ def test_latched_redrive_reset_normalizes_preserved_spec_after_sibling_residue(p
     assert flow.calls.emits == ["pre_rollback", "post_rollback"]
 
 
+@requires_descriptor_restoration
+def test_owned_spec_restore_returns_the_published_identity(tmp_path):
+    """DW-319: restoration hands back what it published — the live inode and the
+    snapshot bytes — and that identity is one the anchored normalizer accepts
+    as ``expected`` for the untouched file.
+
+    Deliberately not a field-by-field comparison with a path ``os.stat``: under
+    Wine a renamed file's path stat reports a different ``st_ctime_ns`` than
+    its handle stats do; the binding that matters is handle against handle."""
+    spec = tmp_path.resolve() / "owned.md"
+    spec.write_bytes(b"failed child bytes\n")
+    snapshot = b"---\nstatus: done\n---\n\noperator input\n"
+
+    identity = RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert identity.data == snapshot
+    assert os.path.samestat(identity.stat, os.stat(spec))
+    verify.set_frontmatter_status_anchored(
+        spec, "ready-for-dev", confine_root=tmp_path.resolve(), expected=identity
+    )
+    assert spec.read_bytes() == snapshot.replace(b"status: done", b"status: ready-for-dev")
+
+
+@requires_descriptor_restoration
+@pytest.mark.parametrize("swapped", ["snapshot-bytes", "other-bytes"])
+def test_owned_spec_restore_settled_readback_refuses_a_swapped_inode(
+    tmp_path, monkeypatch, swapped
+):
+    """The identity restoration returns is read back after the writer releases
+    the published inode, and it must still BE that inode holding the snapshot. A
+    name swapped to a new inode in that window — even one carrying the snapshot
+    bytes — is refused rather than handed to normalization as ``expected``.
+
+    Ablation: drop the samestat/bytes conditions of the settled read-back and
+    both cases return an identity for a file restoration never published."""
+    spec = tmp_path.resolve() / "owned.md"
+    spec.write_bytes(b"failed child bytes\n")
+    snapshot = b"---\nstatus: ready-for-dev\n---\n\noperator input\n"
+    replacement = snapshot if swapped == "snapshot-bytes" else b"swapped operator bytes\n"
+    real_writer = recovery_flow.atomic_write_bytes_at
+
+    def write_then_swap(*args, **kwargs):
+        real_writer(*args, **kwargs)
+        staged = spec.with_name("owned.md.swap")
+        staged.write_bytes(replacement)
+        os.replace(staged, spec)
+
+    monkeypatch.setattr(recovery_flow, "atomic_write_bytes_at", write_then_swap)
+
+    with pytest.raises(_OwnedSpecAuthorityError):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    assert spec.read_bytes() == replacement
+
+
+@requires_descriptor_restoration
+@pytest.mark.parametrize("edit", ["in-place", "new-inode"])
+def test_redrive_restore_then_operator_edit_pauses_and_keeps_operator_bytes(
+    project, monkeypatch, edit
+):
+    """DW-319: an operator edit landing between byte restoration and lifecycle
+    normalization is never overwritten. Restore-then-normalize carries the
+    restored identity, the anchored writer refuses the changed target, and the
+    refusal reaches the owned-spec pause wrapper — authority cleared, operator
+    bytes intact.
+
+    Ablation: drop ``expected=restored`` in `_restore_attempt_owned_spec` and
+    this fails `DID NOT RAISE`, with the operator's ``status: done`` rewritten
+    to ``ready-for-dev``."""
+    repo = project.project
+    source = repo / "redrive-source.txt"
+    source.write_text("baseline source\n")
+    spec = _tracked_spec(project)
+    task = _task(repo)
+    task.dispatched_spec_file = str(spec)
+    task.resolved_redrive = True
+    corrected = b"---\nstatus: ready-for-dev\n---\n\nhuman corrected intent\n"
+    task.dispatched_spec_snapshot = corrected
+    source.write_text("rejected implementation\n")
+    spec.write_text("---\nstatus: done\n---\n\nfailed child body edit\n")
+    operator = b"---\nstatus: done\n---\n\noperator edit after restore\n"
+    real_restore = RecoveryFlow._restore_attempt_owned_spec_bytes
+    restores: list[Path] = []
+
+    def restore_then_operator_edits(spec_path, snapshot, **pin):
+        identity = real_restore(spec_path, snapshot, **pin)
+        restores.append(spec_path)
+        if edit == "in-place":
+            with open(spec_path, "r+b") as fh:
+                fh.write(operator)
+                fh.truncate()
+        else:
+            staged = spec_path.with_name(spec_path.name + ".save")
+            staged.write_bytes(operator)
+            os.replace(staged, spec_path)
+        return identity
+
+    monkeypatch.setattr(
+        RecoveryFlow,
+        "_restore_attempt_owned_spec_bytes",
+        staticmethod(restore_then_operator_edits),
+    )
+    flow = _make_flow(
+        workspace=Workspace.default(project), policy=_policy(rollback_on_failure=True)
+    )
+
+    with pytest.raises(_Pause, match="changed during normalization"):
+        flow.rollback_or_pause(task)
+
+    assert restores == [spec.resolve()]
+    assert spec.read_bytes() == operator
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+    assert "rollback-owned-spec-normalized" not in flow.journal.events()
+
+
 def test_latched_redrive_without_snapshot_refuses_reset_of_sibling_residue(project):
     """Legacy state cannot guess which owned-spec bytes came from the child.
 
@@ -2806,10 +3165,12 @@ def test_latched_redrive_without_snapshot_refuses_reset_of_sibling_residue(proje
     assert "rollback-auto" not in flow.journal.events()
     assert task.dispatched_spec_file is None
     assert task.dispatched_spec_snapshot is None
+    _assert_owned_spec_notice_contract(flow.calls.pauses[0][0], task, flow)
 
-    # The notice tells the operator to restore/verify the approved spec. Because
-    # the unusable pair was cleared before the pause, that remedy converges rather
-    # than hitting the same legacy-snapshot guard forever on resume.
+    # The notice tells the operator to keep the approved spec in place and reset
+    # the other residue. Because the unusable pair was cleared before the pause,
+    # that remedy converges rather than hitting the same legacy-snapshot guard
+    # forever on resume.
     corrected = b"---\nstatus: ready-for-dev\n---\n\noperator restored intent\n"
     spec.write_bytes(corrected)
     flow.rollback_or_pause(task)
@@ -3170,7 +3531,7 @@ def test_patch_restore_redrive_forced_fallback_requires_in_review_adoption(proje
 
     assert spec.read_text() == "---\nstatus: in-progress\n---\n\nrestored human correction\n"
     assert "rollback-owned-spec-normalized" not in flow.journal.events()
-    assert "post_rollback" not in flow.calls.emits
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     _assert_owned_spec_manual_adoption_pause(
         flow,
         task,
@@ -3682,7 +4043,7 @@ def test_dirty_preserve_ref_wins_and_subsumes_the_commits_branch(project):
     `attempt-preserve/*` branch and the still-dirty tree on a dirty snapshot. The
     dirty ref is the one `preserve_ref` keeps, because it is committed parented at
     the attempt's HEAD and therefore already contains the branch — so the single
-    `git merge --ff-only <preserve_ref>` the defer notice prints recovers the
+    `git merge --no-edit <preserve_ref>` the defer notice prints recovers the
     whole attempt, not half of it."""
     repo = project.project
     ws = Workspace.default(project)
@@ -3736,7 +4097,7 @@ def test_changed_owned_snapshot_capture_failure_pauses_latched_redrive(project, 
 
     assert spec.read_bytes() == child
     assert "attempt-worktree-preserve-failed" in flow.journal.events()
-    assert "post_rollback" not in flow.calls.emits
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
 
 
 def test_snapshot_failure_leaves_a_commits_only_ref_flagged_partial(project, monkeypatch):
@@ -3744,7 +4105,7 @@ def test_snapshot_failure_leaves_a_commits_only_ref_flagged_partial(project, mon
     re-drive the reset runs anyway. `preserve_ref` then names the commits branch
     alone, so the whole-attempt promise no longer holds — `preserve_partial` records
     that, and the defer notice downgrades its claim instead of telling the operator
-    a `merge --ff-only` restores work the reset just destroyed.
+    a `merge` restores work the reset just destroyed.
 
     Since #340 a *plain* rollback refuses this reset, so the re-drive
     (`cause="resolved"`, contractually pause-free) is the surviving path where the
@@ -3775,7 +4136,7 @@ def test_snapshot_failure_leaves_a_commits_only_ref_flagged_partial(project, mon
     # why it matters: the reset ran regardless, so the tree is back at baseline and
     # the ref the notice names carries the committed half ONLY — the uncommitted
     # edit survives nowhere, which is exactly what the un-downgraded notice's
-    # `merge --ff-only` would have implied it could restore
+    # `merge` would have implied it could restore
     assert "committed" not in (repo / "src.txt").read_text()
     assert git(repo, "show", f"{task.preserve_ref}:src.txt") == "committed"
 
@@ -4131,12 +4492,15 @@ def test_safe_reset_reverts_tracked_and_keeps_baseline(project):
 
 def test_safe_reset_preflight_failure_journals_and_pauses_redrive(project, monkeypatch):
     """A typed cleanup-preflight refusal is journaled and passed to the injected
-    pause as its exact cause; the resolved re-drive stops before post-rollback or
-    any destructive reset can run.
+    pause as its exact cause; the resolved re-drive stops before any destructive
+    reset or post-reset continuation can run, and the paired `post_rollback`
+    still fires once, labelled "paused" (DW-322).
 
     Ablation target: delete the `except RollbackPreflightError` journal/pause block
-    and this test fails on the uncaught typed error; delete only `_pause` and it
-    fails because `post_rollback` continues and the expected pause is absent.
+    and this test fails on the uncaught typed error (post_rollback then reads
+    "failed"); delete only `_pause` and it fails because the rollback completes
+    and the expected pause is absent; delete the `finally` emit and it fails on
+    the missing post_rollback.
     """
     repo = project.project
     ws = Workspace.default(project)
@@ -4161,7 +4525,8 @@ def test_safe_reset_preflight_failure_journals_and_pauses_redrive(project, monke
     assert isinstance(cause, verify.RollbackPreflightError)
     assert cause is not None and cause.__cause__ is not None
     assert str(cause) in reason
-    assert flow.calls.emits == ["pre_rollback"]  # no post-reset re-drive continuation
+    # Paired post_rollback labelled "paused"; no post-reset re-drive continuation.
+    assert flow.calls.emit_fields == _PAUSED_ROLLBACK_EMITS
     assert (repo / "src.txt").read_text() == "tracked attempt\n"
     assert created.read_text() == "run-created\n"
 
@@ -4181,12 +4546,22 @@ def test_prune_preserve_refs_journals_deleted_per_family(project, monkeypatch):
     flow = _make_flow(workspace=ws, policy=_policy(preserve_keep=3))
     monkeypatch.setattr(verify, "prune_preserve_refs", lambda repo, keep: ["a", "b"])
     monkeypatch.setattr(verify, "prune_preserve_dirty_refs", lambda repo, keep: [])
+    monkeypatch.setattr(
+        verify,
+        "prune_merge_preflight_preserve_refs",
+        lambda repo, keep: ["refs/merge-preflight-preserve/m1"],
+    )
 
     flow.prune_preserve_refs()
 
     assert flow.journal.fields("attempt-preserve-pruned")["count"] == 2
     # empty deletion for the other family journals nothing
     assert "attempt-preserve-dirty-pruned" not in flow.journal.events()
+    # the merge pre-flight family is pruned under its own kind (DW-356)
+    assert flow.journal.fields("merge-preflight-preserve-pruned") == {
+        "count": 1,
+        "refs": ["refs/merge-preflight-preserve/m1"],
+    }
 
 
 def test_prune_preserve_refs_error_journaled_and_other_family_still_runs(project, monkeypatch):
@@ -4201,6 +4576,7 @@ def test_prune_preserve_refs_error_journaled_and_other_family_still_runs(project
 
     monkeypatch.setattr(verify, "prune_preserve_refs", stuck)
     monkeypatch.setattr(verify, "prune_preserve_dirty_refs", lambda repo, keep: ["d1"])
+    monkeypatch.setattr(verify, "prune_merge_preflight_preserve_refs", lambda repo, keep: ["m1"])
 
     flow.prune_preserve_refs()  # a failure in one family must never crash or skip the other
 
@@ -4208,6 +4584,28 @@ def test_prune_preserve_refs_error_journaled_and_other_family_still_runs(project
     assert "attempt-preserve-pruned" in events  # partial deletions stay auditable
     assert flow.journal.fields("attempt-preserve-prune-failed")["failed"] == ["r2"]
     assert "attempt-preserve-dirty-pruned" in events  # the second family still ran
+    assert "merge-preflight-preserve-pruned" in events  # ...and so did the third
+
+
+def test_prune_preserve_refs_merge_preflight_family_failure_is_journaled(project, monkeypatch):
+    """The third family's own failure journals under its own kind and never
+    reaches the run (DW-356)."""
+    ws = Workspace.default(project)
+    flow = _make_flow(workspace=ws, policy=_policy(preserve_keep=3))
+    monkeypatch.setattr(verify, "prune_preserve_refs", lambda repo, keep: [])
+    monkeypatch.setattr(verify, "prune_preserve_dirty_refs", lambda repo, keep: [])
+
+    def stuck(repo, keep):
+        raise verify.GitError("for-each-ref failed")
+
+    monkeypatch.setattr(verify, "prune_merge_preflight_preserve_refs", stuck)
+
+    flow.prune_preserve_refs()
+
+    assert flow.journal.fields("merge-preflight-preserve-prune-failed")["error"] == (
+        "for-each-ref failed"
+    )
+    assert "merge-preflight-preserve-pruned" not in flow.journal.events()
 
 
 # --------------------------------------------------------------- manual recovery
@@ -4228,9 +4626,15 @@ def test_pause_stopped_wording_no_commits(project, tmp_path):
     assert "rollback-manual-required" in flow.journal.events()
     # notify wrote a line to the run dir's attention file (QUIET file=True)
     assert "manual rollback for 1-1-a" in (tmp_path / ATTENTION_FILE).read_text()
+    assert_multiline_notice_keeps_its_lines(
+        tmp_path, "ACTION REQUIRED: manual rollback for 1-1-a", reason
+    )
 
 
 def test_pause_committed_wording_names_at_risk_commits(project, tmp_path):
+    """Shape (c), committed work above the baseline, names the at-risk commits
+    and (DW-371) offers `resume --accept-baseline` for commits that are the
+    operator's own."""
     repo = project.project
     ws = Workspace.default(project)
     flow = _make_flow(workspace=ws, run_dir=tmp_path)
@@ -4245,6 +4649,7 @@ def test_pause_committed_wording_names_at_risk_commits(project, tmp_path):
     reason = excinfo.value.reason
     assert "committed work above its baseline" in reason
     assert "do NOT reset before checking" in reason
+    assert "bmad-loop resume run-1 --accept-baseline" in reason
 
 
 def test_pause_preserve_failed_wording(project, tmp_path):
@@ -4256,6 +4661,390 @@ def test_pause_preserve_failed_wording(project, tmp_path):
         flow.pause_for_manual_recovery(task, task.baseline_commit, preserve_failed=True)
 
     assert "could not be auto-preserved" in excinfo.value.reason
+
+
+@pytest.mark.parametrize("deferred", [True, False], ids=["deferred", "escalated"])
+def test_manual_recovery_pauses_point_a_deferred_story_at_resolve_reverify(
+    project, tmp_path, deferred
+):
+    """DW-522: both manual-recovery pauses on a DEFERRED story name `resolve
+    --reverify` — the gesture that keeps the work instead of the reset the notice
+    otherwise walks the operator through. Any other phase gets no such hint.
+    Ablation: drop either `if task.phase == Phase.DEFERRED` append and its half
+    fails."""
+    repo = project.project
+    flow = _make_flow(workspace=Workspace.default(project), run_dir=tmp_path)
+    task = _task(repo)
+    task.phase = Phase.DEFERRED if deferred else Phase.ESCALATED
+    _commit_something(repo)
+    hint = "bmad-loop resolve run-1 --reverify"
+
+    with pytest.raises(_Pause) as manual:
+        flow.pause_for_manual_recovery(task, task.baseline_commit)
+    with pytest.raises(_Pause) as owned:
+        flow.pause_for_owned_spec_recovery(task, str(repo / "spec.md"), "boom")
+
+    assert (hint in manual.value.reason) is deferred
+    assert (hint in owned.value.reason) is deferred
+
+
+# ------------------------------------------ DW-371: restart park notice / adoption
+
+
+def _attention_lines(run_dir: Path) -> list[str]:
+    attention = run_dir / ATTENTION_FILE
+    return attention.read_text().splitlines() if attention.exists() else []
+
+
+def test_restart_rollback_notifies_parked_commits(project, tmp_path):
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+    for n in range(2):
+        (repo / "src.txt").write_text(f"commit {n}\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", f"above baseline {n}")
+
+    flow.rollback_or_pause(task, restart=True)
+
+    assert rev_parse_head(repo) == task.baseline_commit  # the reset proceeded
+    ref = flow.journal.fields("attempt-commits-preserved")["ref"]
+    lines = _attention_lines(tmp_path)
+    assert len(lines) == 1
+    line = lines[0]
+    assert ref in line and task.baseline_commit[:12] in line
+    assert "2 commits" in line
+    assert f"log --oneline {task.baseline_commit[:12]}..refs/heads/{ref}" in line
+    assert f'git -C "{repo}" cherry-pick <sha>' in line
+    assert "bmad-loop resume run-1 --accept-baseline" in line
+    # attribution-neutral: never claims the commits are the human's
+    assert "made while the run was down" in line and "the interrupted attempt's" in line
+
+
+def test_restart_rollback_notice_waits_for_the_completed_reset(project, tmp_path, monkeypatch):
+    """The parked-commits notice claims a reset, so it is sent only after
+    `safe_reset` completes: commits parked, then the dirty snapshot fails and the
+    #340 gate pauses — the pause propagates and no parked-commits notice exists.
+
+    Ablation: move the notify to right after `preserve_attempt_commits` and this
+    reddens on the notice line."""
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+    _commit_something(repo)
+    (repo / "src.txt").write_text("uncommitted work\n")
+    _fail_snapshot(monkeypatch)
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task, restart=True)
+
+    assert "attempt-commits-preserved" in flow.journal.events()  # commits were parked
+    assert (repo / "src.txt").read_text() == "uncommitted work\n"  # no reset ran
+    assert not any("commits parked on resume" in line for line in _attention_lines(tmp_path))
+
+
+def test_restart_rollback_notifies_the_uncommitted_snapshot(project, tmp_path):
+    """DW-480: a restart reset that parks only uncommitted changes (no commits
+    above the baseline) sends one ATTENTION line naming the snapshot ref and how
+    to recover from it — no commits branch, no `--accept-baseline` hint (the flag
+    never keeps uncommitted changes).
+
+    Ablation: drop `or snapshot` from the notice gate in `rollback_or_pause` and
+    the line disappears."""
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+    (repo / "dirty.txt").write_text("uncommitted\n")
+
+    flow.rollback_or_pause(task, restart=True)
+
+    assert not (repo / "dirty.txt").exists()  # the rollback ran
+    assert "attempt-commits-preserved" not in flow.journal.events()
+    snapshot = flow.journal.fields("attempt-worktree-preserved")["ref"]
+    lines = _attention_lines(tmp_path)
+    assert len(lines) == 1
+    line = lines[0]
+    assert "uncommitted changes parked on resume for 1-1-a" in line
+    assert task.baseline_commit[:12] in line
+    assert f"were parked on `{snapshot}`" in line
+    assert f'git -C "{repo}" diff {snapshot}~1 {snapshot}' in line
+    assert f'git -C "{repo}" restore --source={snapshot} -- <path>' in line
+    assert "attempt-preserve/" not in line and "cherry-pick" not in line
+    assert "--accept-baseline" not in line
+    # the snapshot really holds the discarded change
+    assert git(repo, "show", f"{snapshot}:dirty.txt") == "uncommitted"
+
+
+def test_restart_rollback_names_commits_and_snapshot_in_one_line(project, tmp_path):
+    """DW-482: commits above the baseline AND uncommitted changes — the reset parks
+    both, and ONE line names both refs (never a second line for either).
+
+    Ablation: drop the snapshot sentence from `_notify_reset_preservation` and the
+    snapshot ref goes missing; send a second notice per ref and the one-line
+    assertion reddens."""
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+    _commit_something(repo)
+    (repo / "src.txt").write_text("committed then edited\n")
+
+    flow.rollback_or_pause(task, restart=True)
+
+    assert rev_parse_head(repo) == task.baseline_commit  # the reset proceeded
+    commits_ref = flow.journal.fields("attempt-commits-preserved")["ref"]
+    snapshot = flow.journal.fields("attempt-worktree-preserved")["ref"]
+    lines = _attention_lines(tmp_path)
+    assert len(lines) == 1
+    line = lines[0]
+    assert "commits and uncommitted changes parked on resume for 1-1-a" in line
+    assert "1 commit above it" in line and f"was parked on `{commits_ref}` first" in line
+    assert f"were parked on `{snapshot}` first" in line
+    assert f"log --oneline {task.baseline_commit[:12]}..refs/heads/{commits_ref}" in line
+    assert f"restore --source={snapshot} -- <path>" in line and "cherry-pick <sha>" in line
+    assert "bmad-loop resume run-1 --accept-baseline" in line
+
+
+# ------------------------------------ DW-481: re-drive park failure falls through
+
+
+def _redrive_flow(project, tmp_path):
+    """A plain (non-restart) re-drive rollback: `rollback_on_failure` stays OFF so
+    the resolved re-drive is what carries the auto-recover arm, and its preserve
+    legs run with `allow_pause=False`."""
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=False),
+        run_dir=tmp_path,
+    )
+    return flow, _task(project.project)
+
+
+def _fallthrough_line(tmp_path: Path) -> str:
+    lines = _attention_lines(tmp_path)
+    assert len(lines) == 1
+    assert "reset of 1-1-a ran without full preservation" in lines[0]
+    assert "attempt-preserve-fallthrough" in lines[0]
+    return lines[0]
+
+
+def test_redrive_commits_enumerate_failure_notifies_and_still_resets(
+    project, tmp_path, monkeypatch
+):
+    """DW-481: the commits range cannot be counted on a re-drive — the reset still
+    runs (the human-directed fall-through), but a distinct row and one notice name
+    the leg and the attempt HEAD a reflog rescue starts from.
+
+    Ablation: drop `failed_parks or` from the notice gate and the line disappears;
+    drop the `_record_fallthrough` call in the enumerate arm and the row does."""
+    repo = project.project
+    flow, task = _redrive_flow(project, tmp_path)
+    _commit_something(repo)
+    head = rev_parse_head(repo)
+
+    def boom(*a, **k):
+        raise GitError("git log timed out")
+
+    monkeypatch.setattr(verify, "commits_above", boom)
+
+    flow.rollback_or_pause(task, cause="resolved")
+
+    assert flow.calls.pauses == []
+    assert rev_parse_head(repo) == task.baseline_commit  # the reset still ran
+    assert flow.journal.fields("attempt-preserve-fallthrough") == {
+        "story_key": "1-1-a",
+        "leg": "commits-enumerate",
+        "head": head,
+    }
+    line = _fallthrough_line(tmp_path)
+    assert f"rollback reset 1-1-a to its baseline {task.baseline_commit[:12]}" in line
+    assert "could not be counted (leg commits-enumerate)" in line
+    assert f'git -C "{repo}" branch <name> {head}' in line
+    # the commit is unreferenced but still recoverable by that sha
+    assert git(repo, "cat-file", "-t", head) == "commit"
+
+
+def test_redrive_commits_park_failure_notifies_and_still_resets(project, tmp_path, monkeypatch):
+    """DW-481: the commits were counted but the branch did not take on a re-drive.
+
+    Ablation: drop the `_record_fallthrough` call in the park-failed arm and both
+    the row and the line disappear."""
+    repo = project.project
+    flow, task = _redrive_flow(project, tmp_path)
+    _commit_something(repo)
+    head = rev_parse_head(repo)
+    monkeypatch.setattr(verify, "preserve_commits", lambda *a, **k: None)  # ref did not take
+
+    flow.rollback_or_pause(task, cause="resolved")
+
+    assert flow.calls.pauses == []
+    assert rev_parse_head(repo) == task.baseline_commit
+    events = flow.journal.events()
+    assert "attempt-preserve-failed" in events
+    assert flow.journal.fields("attempt-preserve-fallthrough") == {
+        "story_key": "1-1-a",
+        "leg": "commits-park",
+        "head": head,
+    }
+    line = _fallthrough_line(tmp_path)
+    assert "could not be parked (leg commits-park)" in line
+    assert f"branch <name> {head}" in line
+    assert "attempt-preserve/" not in line  # no ref took, so none is named
+
+
+def test_redrive_snapshot_failure_notifies_and_still_resets(project, tmp_path, monkeypatch):
+    """DW-481: the uncommitted-work snapshot fails on a re-drive. The commits are
+    parked and named, the notice says uncommitted work was NOT preserved and names
+    the HEAD, and the reset runs over the edit anyway.
+
+    Ablation: drop the `_record_fallthrough` calls in preserve_attempt_worktree's
+    re-drive arm and both the row and the line disappear."""
+    repo = project.project
+    flow, task = _redrive_flow(project, tmp_path)
+    _commit_something(repo)
+    head = rev_parse_head(repo)
+    (repo / "src.txt").write_text("committed then edited\n")
+    _fail_snapshot(monkeypatch)
+
+    flow.rollback_or_pause(task, cause="resolved")
+
+    assert flow.calls.pauses == []
+    assert rev_parse_head(repo) == task.baseline_commit
+    assert "edited" not in (repo / "src.txt").read_text()  # the reset ran over it
+    assert flow.journal.fields("attempt-preserve-fallthrough") == {
+        "story_key": "1-1-a",
+        "leg": "worktree-snapshot",
+        "head": head,
+    }
+    commits_ref = flow.journal.fields("attempt-commits-preserved")["ref"]
+    line = _fallthrough_line(tmp_path)
+    assert "(leg worktree-snapshot)" in line
+    assert "uncommitted work was NOT preserved" in line
+    assert f"the attempt HEAD was {head}" in line
+    assert f"was parked on `{commits_ref}` first" in line  # the half that did survive
+
+
+def test_fallthrough_with_unreadable_head_points_at_the_reflog(project, tmp_path, monkeypatch):
+    """DW-481: when HEAD itself cannot be read the row carries `head=""` (the fault
+    is on the enumerate row beside it) and the notice sends the operator to the
+    reflog instead of naming a sha it does not have."""
+    repo = project.project
+    flow, task = _redrive_flow(project, tmp_path)
+    failed: list = []
+
+    def boom(*a, **k):
+        raise GitError("git rev-parse timed out")
+
+    monkeypatch.setattr(verify, "rev_parse_head", boom)
+
+    assert flow.preserve_attempt_commits(task, allow_pause=False, failed_parks=failed) is None
+    assert flow.journal.fields("attempt-preserve-fallthrough") == {
+        "story_key": "1-1-a",
+        "leg": "commits-enumerate",
+        "head": "",
+    }
+    flow._notify_reset_preservation(
+        task, restart=False, parked=None, snapshot=None, failed_parks=failed
+    )
+    line = _fallthrough_line(tmp_path)
+    assert f'the attempt HEAD could not be read; find it in `git -C "{repo}" reflog`' in line
+    assert "branch <name>" not in line
+
+
+def test_in_run_rollback_parks_commits_without_notice(project, tmp_path):
+    """A retry/defer rollback (no ``restart``) journals the park but never notifies.
+
+    Ablation: drop `restart and` from the notice gate and this reddens."""
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+    _commit_something(repo)
+
+    flow.rollback_or_pause(task)
+
+    assert "attempt-commits-preserved" in flow.journal.events()
+    assert rev_parse_head(repo) == task.baseline_commit
+    assert _attention_lines(tmp_path) == []
+
+
+def test_accept_current_baseline_restamps_and_skips_the_reset(project, tmp_path):
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+    previous_baseline = task.baseline_commit
+    _commit_something(repo)
+    human = rev_parse_head(repo)
+    (repo / "notes.txt").write_text("operator's own untracked file\n")
+
+    flow.accept_current_baseline(task)
+    flow.rollback_or_pause(task, restart=True)
+
+    assert flow.journal.fields("baseline-accepted") == {
+        "story_key": "1-1-a",
+        "previous_baseline": previous_baseline,
+        "baseline": human,
+    }
+    assert task.baseline_commit == human
+    assert task.baseline_untracked == ["notes.txt"]
+    assert rev_parse_head(repo) == human  # nothing reset past the commit
+    assert (repo / "notes.txt").exists()
+    assert "rollback-skipped-clean" in flow.journal.events()
+    assert "attempt-commits-preserved" not in flow.journal.events()
+    assert _attention_lines(tmp_path) == []
+
+
+def test_accept_current_baseline_git_fault_pauses_without_reset(project, tmp_path, monkeypatch):
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+    previous = task.baseline_commit
+    untracked_before = list(task.baseline_untracked)
+
+    def boom(root):
+        raise GitError("rev-parse timed out")
+
+    monkeypatch.setattr(verify, "rev_parse_head", boom)
+
+    with pytest.raises(_Pause) as excinfo:
+        flow.accept_current_baseline(task)
+
+    assert flow.journal.fields("baseline-accept-failed") == {
+        "story_key": "1-1-a",
+        "error": "rev-parse timed out",
+    }
+    assert "baseline-accepted" not in flow.journal.events()
+    assert task.baseline_commit == previous
+    assert task.baseline_untracked == untracked_before
+    assert flow.calls.saves == 1
+    assert "could not accept the current baseline" in excinfo.value.reason
+    assert "baseline accept failed for 1-1-a" in (tmp_path / ATTENTION_FILE).read_text()
 
 
 # --------------------------------------------------------------- restore_patch
@@ -4553,3 +5342,524 @@ def test_retry_preserve_notice_refuses_a_ref_this_task_cannot_own(project, stale
             flow.state = SimpleNamespace(run_id="run-2")
 
     assert flow.retry_preserve_notice(task) == ""
+
+
+# ------------------------------------ untrusted fragments fold (DW-417)
+
+# A multi-line fault text carrying a control byte: its second line must never land
+# in ATTENTION as a loose, unprefixed line.
+_MULTILINE_FAULT = "fatal: x\x1b[31m\nhint: y"
+_FOLDED_FAULT = "fatal: x\\x1b[31m ⏎ hint: y"
+
+
+def _assert_fragment_folded(run_dir: Path) -> None:
+    lines = _attention_lines(run_dir)
+    assert lines and lines[0].startswith("[")
+    assert not any(line.lstrip().startswith("hint: y") for line in lines)
+    assert any(_FOLDED_FAULT in line for line in lines)
+    assert "\x1b" not in "\n".join(lines)
+
+
+def test_owned_spec_pause_folds_a_multiline_problem(project, tmp_path):
+    """`pause_for_owned_spec_recovery`'s `{problem}` is folded into one segment of
+    its notice line; the journal row keeps it raw.
+
+    Ablation: interpolate the raw `problem` in the notice and a loose `hint: y`
+    line lands in ATTENTION."""
+    repo = project.project
+    flow = _make_flow(workspace=Workspace.default(project), run_dir=tmp_path)
+    task = _task(repo)
+
+    with pytest.raises(_Pause):
+        flow.pause_for_owned_spec_recovery(task, str(repo / "spec.md"), _MULTILINE_FAULT)
+
+    _assert_fragment_folded(tmp_path)
+    assert flow.journal.fields("rollback-owned-spec-manual-required")["problem"] == (
+        _MULTILINE_FAULT
+    )
+
+
+def test_accept_current_baseline_git_fault_folds_a_multiline_error(project, tmp_path, monkeypatch):
+    """`accept_current_baseline`'s `({exc})` is folded into one segment of its
+    notice line; the `baseline-accept-failed` row keeps `str(exc)` raw.
+
+    Ablation: interpolate the raw `exc` in the notice and a loose `hint: y` line
+    lands in ATTENTION."""
+    repo = project.project
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=True),
+        run_dir=tmp_path,
+    )
+    task = _task(repo)
+
+    def boom(root):
+        raise GitError(_MULTILINE_FAULT)
+
+    monkeypatch.setattr(verify, "rev_parse_head", boom)
+
+    with pytest.raises(_Pause):
+        flow.accept_current_baseline(task)
+
+    _assert_fragment_folded(tmp_path)
+    assert flow.journal.fields("baseline-accept-failed")["error"] == _MULTILINE_FAULT
+
+
+# ------------------------------------------ recovery worktree-mount writer pin (DW-445)
+#
+# Under worktree isolation the live workspace is a REAL unit mount
+# (`workspace.open_unit_workspace`), and every attempt-owned normalization and
+# restore confines to its `paths.project`. The call sites pass
+# `_mount_root_identity(task, workspace)`. The swap: the mount copied to an outside tree,
+# renamed aside, and a link planted at its name. Each row has an unpinned control
+# (`_mount_root_identity` answering None) showing the same swap really lands outside.
+
+requires_symlinked_mount_swap = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+
+_PIN_REFUSAL = "no longer the directory it was pinned to"
+
+
+def _real_unit(project):
+    """(unit workspace, run dir) — a real worktree mounted for ``1-1-a``."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "run-1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    unit = open_unit_workspace(project.project, project, "run-1", "1-1-a", "main", "story", run_dir)
+    return unit.workspace, run_dir
+
+
+def _swap_unit_mount(workspace, outside: Path) -> None:
+    """Copy the unit mount to ``outside``, rename it aside and plant a link at its
+    name — the whole worktree, `.git` file included, so git still works through it."""
+    import shutil
+
+    shutil.copytree(workspace.root, outside, symlinks=True)
+    workspace.root.rename(workspace.root.with_name(workspace.root.name + "-aside"))
+    workspace.root.symlink_to(outside, target_is_directory=True)
+
+
+def _unit_task(workspace, story_key: str = "1-1-a") -> StoryTask:
+    """`_task` on the unit mount ``workspace``, carrying the mount's mint-time
+    identity record (DW-446) — taken now, before any swap, as `run_isolated` takes
+    it before any session runs."""
+    task = _task(workspace.root, story_key)
+    task.worktree_path = str(workspace.root)
+    task.worktree_identity = platform_util.root_identity_record(workspace.root)
+    return task
+
+
+def _unit_flow(project, workspace, run_dir, monkeypatch, *, pinned: bool, rollback: bool):
+    flow = _make_flow(
+        workspace=workspace,
+        paths=project,
+        policy=_policy(rollback_on_failure=rollback),
+        run_dir=run_dir,
+    )
+    if not pinned:
+        monkeypatch.setattr(flow, "_mount_root_identity", lambda task, workspace: None)
+    return flow
+
+
+def _assert_pin_pause(flow, task: StoryTask, unsafe_context: str) -> None:
+    """The byte restore's pin refusal surfaced as the ordinary owned-spec pause at
+    the site named by ``unsafe_context``: the authority pair is cleared and the
+    journaled problem is the revalidation fault the pin pre-check maps to (the
+    canonical walk's own refusal reads "became unsafe" instead)."""
+    problem = flow.journal.fields("rollback-owned-spec-manual-required")["problem"]
+    assert unsafe_context in problem
+    assert "could not be revalidated" in problem
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+
+
+def test_recovery_mount_root_identity_follows_the_live_workspace(project):
+    """None for the default workspace (the operator's project); the mount project's
+    own identity once the workspace is a real unit mount.
+
+    Ablation: drop the `workspace.root == self.paths.repo_root` arm and the first
+    row reddens; answer None unconditionally and the second does."""
+    ws = Workspace.default(project)
+    task = StoryTask(story_key="1-1-a", epic=1)
+    assert _make_flow(workspace=ws, paths=project)._mount_root_identity(task, ws) is None
+
+    unit_ws, run_dir = _real_unit(project)
+    flow = _make_flow(workspace=unit_ws, paths=project, run_dir=run_dir)
+    identity = flow._mount_root_identity(_unit_task(unit_ws), unit_ws)
+    assert identity is not None
+    expected = os.lstat(unit_ws.paths.project)
+    assert (identity.st_dev, identity.st_ino) == (expected.st_dev, expected.st_ino)
+    # DW-446: a task with no mint-time record refuses, never a fresh `lstat`
+    assert flow._mount_root_identity(task, unit_ws).st_ino == 0
+
+
+@requires_descriptor_restoration
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned-control"])
+def test_normalization_refuses_a_relative_binding_made_through_a_swapped_mount(
+    project, tmp_path, monkeypatch, pinned
+):
+    """The mount is swapped BEFORE recovery binds the persisted RELATIVE
+    `dispatched_spec_file`, so the binding resolves canonically OUTSIDE the mount
+    and the anchored normalization takes its external arm. That arm's pin
+    pre-check refuses (`UnconfinedWriteError`) and the outside copy keeps the
+    child's status; unpinned, the same swap lands the normalization outside.
+
+    Ablation: drop the `require_root_pinned` pre-check from `_open_anchored_parent`'s
+    external arm (or `root_identity=` at the plain normalization site) and the
+    pinned row rewrites the outside copy."""
+    spec_main = _tracked_spec(project)
+    ws, run_dir = _real_unit(project)
+    spec = ws.paths.implementation_artifacts / spec_main.name
+    task = _unit_task(ws)
+    task.dispatched_spec_file = spec.relative_to(ws.paths.project).as_posix()
+    spec.write_text(spec.read_text().replace("ready-for-dev", "in-progress"))  # child flip
+    flow = _unit_flow(project, ws, run_dir, monkeypatch, pinned=pinned, rollback=False)
+    outside = tmp_path / "outside"
+    _swap_unit_mount(ws, outside)
+    outside_spec = outside / spec.relative_to(ws.root)
+
+    if pinned:
+        with pytest.raises(UnconfinedWriteError, match=_PIN_REFUSAL):
+            flow.rollback_or_pause(task)
+        assert _status(outside_spec) == "in-progress"
+    else:
+        with contextlib.suppress(_Pause):
+            flow.rollback_or_pause(task)
+        assert _status(outside_spec) == "ready-for-dev"
+
+
+@requires_descriptor_restoration
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned-control"])
+@pytest.mark.parametrize("redrive", [True, False], ids=["redrive", "plain"])
+def test_snapshot_restore_refuses_a_binding_made_through_a_swapped_mount(
+    project, tmp_path, monkeypatch, pinned, redrive
+):
+    """The snapshot restore ("before the baseline reset") of an untracked spec bound
+    through a mount swapped before binding — the latched re-drive's restore-and-route
+    and a plain attempt's byte-only restore: the path is canonical OUTSIDE the mount,
+    so the byte restore's canonical walk alone would accept it. Its pin pre-check
+    refuses before anything is written — surfacing as the owned-spec pause, like
+    any other unsafe restore target — and the outside copy keeps the failed
+    child's bytes; unpinned, the restore lands outside.
+
+    Ablation: drop the `require_root_pinned` pre-check from
+    `_restore_attempt_owned_spec_bytes` (or its `root_identity` forward from
+    `_restore_attempt_owned_spec` / `_restore_attempt_owned_spec_bytes_or_pause`)
+    and the pinned row writes the snapshot outside."""
+    ws, run_dir = _real_unit(project)
+    spec = ws.paths.implementation_artifacts / "untracked-redrive.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    corrected = b"---\nstatus: ready-for-dev\n---\n\nhuman corrected untracked intent\n"
+    spec.write_bytes(corrected)
+    task = _unit_task(ws)
+    task.baseline_untracked = [spec.relative_to(ws.root).as_posix()]
+    task.dispatched_spec_file = spec.relative_to(ws.paths.project).as_posix()
+    task.dispatched_spec_snapshot = corrected
+    task.resolved_redrive = redrive
+    child = b"---\nstatus: done\n---\n\nfailed child untracked body\n"
+    spec.write_bytes(child)
+    flow = _unit_flow(project, ws, run_dir, monkeypatch, pinned=pinned, rollback=False)
+    outside = tmp_path / "outside"
+    _swap_unit_mount(ws, outside)
+    outside_spec = outside / spec.relative_to(ws.root)
+
+    if pinned:
+        with pytest.raises(_Pause):
+            flow.rollback_or_pause(task)
+        _assert_pin_pause(flow, task, "before the baseline reset")
+        assert outside_spec.read_bytes() == child
+    else:
+        with contextlib.suppress(_Pause):
+            flow.rollback_or_pause(task)
+        assert outside_spec.read_bytes() == corrected
+
+
+@requires_descriptor_restoration
+@pytest.mark.parametrize("redrive", [True, False], ids=["redrive", "plain"])
+def test_snapshot_restore_on_an_intact_mount_lands_under_the_pin(project, monkeypatch, redrive):
+    """The positive half of the byte-restore pin: on an INTACT real unit mount, with
+    the pin live, the snapshot restore ("before the baseline reset") writes the
+    corrected bytes into the mount and never takes the owned-spec pause.
+
+    Ablation: pin the wrong directory in `_restore_attempt_owned_spec_bytes` (e.g.
+    `require_root_pinned(spec_path.parent, root_identity)`) and the restore pauses
+    for manual owned-spec recovery here while every swapped-mount row stays green."""
+    ws, run_dir = _real_unit(project)
+    spec = ws.paths.implementation_artifacts / "untracked-redrive.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    corrected = b"---\nstatus: ready-for-dev\n---\n\nhuman corrected untracked intent\n"
+    task = _unit_task(ws)
+    task.baseline_untracked = [spec.relative_to(ws.root).as_posix()]
+    task.dispatched_spec_file = spec.relative_to(ws.paths.project).as_posix()
+    task.dispatched_spec_snapshot = corrected
+    task.resolved_redrive = redrive
+    spec.write_bytes(b"---\nstatus: done\n---\n\nfailed child untracked body\n")
+    flow = _unit_flow(project, ws, run_dir, monkeypatch, pinned=True, rollback=False)
+    assert flow._mount_root_identity(task, ws) is not None
+
+    with contextlib.suppress(_Pause):
+        flow.rollback_or_pause(task)
+
+    assert "rollback-owned-spec-manual-required" not in flow.journal.events()
+    assert spec.read_bytes() == corrected
+
+
+@requires_descriptor_restoration
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned-control"])
+def test_redrive_post_reset_normalization_refuses_a_mount_swapped_during_the_reset(
+    project, tmp_path, monkeypatch, pinned
+):
+    """The `resolved` unwind's post-reset route repair on a real unit mount whose
+    worktree is swapped for a link while the baseline reset runs: the binding was
+    made through the intact mount, so the normalization takes the in-project arm,
+    and the pinned walk refuses the swapped root — the outside copy keeps the
+    escalated attempt's status. Unpinned, the same swap lands the repair outside.
+
+    Ablation: drop `root_identity=` at the post-reset normalization site (or the
+    forward in `_normalize_attempt_owned_spec_or_pause`) and the pinned row
+    rewrites the outside copy."""
+    spec_main = _tracked_spec(project)
+    ws, run_dir = _real_unit(project)
+    spec = ws.paths.implementation_artifacts / spec_main.name
+    spec.write_bytes(b"---\nstatus: done\n---\n\nescalated attempt\n")
+    task = _unit_task(ws)
+    task.dispatched_spec_file = str(spec)
+    (ws.root / "src.txt").write_text("failed attempt residue\n")  # real dirt to undo
+    flow = _unit_flow(project, ws, run_dir, monkeypatch, pinned=pinned, rollback=False)
+    outside = tmp_path / "outside"
+    outside_spec = outside / spec.relative_to(ws.root)
+    real_safe_reset = flow.safe_reset
+
+    def swap_after_reset(reset_task, *, preserve=()):
+        real_safe_reset(reset_task, preserve=preserve)
+        _swap_unit_mount(ws, outside)
+
+    monkeypatch.setattr(flow, "safe_reset", swap_after_reset)
+
+    if pinned:
+        with pytest.raises(UnconfinedWriteError):
+            flow.rollback_or_pause(task, cause="resolved")
+        assert _status(outside_spec) == "done"
+    else:
+        with contextlib.suppress(_Pause):
+            flow.rollback_or_pause(task, cause="resolved")
+        assert _status(outside_spec) == "ready-for-dev"
+
+
+_BASE_SPEC = b"---\nstatus: ready-for-dev\n---\n\nbaseline intent\n"
+_EDITED_SPEC = b"---\nstatus: ready-for-dev\n---\n\nhuman corrected intent\n"
+_CHILD_SPEC = b"---\nstatus: done\n---\n\nfailed child body\n"
+
+
+def _site_retry_input(project, ws, flow, monkeypatch, outside):
+    """Latched re-drive, tracked spec already at its corrected snapshot, no other
+    dirt: the region's restore-and-route "while restoring the pre-attempt retry
+    input". Swapped before binding."""
+    spec = ws.paths.implementation_artifacts / "spec-1-1-a.md"
+    spec.write_bytes(_EDITED_SPEC)
+    task = _unit_task(ws)
+    task.dispatched_spec_file = spec.relative_to(ws.paths.project).as_posix()
+    task.dispatched_spec_snapshot = _EDITED_SPEC
+    task.resolved_redrive = True
+    _swap_unit_mount(ws, outside)
+    return task, spec
+
+
+def _swap_after_normalization(flow, ws, monkeypatch, outside) -> None:
+    real = RecoveryFlow._normalize_attempt_owned_spec
+
+    def normalize_then_swap(path, target_status, **kwargs):
+        real(path, target_status, **kwargs)
+        _swap_unit_mount(ws, outside)
+
+    monkeypatch.setattr(flow, "_normalize_attempt_owned_spec", normalize_then_swap)
+
+
+def _site_operator_input(project, ws, flow, monkeypatch, outside):
+    """Plain attempt whose child reverted the operator's pre-launch edit to the
+    baseline: normalization, then the byte restore "while restoring the pre-launch
+    operator input". Normalization runs first under the SAME pin, so a mount
+    swapped before binding refuses there (raised) and never reaches this site; the
+    swap therefore lands right after normalization. The binding then names a path
+    THROUGH the swapped mount, which the canonical walk refuses too — only the
+    journaled problem ("could not be revalidated", not "became unsafe") tells the
+    pin's refusal apart."""
+    spec = ws.paths.implementation_artifacts / "spec-1-1-a.md"
+    task = _unit_task(ws)
+    task.dispatched_spec_file = str(spec)
+    task.dispatched_spec_snapshot = _EDITED_SPEC  # the operator's pre-launch input
+    spec.write_bytes(_BASE_SPEC)  # the child reverted it to baseline
+    _swap_after_normalization(flow, ws, monkeypatch, outside)
+    return task, spec
+
+
+def _site_tentative_repair(project, ws, flow, monkeypatch, outside):
+    """Plain attempt whose child edited the tracked spec's body and status, no
+    snapshot: normalization fixes the status only, the re-probe stays dirty, and the
+    byte restore "while undoing a tentative lifecycle repair" puts the child's
+    bytes back. Swapped right after normalization, for `_site_operator_input`'s
+    reason (the pin refuses the normalization itself on an earlier swap)."""
+    spec = ws.paths.implementation_artifacts / "spec-1-1-a.md"
+    task = _unit_task(ws)
+    task.dispatched_spec_file = str(spec)
+    spec.write_bytes(_CHILD_SPEC)
+    _swap_after_normalization(flow, ws, monkeypatch, outside)
+    return task, spec
+
+
+def _after_reset_site(redrive: bool):
+    def build(project, ws, flow, monkeypatch, outside):
+        """Baseline-untracked spec at its snapshot plus sibling residue: the reset
+        arm, no restore before the reset, then the after-reset restore — byte-only
+        (plain) or restore-and-route (re-drive). Swapped before binding."""
+        spec = ws.paths.implementation_artifacts / "untracked.md"
+        spec.write_bytes(_EDITED_SPEC)
+        task = _unit_task(ws)
+        task.baseline_untracked = [spec.relative_to(ws.root).as_posix()]
+        task.dispatched_spec_file = spec.relative_to(ws.paths.project).as_posix()
+        task.dispatched_spec_snapshot = _EDITED_SPEC
+        task.resolved_redrive = redrive
+        (ws.root / "residue.txt").write_text("failed attempt residue\n")
+        _swap_unit_mount(ws, outside)
+        return task, spec
+
+    return build
+
+
+_RESTORE_SITES = {
+    "retry-input": (_site_retry_input, "while restoring the pre-attempt retry input"),
+    "operator-input": (_site_operator_input, "while restoring the pre-launch operator input"),
+    "tentative-repair": (_site_tentative_repair, "while undoing a tentative lifecycle repair"),
+    "after-reset-bytes": (_after_reset_site(False), "after the baseline reset"),
+    "after-reset-redrive": (_after_reset_site(True), "after the baseline reset"),
+}
+
+
+@requires_descriptor_restoration
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("site", sorted(_RESTORE_SITES))
+def test_owned_spec_restore_sites_pause_on_a_swapped_mount(project, tmp_path, monkeypatch, site):
+    """Each `rollback_or_pause` restore site on a real unit mount swapped for a
+    link: the byte restore's pin pre-check refuses before anything is written, the
+    refusal surfaces as the owned-spec pause at THAT site, and the outside copy's
+    bytes are unchanged.
+
+    Not covered: the byte restore "before the ordinary manual-recovery pause". That
+    arm is reached only when ``in_unit_worktree`` is False — a mounted workspace
+    always takes the auto-recovery arm — and off a mount the pin is None by the
+    same test, so there is no swapped mount for it to refuse.
+
+    Ablation: drop the site's ``root_identity=`` (or ``confine_root=``) forward in
+    `rollback_or_pause` and its row reddens — no pause at that site, or (for
+    operator-input and tentative-repair, swapped after normalization) the canonical
+    walk's "became unsafe" problem instead."""
+    _tracked_spec(project, body="baseline intent\n")
+    ws, run_dir = _real_unit(project)
+    flow = _unit_flow(project, ws, run_dir, monkeypatch, pinned=True, rollback=False)
+    outside = tmp_path / "outside"
+    build, unsafe_context = _RESTORE_SITES[site]
+    task, spec = build(project, ws, flow, monkeypatch, outside)
+    outside_spec = outside / spec.relative_to(ws.root)
+
+    with pytest.raises(_Pause):
+        flow.rollback_or_pause(task)
+
+    _assert_pin_pause(flow, task, unsafe_context)
+    if site == "operator-input":
+        expected = _BASE_SPEC  # normalized before the swap, never restored after
+    elif site == "tentative-repair":
+        expected = _CHILD_SPEC.replace(b"status: done", b"status: ready-for-dev")
+    else:
+        expected = _EDITED_SPEC
+    assert outside_spec.read_bytes() == expected
+
+
+def test_owned_spec_pause_folds_multiline_spec_and_root_paths(project, tmp_path, monkeypatch):
+    """`pause_for_owned_spec_recovery` folds `{spec}` and `{root}` wherever its notice
+    shows them — headline, contract and steps — into one segment of their line; the
+    journal row keeps `spec` raw (DW-492).
+
+    Ablation: interpolate the raw `spec` (or `root`) in the notice and a loose
+    `hint: y` line lands in ATTENTION."""
+    repo = project.project
+    workspace = Workspace.default(project)
+    flow = _make_flow(workspace=workspace, run_dir=tmp_path)
+    task = _task(repo)
+    root = f"/checkout/{_MULTILINE_FAULT}"
+    monkeypatch.setattr(flow, "_workspace_get", lambda: SimpleNamespace(root=Path(root)))
+    spec = f"/spec/{_MULTILINE_FAULT}.md"
+
+    with pytest.raises(_Pause):
+        flow.pause_for_owned_spec_recovery(task, spec, "problem")
+
+    _assert_fragment_folded(tmp_path)
+    text = "\n".join(_attention_lines(tmp_path))
+    assert text.count(f"/spec/{_FOLDED_FAULT}.md") == 4
+    # `root` reaches the notice through `Path`, so it carries the platform separator.
+    assert text.count(f"{os.sep}checkout{os.sep}{_FOLDED_FAULT}") == 4
+    assert flow.journal.fields("rollback-owned-spec-manual-required")["spec"] == spec
+
+
+class _RecordingPlanWriter:
+    """An `OwnedPlanWriter` owning every spec, recording its calls; its restore
+    writes the bytes back, as `TicketTree.restore_preimage` does."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Path, object]] = []
+
+    def owns(self, task, spec_path) -> bool:
+        return True
+
+    def restore(self, task, spec_path, data) -> None:
+        self.calls.append(("restore", spec_path, data))
+        spec_path.write_bytes(data)
+
+    def normalize(self, task, spec_path, target_status) -> None:
+        self.calls.append(("normalize", spec_path, target_status))
+
+
+@pytest.mark.parametrize("inside", [True, False], ids=["in-store", "outside-store"])
+def test_owned_plan_restore_confined_to_store_root(project, tmp_path, inside):
+    """A work item's plan is restored by its own writer (tickets mode:
+    `TicketTree.restore_preimage`), never the anchored writers here — and only
+    inside the store root `spec_confine_root` answers. A bound plan resolving
+    outside it is never handed to the writer: recovery pauses for the operator
+    with the plan untouched. Ablation (performed): drop the confinement check in
+    `RecoveryFlow._route_owned_plan` and the outside plan is restored — this
+    FAILS."""
+    repo = project.project
+    spec = _tracked_spec(project)
+    baseline = spec.read_bytes()
+    task = _task(repo)
+    operator = baseline.replace(b"baseline intent", b"operator input outside HEAD")
+    task.dispatched_spec_file = str(spec)
+    task.dispatched_spec_snapshot = operator
+    # the failed child put the plan back at HEAD, discarding the pre-launch input
+    spec.write_bytes(baseline)
+    store = spec.parent if inside else tmp_path / "another-store"
+    store.mkdir(exist_ok=True)
+    writer = _RecordingPlanWriter()
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=False),
+        spec_confine_root=lambda _task: store,
+        owned_plan=writer,
+    )
+
+    if inside:
+        flow.rollback_or_pause(task)
+        assert ("restore", spec, operator) in [(k, Path(p), d) for k, p, d in writer.calls]
+        assert spec.read_bytes() == operator
+        assert flow.calls.pauses == []
+    else:
+        with pytest.raises(_Pause):
+            flow.rollback_or_pause(task)
+        assert writer.calls == []
+        assert spec.read_bytes() == baseline
+        assert any("outside the store root" in reason for reason, *_ in flow.calls.pauses)

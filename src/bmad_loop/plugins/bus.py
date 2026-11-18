@@ -12,6 +12,24 @@ plugins. It enforces the two invariants that keep plugins safe:
     offending instance disabled for the rest of the run. A declarative hook that
     errors (timeout, bad interpreter) fails open by default (the run survives);
     ``fail_closed`` turns an error into a defer veto.
+  * **Stop-aware declarative hooks** (DW-353). Declarative hooks run through
+    :func:`bmad_loop.childrun.run_child`, which kills the hook's whole process
+    tree on a timeout or a pending HARD stop request. An interrupted hook is
+    neither an error nor a veto: the bus journals ``plugin-hook-interrupted``
+    and re-raises :class:`~bmad_loop.childrun.ChildInterrupted`, which the
+    engine turns into a hard stop (``RunStopped``) — even under ``fail_closed``.
+
+  * **Trust is the registry's.** The bus dispatches only ``LoadedPlugin.active``
+    plugins — never a refused project plugin or an un-enabled builtin
+    ``[python]`` one, not even its declarative hooks (#496/#497) — and never
+    re-derives trust from a manifest's source. A granted plugin's ``{scripts}``
+    already points at its verified snapshot. Declarative hooks run with
+    ``PYTHONDONTWRITEBYTECODE=1`` so a Python hook never writes ``.pyc`` files.
+  * **Writer dispatches are announced.** Before an active plugin whose manifest
+    is not ``read_only`` dispatches anything for a stage, the bus calls the
+    optional ``on_writer_dispatch(plugin, stage)`` callback — once per plugin per
+    ``emit`` — so the engine can void a ``[verify] reuse_unchanged`` token the
+    hook may have staled. ``read_only`` plugins dispatch silently.
 
 Dispatch order is registry order (manifest ``priority`` then load order).
 Mutations pipeline — a later plugin sees an earlier plugin's edits. Vetoes are
@@ -23,9 +41,9 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 from typing import Any, Callable
 
+from ..childrun import ChildInterrupted, run_child
 from .context import MUTABLE_FIELDS, VETO_ACTIONS, HookContext, Veto
 from .model import LoadedPlugin
 from .registry import PluginRegistry
@@ -44,8 +62,11 @@ def _run_subprocess(
     cmd: str, *, cwd: str | None, env: dict[str, str], timeout: int
 ) -> tuple[int, str]:
     """Default declarative-hook transport: a shell command with the plugin env,
-    capturing output. shell=True is intentional (mirrors the deterministic verify
-    commands + the legacy engine ``*_cmd`` hooks).
+    capturing output, run through the stop-aware :func:`run_child` (DW-353) — the
+    same seam as the deterministic verify commands, so a timeout or a pending hard
+    stop kills the hook's whole process tree. An interrupted hook raises
+    :class:`ChildInterrupted`, deliberately not ``_HookError``: a hard stop is not
+    a hook failure and must never become a fail-closed veto.
 
     Output decodes with ``errors="replace"`` (#383): a hook's output is arbitrary
     operator-tool text whose bytes are not ours to constrain, and a strict decode
@@ -54,21 +75,14 @@ def _run_subprocess(
     transport-failure channel, and crashed the run, losing even a passing hook's
     exit code. Same fix and reasoning as ``verify.run_verify_commands`` (#378)."""
     try:
-        proc = subprocess.run(  # nosec B602 - operator-authored plugin command
-            cmd,
-            shell=True,  # portability: operator-authored plugin command — sanctioned shell-out (see plan out-of-scope)
-            cwd=cwd,
-            env=env,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise _HookError(f"timed out after {timeout}s") from e
+        child = run_child(cmd, cwd=cwd, env=env, timeout=timeout)
     except OSError as e:
         raise _HookError(str(e)) from e
-    return proc.returncode, proc.stdout + proc.stderr
+    if child.interrupted:
+        raise ChildInterrupted(f"hook interrupted by a hard stop request: {cmd}")
+    if child.timed_out or child.returncode is None:
+        raise _HookError(f"timed out after {timeout}s")
+    return child.returncode, child.stdout + child.stderr
 
 
 def _instance_stages(instance: Any) -> set[str]:
@@ -98,9 +112,16 @@ def _hook_env(ctx: HookContext, lp: LoadedPlugin) -> dict[str, str]:
         "BMAD_LOOP_PHASE": ctx.phase or "",
         "BMAD_LOOP_BRANCH": ctx.branch or "",
         "BMAD_LOOP_AGENTS": ",".join(ctx.agents),
+        # at-least-once stages only (post_migrate); the consumer's dedup key
+        "BMAD_LOOP_DELIVERY_ID": ctx.delivery_id or "",
+        # post_rollback only (DW-322): completed | paused | failed
+        "BMAD_LOOP_ROLLBACK_OUTCOME": ctx.rollback_outcome or "",
         "BMAD_LOOP_PLUGIN": lp.name,
     }
     env.update({k: v for k, v in fields.items() if v != ""})
+    # a Python hook must not write __pycache__ into its (snapshot) dir: the next
+    # verify would refuse the snapshot and every launch would rebuild it.
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     # the plugin's *resolved* settings (defaults overlaid by [plugins.<name>]),
     # not bare manifest defaults, so a declarative hook sees the operator's config.
     for key, value in lp.settings.items():
@@ -136,10 +157,14 @@ class HookBus:
         journal: Any = None,
         *,
         runner: HookRunner | None = None,
+        on_writer_dispatch: Callable[[str, str], None] | None = None,
     ):
         self._registry = registry
         self._journal = journal
         self._runner = runner or _run_subprocess
+        # (plugin name, stage) -> None, called before a non-read_only plugin
+        # dispatches; the engine's verify-reuse void (see module docstring).
+        self._on_writer_dispatch = on_writer_dispatch
         # plugins disabled mid-run after an in-process hook raised (failure
         # isolation): skipped for every subsequent stage.
         self._disabled: set[str] = set()
@@ -147,6 +172,8 @@ class HookBus:
         self._active: set[str] = set()
         self._py_stages: dict[str, set[str]] = {}
         for lp in registry.plugins():
+            if not lp.active:
+                continue  # refused / un-enabled: nothing of it runs (#496/#497)
             for hook in lp.manifest.hooks:
                 self._active.add(hook.stage)
             if lp.instance is not None:
@@ -170,6 +197,8 @@ class HookBus:
         run-start journal entry when (and only when) plugins are live."""
         out: list[str] = []
         for lp in self._registry.plugins():
+            if not lp.active:
+                continue
             if lp.manifest.hooks or lp.name in self._py_stages:
                 out.append(lp.name)
         return out
@@ -183,12 +212,19 @@ class HookBus:
         if stage not in self._active:
             return ctx
         for lp in self._registry.plugins():
-            if lp.name in self._disabled:
+            if not lp.active or lp.name in self._disabled:
                 continue
             hook = lp.manifest.hook_for(stage)
+            py = lp.instance is not None and stage in self._py_stages.get(lp.name, ())
+            if (
+                (hook is not None or py)
+                and not lp.manifest.read_only
+                and self._on_writer_dispatch is not None
+            ):
+                self._on_writer_dispatch(lp.name, stage)
             if hook is not None:
                 self._dispatch_declarative(lp, hook, ctx)
-            if lp.instance is not None and stage in self._py_stages.get(lp.name, ()):
+            if py:
                 self._dispatch_python(lp, stage, ctx)
         return ctx
 
@@ -205,6 +241,12 @@ class HookBus:
             cwd = ctx.repo_root or None
         try:
             rc, output = self._runner(cmd, cwd=cwd, env=env, timeout=hook.timeout_sec)
+        except ChildInterrupted:
+            # A hard stop, not a hook failure: no plugin-hook-error, no veto (even
+            # under fail_closed). Journalled so the record says which hook the stop
+            # cut short, then handed to the engine to become RunStopped.
+            self._log("plugin-hook-interrupted", plugin=lp.name, stage=hook.stage)
+            raise
         except _HookError as e:
             self._log("plugin-hook-error", plugin=lp.name, stage=hook.stage, error=str(e))
             if hook.blocking and hook.fail_closed:

@@ -12,26 +12,37 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from unittest import mock
 
 import pytest
 from conftest import (
     NUL_PATH_RESOLVE_FAULTS,
+    RENDER_PROBE_HALT_BODY,
+    RENDER_PROBE_OK_BODY,
+    RENDER_PROBE_TRACEBACK_BODY,
     RENDERER_SCRIPT_IMPORTING_SIBLING,
     RENDERER_STUB_SKILL_MD,
     git,
     install_build_auto_skill,
+    install_build_auto_v7_skill,
     install_dev_shim,
+    install_render_probe_fixture,
+    nested_repo_root_paths,
     refuse_to_resolve,
+    render_probe_stub_skill_md,
     windows_relay_builder,
+    write_script_launcher,
 )
 
 import bmad_loop.install as install_mod
 import bmad_loop.worktree_flow as worktree_flow_mod
 from bmad_loop import verify
 from bmad_loop.adapters.profile import ProfileError, get_profile
+from bmad_loop.checks import Finding
 from bmad_loop.install import (
     BASE_SKILLS,
     BMAD_DIR,
+    BMAD_FLOOR_TEXT,
     BMAD_SCRIPTS_SEED_REL,
     CENTRAL_CONFIG_REL,
     CUSTOMIZE_DIR,
@@ -44,20 +55,24 @@ from bmad_loop.install import (
     RENDERER_CONFIG_UTILS_REL,
     RENDERER_ENTRY_REL,
     RENDERER_SCRIPT_REL,
+    REVIEW_FLOOR_TEXT,
     SNAPSHOT_TOKEN_RE,
     _absent_renderer_sources,
     _copy_traversable,
     _is_dev_primitive_shim,
     _register_hooks,
+    _render_path_unmapper,
     _shield_undo_extension,
     _worktree_local_exclude,
     dev_primitive_or_default,
     dev_primitive_warnings,
+    dev_renderer_probe,
     install_into,
     merge_hooks,
     missing_base_skills,
     missing_stories_support,
     provision_worktree,
+    registered_relay_interpreters,
     registered_relay_paths,
     relay_executable,
     relay_registered,
@@ -73,6 +88,7 @@ from bmad_loop.worktree_flow import (
     _seed_bmad_tree,
     base_skills_seed_incomplete,
     module_skills_seed_undelivered,
+    provision_roots,
     worktree_seed_undelivered,
 )
 
@@ -143,6 +159,21 @@ def _installed_relay_suffix(event: str) -> str:
     """Expected installed entry point and canonical relay event on this host."""
     name = "bmad-loop.exe" if os.name == "nt" else "bmad-loop"
     return f"{name} relay {event}"
+
+
+def _assert_installed_relay(command: str, event: str) -> None:
+    """Exactly `[exe, "relay", event]` with a real, absolute, executable entry point.
+
+    Parsed here with shlex, never through `relay_executable_text`: a harness must
+    not depend on the artifact it validates. init's commands carry no backslashes
+    (#773), so POSIX-mode splitting reads every host's spelling.
+    """
+    parts = shlex.split(command)
+    assert len(parts) == 3 and parts[1:] == ["relay", event], command
+    executable = Path(parts[0])
+    assert executable.is_absolute(), command
+    assert executable.name in {"bmad-loop", "bmad-loop.exe"}, command
+    assert executable.is_file() and os.access(executable, os.X_OK), command
 
 
 def _registrations(profile, command="python3 /x/.bmad-loop/bmad_loop_hook.py {event}"):
@@ -230,13 +261,22 @@ def test_merge_hooks_cursor_is_idempotent():
     assert again["hooks"]["stop"] == [{"command": "/opt/bmad/bin/bmad-loop relay Stop"}]
 
 
-def test_merge_hooks_idempotent():
-    profile = get_profile("claude")
+@pytest.mark.parametrize(
+    "name",
+    [
+        "claude",
+        "copilot",  # the bare-handler shape must still dedupe on a re-run
+        "antigravity",  # keyed by hook NAME ("bmad-loop"), flat Stop handler
+    ],
+)
+def test_merge_hooks_idempotent(name):
+    profile = get_profile(name)
     settings, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
     again, changed = merge_hooks(settings, _registrations(profile), profile.hooks.dialect)
     assert not changed
+    container = install_mod.hook_event_container(again, profile.hooks.dialect)
     for event in profile.hooks.events:
-        assert len(again["hooks"][event]) == 1
+        assert len(container[event]) == 1
 
 
 def test_merge_hooks_preserves_existing():
@@ -286,8 +326,9 @@ def test_init_migrates_legacy_relay_and_preserves_user_hook(tmp_path):
         for hook in group["hooks"]
     ]
     assert commands.count("make lint") == 1
-    assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
-    assert all("bmad_loop_hook.py" not in command for command in commands)
+    relays = [command for command in commands if command != "make lint"]
+    assert len(relays) == 1
+    _assert_installed_relay(relays[0], "Stop")
     assert install_into(tmp_path, skills=False) == 0
     assert config.read_bytes() == migrated
 
@@ -331,7 +372,8 @@ def test_init_migrates_windows_legacy_relay_on_posix(tmp_path, old_command):
         for hook in group["hooks"]
     ]
     assert old_command not in commands
-    assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
+    assert len(commands) == 1
+    _assert_installed_relay(commands[0], "Stop")
 
 
 @pytest.mark.parametrize(
@@ -373,8 +415,8 @@ def test_init_replaces_installed_relay_from_either_os(tmp_path, stale_command):
     ]
     assert commands.count("make lint") == 1
     assert stale_command not in commands
-    assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
     assert len(commands) == 2
+    _assert_installed_relay(next(c for c in commands if c != "make lint"), "Stop")
 
 
 @pytest.mark.parametrize(
@@ -400,6 +442,487 @@ def test_registered_relay_paths_reads_installed_relay_from_either_os(
     assert [str(path).replace("\\", "/") for path, _ in paths] == [expected_path.replace("\\", "/")]
     # The spelling is the registered text, which `Path` would normalize on Windows.
     assert [spelling for _, spelling in paths] == [expected_path]
+
+
+_RELAY_EXE = "/opt/bmad/bin/bmad-loop"
+_FLAT_DIALECTS = {"copilot-settings-json", "antigravity-hooks-json"}
+
+
+def _relay_handler(profile, command, handler_type="command"):
+    """One handler in the profile's own shape: flat for copilot/agy, nested otherwise."""
+    item = {"type": handler_type, "command": command}
+    return item if profile.hooks.dialect in _FLAT_DIALECTS else {"hooks": [item]}
+
+
+def _hook_config(profile, handlers_by_native):
+    key = (
+        install_mod.ANTIGRAVITY_HOOK_GROUP
+        if profile.hooks.dialect == "antigravity-hooks-json"
+        else "hooks"
+    )
+    return {key: handlers_by_native}
+
+
+def _native_for(profile, canonical):
+    return next(native for native, event in profile.hooks.events.items() if event == canonical)
+
+
+def _registered(profile, config):
+    return relay_registered(config, profile.hooks.dialect, profile.hooks.events)
+
+
+@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "antigravity"])
+def test_relay_registered_after_fresh_init(tmp_path, name):
+    profile = get_profile(name)
+    assert install_into(tmp_path, clis=(name,), skills=False) == 0
+    config = json.loads((tmp_path / profile.hooks.config_path).read_text())
+    assert _registered(profile, config)
+
+
+@pytest.mark.parametrize("name", ["claude", "copilot", "antigravity"])
+def test_relay_registered_accepts_command_stop(name):
+    profile = get_profile(name)
+    stop = _native_for(profile, "Stop")
+    config = _hook_config(profile, {stop: [_relay_handler(profile, f"{_RELAY_EXE} relay Stop")]})
+    assert _registered(profile, config)
+
+
+def test_fresh_claude_init_registers_the_notification_relay(tmp_path):
+    """DW-348: claude's parked-session signals ride one unfiltered `Notification`
+    relay reporting the canonical carrier; the subtype is forwarded in the
+    payload, so no per-subtype registration exists."""
+    assert install_into(tmp_path, clis=("claude",), skills=False) == 0
+    config = json.loads((tmp_path / ".claude/settings.json").read_text())
+    (handler,) = config["hooks"]["Notification"]
+    (item,) = handler["hooks"]
+    assert item["command"].endswith(" relay Notification")
+
+
+def test_relay_registered_without_the_notification_relay(tmp_path):
+    """An install that predates DW-348 has no `Notification` relay; registration
+    still holds ("other events need not be present") and the project simply runs
+    without hook-reported parked signals until it is re-initialized."""
+    profile = get_profile("claude")
+    assert install_into(tmp_path, clis=("claude",), skills=False) == 0
+    config = json.loads((tmp_path / profile.hooks.config_path).read_text())
+    del config["hooks"]["Notification"]
+    assert _registered(profile, config)
+
+
+@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "antigravity"])
+def test_missing_relay_events_is_empty_after_fresh_init(tmp_path, name):
+    profile = get_profile(name)
+    assert install_into(tmp_path, clis=(name,), skills=False) == 0
+    config = json.loads((tmp_path / profile.hooks.config_path).read_text(encoding="utf-8"))
+    events = profile.hooks.events
+    assert install_mod.missing_relay_events(config, profile.hooks.dialect, events) == []
+
+
+def test_missing_relay_events_names_unregistered_and_mislabelled_natives():
+    """A config written before claude mapped `StopFailure` lacks it; a relay under
+    a mapped native that reports a different canonical event does not count, and
+    neither does a non-executed (`prompt`) handler."""
+    profile = get_profile("claude")
+    events = profile.hooks.events
+    config = _hook_config(
+        profile,
+        {
+            "Stop": [_relay_handler(profile, f"{_RELAY_EXE} relay Stop")],
+            "SessionStart": [_relay_handler(profile, f"{_RELAY_EXE} relay SessionEnd")],
+            "PreCompact": [
+                _relay_handler(profile, f"{_RELAY_EXE} relay PreCompact", handler_type="prompt")
+            ],
+        },
+    )
+    missing = install_mod.missing_relay_events(config, profile.hooks.dialect, events)
+    assert missing == [native for native in events if native != "Stop"]
+
+
+@pytest.mark.parametrize("kind", ["Notification", "PermissionPrompt", "IdlePrompt", "QuotaPrompt"])
+def test_parked_kind_relay_commands_are_managed(kind):
+    """A profile may map a native event straight to a parked kind (DW-348); its
+    `relay <kind>` command must read as managed so init dedups and strips it like
+    every other relay rather than piling up a second copy per re-init."""
+    assert install_mod._relay_canonical_event(f"{_RELAY_EXE} relay {kind}") == kind
+    assert install_mod._relay_command(f"{_RELAY_EXE} relay {kind}")
+
+
+@pytest.mark.parametrize("name", ["claude", "copilot"])
+def test_relay_registered_refuses_session_start_only(name):
+    profile = get_profile(name)
+    start = _native_for(profile, "SessionStart")
+    config = _hook_config(
+        profile, {start: [_relay_handler(profile, f"{_RELAY_EXE} relay SessionStart")]}
+    )
+    assert not _registered(profile, config)
+
+
+@pytest.mark.parametrize("name", ["claude", "copilot", "antigravity"])
+def test_relay_registered_refuses_wrong_canonical_on_stop(name):
+    profile = get_profile(name)
+    stop = _native_for(profile, "Stop")
+    config = _hook_config(
+        profile, {stop: [_relay_handler(profile, f"{_RELAY_EXE} relay SessionEnd")]}
+    )
+    assert not _registered(profile, config)
+
+
+@pytest.mark.parametrize("name", ["claude", "copilot"])
+def test_relay_registered_refuses_wrong_canonical_elsewhere(name):
+    # A SessionStart firing `relay Stop` completes every session at launch.
+    profile = get_profile(name)
+    stop, start = _native_for(profile, "Stop"), _native_for(profile, "SessionStart")
+    config = _hook_config(
+        profile,
+        {
+            stop: [_relay_handler(profile, f"{_RELAY_EXE} relay Stop")],
+            start: [_relay_handler(profile, f"{_RELAY_EXE} relay Stop")],
+        },
+    )
+    assert not _registered(profile, config)
+
+
+@pytest.mark.parametrize("name", ["claude", "copilot", "antigravity"])
+def test_non_command_stop_relay_is_unregistered_and_merge_adds_command(name):
+    profile = get_profile(name)
+    stop = _native_for(profile, "Stop")
+    registrations = {
+        native: f"{_RELAY_EXE} relay {canonical}"
+        for native, canonical in profile.hooks.events.items()
+    }
+    prompt = _relay_handler(profile, registrations[stop], handler_type="prompt")
+    config = _hook_config(profile, {stop: [prompt]})
+    assert not _registered(profile, config)
+
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert changed
+    handlers = install_mod.hook_event_container(config, profile.hooks.dialect)[stop]
+    assert prompt in handlers
+    executed = [
+        item
+        for handler in handlers
+        for item in (handler["hooks"] if "hooks" in handler else [handler])
+        if item["type"] == "command"
+    ]
+    assert [item["command"] for item in executed] == [registrations[stop]]
+    assert _registered(profile, config)
+    _, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert not changed
+
+
+def _correct_config(profile):
+    """Every mapped native running its own correct relay, in the profile's shape."""
+    return _hook_config(
+        profile,
+        {
+            native: [_relay_handler(profile, command)]
+            for native, command in _registrations(profile, f"{_RELAY_EXE} relay {{event}}").items()
+        },
+    )
+
+
+_LEGACY_STOP = "python3 /p/.bmad-loop/bmad_loop_hook.py Stop"
+
+
+@pytest.mark.parametrize(
+    "name,native,command",
+    [
+        ("claude", "SubagentStop", f"{_RELAY_EXE} relay Stop"),
+        ("claude", "UserPromptSubmit", f"{_RELAY_EXE} relay Stop"),
+        ("copilot", "userPromptSubmitted", f"{_RELAY_EXE} relay Stop"),
+        ("antigravity", "PreToolUse", f"{_RELAY_EXE} relay Stop"),
+        ("claude", "UserPromptSubmit", f"{_RELAY_EXE} relay SessionStart"),
+        ("claude", "SubagentStop", _LEGACY_STOP),
+    ],
+    ids=["subagent-stop", "user-prompt", "copilot-flat", "agy-flat", "disagrees", "legacy"],
+)
+def test_hazardous_relay_under_unmapped_native_is_refused_and_merge_strips_it(
+    name, native, command
+):
+    """DW-409: a managed relay under a native the profile does not map, reporting
+    Stop or a canonical event the profile maps from another native, fires on the
+    wrong event. `relay_registered` refuses it and `merge_hooks` repairs it."""
+    profile = get_profile(name)
+    assert native not in profile.hooks.events
+    config = _correct_config(profile)
+    container = install_mod.hook_event_container(config, profile.hooks.dialect)
+    assert _registered(profile, config)
+    container[native] = [_relay_handler(profile, command)]
+    assert not _registered(profile, config)
+
+    registrations = _registrations(profile, f"{_RELAY_EXE} relay {{event}}")
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert changed
+    container = install_mod.hook_event_container(config, profile.hooks.dialect)
+    assert native not in container
+    assert container == install_mod.hook_event_container(
+        _correct_config(profile), profile.hooks.dialect
+    )
+    assert _registered(profile, config)
+    _, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert not changed
+
+
+def test_relay_reporting_an_unmapped_canonical_under_an_unmapped_native_is_kept():
+    """It may be an alias profile's registration in a shared config file."""
+    profile = get_profile("codex")
+    assert "PreCompact" not in profile.hooks.events
+    assert "PreCompact" not in profile.hooks.events.values()
+    config = _correct_config(profile)
+    config["hooks"]["PreCompact"] = [_relay_handler(profile, f"{_RELAY_EXE} relay PreCompact")]
+    before = json.loads(json.dumps(config))
+    assert _registered(profile, config)
+
+    config, changed = merge_hooks(
+        config, _registrations(profile, f"{_RELAY_EXE} relay {{event}}"), profile.hooks.dialect
+    )
+    assert not changed
+    assert config == before
+
+
+def test_unmapped_strip_keeps_a_user_command_beside_the_relay():
+    profile = get_profile("claude")
+    user = {"type": "command", "command": "make lint"}
+    relay = {"type": "command", "command": f"{_RELAY_EXE} relay Stop"}
+    config = _correct_config(profile)
+    config["hooks"]["SubagentStop"] = [{"hooks": [user, relay]}]
+    assert not _registered(profile, config)
+
+    registrations = _registrations(profile, f"{_RELAY_EXE} relay {{event}}")
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert changed
+    assert config["hooks"]["SubagentStop"] == [{"hooks": [user]}]
+    assert _registered(profile, config)
+    _, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert not changed
+
+
+@pytest.mark.parametrize("grouped", [True, False], ids=["one-matcher", "two-matchers"])
+def test_unmapped_strip_removes_only_the_hazardous_relay(grouped):
+    """codex maps no Notification, so that relay may be an alias's; Stop never is."""
+    profile = get_profile("codex")
+    stop = {"type": "command", "command": f"{_RELAY_EXE} relay Stop"}
+    notification = {"type": "command", "command": f"{_RELAY_EXE} relay Notification"}
+    config = _correct_config(profile)
+    config["hooks"]["SubagentStop"] = (
+        [{"hooks": [stop, notification]}]
+        if grouped
+        else [{"hooks": [stop]}, {"hooks": [notification]}]
+    )
+    assert not _registered(profile, config)
+
+    registrations = _registrations(profile, f"{_RELAY_EXE} relay {{event}}")
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert changed
+    assert config["hooks"]["SubagentStop"] == [{"hooks": [notification]}]
+    assert _registered(profile, config)
+    _, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert not changed
+
+
+def test_non_command_relay_under_unmapped_native_never_runs():
+    profile = get_profile("claude")
+    config = _correct_config(profile)
+    config["hooks"]["SubagentStop"] = [
+        _relay_handler(profile, f"{_RELAY_EXE} relay Stop", handler_type="prompt")
+    ]
+    assert _registered(profile, config)
+
+    # The strip is any-shape, like `strip_relay_hooks`: a managed command goes
+    # wherever it sits, executed or not.
+    registrations = _registrations(profile, f"{_RELAY_EXE} relay {{event}}")
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert changed
+    assert "SubagentStop" not in config["hooks"]
+    _, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert not changed
+
+
+@pytest.mark.parametrize("name", ["claude", "antigravity"])
+def test_non_list_value_under_unmapped_native_is_skipped(name):
+    profile = get_profile(name)
+    config = _correct_config(profile)
+    container = install_mod.hook_event_container(config, profile.hooks.dialect)
+    container["SubagentStop"] = {"not": "ours"}
+    assert _registered(profile, config)
+    config, changed = merge_hooks(
+        config, _registrations(profile, f"{_RELAY_EXE} relay {{event}}"), profile.hooks.dialect
+    )
+    assert not changed
+    assert install_mod.hook_event_container(config, profile.hooks.dialect)["SubagentStop"] == {
+        "not": "ours"
+    }
+
+
+_USER_GROUP = "user-hooks"
+
+
+@pytest.mark.parametrize(
+    "native,command",
+    [
+        ("PreToolUse", f"{_RELAY_EXE} relay Stop"),
+        ("PreToolUse", _LEGACY_STOP),
+        ("Stop", f"{_RELAY_EXE} relay SessionStart"),
+    ],
+    ids=["unmapped-stop", "unmapped-legacy", "mapped-disagrees"],
+)
+def test_hazardous_relay_in_a_foreign_agy_group_is_refused_and_left_alone(native, command):
+    """DW-490: agy runs every top-level group, so a lying relay in a user group
+    fires as surely as one in ours. `relay_registered` refuses it; the group is
+    the operator's, so `merge_hooks` does not touch it."""
+    profile = get_profile("antigravity")
+    config = _correct_config(profile)
+    assert _registered(profile, config)
+    config[_USER_GROUP] = {native: [_relay_handler(profile, command)]}
+    before = json.loads(json.dumps(config))
+    assert not _registered(profile, config)
+    assert install_mod.foreign_group_relay_hazards(
+        config, profile.hooks.dialect, profile.hooks.events
+    ) == [(_USER_GROUP, native)]
+
+    registrations = _registrations(profile, f"{_RELAY_EXE} relay {{event}}")
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert not changed
+    assert config == before
+
+
+@pytest.mark.parametrize(
+    "native,command",
+    [
+        ("PreToolUse", "make lint"),
+        ("Stop", f"{_RELAY_EXE} relay Stop"),
+        ("PreCompact", f"{_RELAY_EXE} relay PreCompact"),
+    ],
+    ids=["user-command", "truthful-relay", "unmapped-canonical"],
+)
+def test_clean_foreign_agy_group_is_not_flagged(native, command):
+    profile = get_profile("antigravity")
+    config = _correct_config(profile)
+    config[_USER_GROUP] = {native: [_relay_handler(profile, command)]}
+    config["notes"] = "not a group"
+    assert _registered(profile, config)
+    assert not install_mod.foreign_group_relay_hazards(
+        config, profile.hooks.dialect, profile.hooks.events
+    )
+
+
+def test_truthful_foreign_agy_relay_does_not_satisfy_registration():
+    profile = get_profile("antigravity")
+    config = {_USER_GROUP: {"Stop": [_relay_handler(profile, f"{_RELAY_EXE} relay Stop")]}}
+    assert not _registered(profile, config)
+
+
+def test_managed_agy_group_is_still_repaired_beside_a_flagged_foreign_group():
+    profile = get_profile("antigravity")
+    stop = _relay_handler(profile, f"{_RELAY_EXE} relay Stop")
+    config = _correct_config(profile)
+    config[install_mod.ANTIGRAVITY_HOOK_GROUP]["PreToolUse"] = [stop]
+    config[_USER_GROUP] = {"PreToolUse": [stop]}
+
+    registrations = _registrations(profile, f"{_RELAY_EXE} relay {{event}}")
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert changed
+    assert config[install_mod.ANTIGRAVITY_HOOK_GROUP] == (
+        _correct_config(profile)[install_mod.ANTIGRAVITY_HOOK_GROUP]
+    )
+    assert config[_USER_GROUP] == {"PreToolUse": [stop]}
+    assert not _registered(profile, config)
+
+
+def test_init_warns_about_a_foreign_agy_group_relay_and_keeps_it(tmp_path, capsys):
+    profile = get_profile("antigravity")
+    config_path = tmp_path / profile.hooks.config_path
+    config_path.parent.mkdir(parents=True)
+    user_group = {"PreToolUse": [{"type": "command", "command": f"{_RELAY_EXE} relay Stop"}]}
+    config_path.write_text(json.dumps({_USER_GROUP: user_group}))
+    capsys.readouterr()
+
+    assert install_into(tmp_path, clis=("antigravity",), skills=False) == 0
+    out = capsys.readouterr().out
+    assert f"group {_USER_GROUP!r}" in out and "'PreToolUse'" in out
+    assert json.loads(config_path.read_text())[_USER_GROUP] == user_group
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ('python3 "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop', True),
+        ("uv run --no-project python /p/.bmad-loop/bmad_loop_hook.py Stop", True),
+        ("python3 /p/.bmad-loop/bmad_loop_hook.py SessionEnd", False),
+    ],
+    ids=["python3", "uv", "wrong-event"],
+)
+def test_relay_registered_reads_legacy_commands(command, expected):
+    profile = get_profile("claude")
+    config = _hook_config(profile, {"Stop": [_relay_handler(profile, command)]})
+    assert _registered(profile, config) is expected
+
+
+def test_relay_registered_requires_every_stop_native_and_some_stop_native():
+    claude = get_profile("claude")
+
+    def registered(events, config):
+        hooks = dataclasses.replace(claude.hooks, events=events)
+        return relay_registered(config, hooks.dialect, hooks.events)
+
+    stop = {"hooks": [{"type": "command", "command": f"{_RELAY_EXE} relay Stop"}]}
+    two_stops = {"Stop": "Stop", "SubagentStop": "Stop"}
+    # Every native event mapped to Stop must carry the relay, not just one of them.
+    assert not registered(two_stops, {"hooks": {"Stop": [stop]}})
+    assert registered(two_stops, {"hooks": {"Stop": [stop], "SubagentStop": [stop]}})
+
+    # A map with no Stop native can never deliver completion, even when correct.
+    start = {"hooks": [{"type": "command", "command": f"{_RELAY_EXE} relay SessionStart"}]}
+    assert not registered({"SessionStart": "SessionStart"}, {"hooks": {"SessionStart": [start]}})
+
+
+@pytest.mark.parametrize("name", ["claude", "copilot"])
+def test_registered_relay_interpreters_reads_first_token_of_executed_legacy(name):
+    profile = get_profile(name)
+    stop = _native_for(profile, "Stop")
+    config = _hook_config(
+        profile,
+        {
+            stop: [
+                _relay_handler(profile, "python3 /p/.bmad-loop/bmad_loop_hook.py Stop"),
+                _relay_handler(
+                    profile, "uv run --no-project python /p/.bmad-loop/bmad_loop_hook.py Stop"
+                ),
+                _relay_handler(
+                    profile,
+                    "python-prompt-only /p/.bmad-loop/bmad_loop_hook.py Stop",
+                    handler_type="prompt",
+                ),
+                _relay_handler(profile, f"{_RELAY_EXE} relay Stop"),
+            ]
+        },
+    )
+    assert registered_relay_interpreters(config, profile.hooks.dialect, [stop]) == [
+        "python3",
+        "uv",
+    ]
+
+
+@pytest.mark.parametrize("name", ["claude", "copilot"])
+@pytest.mark.parametrize(
+    "ignored",
+    ["/old/bin/bmad-loop relay Stop", "python3 /old/.bmad-loop/bmad_loop_hook.py Stop"],
+    ids=["installed", "legacy"],
+)
+def test_registered_relay_paths_ignores_non_command_handlers(tmp_path, name, ignored):
+    profile = get_profile(name)
+    stop = _native_for(profile, "Stop")
+    config = _hook_config(
+        profile,
+        {
+            stop: [
+                _relay_handler(profile, ignored, handler_type="prompt"),
+                _relay_handler(profile, f"{_RELAY_EXE} relay Stop"),
+            ]
+        },
+    )
+    paths = registered_relay_paths(config, profile.hooks.dialect, [stop], tmp_path)
+    assert [spelling for _, spelling in paths] == [_RELAY_EXE]
 
 
 def test_init_preserves_different_script_with_same_basename(tmp_path):
@@ -435,8 +958,9 @@ def test_init_migrates_flat_legacy_hook_and_preserves_user(tmp_path, name, conta
     current = json.loads(config.read_text())[container][native_stop]
     commands = [item["command"] for item in current]
     assert commands.count("echo mine") == 1
-    assert old["command"] not in commands
-    assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
+    relays = [command for command in commands if command != "echo mine"]
+    assert len(relays) == 1
+    _assert_installed_relay(relays[0], "Stop")
 
 
 def test_init_removes_stale_relay_beside_current_relay(tmp_path):
@@ -458,7 +982,8 @@ def test_init_removes_stale_relay_beside_current_relay(tmp_path):
         for group in json.loads(config.read_text())["hooks"]["Stop"]
         for hook in group["hooks"]
     ]
-    assert len(commands) == 1 and commands[0].endswith(_installed_relay_suffix("Stop"))
+    assert len(commands) == 1
+    _assert_installed_relay(commands[0], "Stop")
 
 
 def test_init_refuses_missing_installed_command(tmp_path, monkeypatch, capsys):
@@ -641,16 +1166,6 @@ def test_merge_hooks_copilot_entry_shape():
     assert handler["command"].endswith("bmad_loop_hook.py Stop")
 
 
-def test_merge_hooks_copilot_idempotent():
-    # the bare-handler shape must still dedupe on a re-run
-    profile = get_profile("copilot")
-    settings, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
-    again, changed = merge_hooks(settings, _registrations(profile), profile.hooks.dialect)
-    assert not changed
-    for event in profile.hooks.events:
-        assert len(again["hooks"][event]) == 1
-
-
 def test_merge_hooks_antigravity_entry_shape():
     # agy keys hooks.json by hook NAME at the top level ("bmad-loop"), and its Stop
     # event is FLAT (handler dict directly, no matcher/hooks wrapper).
@@ -661,15 +1176,6 @@ def test_merge_hooks_antigravity_entry_shape():
     assert handler["type"] == "command"
     assert handler["timeout"] == 60  # agy hook timeouts are seconds
     assert handler["command"].endswith("bmad_loop_hook.py Stop")
-
-
-def test_merge_hooks_antigravity_idempotent():
-    profile = get_profile("antigravity")
-    settings, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
-    again, changed = merge_hooks(settings, _registrations(profile), profile.hooks.dialect)
-    assert not changed
-    for event in profile.hooks.events:
-        assert len(again["bmad-loop"][event]) == 1
 
 
 def test_merge_hooks_antigravity_appends_beside_existing_stop():
@@ -935,20 +1441,128 @@ def test_tracking_warning_degrades_on_a_chokepoint_fault(tmp_path, capsys, monke
 
 
 def test_hook_command_uses_selected_process_host(tmp_path, monkeypatch):
-    # The hook interpreter is platform-selected: forcing the Windows host swaps the
-    # registered command's prefix without `install` branching on sys.platform.
+    # The hook command's quoting is platform-selected behind the process host: the
+    # Windows host double-quotes a spaced path (list2cmdline, forward slashes),
+    # the POSIX host single-quotes it (shlex.quote). Asserting BOTH forced hosts
+    # makes an ignored override visible on every OS — on Windows CI the forced
+    # Windows half alone would pass with the override ignored.
     from bmad_loop.process_host import get_process_host
 
-    monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "windows")
-    get_process_host.cache_clear()
+    launcher = tmp_path / "user bin" / ("bmad-loop.exe" if os.name == "nt" else "bmad-loop")
+    launcher.parent.mkdir()
+    launcher.write_text("#!/bin/sh\n")
+    launcher.chmod(0o755)
+    monkeypatch.setattr(install_mod.sys, "argv", [str(launcher)])
+    project = tmp_path / "project"
+    project.mkdir()
     try:
-        assert install_into(tmp_path) == 0
-        settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())
+        monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "windows")
+        get_process_host.cache_clear()
+        assert install_into(project, skills=False) == 0
+        settings = json.loads((project / ".claude" / "settings.json").read_text())
         cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
-        assert cmd.endswith(_installed_relay_suffix("Stop"))
+        assert cmd == f'"{launcher.as_posix()}" relay Stop'
+
+        # _hook_command directly, not install_into: a forced POSIX host must never
+        # run a whole install on Windows.
+        monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "posix")
+        get_process_host.cache_clear()
+        posix_cmd = install_mod._hook_command(project, get_profile("claude"), "Stop")
+        assert posix_cmd == f"{shlex.quote(str(launcher))} relay Stop"
     finally:
         monkeypatch.delenv("BMAD_LOOP_PROCESS_HOST", raising=False)
         get_process_host.cache_clear()
+
+
+def _forced_host(monkeypatch, name):
+    from bmad_loop.process_host import get_process_host
+
+    monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", name)
+    get_process_host.cache_clear()
+
+
+def _launcher_in(tmp_path, monkeypatch, dirname):
+    launcher = tmp_path / dirname / ("bmad-loop.exe" if os.name == "nt" else "bmad-loop")
+    launcher.parent.mkdir()
+    launcher.write_text("#!/bin/sh\n")
+    launcher.chmod(0o755)
+    monkeypatch.setattr(install_mod.sys, "argv", [str(launcher)])
+    project = tmp_path / "project"
+    project.mkdir()
+    return launcher, project
+
+
+@pytest.fixture
+def _reset_process_host():
+    from bmad_loop.process_host import get_process_host
+
+    yield
+    get_process_host.cache_clear()
+
+
+def test_init_warns_on_unsafe_relay_path_under_windows_host(
+    tmp_path, monkeypatch, capsys, _reset_process_host
+):
+    """DW-346: an unspaced launcher dir holding `&` is registered bare by the
+    Windows host's list2cmdline, so init prints one advisory line — rc 0 and the
+    registered command byte-identical. Ablation: make
+    `WindowsProcessHost.unsafe_shell_chars` return `()`, or delete the
+    `_warn_unsafe_relay_path()` call in `install_into` — this test fails."""
+    launcher, project = _launcher_in(tmp_path, monkeypatch, "a&b")
+    _forced_host(monkeypatch, "windows")
+    assert install_into(project, skills=False) == 0
+    out = capsys.readouterr().out
+    warnings = [line for line in out.splitlines() if line.startswith("  warning:")]
+    assert len(warnings) == 1
+    assert str(launcher) in warnings[0]
+    assert "metacharacter(s) & " in warnings[0]
+    settings = json.loads((project / ".claude" / "settings.json").read_text())
+    assert settings["hooks"]["Stop"][0]["hooks"][0]["command"] == (
+        f"{launcher.as_posix()} relay Stop"
+    )
+
+
+def test_init_silent_on_clean_relay_path_under_windows_host(
+    tmp_path, monkeypatch, capsys, _reset_process_host
+):
+    _, project = _launcher_in(tmp_path, monkeypatch, "bin")
+    _forced_host(monkeypatch, "windows")
+    assert install_into(project, skills=False) == 0
+    assert "warning:" not in capsys.readouterr().out
+
+
+def test_init_silent_for_hookless_only_profiles_under_windows_host(
+    tmp_path, monkeypatch, capsys, _reset_process_host
+):
+    """A hookless profile registers no relay, so there is no path to warn about
+    even when the launcher sits in an `a&b` dir.
+
+    ABLATION: drop the `any(not profile.hookless …)` guard in `install_into` and
+    this reddens."""
+    _, project = _launcher_in(tmp_path, monkeypatch, "a&b")
+    _forced_host(monkeypatch, "windows")
+    assert install_into(project, clis=("opencode",), skills=False) == 0
+    out = capsys.readouterr().out
+    assert "no hooks needed (opencode-http)" in out  # control: the hookless branch ran
+    assert "warning:" not in out
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="a forced POSIX host never runs init on Windows"
+)
+def test_init_silent_on_metachar_relay_path_under_posix_host(
+    tmp_path, monkeypatch, capsys, _reset_process_host
+):
+    """shlex.quote single-quotes every sh metacharacter, so the POSIX host never
+    warns — and still registers the quoted path."""
+    launcher, project = _launcher_in(tmp_path, monkeypatch, "a&b")
+    _forced_host(monkeypatch, "posix")
+    assert install_into(project, skills=False) == 0
+    assert "warning:" not in capsys.readouterr().out
+    settings = json.loads((project / ".claude" / "settings.json").read_text())
+    assert settings["hooks"]["Stop"][0]["hooks"][0]["command"] == (
+        f"{shlex.quote(str(launcher))} relay Stop"
+    )
 
 
 def test_install_into_multiple_clis(tmp_path):
@@ -1001,6 +1615,126 @@ def test_install_no_skills(tmp_path):
     # hooks still installed, but no skill tree created
     assert (tmp_path / ".claude" / "settings.json").is_file()
     assert not (tmp_path / ".claude" / "skills").exists()
+
+
+# The real `<binary> --version` probe, captured before conftest's autouse stub
+# replaces it for every test.
+_REAL_CLI_VERSION = install_mod.cli_version
+
+
+def _claude_hooks(project: Path) -> dict:
+    return json.loads((project / ".claude" / "settings.json").read_text(encoding="utf-8"))["hooks"]
+
+
+def test_init_registers_the_stop_failure_relay(tmp_path):
+    """#865: init writes `relay StopFailure` under claude's native `StopFailure`
+    (the conftest stub reports a Claude Code new enough to know the event)."""
+    assert install_into(tmp_path, skills=False) == 0
+    hooks = _claude_hooks(tmp_path)
+    assert _installed_relay_suffix("StopFailure") in hooks["StopFailure"][0]["hooks"][0]["command"]
+
+
+@pytest.mark.parametrize(
+    ("version", "found"), [((2, 1, 77), "found 2.1.77"), (None, "an unreadable version")]
+)
+def test_init_leaves_stop_failure_out_below_its_floor(
+    tmp_path, monkeypatch, capsys, version, found
+):
+    """#865: Claude Code before 2.1.78 skips the WHOLE settings file over the unknown
+    `StopFailure` key, Stop relay included — so below the floor, or when the
+    version cannot be read, init leaves that one event out and says so.
+
+    Ablation: drop the `del events[native]` in `gated_hook_events` and the
+    `"StopFailure" not in hooks` assertion fails."""
+    monkeypatch.setattr(install_mod, "cli_version", lambda profile: version)
+    assert install_into(tmp_path, skills=False) == 0
+    hooks = _claude_hooks(tmp_path)
+    assert "StopFailure" not in hooks
+    assert _installed_relay_suffix("Stop") in hooks["Stop"][0]["hooks"][0]["command"]
+    out = capsys.readouterr().out
+    assert "warning: StopFailure hook not registered (claude)" in out
+    assert found in out and "re-run `bmad-loop init --cli claude`" in out
+
+
+def test_init_registers_stop_failure_at_exactly_its_floor(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(install_mod, "cli_version", lambda profile: (2, 1, 78))
+    assert install_into(tmp_path, skills=False) == 0
+    assert "StopFailure" in _claude_hooks(tmp_path)
+    assert "StopFailure hook not registered" not in capsys.readouterr().out
+
+
+def test_init_strips_a_gated_relay_after_a_downgrade(tmp_path, monkeypatch):
+    """A config written while Claude Code was new enough keeps its StopFailure
+    relay after a downgrade, and that entry alone makes the older CLI skip the
+    file — so re-running init strips it. The operator's own StopFailure handler
+    stays.
+
+    Ablation: drop the `strip_event_relays` call in `_register_hooks` and the
+    relay survives."""
+    assert install_into(tmp_path, skills=False) == 0
+    config = tmp_path / ".claude" / "settings.json"
+    data = json.loads(config.read_text(encoding="utf-8"))
+    data["hooks"]["StopFailure"].append({"hooks": [{"type": "command", "command": "notify-me"}]})
+    config.write_text(json.dumps(data), encoding="utf-8")
+
+    monkeypatch.setattr(install_mod, "cli_version", lambda profile: (2, 1, 77))
+    assert install_into(tmp_path, skills=False) == 0
+    hooks = _claude_hooks(tmp_path)
+    commands = [h["command"] for group in hooks["StopFailure"] for h in group["hooks"]]
+    assert commands == ["notify-me"]
+    assert _installed_relay_suffix("Stop") in hooks["Stop"][0]["hooks"][0]["command"]
+
+
+def test_gated_hook_events_never_probes_a_profile_without_floors(monkeypatch):
+    """Only a profile declaring `hooks.event_min_versions` spawns `--version`: every
+    other built-in registers exactly as before, with no process launched."""
+
+    def boom(profile):
+        raise AssertionError(f"probed {profile.name}")
+
+    monkeypatch.setattr(install_mod, "cli_version", boom)
+    for name in ("codex", "gemini"):
+        profile = get_profile(name)
+        assert install_mod.gated_hook_events(profile) == (dict(profile.hooks.events), [])
+
+
+def test_cli_version_reads_the_binarys_version_output(monkeypatch):
+    """The real probe, against a binary every host has: `python --version` prints
+    `Python X.Y.Z`. A binary that is not on PATH reads None, never raises."""
+    monkeypatch.setattr(install_mod, "_cli_versions", {})
+    claude = get_profile("claude")
+    python = dataclasses.replace(claude, binary=sys.executable, env={})
+    assert _REAL_CLI_VERSION(python) == tuple(sys.version_info[:3])
+    missing = dataclasses.replace(claude, binary="bmad-loop-no-such-cli-865", env={})
+    assert _REAL_CLI_VERSION(missing) is None
+
+
+def test_cli_version_runs_the_binary_under_the_profile_env(tmp_path, monkeypatch):
+    """The probe runs the binary in the session's environment, not only resolves
+    it there: a launcher whose answer depends on the profile's `env` (a
+    version-manager shim, an `env node` launcher) reads the version the session
+    would run. The cache is keyed by that env, so a second profile over the same
+    binary is probed again.
+
+    ABLATION: drop `env=` from the `run_argv` call and the first read is None."""
+    monkeypatch.setattr(install_mod, "_cli_versions", {})
+    launcher = write_script_launcher(
+        tmp_path,
+        "envcli",
+        "import os\nv = os.environ.get('BMAD_LOOP_TEST_CLI_VERSION')\n"
+        "print(v if v else 'no version')\n",
+    )
+    monkeypatch.delenv("BMAD_LOOP_TEST_CLI_VERSION", raising=False)
+    claude = get_profile("claude")
+    old = dataclasses.replace(
+        claude, binary=str(launcher), env={"BMAD_LOOP_TEST_CLI_VERSION": "2.1.77"}
+    )
+    new = dataclasses.replace(
+        claude, binary=str(launcher), env={"BMAD_LOOP_TEST_CLI_VERSION": "2.1.80"}
+    )
+    assert _REAL_CLI_VERSION(old) == (2, 1, 77)
+    assert _REAL_CLI_VERSION(new) == (2, 1, 80)
+    assert _REAL_CLI_VERSION(dataclasses.replace(claude, binary=str(launcher), env={})) is None
 
 
 def test_install_unknown_cli(tmp_path):
@@ -1123,8 +1857,8 @@ def test_provision_worktree_replaces_seeded_relay_from_either_os(tmp_path, stale
     ]
     assert commands.count("make lint") == 1
     assert stale_command not in commands
-    assert sum(command.endswith(_installed_relay_suffix("Stop")) for command in commands) == 1
     assert len(commands) == 2
+    _assert_installed_relay(next(c for c in commands if c != "make lint"), "Stop")
 
 
 def test_provision_worktree_tracked_config_rewrite_stays_out_of_commits(project, tmp_path):
@@ -1135,7 +1869,9 @@ def test_provision_worktree_tracked_config_rewrite_stays_out_of_commits(project,
     the skip-worktree pin, `git add -A` folds it into the story commit and the
     merge-back hands every other checkout a relay path that does not exist there.
     Asserted through git's own staging answer, since that is what finalize_commit
-    and the skill's own commits run."""
+    and the skill's own commits run. The pin is reported to `on_pinned` with the
+    exact text written, the record success teardown checks a story's edit against
+    (DW-368). Ablation: drop the `on_pinned` call and `pins` stays empty."""
     repo = project.project
     claude = get_profile("claude")
     hook_rel = claude.hooks.config_path
@@ -1150,9 +1886,12 @@ def test_provision_worktree_tracked_config_rewrite_stays_out_of_commits(project,
     git(repo, "commit", "-q", "-m", "track the hook config")
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
+    pins: list[tuple[str, str, str]] = []
 
-    provision_worktree(wt, [claude], repo)
+    provision_worktree(wt, [claude], repo, on_pinned=lambda *a: pins.append(a))
 
+    assert pins == [(hook_rel, claude.hooks.dialect, (wt / hook_rel).read_text(encoding="utf-8"))]
+    assert claude.hooks.dialect == "claude-settings-json"
     cmd = json.loads((wt / hook_rel).read_text(encoding="utf-8"))["hooks"]["Stop"][0]["hooks"][0][
         "command"
     ]
@@ -1170,7 +1909,8 @@ def test_provision_worktree_tracked_portable_config_is_left_alone(project, tmp_p
     carrying exactly the command provisioning would register: strip-then-merge
     nets to zero. No write may happen and no skip-worktree pin may be set —
     pinning claims orchestrator ownership of a file this run never modified,
-    hiding a story's own edit to it for no benefit."""
+    hiding a story's own edit to it for no benefit. Nor is `on_pinned` called, so
+    teardown has nothing to check (DW-368)."""
     repo = project.project
     codex = get_profile("codex")
     hook_rel = codex.hooks.config_path
@@ -1181,8 +1921,10 @@ def test_provision_worktree_tracked_portable_config_is_left_alone(project, tmp_p
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
 
-    provision_worktree(wt, [codex], repo)
+    pins: list[tuple[str, str, str]] = []
+    provision_worktree(wt, [codex], repo, on_pinned=lambda *a: pins.append(a))
 
+    assert pins == []
     assert (wt / hook_rel).read_bytes() == committed  # no rewrite happened
     assert not git(wt, "ls-files", "-t", "--", hook_rel).startswith("S")  # and no pin
     # a story's own edit to the un-pinned tracked config stays stageable
@@ -1861,6 +2603,35 @@ def test_provision_worktree_merge_preserves_the_operators_own_settings(tmp_path)
     assert _installed_relay_suffix("Stop") in hooks["Stop"][0]["hooks"][0]["command"]
 
 
+def test_provision_worktree_gates_stop_failure_on_the_cli_version(tmp_path, monkeypatch):
+    """#865: provisioning applies init's version gate. A seeded config carrying a
+    StopFailure relay (written while the CLI was newer) loses it below the
+    floor, the Stop relay stays, and the omission reaches `on_hook_gated` — the
+    engine journals it as `worktree-hook-gated`.
+
+    Ablation: drop the `on_hook_gated` loop in `provision_worktree` and `notes`
+    stays empty."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    seeded = json.loads(_OPERATOR_SETTINGS)
+    seeded.setdefault("hooks", {})["StopFailure"] = [
+        {"hooks": [{"type": "command", "command": "/opt/bin/bmad-loop relay StopFailure"}]}
+    ]
+    config.write_text(json.dumps(seeded), encoding="utf-8")
+    monkeypatch.setattr(install_mod, "cli_version", lambda profile: (2, 1, 77))
+    notes: list[str] = []
+
+    provision_worktree(wt, [claude], repo, on_hook_gated=notes.append)
+
+    hooks = json.loads(config.read_text(encoding="utf-8"))["hooks"]
+    assert "StopFailure" not in hooks
+    assert _installed_relay_suffix("Stop") in hooks["Stop"][0]["hooks"][0]["command"]
+    assert len(notes) == 1 and notes[0].startswith("StopFailure hook not registered (claude)")
+
+
 def test_provision_worktree_write_failure_raises_and_leaves_the_config_entire(
     tmp_path, monkeypatch
 ):
@@ -2284,15 +3055,80 @@ def test_provision_worktree_copies_base_skills_from_repo(tmp_path):
     assert (wt / claude.skill_tree / "bmad-dev-auto" / "step-04-review.md").is_file()
 
 
+def test_provision_worktree_copies_base_skills_from_the_extra_tree(tmp_path):
+    """opencode-http also reads `.agents/skills` (`extra_skill_trees`), where the
+    skills CLI installs its project skills: a repo carrying the upstream skills
+    only there gets them seeded into the same tree of the worktree, the gate is
+    satisfied, and the wheel's own MODULE_SKILLS stay in the primary tree."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    opencode = get_profile("opencode-http")
+    (extra,) = opencode.extra_skill_trees
+    _install_base_skills(repo, extra)
+
+    skipped = provision_worktree(wt, [opencode], repo)
+
+    for skill in BASE_SKILLS:
+        assert (wt / extra / skill / "SKILL.md").is_file(), skill
+    assert not [rel for rel in skipped if rel.startswith(extra)]
+    assert (
+        base_skills_seed_incomplete(wt, repo, [_user_scope("opencode-http", None, on=False)]) == []
+    )
+    for skill in MODULE_SKILLS:
+        assert (wt / opencode.skill_tree / skill).is_dir()
+        assert not (wt / extra / skill).exists()
+
+
+def test_provision_worktree_never_copies_from_a_user_root(tmp_path, monkeypatch):
+    """Under `[skills] user_roots` a required skill located in the operator's home
+    is neither copied into the worktree nor reported missing by the seed gate —
+    the session loads it from the home in place — and `base_skills_user_rooted`
+    names it for the journal. With the switch off the same home is invisible.
+
+    Ablation: drop the user-root `continue` in `base_skills_seed_incomplete` and
+    the gate reports `~/.agents/skills/bmad-build-auto` (and its reviewers)."""
+    from bmad_loop import skill_locate
+    from bmad_loop.worktree_flow import base_skills_user_rooted
+
+    wt, repo, home = tmp_path / "wt", tmp_path / "repo", tmp_path / "home"
+    repo.mkdir()
+    _install_skills(home, ".agents/skills", _era_catalog(DEV_PRIMITIVE_NEW))
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    codex = get_profile("codex")
+
+    skipped = provision_worktree(wt, [codex], repo, user_roots=True)
+
+    assert not (wt / codex.skill_tree / DEV_PRIMITIVE_NEW).exists()
+    assert not [rel for rel in skipped if "~" in rel or DEV_PRIMITIVE_NEW in rel]
+    scope = _user_scope("codex", home, on=True)
+    assert base_skills_seed_incomplete(wt, repo, [scope]) == []
+    rooted = base_skills_user_rooted(repo, [scope])
+    assert f"~/.agents/skills/{DEV_PRIMITIVE_NEW}" in rooted
+    assert all(entry.startswith("~/.agents/skills/") for entry in rooted)
+    # plain trees and the switch off never resolve from the home
+    assert base_skills_user_rooted(repo, [codex.skill_tree]) == []
+    assert base_skills_user_rooted(repo, [_user_scope("codex", home, on=False)]) == []
+
+
+def test_floor_message_names_v7(tmp_path):
+    """The base-skill floor text names both config eras: a v7 project gets its skills
+    from the method module, so a v6-only floor would send its operator after bmm."""
+    claude = get_profile("claude")
+    problems = missing_base_skills(tmp_path, [claude.skill_tree])
+    assert problems
+    for problem in problems:
+        assert "BMAD-METHOD >= 6.10.0" in problem.message
+        assert "on BMAD v7, the method module" in problem.message
+
+
 def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):
     claude = get_profile("claude")
-    # nothing installed → dev primitive + the two inline review layers reported
-    # missing (the hunters are required whenever the merged reviewer is absent —
-    # the primitive's step-04 invokes them on every run)
+    # nothing installed → only the dev primitive is reported missing: the review
+    # skills derive from it, so with nothing to derive from they are not demanded
     problems = missing_base_skills(tmp_path, [claude.skill_tree])
-    assert len(problems) == 3
+    assert len(problems) == 1
     assert {p.check for p in problems} == {"skills.base-missing"}
     assert all("BMAD-METHOD >= 6.10.0" in p.message for p in problems)
+    assert all(BMAD_FLOOR_TEXT in p.message for p in problems)
 
     # install everything → no problems
     _install_base_skills(tmp_path, claude.skill_tree)
@@ -2329,6 +3165,83 @@ def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):
     assert missing_base_skills(tmp_path, [claude.skill_tree]) == []
 
 
+def test_bundled_sweep_file_set_is_read_from_the_wheel():
+    """The required set is the bundle itself, never a restated literal: every file
+    under the bundled `skills/bmad-loop-sweep/` is required, so a mode file
+    added there is checked the moment it ships."""
+    from bmad_loop.install import SWEEP_SKILL, bundled_skill_files, skills_root
+
+    assert SWEEP_SKILL in MODULE_SKILLS
+    bundle = skills_root().joinpath(SWEEP_SKILL)
+    on_disk = sorted(entry.name for entry in bundle.iterdir() if entry.is_file())
+    assert list(bundled_skill_files(SWEEP_SKILL)) == on_disk
+    assert {"SKILL.md", "automation-mode.md", "migration-mode.md"} <= set(on_disk)
+
+
+def test_missing_sweep_skill_complete_deleted_and_partial(tmp_path):
+    """DW-367: the triage tree's `/bmad-loop-sweep` target is probed for the whole
+    bundled file set. Absent dir and partial copy are separate ids; the partial one
+    names exactly the absent rels as a list; both remediate with `init --force-skills`."""
+    from bmad_loop.checks import VALIDATE_CHECKS
+    from bmad_loop.install import SWEEP_SKILL, _copy_skills, missing_sweep_skill
+
+    tree = get_profile("gemini").skill_tree
+
+    # deleted → one skills.sweep-missing problem
+    problems = missing_sweep_skill(tmp_path, [tree])
+    assert [(p.check, p.severity) for p in problems] == [("skills.sweep-missing", "problem")]
+    assert problems[0].detail == {"tree": tree, "skill": SWEEP_SKILL}
+    assert "bmad-loop init --force-skills" in problems[0].message
+    assert f"{tree}/{SWEEP_SKILL}" in problems[0].message
+
+    # what `bmad-loop init` lays down satisfies the probe (fixture parity with init)
+    _copy_skills(tmp_path, [tree], force=False)
+    assert missing_sweep_skill(tmp_path, [tree]) == []
+
+    # partial → one skills.sweep-incomplete problem naming exactly the absent rels
+    skill_dir = tmp_path / tree / SWEEP_SKILL
+    (skill_dir / "automation-mode.md").unlink()
+    (skill_dir / "migration-mode.md").unlink()
+    problems = missing_sweep_skill(tmp_path, [tree])
+    assert [p.check for p in problems] == ["skills.sweep-incomplete"]
+    assert problems[0].severity == "problem"
+    assert problems[0].detail == {
+        "tree": tree,
+        "skill": SWEEP_SKILL,
+        "missing_files": ["automation-mode.md", "migration-mode.md"],
+    }
+    assert "missing automation-mode.md, migration-mode.md" in problems[0].message
+    assert "bmad-loop init --force-skills" in problems[0].message
+
+    # a lone SKILL.md is not a sweep skill either: the mode files are what it reads
+    for extra in skill_dir.iterdir():
+        if extra.name != "SKILL.md":
+            extra.unlink()
+    (only,) = missing_sweep_skill(tmp_path, [tree])
+    assert only.check == "skills.sweep-incomplete"
+    assert "SKILL.md" not in only.detail["missing_files"]
+
+    # a directory where SKILL.md should be is not a usable file
+    (skill_dir / "SKILL.md").unlink()
+    (skill_dir / "SKILL.md").mkdir()
+    (only,) = missing_sweep_skill(tmp_path, [tree])
+    assert "SKILL.md" in only.detail["missing_files"]
+    assert {"skills.sweep", "skills.sweep-missing", "skills.sweep-incomplete"} <= VALIDATE_CHECKS
+
+
+def test_missing_sweep_skill_probes_each_distinct_tree_once(tmp_path):
+    """Duplicate trees collapse (one finding per tree), and distinct trees are
+    answered independently — a complete `.claude` copy never covers a bare `.agents`."""
+    from bmad_loop.install import _copy_skills, missing_sweep_skill
+
+    claude, agents = get_profile("claude").skill_tree, get_profile("gemini").skill_tree
+    assert claude != agents
+    assert len(missing_sweep_skill(tmp_path, [agents, agents])) == 1
+    _copy_skills(tmp_path, [claude], force=False)
+    problems = missing_sweep_skill(tmp_path, [claude, agents])
+    assert [p.detail["tree"] for p in problems] == [agents]
+
+
 def test_missing_stories_support_probes_step01_content(tmp_path):
     from bmad_loop.install import (
         STORIES_PROBE_FILE,
@@ -2338,6 +3251,9 @@ def test_missing_stories_support_probes_step01_content(tmp_path):
 
     claude = get_profile("claude")
     tree = claude.skill_tree
+    # a resolvable primitive (SKILL.md is all the new name needs to resolve): an
+    # unresolved tree is named, but probed under DEV_PRIMITIVE_NEW, not this dir
+    _install_skills(tmp_path, tree, {STORIES_PROBE_SKILL: DEV_PRIMITIVE_MARKERS})
     step01 = tmp_path / tree / STORIES_PROBE_SKILL / STORIES_PROBE_FILE
 
     # step-01 absent → reported (older/half install)
@@ -2368,12 +3284,9 @@ def test_missing_base_skills_findings_carry_ids_and_detail(tmp_path):
     assert all(f.severity == "problem" for f in absent)
     assert all(f.check in VALIDATE_CHECKS for f in absent)
     # an empty tree names the CURRENT spelling — the older one appears in the
-    # message as a hint, never as the thing a consumer keys on
-    assert {f.detail["skill"] for f in absent} == {
-        DEV_PRIMITIVE_NEW,
-        "bmad-review-adversarial-general",
-        "bmad-review-edge-case-hunter",
-    }
+    # message as a hint, never as the thing a consumer keys on — and only the
+    # primitive: the reviewers derive from it, so none is demanded without it
+    assert {f.detail["skill"] for f in absent} == {DEV_PRIMITIVE_NEW}
     assert all(f.detail["tree"] == claude.skill_tree for f in absent)
 
     _install_base_skills(tmp_path, claude.skill_tree)
@@ -2753,6 +3666,344 @@ def test_renderer_walk_does_not_descend_a_symlinked_source_directory(tmp_path):
     assert _absent_renderer_sources(skill) == ["linked/plan.md"]
 
 
+# --- validate --render-probe (DW-381) ------------------------------------------
+
+
+def _probe_project(tmp_path: Path, body: str, tree: str = ".claude/skills"):
+    """A project under tmp_path/project plus a marker path OUTSIDE it."""
+    project = tmp_path / "project"
+    project.mkdir()
+    marker = tmp_path / "ran.json"
+    primitive = install_render_probe_fixture(project, marker, body, tree)
+    return project, marker, primitive
+
+
+def _tree_snapshot(root: Path) -> set[str]:
+    return {p.relative_to(root).as_posix() for p in root.rglob("*")}
+
+
+def test_render_probe_passing_render_is_ok_and_leaves_the_project_untouched(tmp_path):
+    project, marker, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    # A stale render dir must not be staged: the copy excludes top-level render/.
+    stale = project / RENDER_DIR_REL / "old"
+    stale.mkdir(parents=True)
+    (stale / "workflow.md").write_text("stale\n", encoding="utf-8")
+    before = _tree_snapshot(project)
+
+    findings = dev_renderer_probe(project, [".claude/skills", ".claude/skills"])
+
+    assert [(f.check, f.severity) for f in findings] == [("skills.dev-render-probe", "ok")]
+    assert findings[0].detail["tree"] == ".claude/skills"
+    assert findings[0].detail["skill"] == DEV_PRIMITIVE_NEW
+    # the renderer really ran, in a throwaway root that is gone afterwards
+    ran = json.loads(marker.read_text(encoding="utf-8"))
+    tmp_root = Path(ran["root"])
+    assert tmp_root != project and not tmp_root.exists()
+    assert Path(ran["cwd"]).resolve() == tmp_root.resolve()
+    assert Path(ran["skill"]) == tmp_root / ".claude/skills" / DEV_PRIMITIVE_NEW
+    assert ran["skill_md"] is True
+    assert ran["stale_render"] is False
+    assert not any("--set" in arg for arg in ran["argv"])
+    # the project gained nothing — no _bmad/render/<skill> output in particular
+    assert _tree_snapshot(project) == before
+    assert not (project / RENDER_DIR_REL / DEV_PRIMITIVE_NEW).exists()
+    # no temp-root spelling leaks into what the operator sees
+    shown = [findings[0].message, *map(str, findings[0].detail.values())]
+    assert not any(str(tmp_root) in text or tmp_root.as_posix() in text for text in shown)
+
+
+def test_render_probe_never_writes_the_projects_render_dir(tmp_path):
+    """Negative control for the untouched-project assertion: no render dir at all
+    beforehand, and none after a render that writes one under its project root."""
+    project, marker, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "ok"
+    assert marker.is_file()
+    assert not (project / RENDER_DIR_REL).exists()
+
+
+def test_render_probe_halt_is_a_problem_carrying_the_halt_text(tmp_path):
+    project, _, _ = _probe_project(tmp_path, RENDER_PROBE_HALT_BODY)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert (finding.check, finding.severity) == ("skills.dev-render-probe", "problem")
+    expected = f"missing config value x under {project}"
+    assert finding.detail["halt"] == expected
+    assert expected in finding.message
+    assert finding.detail["rc"] == 1
+    assert "bmad-loop-render-probe-" not in finding.message
+
+
+def test_render_probe_escaped_failure_names_rc_and_last_stderr_line(tmp_path):
+    project, _, _ = _probe_project(tmp_path, RENDER_PROBE_TRACEBACK_BODY)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "halt" not in finding.detail
+    assert finding.detail["rc"] == 1
+    assert finding.detail["last_line"] == "RuntimeError: renderer exploded"
+    assert "rc 1" in finding.message
+    assert "RuntimeError: renderer exploded" in finding.message
+
+
+def test_render_probe_rc0_without_an_entry_line_is_not_ok(tmp_path):
+    project, _, _ = _probe_project(tmp_path, 'print("rendered, honest")\n')
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert finding.detail["rc"] == 0
+    assert finding.detail["last_line"] == "rendered, honest"
+
+
+@pytest.mark.parametrize(
+    "skill_md",
+    [
+        # names the script, but never inside a fence
+        "Run `python render_skill.py --project-root {project-root} --skill {skill-root}`.\n",
+        # fenced, but the quote never closes
+        '```bash\npython "{project-root}/_bmad/scripts/render_skill.py --skill {skill-root}\n```\n',
+        # fenced and splittable, but no {skill-root}
+        '```bash\npython "{project-root}/_bmad/scripts/render_skill.py"\n```\n',
+    ],
+    ids=["unfenced", "unbalanced-quote", "missing-token"],
+)
+def test_render_probe_unparseable_stub_is_a_problem_and_executes_nothing(tmp_path, skill_md):
+    project, marker, primitive = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    (primitive / "SKILL.md").write_text(skill_md, encoding="utf-8")
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "could not be parsed" in finding.message
+    assert "nothing was executed" in finding.message
+    assert not marker.exists()
+
+
+def test_render_probe_first_fenced_render_line_wins_over_prose_and_later_fences(tmp_path):
+    project, marker, primitive = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    stub = render_probe_stub_skill_md()
+    (primitive / "SKILL.md").write_text(
+        "```text\nunrelated fence\n```\n"
+        + stub
+        + '```bash\nno-such-launcher "{project-root}/render_skill.py" {skill-root}\n```\n',
+        encoding="utf-8",
+    )
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "ok"
+    assert marker.exists()
+
+
+def test_render_probe_missing_launcher_names_it_and_the_path(tmp_path, monkeypatch):
+    project, marker, primitive = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    (primitive / "SKILL.md").write_text(
+        render_probe_stub_skill_md("bmad-loop-no-such-launcher"), encoding="utf-8"
+    )
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert finding.detail["launcher"] == "bmad-loop-no-such-launcher"
+    assert finding.detail["path"] == str(tmp_path / "empty-bin")
+    assert "bmad-loop-no-such-launcher" in finding.message
+    assert str(tmp_path / "empty-bin") in finding.message
+    assert not marker.exists()
+
+
+def test_render_probe_timeout_tree_kills_and_is_a_problem(tmp_path, monkeypatch):
+    """A timeout kills the whole tree (uv run's renderer grandchild included) via
+    the childrun seam, then reports — never subprocess.run's root-only kill."""
+    project, _, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    seen = {"timeouts": [], "killed": []}
+
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            seen["kwargs"] = kwargs
+
+        def communicate(self, timeout=None):
+            seen["timeouts"].append(timeout)
+            raise subprocess.TimeoutExpired(cmd="render", timeout=timeout)
+
+    monkeypatch.setattr(install_mod.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(install_mod.childrun, "kill_tree", seen["killed"].append)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "did not finish within 120s" in finding.message
+    assert len(seen["killed"]) == 1 and isinstance(seen["killed"][0], FakePopen)
+    assert seen["timeouts"][0] == install_mod.RENDER_PROBE_TIMEOUT_S == 120
+    assert seen["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert seen["kwargs"]["stdout"] is seen["kwargs"]["stderr"] is subprocess.PIPE
+
+
+def test_render_probe_spawn_oserror_is_a_problem_not_a_raise(tmp_path, monkeypatch):
+    project, _, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+
+    def refuse(argv, **_kwargs):
+        raise PermissionError("spawn refused")
+
+    monkeypatch.setattr(install_mod.subprocess, "Popen", refuse)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "could not be launched (spawn refused)" in finding.message
+
+
+def test_render_probe_nul_byte_argv_is_a_problem_not_a_raise(tmp_path):
+    """A NUL byte read from SKILL.md makes the spawn raise ValueError; the probe
+    reports it instead of crashing validate."""
+    project, marker, primitive = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    stub = render_probe_stub_skill_md().replace("--skill", "--sk\0ill")
+    (primitive / "SKILL.md").write_text(stub, encoding="utf-8")
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "could not be launched" in finding.message
+    assert not marker.exists()
+
+
+def test_render_probe_launcher_lookup_valueerror_is_a_problem_not_a_raise(tmp_path, monkeypatch):
+    """`shutil.which` raises ValueError on a NUL in argv[0] where it consults the OS
+    (Windows' NeedCurrentDirectoryForExePath); POSIX answers None instead."""
+    project, marker, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+
+    def refuse(cmd, *_args, **_kwargs):
+        raise ValueError("embedded null character")
+
+    monkeypatch.setattr(install_mod.shutil, "which", refuse)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "is unusable (embedded null character)" in finding.message
+    assert not marker.exists()
+
+
+def test_render_probe_unreadable_skill_md_is_a_problem_not_a_raise(tmp_path, monkeypatch):
+    """SKILL.md turning non-UTF-8 between stub detection and the probe's own read."""
+    project, marker, primitive = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    (primitive / "SKILL.md").write_bytes(b"\xff\xfe render_skill.py \xff\n")
+    monkeypatch.setattr(install_mod, "_is_renderer_stub", lambda _skill_dir: True)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "could not be parsed" in finding.message
+    assert "nothing was executed" in finding.message
+    assert not marker.exists()
+
+
+def test_render_probe_tempdir_fault_is_a_problem_not_a_raise(tmp_path, monkeypatch):
+    project, marker, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+
+    def refuse(**_kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(install_mod.tempfile, "TemporaryDirectory", refuse)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "could not create a throwaway render directory" in finding.message
+    assert not marker.exists()
+
+
+def test_render_probe_output_read_fault_tree_kills_and_is_a_problem(tmp_path, monkeypatch):
+    project, _, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+    killed: list[object] = []
+
+    class FakePopen:
+        def __init__(self, argv, **_kwargs):
+            pass
+
+        def communicate(self, timeout=None):
+            raise OSError("broken pipe")
+
+    monkeypatch.setattr(install_mod.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(install_mod.childrun, "kill_tree", killed.append)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "output could not be read (broken pipe)" in finding.message
+    assert len(killed) == 1 and isinstance(killed[0], FakePopen)
+
+
+def test_render_probe_stages_a_skill_tree_that_lives_under_bmad(tmp_path):
+    """The skill copy lands inside the already-copied `_bmad/`: no false staging fault."""
+    project, marker, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY, "_bmad/skills")
+
+    [finding] = dev_renderer_probe(project, ["_bmad/skills"])
+
+    assert finding.severity == "ok", finding.message
+    assert marker.exists()
+
+
+def test_render_path_unmapper_maps_the_resolved_temp_spelling(tmp_path):
+    """macOS /private/var and Windows 8.3 TEMP names: the renderer resolves its
+    project root, so the resolved spelling must map back too."""
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    project = tmp_path / "project"
+    unmap = _render_path_unmapper(link, project)
+
+    assert unmap(f"HALT: bad value under {real / 'x'}") == f"HALT: bad value under {project / 'x'}"
+    assert unmap(f"at {link}") == f"at {project}"
+
+
+def test_render_probe_staging_fault_is_a_problem_with_project_paths(tmp_path, monkeypatch):
+    project, marker, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY)
+
+    def refuse(src, dst, **_kwargs):
+        raise OSError(f"cannot copy to {dst}")
+
+    monkeypatch.setattr(install_mod.shutil, "copytree", refuse)
+
+    [finding] = dev_renderer_probe(project, [".claude/skills"])
+
+    assert finding.severity == "problem"
+    assert "could not stage" in finding.message
+    assert f"cannot copy to {project / BMAD_DIR}" in finding.message
+    assert not marker.exists()
+
+
+def test_render_probe_inline_primitive_has_nothing_to_render(tmp_path):
+    install_build_auto_skill(tmp_path, ".claude/skills")
+
+    findings = dev_renderer_probe(tmp_path, [".claude/skills", ".claude/skills"])
+
+    assert [(f.check, f.severity) for f in findings] == [("skills.dev-render-probe", "ok")]
+    assert "nothing to render" in findings[0].message
+    assert findings[0].detail == {"trees": [".claude/skills"]}
+
+
+def test_render_probe_reports_one_finding_per_stub_tree(tmp_path):
+    project, _, _ = _probe_project(tmp_path, RENDER_PROBE_OK_BODY, ".claude/skills")
+    install_build_auto_skill(project, ".agents/skills")  # inline era: nothing to probe
+    other = tmp_path / "ran-2.json"
+    install_render_probe_fixture(project, other, RENDER_PROBE_OK_BODY, ".opencode/skills")
+
+    findings = dev_renderer_probe(project, [".claude/skills", ".agents/skills", ".opencode/skills"])
+
+    assert [f.detail["tree"] for f in findings] == [".claude/skills", ".opencode/skills"]
+    assert all(f.severity == "ok" for f in findings)
+
+
 @pytest.mark.parametrize("primitive", [DEV_PRIMITIVE_NEW, DEV_PRIMITIVE_LEGACY])
 def test_merged_bmad_review_satisfies_review_layers(tmp_path, primitive):
     """#260: post-consolidation bmm installs ship the merged `bmad-review` skill, with
@@ -2818,7 +4069,7 @@ def test_review_hunter_missing_without_merged_review_reported(tmp_path):
     }
     assert "bmad-review-edge-case-hunter" in problems[0].message
     assert "install the BMad Method" not in problems[0].message
-    assert "update bmm" in problems[0].message
+    assert REVIEW_FLOOR_TEXT in problems[0].message
 
 
 # The invoke-a-skill layer topology: four review layers, three invoking the merged
@@ -4016,6 +5267,154 @@ def test_provision_worktree_bmad_custom_shielded_in_local_exclude(project, tmp_p
     assert shared.read_bytes() == before
 
 
+def test_provision_worktree_nested_project_lands_under_its_offset(project, tmp_path):
+    """DW-379, nested monorepo: `repo_root` is the checkout, the BMAD project `app/`.
+    The mount mirrors the main checkout, so every project-local surface is read from
+    the main `app/` and lands under `<worktree>/app/` — `_bmad/`, the bundled and
+    upstream skill trees, the hook config, the seed files — with nothing at the
+    worktree root, and the shield patterns carry the `/app/` offset git reads them
+    at.
+
+    Ablation: drop `project=` from the call (the pre-DW-379 shape) and every
+    `wt/app/...` assertion fails — the surfaces are read from the checkout root,
+    which carries none of them."""
+    paths = nested_repo_root_paths(project)
+    repo, app = paths.repo_root, paths.project
+    assert app == repo / "app", "premise: nested roots"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    # Project-local surfaces the checkout cannot deliver: left untracked in main.
+    _install_base_skills(app, tree)
+    custom = _write_override(app, _layer("house-style", "bmad-review-company"), user=True)
+    _write_worktree_renderer_surface(app)  # renderer unit + central config under app/_bmad
+    (app / ".mcp.json").write_text('{"mcpServers": {}}\n', encoding="utf-8")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    pins: list[tuple[str, str, str]] = []
+    # the probes see the gap at the mount project before provisioning fills it
+    assert _bmad_scripts_seed_incomplete(wt, repo, project=app)
+    assert _central_config_seed_incomplete(wt, repo, project=app)
+
+    skipped = provision_worktree(
+        wt,
+        [claude],
+        repo,
+        seed_files=[".mcp.json"],
+        project=app,
+        on_pinned=lambda *a: pins.append(a),
+    )
+
+    mount = wt / "app"
+    custom_rel = custom.relative_to(app)
+    assert (mount / custom_rel).is_file()
+    assert (mount / ".mcp.json").is_file()
+    for skill in MODULE_SKILLS:
+        assert (mount / tree / skill / "SKILL.md").is_file()
+    for skill in BASE_SKILLS:
+        assert (mount / tree / skill / "SKILL.md").is_file()
+    hook = json.loads((mount / claude.hooks.config_path).read_text(encoding="utf-8"))
+    assert hook["hooks"]["Stop"][0]["hooks"][0]["command"].endswith(_installed_relay_suffix("Stop"))
+    # nothing project-local at the checkout root
+    for rel in (BMAD_DIR, ".claude", ".mcp.json"):
+        assert not (wt / rel).exists(), rel
+    assert skipped == []
+    assert pins == []  # the hook config is untracked: shielded, not pinned
+    # the shield names the offset, never the root-anchored spelling
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert f"/app/{tree}" in exclude
+    assert f"/app/{claude.hooks.config_path}" in exclude
+    assert "/app/.mcp.json" in exclude
+    assert f"/app/{custom_rel.as_posix()}" in exclude
+    assert not any(line in exclude for line in (f"/{tree}", "/.mcp.json", f"/{BMAD_DIR}"))
+    # the renderer's generated dir is shielded at the offset (or subsumed by the root)
+    assert f"/app/{RENDER_DIR_REL}/" in exclude or f"/app/{BMAD_DIR}" in exclude
+    assert f"/{RENDER_DIR_REL}/" not in exclude
+    assert (mount / CENTRAL_CONFIG_REL).is_file()
+    # the unit's `git add -A` stages none of it
+    git(wt, "add", "-A")
+    assert git(wt, "diff", "--cached", "--name-only") == ""
+    # and the result-side probes agree, reading the same roots
+    assert base_skills_seed_incomplete(wt, repo, [tree], project=app) == []
+    assert worktree_seed_undelivered(wt, repo, seed_files=[".mcp.json"], project=app) == []
+    assert module_skills_seed_undelivered(wt, [tree], repo_root=repo, project=app) == []
+    assert not _bmad_scripts_seed_incomplete(wt, repo, project=app)
+    assert not _central_config_seed_incomplete(wt, repo, project=app)
+
+
+def test_nested_result_probes_report_what_the_mount_project_lacks(project, tmp_path):
+    """The other direction of the probes above: under the nested layout they look at
+    `<worktree>/app`, so a surface missing THERE is reported even though nothing is
+    at the checkout root either — and, read without `project=`, the same probes see
+    no source at the checkout root and report nothing (the #414 silent stall shape).
+
+    Ablation: make the probes ignore `project=` and the first assertions go empty."""
+    paths = nested_repo_root_paths(project)
+    repo, app = paths.repo_root, paths.project
+    tree = get_profile("claude").skill_tree
+    _install_base_skills(app, tree)
+    (app / ".mcp.json").write_text("{}\n", encoding="utf-8")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    assert base_skills_seed_incomplete(wt, repo, [tree], project=app)
+    assert worktree_seed_undelivered(wt, repo, seed_files=[".mcp.json"], project=app) == [
+        ".mcp.json"
+    ]
+    assert module_skills_seed_undelivered(wt, [tree], repo_root=repo, project=app)
+    # without the project, the checkout root has no source to measure
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+    assert worktree_seed_undelivered(wt, repo, seed_files=[".mcp.json"]) == []
+
+
+def test_provision_worktree_nested_tracked_hook_pin_is_worktree_relative(project, tmp_path):
+    """The skip-worktree pin runs git from the worktree root, so a nested project's
+    tracked hook config is pinned — and recorded for the DW-368 teardown check — at
+    `app/<config_path>`, the rel `_pinned_config_edits` reads back against the
+    worktree.
+
+    Ablation: pin `profile.hooks.config_path` unprefixed and the pin is refused by
+    `git update-index` (no such path at the worktree root)."""
+    paths = nested_repo_root_paths(project)
+    repo, app = paths.repo_root, paths.project
+    claude = get_profile("claude")
+    hook_rel = claude.hooks.config_path
+    (app / hook_rel).parent.mkdir(parents=True, exist_ok=True)
+    (app / hook_rel).write_text('{"hooks": {}}\n', encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the nested hook config")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    pins: list[tuple[str, str, str]] = []
+    degraded: list[str] = []
+
+    provision_worktree(
+        wt,
+        [claude],
+        repo,
+        project=app,
+        on_pinned=lambda *a: pins.append(a),
+        on_degraded=degraded.append,
+    )
+
+    written = (wt / "app" / hook_rel).read_text(encoding="utf-8")
+    assert pins == [(f"app/{hook_rel}", claude.hooks.dialect, written)]
+    assert degraded == []
+    git(wt, "add", "-A")
+    assert f"app/{hook_rel}" not in git(wt, "diff", "--cached", "--name-only").splitlines()
+
+
+def test_provision_roots_refuses_a_project_outside_repo_root(tmp_path):
+    """A disjoint layout never reaches provisioning — worktree isolation refuses it
+    (#414) — so reaching here with one fails LOUD rather than seeding from either
+    root. `project=None` keeps the checkout roots; the default config is identity."""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    assert provision_roots(wt, repo, None) == (repo, wt)
+    assert provision_roots(wt, repo, repo) == (repo, wt)
+    assert provision_roots(wt, repo, repo / "app") == (repo / "app", wt / "app")
+    with pytest.raises(verify.GitError, match="outside repo_root"):
+        provision_roots(wt, repo, tmp_path / "elsewhere")
+
+
 def test_shield_tracked_hook_config_is_not_excluded(project, tmp_path):
     """#392, reported from production: a project that TRACKS its hook config had that
     path written into the shield, making it read as tracked-and-ignored, which the
@@ -4283,12 +5682,12 @@ def test_shield_tracked_dir_with_nothing_landed_drops_cleanly(project, tmp_path)
 
     Ablation: restore `kept.add(pattern)` in the `"dir"` branch — the `-ci` assertions
     redden, on the wheel skills the project now tracks itself."""
-    from importlib import resources
+    from bmad_loop.install import skills_root
 
     repo = project.project
     claude = get_profile("claude")
     tree = claude.skill_tree
-    wheel = resources.files("bmad_loop.data").joinpath("skills")
+    wheel = skills_root()
     for skill in MODULE_SKILLS:
         _copy_traversable(wheel.joinpath(skill), repo / tree / skill)
     git(repo, "add", "-A")
@@ -4305,6 +5704,28 @@ def test_shield_tracked_dir_with_nothing_landed_drops_cleanly(project, tmp_path)
     assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
     assert f"/{tree}" not in exclude
     assert not [ln for ln in exclude if ln.startswith(f"/{tree}/")]
+
+
+def test_shield_covers_the_extra_skill_trees(project, tmp_path):
+    """opencode-http's extra project tree (`.agents/skills`) is shielded beside
+    its primary one, so the base skills seeded there never reach `git add -A`.
+
+    Ablation: build the shield from `p.skill_tree` alone and the extra-tree
+    pattern disappears."""
+    repo = project.project
+    opencode = get_profile("opencode-http")
+    (extra,) = opencode.extra_skill_trees
+    _install_base_skills(repo, extra)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [opencode], repo)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert f"/{opencode.skill_tree}" in exclude
+    assert f"/{extra}" in exclude
+    assert (wt / extra / DEV_PRIMITIVE_NEW / "SKILL.md").is_file()
+    assert git(wt, "status", "--porcelain", "--untracked-files=all", "--", extra) == ""
 
 
 def test_shield_untracked_skill_tree_keeps_dir_pattern_without_per_file_noise(project, tmp_path):
@@ -4529,6 +5950,8 @@ def test_missing_stories_support_findings_split_absent_from_stale(tmp_path):
 
     claude = get_profile("claude")
     tree = claude.skill_tree
+    # a complete legacy primitive resolves, so the probe reads THIS dir
+    _install_skills(tmp_path, tree, {STORIES_PROBE_SKILL: DEV_PRIMITIVE_MARKERS})
     step01 = tmp_path / tree / STORIES_PROBE_SKILL / STORIES_PROBE_FILE
 
     absent = missing_stories_support(tmp_path, [tree])
@@ -4596,38 +6019,9 @@ def test_new_dev_auto_skill_is_additive_for_sprint_mode(tmp_path, primitive):
     assert missing_stories_support(tmp_path, [tree]) == []
 
 
-def test_provision_worktree_seeds_gitignored_config(tmp_path):
-    """A gitignored config present in the main repo is copied into the worktree
-    (a `git worktree add` checkout would omit it)."""
-    wt, repo = tmp_path / "wt", tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".mcp.json").write_text('{"mcpServers": {}}', encoding="utf-8")
-    provision_worktree(wt, [], repo, seed_files=[".mcp.json"])
-    assert (wt / ".mcp.json").read_text() == '{"mcpServers": {}}'
-
-
-def test_provision_worktree_seed_skips_missing_source(tmp_path):
-    wt, repo = tmp_path / "wt", tmp_path / "repo"
-    repo.mkdir()
-    provision_worktree(wt, [], repo, seed_files=[".mcp.json"])
-    assert not (wt / ".mcp.json").exists()
-
-
 def test_provision_worktree_seed_does_not_clobber_existing(tmp_path):
     """A seed target already present in the worktree (tracked/committed) is left
-    untouched, so no diff is merged back."""
-    wt, repo = tmp_path / "wt", tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".mcp.json").write_text("FROM_REPO", encoding="utf-8")
-    dst = wt / ".mcp.json"
-    dst.parent.mkdir(parents=True)
-    dst.write_text("IN_WORKTREE", encoding="utf-8")
-    provision_worktree(wt, [], repo, seed_files=[".mcp.json"])
-    assert dst.read_text() == "IN_WORKTREE"
-
-
-def test_provision_worktree_reports_seed_skipped_as_noop(tmp_path):
-    """A seed entry left untouched because the destination exists is REPORTED, so a
+    untouched, so no diff is merged back. The untouched entry is REPORTED, so a
     `worktree_seed` that copies nothing cannot look like applied configuration."""
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     repo.mkdir()
@@ -4636,6 +6030,7 @@ def test_provision_worktree_reports_seed_skipped_as_noop(tmp_path):
     dst.parent.mkdir(parents=True)
     dst.write_text("IN_WORKTREE", encoding="utf-8")
     assert provision_worktree(wt, [], repo, seed_files=[".mcp.json"]) == [".mcp.json"]
+    assert dst.read_text() == "IN_WORKTREE"
 
 
 def test_provision_preserves_unrelated_bmad_noop_when_internal_sibling_lands(tmp_path):
@@ -4747,14 +6142,16 @@ def test_provision_worktree_seeds_absent_empty_child_dir(tmp_path):
 
 
 def test_provision_worktree_reports_nothing_when_seeding_succeeds(tmp_path):
-    """A seed that actually copies is not reported — the signal stays specific to
-    entries that silently did nothing. A missing source is also not a no-op report:
-    it is already covered as its own case."""
+    """A gitignored config present in the main repo is copied into the worktree (a
+    `git worktree add` checkout would omit it). A seed that actually copies is not
+    reported — the signal stays specific to entries that silently did nothing. A
+    missing source (`absent.json`) is skipped: neither copied nor reported."""
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     repo.mkdir()
     (repo / ".mcp.json").write_text("FROM_REPO", encoding="utf-8")
     assert provision_worktree(wt, [], repo, seed_files=[".mcp.json", "absent.json"]) == []
     assert (wt / ".mcp.json").read_text() == "FROM_REPO"
+    assert not (wt / "absent.json").exists()
 
 
 def test_provision_worktree_seed_rejects_escaping_path(tmp_path):
@@ -6249,30 +7646,6 @@ def test_shield_runs_in_a_repository_with_an_owner_only_octal_mode(project, tmp_
     assert "probe-384" not in git(wt, "status", "--porcelain", "-uall")
 
 
-def test_shield_refuses_a_group_readable_octal_mode(project, tmp_path):
-    """`core.sharedRepository = 0640` is a filemode granting GROUP access, so it is
-    refused exactly like the `group` keyword — the octal support accepts owner-only
-    modes and must not widen past them.
-
-    `0640` rather than `0666` on purpose: it is the row immediately across the
-    boundary from the accepted `0600`, so it fails first if the mask is loosened.
-
-    Ablation: drop the `& 0066` mask from `_shared_repository_is_private` (accept any
-    octal git does not reject) and this fails — the shield proceeds in a repository
-    shared between OS users."""
-    repo = project.project
-    wt = tmp_path / "wt"
-    verify.worktree_add(repo, wt, "feat", "main")
-    git(repo, "config", "core.sharedRepository", "0640")
-
-    reason = _worktree_local_exclude(wt, ["/probe-384"])
-
-    assert reason is not None and "shared between OS users" in reason
-    assert "0640" in reason
-    assert not (repo / ".git" / "bmad-loop-shield.lock").exists()
-    assert not _wt_private_exclude(wt).exists()
-
-
 def test_shield_refuses_a_valueless_shared_repository_key(project, tmp_path):
     """`sharedRepository` with NO value is git's `PERM_GROUP` — a shared repository —
     and `--get` answers it rc 0 with a lone newline, byte-identical to an explicitly
@@ -6644,68 +8017,6 @@ def test_shield_refuses_to_enable_extension_at_the_old_capability_floor(
     assert "supports git" in reason  # policy wording, not a capability claim
     assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     assert not _wt_private_exclude(wt).exists()
-
-
-def test_shield_degrade_leaves_no_permanent_repo_format_change(project, tmp_path, monkeypatch):
-    """`extensions.worktreeConfig` is a PERMANENT repo-format change bmad-loop never
-    reverses, so it must not be paid for a shield that then degrades away.
-    `_shield_enable_worktree_config` used to perform the enable itself, ahead of the
-    seed, the mkdir, the write and the activation — so every degrade below it left
-    the operator's repo marked forever for a shield that never applied. It now only
-    PROBES; the write happens one line above the activation.
-
-    Driven through the seed fault, because that is the degrade path this reordering exists
-    for — a fault the old code could not even reach, since it swallowed instead of
-    degrading.
-
-    Read as TEXT rather than via `git config --get`, for the reason the sibling
-    refusal tests give: conftest's git() is check=True and an unset key exits 1.
-
-    Ablation: move the enable back above the seed (into
-    `_shield_enable_worktree_config`, where it was) and this fails —
-    `worktreeConfig` is in the shared config after a degrade that shielded nothing."""
-    repo = project.project
-    wt = tmp_path / "wt"
-    verify.worktree_add(repo, wt, "feat", "main")
-    users = tmp_path / "my-global-ignores"
-    users.write_text("mine.log\n", encoding="utf-8")
-    git(repo, "config", "core.excludesFile", str(users))
-    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
-    real = install_mod.git_bytes
-
-    def unanswerable_excludes_read(worktree, *args):
-        if "core.excludesFile" in args and "--get" in args:
-            raise verify.GitError("git config did not answer")
-        return real(worktree, *args)
-
-    monkeypatch.setattr(install_mod, "git_bytes", unanswerable_excludes_read)
-
-    reason = _worktree_local_exclude(wt, ["/probe-384"])
-
-    assert reason is not None  # it really did degrade
-    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
-
-
-def test_shield_enables_the_extension_on_the_path_that_activates(project, tmp_path):
-    """The other half of the deferral: moving the enable down must not lose it. A
-    happy path still leaves the repo carrying the extension — that write is what
-    `git config --worktree` needs to exist at all, so without it the activation
-    fatals and the shield does nothing.
-
-    The sibling above proves the flag is absent after a degrade; this proves the
-    reordering did not simply stop setting it. Neither alone distinguishes the fix
-    from a deletion."""
-    repo = project.project
-    wt = tmp_path / "wt"
-    verify.worktree_add(repo, wt, "feat", "main")
-    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
-
-    assert _worktree_local_exclude(wt, ["/probe-384"]) is None
-
-    assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
-    # ...and it bought a shield that actually holds
-    (wt / "probe-384").write_text("noise\n", encoding="utf-8")
-    assert git(wt, "status", "--short") == ""
 
 
 def test_shield_rolls_back_the_extension_when_activation_fails(project, tmp_path, monkeypatch):
@@ -7549,12 +8860,18 @@ def test_shield_enables_extension_when_only_the_global_config_claims_it(
     call alone for the reason the XDG test gives at length: an env pin that outlives
     the code under test changes what git thinks of files already checked out.
 
+    It is also the other half of the enable's deferral: moving the enable down must
+    not lose it. `test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are`
+    proves the flag is absent after a degrade; this proves the reordering did not
+    simply stop setting it. Neither alone distinguishes the fix from a deletion.
+
     Ablation: drop `--file <shared>` from the extension probe and this fails — the
     global value is believed, the extension never reaches the repo config, and the
     activation returns a reason instead of None."""
     repo = project.project
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     fake_global = tmp_path / "gitconfig-with-the-extension"
     fake_global.write_text("[extensions]\n\tworktreeConfig = true\n", encoding="utf-8")
 
@@ -8706,37 +10023,6 @@ def test_worktree_local_exclude_degrades_on_symlink_loop_resolve(project, monkey
     assert not exclude.is_file() or "/probe-359" not in exclude.read_text(encoding="utf-8")
 
 
-def test_worktree_local_exclude_degrades_on_write_fault(project, tmp_path, monkeypatch):
-    """A write fault on the exclude file itself (e.g. a read-only .git) degrades to
-    a reason instead of propagating — this pins the guard reaching the LAST
-    statement of the tail, not just the early resolve/mkdir steps.
-
-    Injected rather than chmod: a root-owned CI runner ignores a read-only bit.
-
-    A real LINKED worktree is the subject here and in the rest of this block: since
-    #384 the tail's write only happens for one (a main checkout is refused before
-    it), so a main-checkout subject would degrade for the wrong reason and pass
-    without ever reaching the statement under test.
-
-    Ablation: drop the tail's `try` (or `OSError` from its tuple) and this fails —
-    the OSError propagates out of `_worktree_local_exclude`."""
-    wt = tmp_path / "wt"
-    verify.worktree_add(project.project, wt, "feat", "main")
-
-    def boom(*a, **kw):
-        raise OSError("read-only .git")
-
-    # patched at install's OWN binding: the exclude write goes through atomic_write_bytes
-    # (#375, #384), which writes via os.fdopen on an mkstemp fd, so a
-    # Path.write_bytes/Path.open patch never fires and would pass vacuously — and so would
-    # a patch left on the atomic_write_TEXT this replaced.
-    monkeypatch.setattr(install_mod, "atomic_write_bytes", boom)
-
-    reason = _worktree_local_exclude(wt, ["/probe-359"])
-
-    assert reason is not None and "read-only .git" in reason
-
-
 def test_worktree_local_exclude_appends_to_a_non_utf8_private_exclude(project, tmp_path):
     """REPURPOSED, and the reversal is the fix (#384). This case used
     to assert that a private exclude which is not UTF-8 DEGRADES the shield away,
@@ -8820,8 +10106,15 @@ def test_worktree_local_exclude_short_write_leaves_exclude_intact(project, tmp_p
     through the real `open(mode="wb")` is the whole point — that is what
     truncates.
 
+    A real LINKED worktree is the subject: since #384 the tail's write only happens
+    for one (a main checkout is refused before it), so a main-checkout subject would
+    degrade for the wrong reason without ever reaching the write.
+
     Ablation: swap `atomic_write_bytes` back to a direct `exclude.write_bytes` and
-    this fails — the file comes back truncated."""
+    this fails — the file comes back truncated. This also pins the guard reaching
+    the LAST statement of the tail, not just the early resolve/mkdir steps: drop the
+    tail's `try` (or `OSError` from its tuple) and this fails — the OSError
+    propagates out of `_worktree_local_exclude`."""
     wt = tmp_path / "wt"
     verify.worktree_add(project.project, wt, "feat", "main")
     exclude = _wt_private_exclude(wt)
@@ -9341,6 +10634,13 @@ def test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are(
     and both cases fail — on assertion 1 (`reason` comes back None) and again on
     assertion 3 (`mine.log` shows up untracked, the shadow).
 
+    The degrade also costs no PERMANENT repo-format change: `extensions.worktreeConfig`
+    is written one line above the activation, never ahead of the seed. Read as TEXT,
+    not via `git config --get`: conftest's git() is check=True and an unset key exits 1.
+    Ablation: move the enable back above the seed (into `_shield_enable_worktree_config`,
+    where it was) and both cases fail on the flag assertion — `worktreeConfig` is in
+    the shared config after a degrade that shielded nothing.
+
     Asserts on "did not answer", NOT "timed out": the latter is a lie for
     `GitSpawnError`, and it is the substring the activation-fault test above already
     asserts, so it could not tell which call faulted."""
@@ -9350,6 +10650,7 @@ def test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are(
     users = tmp_path / "my-global-ignores"
     users.write_text("mine.log\n", encoding="utf-8")
     git(repo, "config", "core.excludesFile", str(users))
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     real = install_mod.git_bytes
 
     def unanswerable_excludes_read(worktree, *args):
@@ -9365,6 +10666,7 @@ def test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are(
     reason = _worktree_local_exclude(wt, ["/probe-389"])
 
     assert reason is not None and "did not answer" in reason
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     assert not _wt_private_exclude(wt).exists()  # nothing to point a shadowing key at
     (wt / "mine.log").write_text("noise\n", encoding="utf-8")
     (wt / "probe-389").write_text("noise\n", encoding="utf-8")
@@ -10320,6 +11622,160 @@ def test_base_skills_seed_incomplete_ignores_inactive_catalog_symlink(tmp_path):
     assert base_skills_seed_incomplete(wt, repo, [tree]) == []
 
 
+def _link_dir(link, target):
+    """A directory link at ``link``: a junction on win32 (never ``os.symlink`` there —
+    it needs a privilege CI does not have), a symlink elsewhere."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        import _winapi  # Windows-only stdlib module
+
+        _winapi.CreateJunction(str(target), str(link))
+    elif hasattr(os, "symlink"):
+        link.symlink_to(target, target_is_directory=True)
+    else:
+        pytest.skip("no directory link primitive on this platform")
+
+
+def _global_tree_link(tmp_path):
+    """``repo/.agents/skills`` linked to a complete global install outside the repo —
+    the #770 junction workaround. Returns ``(repo, tree, target)``."""
+    repo, tree = tmp_path / "repo", ".agents/skills"
+    home_tree = tmp_path / "home" / ".agents" / "skills"
+    _install_dev_auto(
+        tmp_path / "home",
+        ".agents/skills",
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n" + _layer("blind", "bmad-review"),
+    )
+    _install_skills(tmp_path / "home", ".agents/skills", {"bmad-review": ()})
+    repo.mkdir()
+    _link_dir(repo / tree, home_tree)
+    return repo, tree, str(home_tree.resolve())
+
+
+def test_skill_tree_outside_tree_link_warns_without_worktree(tmp_path):
+    """In place, the session reads straight through the link, so it only warns —
+    `init` is what refuses to write through it."""
+    repo, tree, target = _global_tree_link(tmp_path)
+
+    assert install_mod.skill_trees_outside(repo, repo, [tree], isolation="none") == [
+        Finding(
+            "skills.tree-outside",
+            "warning",
+            mock.ANY,
+            {"tree": tree, "target": target, "isolation": "none"},
+        )
+    ]
+
+
+def test_skill_tree_outside_tree_link_problem_under_worktree(tmp_path):
+    """Worktree seeding cannot copy one skill out of a tree linked out of the repo:
+    one problem for the tree, and its skill-level links are not repeated."""
+    repo, tree, target = _global_tree_link(tmp_path)
+
+    findings = install_mod.skill_trees_outside(repo, repo, [tree], isolation="worktree")
+
+    assert findings == [
+        Finding(
+            "skills.tree-outside",
+            "problem",
+            mock.ANY,
+            {"tree": tree, "target": target, "isolation": "worktree"},
+        )
+    ]
+    assert "worktree isolation" in findings[0].message
+
+
+def test_skill_tree_outside_skill_link_only_under_worktree(tmp_path):
+    """A required reviewer linked to a shared install: invisible in place, and under
+    worktree isolation the preflight refusal that replaces the mid-run escalation.
+    The inactive catalog link beside it is not required, so it is not reported."""
+    repo, tree = tmp_path / "repo", ".claude/skills"
+    _install_dev_auto(
+        repo,
+        tree,
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n" + _layer("blind", "bmad-review"),
+    )
+    for skill in ("bmad-review", "bmad-review-edge-case-hunter"):
+        _install_skills(tmp_path / "shared", "skills", {skill: ()})
+        _link_dir(repo / tree / skill, tmp_path / "shared" / "skills" / skill)
+
+    assert install_mod.skill_trees_outside(repo, repo, [tree], isolation="none") == []
+    assert install_mod.skill_trees_outside(repo, repo, [tree], isolation="worktree") == [
+        Finding(
+            "skills.tree-outside",
+            "problem",
+            mock.ANY,
+            {
+                "tree": tree,
+                "skill": "bmad-review",
+                "target": str((tmp_path / "shared" / "skills" / "bmad-review").resolve()),
+                "isolation": "worktree",
+            },
+        )
+    ]
+
+
+def test_skill_tree_outside_skips_linked_advisory_reviewer(tmp_path):
+    """A `when`-gated reviewer linked to a shared install may never run, so the
+    worktree gate does not require it (`base_skills_seed_incomplete`) and neither
+    does this check — while a required reviewer linked the same way still is.
+
+    Ablation: check `_review_skill_names` instead of `required_review_skill_names`
+    in `skill_trees_outside` and the advisory link is reported too."""
+    repo, tree = tmp_path / "repo", ".claude/skills"
+    advisory = "bmad-review-performance"
+    _install_dev_auto(
+        repo,
+        tree,
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n"
+        + _layer("blind", "bmad-review")
+        + _layer("perf", advisory, when="the diff touches hot paths"),
+    )
+    _install_skills(repo, tree, {"bmad-review": ()})
+    _install_skills(tmp_path / "shared", "skills", {advisory: ()})
+    _link_dir(repo / tree / advisory, tmp_path / "shared" / "skills" / advisory)
+
+    assert missing_base_skills(repo, [tree]) == []
+    assert install_mod.skill_trees_outside(repo, repo, [tree], isolation="worktree") == []
+
+    shutil.rmtree(repo / tree / "bmad-review")
+    _install_skills(tmp_path / "shared", "skills", {"bmad-review": ()})
+    _link_dir(repo / tree / "bmad-review", tmp_path / "shared" / "skills" / "bmad-review")
+    assert [
+        f.detail["skill"]
+        for f in install_mod.skill_trees_outside(repo, repo, [tree], isolation="worktree")
+    ] == ["bmad-review"]
+
+
+def test_skill_tree_outside_ignores_in_repo_link(tmp_path):
+    """The `skills` CLI's own layout — `.claude/skills` linked to `.agents/skills` —
+    stays inside the repo, so neither the tree nor its skills are reported, even
+    under worktree isolation.
+
+    Ablation: make either `_confined_to` comparison in `skill_trees_outside` always
+    False and this reddens."""
+    repo = tmp_path / "repo"
+    _install_dev_auto(
+        repo,
+        ".agents/skills",
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n" + _layer("blind", "bmad-review"),
+    )
+    _install_skills(repo, ".agents/skills", {"bmad-review": ()})
+    _link_dir(repo / ".claude" / "skills", repo / ".agents" / "skills")
+
+    for isolation in ("none", "worktree"):
+        assert (
+            install_mod.skill_trees_outside(
+                repo, repo, [".claude/skills", ".agents/skills"], isolation=isolation
+            )
+            == []
+        )
+
+
 @pytest.mark.parametrize(
     "resolve_fault", [pytest.param(None, id="oserror"), *NUL_PATH_RESOLVE_FAULTS]
 )
@@ -10927,3 +12383,1322 @@ def test_module_skills_unreadable_source_dir_is_reported(tmp_path):
     assert module_skills_seed_undelivered(wt, [_MODULE_SKILL_TREE], skills_root) == [
         f"{_MODULE_SKILL_TREE}/bmad-loop-sweep"
     ]
+
+
+# --- tickets mode (BMAD v7 ticket tree): preflight findings, one test per id ---
+#
+# Real-spawn budget: one capability probe of the vendored tickets.py (2 spawns:
+# `--help` and `mark --help`) in test_tickets_preflight_capability_ok_on_project_v7;
+# every other capability row stubs `TicketTree.capability`.
+
+
+def _tickets_paths(layout):
+    from bmad_loop import bmadconfig
+
+    return bmadconfig.load_paths(layout.project, want_tickets=True)
+
+
+def _tickets_findings(layout, monkeypatch, *, probe=False, uv="/usr/bin/uv", **kwargs):
+    """`tickets_preflight` on ``layout`` with uv pinned present (or absent with
+    ``uv=None``) — the host's PATH must not decide a project check. ``kwargs`` go
+    to the preflight."""
+    monkeypatch.setattr(
+        install_mod.shutil, "which", lambda tool: uv if tool == "uv" else f"/usr/bin/{tool}"
+    )
+    return install_mod.tickets_preflight(
+        _tickets_paths(layout), [".claude/skills"], probe_capability=probe, **kwargs
+    )
+
+
+def _ids(findings):
+    return [f.check for f in findings]
+
+
+def test_tickets_preflight_passes_on_project_v7(project_v7, monkeypatch):
+    """The v7 sandbox is a tickets project bmad-loop can drive: no problem, and the
+    `tickets.era` ok line names the script, the method module and the initiative."""
+    from bmad_loop.checks import VALIDATE_CHECKS
+
+    findings = _tickets_findings(project_v7, monkeypatch)
+    assert _ids(findings) == ["tickets.era", "tickets.store-topology", "tickets.capability-not-run"]
+    assert findings[1].severity == "ok"
+    assert findings[1].detail["topology"]["layout"] == "T1"
+    era = findings[0]
+    assert era.severity == "ok"
+    assert era.detail == {
+        "era": "v7",
+        "script": "_bmad/method/scripts/tickets.py",
+        "bmod_method_version": "7.0.0",
+        "initiative": project_v7.initiative,
+    }
+    assert "7.0.0" in era.message and project_v7.initiative in era.message
+    assert set(_ids(findings)) <= VALIDATE_CHECKS
+
+
+def test_tickets_preflight_script_missing(project_v7, monkeypatch):
+    """Tickets mode on a v6 install (no `_bmad/method/scripts/tickets.py`, so the
+    config resolved as v6 — without the v6 keys `load_paths` itself refuses): a
+    problem, and no `tickets.era` ok line or capability note about a script that is
+    not there. Ablation: drop the is_file gate and this FAILS."""
+    from bmad_loop import bmadconfig
+
+    project_v7.tickets_script.unlink()
+    paths = bmadconfig.ProjectPaths(
+        project=project_v7.project,
+        implementation_artifacts=project_v7.output_folder,
+        planning_artifacts=project_v7.output_folder,
+    )
+    monkeypatch.setattr(install_mod.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    findings = install_mod.tickets_preflight(paths, [".claude/skills"], probe_capability=True)
+    assert _ids(findings) == ["tickets.script-missing"]
+    assert findings[0].severity == "problem"
+    assert "bmad setup" in findings[0].message
+
+
+def test_tickets_preflight_config_utils_missing(project_v7, monkeypatch):
+    """`tickets.py` imports the project's `_bmad/scripts/config_utils.py`; without it
+    every call exits `cannot read the BMad config`. Ablation: drop the check and this
+    FAILS."""
+    (project_v7.project / install_mod.RENDERER_CONFIG_UTILS_REL).unlink()
+    findings = _tickets_findings(project_v7, monkeypatch)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.config-utils-missing"
+    assert problem.detail == {"path": install_mod.RENDERER_CONFIG_UTILS_REL}
+
+
+def test_tickets_preflight_uv_missing(project_v7, monkeypatch):
+    """bmad-build-auto runs tickets.py with `uv run`, so uv is required even though
+    bmad-loop itself runs the script directly. Ablation: drop the check and this
+    FAILS."""
+    findings = _tickets_findings(project_v7, monkeypatch, uv=None)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.uv-missing"
+    assert "uv run" in problem.message
+
+
+def test_tickets_preflight_initiative_unset(project_v7, monkeypatch):
+    """No `[core] active_initiative`: validate's `bmad-config.initiative-unset` is a
+    warning, but tickets mode has no tree to run, so here it is a problem.
+    Ablation: drop the check and this FAILS."""
+    (project_v7.project / "_bmad" / "custom" / "config.user.toml").write_text(
+        "# no initiative\n", encoding="utf-8"
+    )
+    findings = _tickets_findings(project_v7, monkeypatch)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.initiative-unset"
+    assert "config.user.toml" in problem.message
+    assert "tickets.initiative-missing" not in _ids(findings)
+
+
+def test_tickets_preflight_initiative_missing(project_v7, monkeypatch):
+    """The active initiative names a folder that does not exist (tickets.py would
+    exit `active initiative folder not found`). Ablation: drop the check and this
+    FAILS."""
+    shutil.rmtree(project_v7.initiative_folder)
+    findings = _tickets_findings(project_v7, monkeypatch)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.initiative-missing"
+    assert problem.detail["initiative"] == project_v7.initiative
+    assert "create it with the `bmad-agent-po` skill" in problem.message
+
+
+_PARENT_BREAKDOWN = """\
+[[initiative]]
+id = 1
+slug = "initiative-auth"
+
+[[initiative]]
+id = 2
+slug = "initiative-billing"
+after = [{ initiative = 1 }]
+"""
+
+
+def _make_parent(layout, *, flat: bool = False) -> Path:
+    """Turn the active initiative into a parent: its `tickets.toml` lists
+    `[[initiative]]` children (in its `tickets/` folder, or the folder itself)."""
+    folder = layout.initiative_folder
+    shutil.rmtree(folder / "tickets", ignore_errors=True)
+    breakdown = folder if flat else folder / "tickets"
+    breakdown.mkdir(parents=True, exist_ok=True)
+    path = breakdown / "tickets.toml"
+    path.write_text(_PARENT_BREAKDOWN, encoding="utf-8")
+    return path
+
+
+def _slice_children(layout, *slugs: str) -> None:
+    """Give each child initiative in ``slugs`` a committed folder beside the active
+    initiative's, a copy of its ticket tree (call before `_make_parent`)."""
+    for slug in slugs:
+        shutil.copytree(layout.initiative_folder, layout.initiative_folder.parent / slug)
+    git(layout.project, "add", "-A")
+    git(layout.project, "commit", "-q", "-m", "child initiatives")
+
+
+def test_tickets_preflight_refuses_a_parent_initiative(project_v7, monkeypatch):
+    """A parent initiative has no tickets of its own (tickets.py `status`/`next`
+    print its children, every other verb refuses), and without worktree isolation
+    every session reads the parent from the user config: a problem naming the
+    children, read from its `tickets.toml` without a spawn, and the store checks
+    are skipped. Ablation (performed): drop the isolation check and this FAILS
+    (the parent is accepted instead)."""
+    from bmad_loop.checks import VALIDATE_CHECKS
+
+    _slice_children(project_v7, "initiative-auth", "initiative-billing")
+    _make_parent(project_v7)
+    findings = _tickets_findings(project_v7, monkeypatch, isolation="none")
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.initiative-parent"
+    assert problem.detail == {
+        "initiative": project_v7.initiative,
+        "children": ["initiative-auth", "initiative-billing"],
+        "isolation": "none",
+        "retrospective": None,
+    }
+    assert "(children: initiative-auth, initiative-billing)" in problem.message
+    assert '`isolation = "worktree"`' in problem.message
+    assert "`[core] active_initiative`" in problem.message
+    assert "tickets.store-topology" not in _ids(findings)
+    assert set(_ids(findings)) <= VALIDATE_CHECKS
+
+
+def test_tickets_preflight_accepts_a_parent_under_worktree_isolation(project_v7, monkeypatch):
+    """Under worktree isolation, with no auto retrospective, a parent is an ok line
+    naming its children, and each child's store is classified on its own folder.
+    Ablation (performed): drop the per-child store loop and this FAILS."""
+    from bmad_loop.checks import VALIDATE_CHECKS
+
+    _slice_children(project_v7, "initiative-auth", "initiative-billing")
+    _make_parent(project_v7)
+    findings = _tickets_findings(
+        project_v7, monkeypatch, isolation="worktree", retrospective="notify"
+    )
+    assert [f for f in findings if f.severity == "problem"] == []
+    (parent,) = [f for f in findings if f.check == "tickets.initiative-parent"]
+    assert parent.severity == "ok"
+    assert parent.detail["children"] == ["initiative-auth", "initiative-billing"]
+    assert parent.detail["skipped"] == []
+    stores = [f for f in findings if f.check == "tickets.store-topology"]
+    assert [f.detail["initiative"] for f in stores] == ["initiative-auth", "initiative-billing"]
+    root = project_v7.initiative_folder.parent
+    assert [f.detail["path"] for f in stores] == [
+        str(root / "initiative-auth"),
+        str(root / "initiative-billing"),
+    ]
+    assert all(f.severity == "ok" and f.detail["topology"]["layout"] == "T1" for f in stores)
+    assert stores[0].message.startswith("child initiative 'initiative-auth': ")
+    assert set(_ids(findings)) <= VALIDATE_CHECKS
+
+
+def test_tickets_preflight_refuses_a_parent_under_auto_retrospective(project_v7, monkeypatch):
+    """The auto retrospective session runs in the main checkout and reads the
+    parent, so even worktree isolation refuses a parent while it is on.
+    Ablation (performed): drop the retrospective check and this FAILS."""
+    _slice_children(project_v7, "initiative-auth", "initiative-billing")
+    _make_parent(project_v7)
+    findings = _tickets_findings(
+        project_v7, monkeypatch, isolation="worktree", retrospective="auto"
+    )
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.initiative-parent"
+    assert '`gates.retrospective = "auto"`' in problem.message
+    assert "`[scm] isolation" not in problem.message
+    assert "tickets.store-topology" not in _ids(findings)
+
+
+def test_tickets_preflight_skips_a_parents_unsliced_child(project_v7, monkeypatch):
+    """A child declared but not sliced yet has no folder: the ok line says it is
+    skipped, and only the sliced child's store is classified."""
+    _slice_children(project_v7, "initiative-auth")
+    _make_parent(project_v7)
+    findings = _tickets_findings(project_v7, monkeypatch, isolation="worktree")
+    assert [f for f in findings if f.severity == "problem"] == []
+    (parent,) = [f for f in findings if f.check == "tickets.initiative-parent"]
+    assert parent.severity == "ok"
+    assert parent.detail["skipped"] == ["initiative-billing"]
+    assert "initiative-billing has no folder yet (declared, not sliced)" in parent.message
+    stores = [f for f in findings if f.check == "tickets.store-topology"]
+    assert [f.detail["initiative"] for f in stores] == ["initiative-auth"]
+
+
+def test_tickets_preflight_refuses_a_parents_child_on_a_tracked_user_config(
+    project_v7, monkeypatch
+):
+    """A chained run rewrites the mount's `config.user.toml` on every layout, so a
+    tracked personal layer refuses each child even on T1, which needs no store
+    redirect (the same project as a plain initiative runs)."""
+    _slice_children(project_v7, "initiative-auth", "initiative-billing")
+    git(project_v7.project, "add", "-f", "_bmad/custom/config.user.toml")
+    git(project_v7.project, "commit", "-q", "-m", "track the personal layer")
+    plain = _tickets_findings(project_v7, monkeypatch, isolation="worktree")
+    assert [f for f in plain if f.severity == "problem"] == []
+    _make_parent(project_v7)
+    findings = _tickets_findings(project_v7, monkeypatch, isolation="worktree")
+    problems = [f for f in findings if f.severity == "problem"]
+    assert [f.check for f in problems] == ["tickets.own-repo-isolation"] * 2
+    assert [f.detail["initiative"] for f in problems] == ["initiative-auth", "initiative-billing"]
+    assert [f.detail["refusal"] for f in problems] == ["user-config-tracked"] * 2
+    assert "config.user.toml" in problems[0].message
+
+
+def test_tickets_preflight_reads_a_parent_in_the_flat_layout_too(project_v7, monkeypatch):
+    """A preview-era tree keeps `tickets.toml` in the initiative folder itself: the
+    same parent check reads it there (upstream's `tickets/`-is-a-directory rule)."""
+    _make_parent(project_v7, flat=True)
+    findings = _tickets_findings(project_v7, monkeypatch)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.initiative-parent"
+    assert problem.detail["children"] == ["initiative-auth", "initiative-billing"]
+
+
+@pytest.mark.parametrize("fault", ["stat", "toml"])
+def test_tickets_preflight_parent_probe_fault_is_a_finding(project_v7, monkeypatch, fault):
+    """A `tickets.toml` the parent check cannot stat or parse is a problem naming
+    the error, never read as "no parent" (which would go on to the store checks)
+    and never raised out of the preflight."""
+    path = _make_parent(project_v7)
+    if fault == "toml":
+        path.write_text("[[initiative]\n", encoding="utf-8")
+    else:
+        real_stat = Path.stat
+
+        def stat(self, *args, **kwargs):
+            if self == path:
+                raise PermissionError(errno.EACCES, "Permission denied", str(self))
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+    findings = _tickets_findings(project_v7, monkeypatch)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.initiative-parent"
+    assert problem.detail["path"] == str(path)
+    error = "PermissionError:" if fault == "stat" else "TOMLDecodeError:"
+    assert problem.detail["error"].startswith(error)
+    assert "could not be checked" in problem.message
+    assert "tickets.store-topology" not in _ids(findings)
+
+
+@pytest.mark.parametrize(
+    ("layout", "check", "text"),
+    [
+        ("ignored", "tickets.store-topology", "T2: "),
+        ("uncommitted", "tickets.tree-untracked", "neither tracks nor ignores"),
+        ("outside", "tickets.store-topology", "T4: "),
+    ],
+)
+def test_tickets_preflight_classifies_store_layouts(
+    project_v7, monkeypatch, tmp_path, layout, check, text
+):
+    """The store-topology classifier stands where the tracked-in-checkout gate
+    stood: an ignored initiative folder classifies as T2 and a code repo elsewhere
+    makes the store its own repository (T4) — both an ok finding carrying the
+    topology, since shared stores run — while a folder neither tracked nor ignored
+    is untracked dirt (`tickets.tree-untracked`), the one problem. Ablation
+    (performed): drop the `_tickets_store_findings` call in `tickets_preflight` and
+    every row FAILS."""
+    import dataclasses
+
+    rel = project_v7.initiative_folder.relative_to(project_v7.project).as_posix()
+    paths = _tickets_paths(project_v7)
+    if layout in ("ignored", "uncommitted"):
+        git(project_v7.project, "rm", "-r", "-q", "--cached", rel)
+        if layout == "ignored":
+            with (project_v7.project / ".gitignore").open("a", encoding="utf-8") as f:
+                f.write(f"/{rel}/\n")
+            git(project_v7.project, "add", ".gitignore")
+        git(project_v7.project, "commit", "-q", "-m", "untrack the initiative")
+    else:
+        other = tmp_path / "code"
+        other.mkdir()
+        git(other, "init", "-q")
+        paths = dataclasses.replace(paths, repo_root=other)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+
+    findings = install_mod.tickets_preflight(paths, [".claude/skills"], probe_capability=False)
+
+    (found,) = [f for f in findings if f.check == check]
+    assert text in found.message
+    assert found.detail["path"] == str(paths.initiative_folder)
+    if layout == "uncommitted":
+        assert found.severity == "problem"
+        assert found.detail["refusal"] == "store-not-ignored"
+    else:
+        assert found.severity == "ok"
+        assert found.detail["topology"]["layout"] == text[:2]
+        assert not [f for f in findings if f.severity == "problem"]
+
+
+@pytest.mark.parametrize(
+    ("isolation", "roles", "sandboxed", "warned"),
+    [
+        ("worktree", ("dev",), (), True),
+        ("worktree", (), ("review",), True),
+        ("worktree", (), (), False),
+        ("none", ("dev",), (), False),
+        ("none", (), ("review",), False),
+    ],
+)
+def test_tickets_preflight_warns_shared_store_extra_args(
+    project_v7, monkeypatch, isolation, roles, sandboxed, warned
+):
+    """A shared store written outside the session cwd (an ignored store under worktree
+    isolation) while a role sets `extra_args` or runs `permission_mode =
+    "sandboxed"`: the `tickets.store-sandbox` warning — stage `extra_args` replace
+    the profile's sandbox-bypass flags, and the sandboxed mode confines writes to
+    the cwd. Silent without such a role, and under isolation "none", where the
+    store is inside the cwd. Ablation (performed): drop the warning branch and the
+    warned rows FAIL; drop `sandboxed_roles` from its condition and the sandboxed
+    row FAILS."""
+    rel = project_v7.initiative_folder.relative_to(project_v7.project).as_posix()
+    git(project_v7.project, "rm", "-r", "-q", "--cached", rel)
+    with (project_v7.project / ".gitignore").open("a", encoding="utf-8") as f:
+        f.write(f"/{rel}/\n")
+    git(project_v7.project, "add", ".gitignore")
+    git(project_v7.project, "commit", "-q", "-m", "untrack the initiative")
+    monkeypatch.setattr(install_mod.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+
+    findings = install_mod.tickets_preflight(
+        _tickets_paths(project_v7),
+        [".claude/skills"],
+        probe_capability=False,
+        isolation=isolation,
+        extra_args_roles=roles,
+        sandboxed_roles=sandboxed,
+    )
+
+    sandbox = [f for f in findings if f.check == "tickets.store-sandbox"]
+    assert len(sandbox) == (1 if warned else 0)
+    if warned:
+        assert sandbox[0].severity == "warning"
+        assert sandbox[0].detail["roles"] == list(roles)
+        assert sandbox[0].detail["sandboxed_roles"] == list(sandboxed)
+        assert ('permission_mode = "sandboxed"' in sandbox[0].message) == bool(sandboxed)
+
+
+@pytest.mark.parametrize(("branch_per", "warned"), [("run", True), ("story", False), (None, False)])
+def test_tickets_preflight_warns_branch_per_run(project_v7, monkeypatch, branch_per, warned):
+    """`branch_per = "run"` builds every ticket on one branch, and build-auto's
+    branch-fit check may HALT a ticket it judges the branch does not fit: a
+    warning, never a problem. Ablation (performed): drop the check and the `run`
+    row FAILS."""
+    monkeypatch.setattr(install_mod.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    findings = install_mod.tickets_preflight(
+        _tickets_paths(project_v7),
+        [".claude/skills"],
+        probe_capability=False,
+        branch_per=branch_per,
+    )
+    warnings = [f for f in findings if f.check == "tickets.branch-per-run"]
+    assert [(f.severity, f.detail) for f in warnings] == (
+        [("warning", {"branch_per": "run"})] if warned else []
+    )
+    assert not [f for f in findings if f.severity == "problem"]
+
+
+@pytest.mark.parametrize(
+    ("config", "store"),
+    [('[tickets]\nstore = "jira"\n', "jira"), ("[tickets\nstore = ", None)],
+    ids=["tracker", "unreadable"],
+)
+def test_tickets_preflight_store_not_repo(project_v7, monkeypatch, config, store):
+    """Tracker stores are refused (decision 9): bmad-loop drives a repo store only,
+    and a store config it cannot read is not assumed to be one. Ablation: drop the
+    store check and both rows FAIL."""
+    (project_v7.project / install_mod.TICKETS_STORE_CONFIG_REL).write_text(config, encoding="utf-8")
+    findings = _tickets_findings(project_v7, monkeypatch)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.store-not-repo"
+    assert problem.detail["store"] == store
+    assert ("tracker stores are not supported" in problem.message) == (store is not None)
+
+
+@pytest.mark.parametrize(
+    "config", [None, "# no table\n", '[tickets]\nstore = ""\n', '[tickets]\nstore = "repo"\n']
+)
+def test_tickets_preflight_repo_store_defaults_like_upstream(project_v7, monkeypatch, config):
+    """Upstream reads an absent file, table or blank value as the repo store — so
+    must the preflight, or it would refuse a stock install."""
+    store_cfg = project_v7.project / install_mod.TICKETS_STORE_CONFIG_REL
+    if config is None:
+        store_cfg.unlink()
+    else:
+        store_cfg.write_text(config, encoding="utf-8")
+    assert "tickets.store-not-repo" not in _ids(_tickets_findings(project_v7, monkeypatch))
+
+
+@pytest.mark.parametrize(("config", "store"), [("repo", None), ("jira", "jira")])
+def test_tickets_preflight_store_config_reads_through_a_bom(project_v7, monkeypatch, config, store):
+    """Upstream's `store_config` decodes with utf-8-sig, so a BOM-saved store config
+    is the store it names, not an unreadable file. Ablation: read with plain utf-8
+    and the repo row FAILS (`tickets.store-not-repo`, TOMLDecodeError)."""
+    (project_v7.project / install_mod.TICKETS_STORE_CONFIG_REL).write_bytes(
+        b"\xef\xbb\xbf" + f'[tickets]\nstore = "{config}"\n'.encode()
+    )
+    problems = [f for f in _tickets_findings(project_v7, monkeypatch) if f.severity == "problem"]
+    assert [(f.check, f.detail["store"]) for f in problems] == (
+        [("tickets.store-not-repo", store)] if store else []
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "check"),
+    [
+        ("script", "tickets.script-missing"),
+        ("config-utils", "tickets.config-utils-missing"),
+        ("initiative", "tickets.initiative-missing"),
+    ],
+)
+def test_tickets_preflight_stat_fault_is_a_named_problem(project_v7, monkeypatch, target, check):
+    """A stat fault other than absence on a probed path (an unsearchable parent, a
+    failing share) neither raises out of the preflight — `validate --json` must
+    still emit its document — nor reads as a missing path: it is a problem naming
+    the error. Ablation: probe with `Path.is_file`/`is_dir` and every row FAILS
+    (raises on 3.11–3.13, reads as absent on 3.14)."""
+    paths = _tickets_paths(project_v7)
+    victim = {
+        "script": project_v7.project / install_mod.TICKETS_SCRIPT_REL,
+        "config-utils": project_v7.project / install_mod.RENDERER_CONFIG_UTILS_REL,
+        "initiative": paths.initiative_folder,
+    }[target]
+    real_stat = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self == victim:
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    findings = install_mod.tickets_preflight(paths, [".claude/skills"], probe_capability=False)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == check
+    assert problem.detail["error"].startswith("PermissionError:")
+    assert "could not be checked" in problem.message
+
+
+def test_tickets_preflight_capability_ok_on_project_v7(project_v7, monkeypatch):
+    """Under `probe_capability` the vendored script's `--help` offers every verb and
+    `mark` status bmad-loop needs (2 real spawns, this file's whole budget)."""
+    findings = _tickets_findings(project_v7, monkeypatch, probe=True)
+    cap = next(f for f in findings if f.check == "tickets.capability")
+    assert cap.severity == "ok"
+    assert {"next", "status", "find", "mark"} <= set(cap.detail["verbs"])
+    assert "tickets.capability-not-run" not in _ids(findings)
+
+
+def test_tickets_preflight_capability_problem_names_the_gap(project_v7, monkeypatch):
+    """A script missing a verb or a `mark` status cannot drive a run. Ablation: drop
+    the `capability_problems` check and this FAILS."""
+    from bmad_loop import ticketmodel, tickettree
+
+    monkeypatch.setattr(
+        tickettree.TicketTree,
+        "capability",
+        lambda self: ticketmodel.Capability(
+            verbs=frozenset({"next", "status", "find"}), statuses=frozenset({"done"})
+        ),
+    )
+    findings = _tickets_findings(project_v7, monkeypatch, probe=True)
+    cap = next(f for f in findings if f.check == "tickets.capability")
+    assert cap.severity == "problem"
+    assert "no `mark` command" in cap.message
+    assert any("blocked" in line for line in cap.detail["problems"])
+
+
+def test_tickets_preflight_capability_fault_is_a_problem(project_v7, monkeypatch):
+    """A probe that cannot run (here: timed out) is a problem carrying the error's
+    `kind`, never a silent pass."""
+    from bmad_loop import tickettree
+
+    def boom(self):
+        raise tickettree.TicketsTimeout("tickets.py --help timed out")
+
+    monkeypatch.setattr(tickettree.TicketTree, "capability", boom)
+    findings = _tickets_findings(project_v7, monkeypatch, probe=True)
+    cap = next(f for f in findings if f.check == "tickets.capability")
+    assert (cap.severity, cap.detail) == ("problem", {"kind": "timeout"})
+
+
+def test_tickets_preflight_capability_not_run_executes_nothing(project_v7, monkeypatch):
+    """Without `probe_capability` the project's script is never executed (plain
+    validate runs no project-controlled command); a note says so. Ablation: probe
+    unconditionally and the stub below raises."""
+    from bmad_loop import tickettree
+
+    def never(self):
+        raise AssertionError("capability probed without probe_capability")
+
+    monkeypatch.setattr(tickettree.TicketTree, "capability", never)
+    findings = _tickets_findings(project_v7, monkeypatch)
+    note = next(f for f in findings if f.check == "tickets.capability-not-run")
+    assert (note.severity, note.detail) == ("ok", {"run": False})
+    assert "--probes" in note.message
+
+
+def test_tickets_script_rel_is_the_v7_marker():
+    """The script tickets mode runs IS the era marker bmadconfig probes."""
+    from bmad_loop import bmadconfig
+
+    assert install_mod.TICKETS_SCRIPT_REL == bmadconfig.V7_MARKER_REL.as_posix()
+
+
+def test_bmod_method_version_reads_the_first_tree_with_one(tmp_path):
+    """Display only: the first tree carrying a `[bmod] version`, None when none does."""
+    assert install_mod.bmod_method_version(tmp_path, [".claude/skills"]) is None
+    manifest = tmp_path / ".agents/skills" / install_mod.BMOD_METHOD_MANIFEST
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text('[bmod]\ncode = "method"\nversion = "6.13.0"\n', encoding="utf-8")
+    assert (
+        install_mod.bmod_method_version(tmp_path, [".claude/skills", ".agents/skills"]) == "6.13.0"
+    )
+
+
+def test_missing_tickets_support_findings_split_absent_from_stale(tmp_path):
+    """Tickets mode needs a dev primitive whose step-01 resolves a ticket from the
+    tree: a half install (`-missing`) and a pre-v7 one (`-stale`) are separate ids,
+    and the v7 build-auto clears both. Ablation: drop the marker check and the
+    stale leg FAILS."""
+    from bmad_loop.checks import VALIDATE_CHECKS
+    from bmad_loop.install import (
+        DEV_PRIMITIVE_NEW,
+        TICKETS_PROBE_FILE,
+        TICKETS_PROBE_TEXT,
+        missing_tickets_support,
+    )
+
+    tree = ".claude/skills"
+    absent = missing_tickets_support(tmp_path, [tree])
+    assert [f.check for f in absent] == ["skills.tickets-dispatch-missing"]
+
+    install_build_auto_v7_skill(tmp_path, tree, tickets_route=False)
+    stale = missing_tickets_support(tmp_path, [tree])
+    assert [f.check for f in stale] == ["skills.tickets-dispatch-stale"]
+    assert stale[0].detail == {
+        "tree": tree,
+        "skill": DEV_PRIMITIVE_NEW,
+        "file": TICKETS_PROBE_FILE,
+        "marker": TICKETS_PROBE_TEXT,
+    }
+    assert all(f.check in VALIDATE_CHECKS for f in (*absent, *stale))
+
+    install_build_auto_v7_skill(tmp_path, tree)
+    assert missing_tickets_support(tmp_path, [tree]) == []
+
+
+# The BMAD v7 lens shape (BMAD-METHOD #2861), trimmed from the shipped
+# bmad-build-auto/customize.toml: a `review` selection plus two lens sets. Every
+# shipped lens says "Do not invoke any skill" — the derived requirement is empty.
+LENS_CUSTOMIZE = '''
+[workflow]
+review = "quick"
+
+[[workflow.quick_lenses]]
+id = "quick"
+name = "Quick"
+instruction = """
+Launch a context-free subagent with this prompt:
+
+Read `{plan_file}` and the unified diff at `{diff_file}`. Report findings.
+Do not invoke any skill, and do not spawn subagents of your own.
+"""
+
+[[workflow.thorough_lenses]]
+id = "blind-hunter"
+name = "Blind Hunter"
+instruction = """
+Launch a context-free subagent with this prompt:
+
+CONTENT: the unified diff at `{diff_file}`.
+Do not invoke any skill, and do not spawn subagents of your own.
+"""
+
+[[workflow.thorough_lenses]]
+id = "edge-case-hunter"
+name = "Edge Case Hunter"
+instruction = """
+Launch a context-free subagent with this prompt:
+
+Read `{skill-root}/review-prompts/edge-case-hunter.md` completely and follow it.
+Do not invoke any skill, and do not spawn subagents of your own.
+"""
+'''
+
+_HUNTERS = {"bmad-review-adversarial-general", "bmad-review-edge-case-hunter"}
+
+
+def _lens_tree(root, customize=LENS_CUSTOMIZE):
+    """A v7 primitive (bmad-build-auto) carrying ``customize``, alone in its tree."""
+    tree = get_profile("claude").skill_tree
+    _install_dev_auto(root, tree, skill=DEV_PRIMITIVE_NEW, customize=customize)
+    return tree
+
+
+def test_v7_lens_sets_require_no_review_skill(tmp_path):
+    """#768: a v7 tree reviews through its own lens prompts and invokes no skill, so
+    neither the merged reviewer nor the two long-deleted hunters is demanded.
+    Ablation: with the lens path removed from resolve_review_layers the shape reads
+    as unknown and the static fallback FAILs on both hunters."""
+    tree = _lens_tree(tmp_path)
+    assert not (tmp_path / tree / "bmad-review").exists()
+
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+
+def test_v7_lens_resolution_is_layer_driven(tmp_path):
+    tree = _lens_tree(tmp_path)
+
+    resolved = resolve_review_layers(tmp_path, tree)
+
+    assert resolved is not None
+    assert resolved.source == "customize.toml"
+    assert resolved.layer_driven is True
+    assert resolved.required == {}
+    assert resolved.advisory == {}
+    # BOTH sets count: the selection that runs is decided at run time
+    assert resolved.active_layers == ("quick", "blind-hunter", "edge-case-hunter")
+    assert resolved.lens_sets == ("quick", "thorough")
+    assert resolved.selection == "quick"
+
+
+def test_v7_lens_invoking_a_skill_is_required_in_either_set(tmp_path):
+    """A thorough lens runs whenever the run asks for thorough (`auto` on a full
+    route, `--set workflow.review=thorough`, `[tickets] thorough_review`), so a
+    skill it invokes is required even while the configured selection is quick."""
+    invoking = LENS_CUSTOMIZE.replace(
+        "Read `{skill-root}/review-prompts/edge-case-hunter.md` completely and follow it.",
+        "Invoke the `bmad-foo` skill on this diff.",
+    )
+    tree = _lens_tree(tmp_path, invoking)
+
+    problems = missing_base_skills(tmp_path, [tree])
+
+    assert [p.check for p in problems] == ["skills.review-layer-missing"]
+    assert problems[0].severity == "problem"
+    assert problems[0].detail["skill"] == "bmad-foo"
+    assert problems[0].detail["layers"] == ["edge-case-hunter"]
+
+    _install_skills(tmp_path, tree, {"bmad-foo": ()})
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+
+def test_v7_gated_lens_skill_is_advisory(tmp_path):
+    """#260: a `when`-gated lens may never run, so its skill only warns."""
+    gated = LENS_CUSTOMIZE.replace(
+        'name = "Blind Hunter"\n',
+        'name = "Blind Hunter"\nwhen = "the diff touches auth"\n',
+    ).replace(
+        "CONTENT: the unified diff at `{diff_file}`.",
+        "Invoke the `bmad-foo` skill on this diff.",
+    )
+    tree = _lens_tree(tmp_path, gated)
+
+    findings = missing_base_skills(tmp_path, [tree])
+
+    assert [(f.check, f.severity) for f in findings] == [
+        ("skills.review-layer-unresolved", "warning")
+    ]
+    assert findings[0].detail["layers"] == ["blind-hunter"]
+
+
+def test_v7_lens_override_replaces_by_id(tmp_path):
+    """The lens sets merge with project overrides keyed on `id`, per set — the
+    same deep merge BMAD's resolver applies at run time."""
+    tree = _lens_tree(tmp_path)
+    override = _write_override(
+        tmp_path,
+        '[[workflow.thorough_lenses]]\nid = "blind-hunter"\n'
+        'instruction = "Invoke the `bmad-foo` skill on this diff."\n',
+        skill=DEV_PRIMITIVE_NEW,
+    )
+
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [p.check for p in problems] == ["skills.review-layer-missing"]
+    assert problems[0].detail["layers"] == ["blind-hunter"]
+
+    # an override emptying the lens disables it: nothing is required any more
+    override.write_text(
+        '[[workflow.thorough_lenses]]\nid = "blind-hunter"\ninstruction = ""\n',
+        encoding="utf-8",
+    )
+    assert missing_base_skills(tmp_path, [tree]) == []
+    resolved = resolve_review_layers(tmp_path, tree)
+    assert resolved is not None
+    assert "blind-hunter" not in resolved.active_layers
+
+
+_ALL_LENSES_OFF = (
+    '[[workflow.quick_lenses]]\nid = "quick"\ninstruction = ""\n'
+    '[[workflow.thorough_lenses]]\nid = "blind-hunter"\ninstruction = ""\n'
+    '[[workflow.thorough_lenses]]\nid = "edge-case-hunter"\ninstruction = ""\n'
+)
+
+
+def test_v7_all_lenses_disabled_is_reported(tmp_path):
+    """Every lens disabled under `auto` leaves the run nothing to launch on either
+    route. Ablation: drop the lens branch's empty check and this goes green."""
+    tree = _lens_tree(tmp_path)
+    _write_override(
+        tmp_path, '[workflow]\nreview = "auto"\n' + _ALL_LENSES_OFF, skill=DEV_PRIMITIVE_NEW
+    )
+
+    problems = missing_base_skills(tmp_path, [tree])
+
+    assert [p.check for p in problems] == ["skills.review-layers-empty"]
+    assert problems[0].severity == "problem"
+    assert "[[workflow.quick_lenses]]" in problems[0].message
+    assert "[[workflow.thorough_lenses]]" in problems[0].message
+
+
+@pytest.mark.parametrize(
+    ("selection", "disabled", "empty_table"),
+    [
+        ("quick", '[[workflow.quick_lenses]]\nid = "quick"\ninstruction = ""\n', "quick_lenses"),
+        (
+            "thorough",
+            '[[workflow.thorough_lenses]]\nid = "blind-hunter"\ninstruction = ""\n'
+            '[[workflow.thorough_lenses]]\nid = "edge-case-hunter"\ninstruction = ""\n',
+            "thorough_lenses",
+        ),
+    ],
+)
+def test_v7_selected_lens_set_disabled_is_reported(tmp_path, selection, disabled, empty_table):
+    """`quick`/`thorough` launch only their own set, so an enabled lens in the OTHER
+    set cannot serve the run. Ablation: check the combined active lenses instead of
+    the selected set and this goes green."""
+    tree = _lens_tree(tmp_path)
+    _write_override(
+        tmp_path, f'[workflow]\nreview = "{selection}"\n' + disabled, skill=DEV_PRIMITIVE_NEW
+    )
+
+    problems = missing_base_skills(tmp_path, [tree])
+
+    assert [p.check for p in problems] == ["skills.review-layers-empty"]
+    assert f"[[workflow.{empty_table}]]" in problems[0].message
+    # the set that cannot run is not offered as the culprit
+    other = "thorough_lenses" if empty_table == "quick_lenses" else "quick_lenses"
+    assert other not in problems[0].message
+
+
+def test_v7_auto_selection_needs_one_enabled_set(tmp_path):
+    """`auto` may route to either set, so one disabled set is not a HALT."""
+    tree = _lens_tree(tmp_path)
+    _write_override(
+        tmp_path,
+        '[workflow]\nreview = "auto"\n[[workflow.quick_lenses]]\nid = "quick"\ninstruction = ""\n',
+        skill=DEV_PRIMITIVE_NEW,
+    )
+
+    assert missing_base_skills(tmp_path, [tree]) == []
+    resolved = resolve_review_layers(tmp_path, tree)
+    assert resolved is not None and resolved.active_sets == ("thorough",)
+
+
+@pytest.mark.parametrize("key", ["id", "code"])
+@pytest.mark.parametrize("value", ['["quick"]', "{ a = 1 }", "1", '""'])
+def test_v7_lens_override_with_malformed_key_is_reported_not_raised(tmp_path, key, value):
+    """v7's loader accepts only a non-empty string merge key and refuses to render
+    the skill otherwise; the preflight reports the override as a problem instead of
+    crashing with TypeError on an unhashable key, and leaves the file out whole.
+    Ablation: drop the `_MalformedMergeKey` guard and the array/table cases raise
+    TypeError out of missing_base_skills while the int/empty cases go clean."""
+    tree = _lens_tree(tmp_path)
+    shipped = LENS_CUSTOMIZE if key == "id" else LENS_CUSTOMIZE.replace("\nid = ", "\ncode = ")
+    _lens_tree(tmp_path, shipped)
+    _write_override(
+        tmp_path,
+        f'[[workflow.quick_lenses]]\n{key} = {value}\ninstruction = ""\n',
+        skill=DEV_PRIMITIVE_NEW,
+    )
+
+    findings = missing_base_skills(tmp_path, [tree])
+
+    assert [(f.check, f.severity) for f in findings] == [("skills.customize-unreadable", "problem")]
+    assert "fails to start" in findings[0].message
+    resolved = resolve_review_layers(tmp_path, tree)
+    assert resolved is not None
+    assert "quick" in resolved.active_sets
+
+
+def test_v7_unparseable_override_is_a_problem(tmp_path):
+    """v7 renders the dev skill through a strict loader that raises on invalid TOML
+    in an override, so no dev run starts; the layer-era warning would let the run
+    preflight pass. Ablation: report it as a warning on every tree and this fails."""
+    tree = _lens_tree(tmp_path)
+    _write_override(tmp_path, "this is not = valid toml [[[", skill=DEV_PRIMITIVE_NEW)
+
+    findings = missing_base_skills(tmp_path, [tree])
+
+    assert [(f.check, f.severity) for f in findings] == [("skills.customize-unreadable", "problem")]
+
+
+def test_v7_all_lenses_disabled_with_review_none_is_clean(tmp_path):
+    """`review = "none"` launches no lens by design, so empty sets are legitimate.
+    Ablation: drop the `selection != "none"` guard and this reports empty lenses."""
+    tree = _lens_tree(tmp_path)
+    _write_override(
+        tmp_path, '[workflow]\nreview = "none"\n' + _ALL_LENSES_OFF, skill=DEV_PRIMITIVE_NEW
+    )
+
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+
+def test_v7_invalid_review_selection_is_a_problem(tmp_path):
+    """bmad-build-auto's workflow.md HALTs every run on a `workflow.review` outside
+    none/quick/thorough/auto — shipped or overridden, the last string wins."""
+    from bmad_loop.checks import VALIDATE_CHECKS
+
+    assert "skills.review-selection-invalid" in VALIDATE_CHECKS
+    tree = _lens_tree(tmp_path, LENS_CUSTOMIZE.replace('review = "quick"', 'review = "deep"'))
+
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [p.check for p in problems] == ["skills.review-selection-invalid"]
+    assert problems[0].detail["selection"] == "deep"
+
+    # an override fixing it clears the problem...
+    override = _write_override(tmp_path, '[workflow]\nreview = "auto"\n', skill=DEV_PRIMITIVE_NEW)
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+    # ...and an override breaking a valid shipped value raises it
+    _lens_tree(tmp_path)
+    override.write_text('[workflow]\nreview = "deep"\n', encoding="utf-8")
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [p.check for p in problems] == ["skills.review-selection-invalid"]
+
+
+@pytest.mark.parametrize(
+    ("literal", "shown"), [("false", "false"), ("1", "1"), ('["quick"]', '["quick"]')]
+)
+def test_v7_non_string_review_selection_is_a_problem(tmp_path, literal, shown):
+    """A non-string `review` is not "unset": the override still replaces the shipped
+    value and the template HALTs on it. Ablation: drop non-string values in
+    `_review_selection_of` and the shipped `quick` wins, reporting nothing."""
+    tree = _lens_tree(tmp_path)
+    _write_override(tmp_path, f"[workflow]\nreview = {literal}\n", skill=DEV_PRIMITIVE_NEW)
+
+    problems = missing_base_skills(tmp_path, [tree])
+
+    assert [p.check for p in problems] == ["skills.review-selection-invalid"]
+    assert problems[0].detail["selection"] == shown
+
+
+def test_review_layers_shape_still_wins_over_lenses(tmp_path):
+    """A shipped config carrying review layers keeps the v6.10-6.12 contract even
+    when it also carries lens tables: its layers decide the requirement."""
+    both = LAYER_CUSTOMIZE + LENS_CUSTOMIZE.replace('[workflow]\nreview = "quick"\n', "")
+    tree = _lens_tree(tmp_path, both)
+
+    resolved = resolve_review_layers(tmp_path, tree)
+
+    assert resolved is not None
+    assert resolved.lens_sets == ()
+    assert resolved.required == {
+        "bmad-review": ("blind-hunter", "edge-case-hunter", "verification-gap")
+    }
+    assert [p.check for p in missing_base_skills(tmp_path, [tree])] == [
+        "skills.review-layer-missing"
+    ]
+
+
+def test_v7_leftover_review_layers_override_is_inert(tmp_path):
+    """A v7 run reads only the lens sets, so a `review_layers` override left over
+    from a v6 install must not pull the preflight onto the layer path and require
+    the skills those dead layers name. Ablation: decide the shape on the MERGED
+    layers instead of the shipped file and bmad-review is required."""
+    tree = _lens_tree(tmp_path)
+    _write_override(
+        tmp_path,
+        '[[workflow.review_layers]]\nid = "blind-hunter"\n'
+        'instruction = "Invoke the `bmad-review` skill with only the `adversarial` lens"\n',
+        skill=DEV_PRIMITIVE_NEW,
+    )
+
+    assert missing_base_skills(tmp_path, [tree]) == []
+    resolved = resolve_review_layers(tmp_path, tree)
+    assert resolved is not None and resolved.lens_sets == ("quick", "thorough")
+
+
+def test_unresolved_primitive_reports_only_base_missing(tmp_path):
+    """#768: with no primitive there is nothing to derive reviewers from, so the
+    one finding is the root cause — not the deleted hunters on top of it.
+    Ablation: remove the early return in _review_findings and both hunters FAIL."""
+    tree = get_profile("claude").skill_tree
+
+    problems = missing_base_skills(tmp_path, [tree])
+
+    assert [(p.check, p.detail["skill"]) for p in problems] == [
+        ("skills.base-missing", DEV_PRIMITIVE_NEW)
+    ]
+    assert not any(h in p.message for p in problems for h in _HUNTERS)
+
+
+def test_tickets_dispatch_skips_unresolved_primitive(tmp_path):
+    """Callers that also run missing_base_skills skip an unresolved tree (it is
+    already reported); the default still reports it, under the CURRENT name —
+    never the legacy bmad-dev-auto dir nobody would install."""
+    from bmad_loop.install import missing_tickets_support
+
+    tree = get_profile("claude").skill_tree
+
+    assert missing_tickets_support(tmp_path, [tree], skip_unresolved=True) == []
+    reported = missing_tickets_support(tmp_path, [tree])
+    assert [f.check for f in reported] == ["skills.tickets-dispatch-missing"]
+    assert reported[0].detail["skill"] == DEV_PRIMITIVE_NEW
+    assert DEV_PRIMITIVE_LEGACY not in reported[0].message
+    # the combined preflight still refuses: the root cause is a problem
+    assert [p.check for p in missing_base_skills(tmp_path, [tree])] == ["skills.base-missing"]
+
+
+def test_stories_dispatch_skips_unresolved_primitive(tmp_path):
+    from bmad_loop.install import missing_stories_support
+
+    tree = get_profile("claude").skill_tree
+
+    assert missing_stories_support(tmp_path, [tree], skip_unresolved=True) == []
+    reported = missing_stories_support(tmp_path, [tree])
+    assert [f.check for f in reported] == ["skills.stories-dispatch-missing"]
+    assert reported[0].detail["skill"] == DEV_PRIMITIVE_NEW
+    assert DEV_PRIMITIVE_LEGACY not in reported[0].message
+    assert [p.check for p in missing_base_skills(tmp_path, [tree])] == ["skills.base-missing"]
+
+
+def test_review_remediation_names_core_tools(tmp_path):
+    """On v7 the merged bmad-review ships in core-tools, not the method module."""
+    tree = get_profile("claude").skill_tree
+    # unknown shape (unparseable customize.toml) → the static fallback
+    _install_dev_auto(tmp_path, tree, skill=DEV_PRIMITIVE_NEW, customize="x\n")
+    fallback = missing_base_skills(tmp_path, [tree])
+    assert {f.detail["skill"] for f in fallback} == _HUNTERS
+    assert all("core-tools" in f.message for f in fallback)
+
+    _install_dev_auto(tmp_path, tree, skill=DEV_PRIMITIVE_NEW, customize=LAYER_CUSTOMIZE)
+    derived = missing_base_skills(tmp_path, [tree])
+    assert [f.check for f in derived] == ["skills.review-layer-missing"]
+    assert "core-tools" in derived[0].message
+
+
+@pytest.mark.parametrize(
+    ("profile", "root"),
+    [
+        ("claude", ".claude/skills"),
+        ("codex", ".agents/skills"),
+        ("codex", ".codex/skills"),
+        ("gemini", ".gemini/skills"),
+        ("copilot", ".copilot/skills"),
+    ],
+)
+def test_home_hint_names_a_copy_in_the_profiles_own_root(tmp_path, profile, root):
+    """Switch off, a copy in one of the CLI's own user roots is named as a hint that
+    offers `[skills] user_roots` — the run still refuses."""
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    scope = _user_scope(profile, home, on=False)
+
+    bare = missing_base_skills(project, [scope])
+    assert "outside" not in bare[0].detail
+    assert "a copy exists" not in bare[0].message
+
+    _install_skills(home, root, {DEV_PRIMITIVE_NEW: ()})
+    problems = missing_base_skills(project, [scope])
+
+    assert [p.check for p in problems] == ["skills.base-missing"]
+    expected = PurePosixPath("~", root, DEV_PRIMITIVE_NEW).as_posix()
+    assert problems[0].detail["outside"] == expected
+    assert expected in problems[0].message
+    assert "`[skills] user_roots = true`" in problems[0].message
+    assert "npx skills add" in problems[0].message
+
+
+def test_home_hint_ignores_a_root_the_profile_does_not_load(tmp_path):
+    """claude loads only `~/.claude/skills`: a copy in `~/.agents/skills` is no hint,
+    since setting the switch would not make claude load it.
+
+    Ablation: add `"~/.agents/skills"` to claude.toml's `[user_skills] roots` and
+    the hint appears."""
+    home = tmp_path / "home"
+    _install_skills(home, ".agents/skills", {DEV_PRIMITIVE_NEW: ()})
+    problems = missing_base_skills(tmp_path / "project", [_user_scope("claude", home, on=False)])
+
+    assert [p.check for p in problems] == ["skills.base-missing"]
+    assert "outside" not in problems[0].detail
+    assert "a copy exists" not in problems[0].message
+
+
+def test_home_hint_on_review_findings(tmp_path):
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    scope = _user_scope("claude", home, on=False)
+    tree = scope.tree
+    _install_skills(home, ".claude/skills", {"bmad-review": (), **{h: () for h in _HUNTERS}})
+
+    _install_dev_auto(project, tree, skill=DEV_PRIMITIVE_NEW, customize=LAYER_CUSTOMIZE)
+    derived = missing_base_skills(project, [scope])
+    assert derived[0].detail["outside"] == "~/.claude/skills/bmad-review"
+
+    _install_dev_auto(project, tree, skill=DEV_PRIMITIVE_NEW, customize="x\n")
+    fallback = missing_base_skills(project, [scope])
+    assert {f.detail["outside"] for f in fallback} == {f"~/.claude/skills/{h}" for h in _HUNTERS}
+
+
+def test_home_hint_absent_without_a_home_or_for_a_plain_tree(tmp_path):
+    """No determinable home is no hint, and a plain tree string declares no user
+    roots, so it never probes the home directory at all."""
+    project = tmp_path / "project"
+    no_home = missing_base_skills(project, [_user_scope("claude", None, on=False)])
+    assert "outside" not in no_home[0].detail
+    plain = missing_base_skills(project, [get_profile("claude").skill_tree])
+    assert "outside" not in plain[0].detail
+
+
+# --- user-level skill roots through SkillScope ---------------------------------
+
+
+def _user_scope(profile, home, *, on, environ=None):
+    """``profile``'s scope over a pinned ``home`` and environment."""
+    from bmad_loop.skill_locate import scope_for
+
+    return scope_for(get_profile(profile), resolve_user=on, home=home, environ=environ or {})
+
+
+def test_scope_global_only_install_resolves_from_the_user_root(tmp_path):
+    """Switch on: a global-only primitive resolves (no base-missing) and the findings
+    about that copy name its root; a plain string still reports today's base-missing."""
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    # truncated primitive (no step-04) plus the merged reviewer, all in ~/.agents/skills
+    _install_skills(
+        home, ".agents/skills", {DEV_PRIMITIVE_NEW: ("customize.toml",), "bmad-review": ()}
+    )
+    scope = _user_scope("codex", home, on=True)
+
+    findings = missing_base_skills(project, [scope])
+
+    assert [f.check for f in findings] == ["skills.base-incomplete"]
+    assert findings[0].detail["root"] == "~/.agents/skills"
+    assert findings[0].detail["tree"] == ".agents/skills"
+    assert findings[0].message.startswith(f"~/.agents/skills/{DEV_PRIMITIVE_NEW} is incomplete")
+    assert resolve_dev_primitive(project, scope) == DEV_PRIMITIVE_NEW
+    # the plain string, and the switch off, never resolve from home
+    assert [f.check for f in missing_base_skills(project, [".agents/skills"])] == [
+        "skills.base-missing"
+    ]
+    assert resolve_dev_primitive(project, _user_scope("codex", home, on=False)) is None
+
+
+def test_scope_missing_primitive_names_searched_roots_and_the_home_hint(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+
+    [on] = missing_base_skills(project, [_user_scope("codex", home, on=True)])
+    assert on.check == "skills.base-missing"
+    assert on.detail["searched"] == [".agents/skills", "~/.agents/skills", "~/.codex/skills"]
+    assert "outside" not in on.detail
+
+    _install_skills(home, ".codex/skills", {DEV_PRIMITIVE_NEW: ()})
+    [off] = missing_base_skills(project, [_user_scope("codex", home, on=False)])
+    assert off.check == "skills.base-missing"
+    assert "searched" not in off.detail
+    assert off.detail["outside"] == f"~/.codex/skills/{DEV_PRIMITIVE_NEW}"
+    assert "which this CLI loads" in off.message
+    assert "`[skills] user_roots = true`" in off.message
+
+
+def _shadow_layout(tmp_path, tree, home_root):
+    home, project = tmp_path / "home", tmp_path / "project"
+    install_build_auto_skill(project, tree)
+    _install_skills(home, home_root, {DEV_PRIMITIVE_NEW: ()})
+    return home, project
+
+
+def _checks(findings, check):
+    return [f for f in findings if f.check == check]
+
+
+def test_user_shadow_claude_personal_copy_overrides_with_the_switch_off(tmp_path):
+    home, project = _shadow_layout(tmp_path, ".claude/skills", ".claude/skills")
+
+    off = missing_base_skills(project, [_user_scope("claude", home, on=False)])
+    [shadow] = _checks(off, "skills.user-shadow")
+    assert shadow.severity == "warning"
+    assert shadow.detail == {
+        "tree": ".claude/skills",
+        "skill": DEV_PRIMITIVE_NEW,
+        "checked": f".claude/skills/{DEV_PRIMITIVE_NEW}",
+        "other": f"~/.claude/skills/{DEV_PRIMITIVE_NEW}",
+        "precedence": "user",
+        "kind": "overrides",
+    }
+    # switch on: the checks read the personal copy itself, so nothing is shadowed
+    on = missing_base_skills(project, [_user_scope("claude", home, on=True)])
+    assert not _checks(on, "skills.user-shadow")
+    # a plain string never looks at home
+    assert not _checks(missing_base_skills(project, [".claude/skills"]), "skills.user-shadow")
+
+
+def test_user_shadow_codex_unordered_copies_compete(tmp_path):
+    home, project = _shadow_layout(tmp_path, ".agents/skills", ".agents/skills")
+
+    for on in (False, True):
+        findings = missing_base_skills(project, [_user_scope("codex", home, on=on)])
+        [shadow] = _checks(findings, "skills.user-shadow")
+        assert shadow.detail["kind"] == "competes"
+        assert shadow.detail["precedence"] == "unordered"
+
+
+def test_user_shadow_gemini_project_precedence_is_no_shadow(tmp_path):
+    """Negative: gemini's workspace copy wins, so a user copy shadows nothing.
+    Ablation: drop the precedence test in skill_locate.shadow and this fails."""
+    home, project = _shadow_layout(tmp_path, ".agents/skills", ".agents/skills")
+
+    for on in (False, True):
+        findings = missing_base_skills(project, [_user_scope("gemini", home, on=on)])
+        assert not _checks(findings, "skills.user-shadow")
+
+
+def test_user_root_unavailable_is_reported_only_with_the_switch_on(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    install_build_auto_skill(project, ".agents/skills")
+    environ = {"CODEX_HOME": str(tmp_path / "codex")}
+
+    off = missing_base_skills(project, [_user_scope("codex", home, on=False, environ=environ)])
+    assert not _checks(off, "skills.user-root-unavailable")
+
+    on = missing_base_skills(project, [_user_scope("codex", home, on=True, environ=environ)])
+    [finding] = _checks(on, "skills.user-root-unavailable")
+    assert finding.severity == "warning"
+    assert finding.detail == {
+        "tree": ".agents/skills",
+        "root": "~/.codex/skills",
+        "reason": "env:CODEX_HOME",
+    }
+    assert "CODEX_HOME is set" in finding.message
+
+
+def _bmod_method(root, tree, version):
+    d = root / tree / "bmod-method"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text("# bmod-method\n", encoding="utf-8")
+    (d / "bmod.toml").write_text(f'[bmod]\nversion = "{version}"\n', encoding="utf-8")
+
+
+def test_user_root_version_skew_warns_when_module_records_differ(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    install_build_auto_skill(project, ".agents/skills")
+    _bmod_method(project, ".agents/skills", "6.13.0")
+    _bmod_method(home, ".agents/skills", "6.13.0")
+    scope = _user_scope("codex", home, on=True)
+
+    assert not _checks(missing_base_skills(project, [scope]), "skills.user-root-version-skew")
+
+    _bmod_method(home, ".agents/skills", "6.12.0")
+    [skew] = _checks(missing_base_skills(project, [scope]), "skills.user-root-version-skew")
+    assert skew.severity == "warning"
+    assert skew.detail == {
+        "tree": ".agents/skills",
+        "root": "~/.agents/skills",
+        "user_version": "6.12.0",
+        "project_version": "6.13.0",
+    }
+    # the project record still answers the display-only version
+    assert install_mod.bmod_method_version(project, [scope]) == "6.13.0"
+
+
+def test_render_probe_stages_a_user_root_primitive(tmp_path):
+    project, marker, primitive = _probe_project(tmp_path, RENDER_PROBE_OK_BODY, ".agents/skills")
+    home = tmp_path / "home"
+    (home / ".agents/skills").mkdir(parents=True)
+    shutil.move(primitive, home / ".agents/skills" / DEV_PRIMITIVE_NEW)
+    scope = _user_scope("codex", home, on=True)
+
+    [finding] = dev_renderer_probe(project, [scope])
+
+    assert finding.severity == "ok", finding.message
+    assert finding.detail["root"] == "~/.agents/skills"
+    assert finding.message.startswith(f"~/.agents/skills/{DEV_PRIMITIVE_NEW} renders cleanly")
+    ran = json.loads(marker.read_text(encoding="utf-8"))
+    assert Path(ran["skill"]) == Path(ran["root"]) / ".agents/skills" / DEV_PRIMITIVE_NEW
+    assert ran["skill_md"] is True
+    # switch off: the project tree has no primitive, so there is nothing to render
+    [off] = dev_renderer_probe(project, [_user_scope("codex", home, on=False)])
+    assert off.detail == {"trees": [".agents/skills"]}
+
+
+def test_review_layers_read_the_user_copy_with_project_local_overrides(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    _install_dev_auto(home, ".agents/skills", skill=DEV_PRIMITIVE_NEW, customize=LAYER_CUSTOMIZE)
+    extra = (
+        '[[workflow.review_layers]]\nid = "extra"\n'
+        'instruction = "Invoke the `bmad-review-extra` skill on this diff"\n'
+    )
+    override = project / install_mod.CUSTOMIZE_DIR / f"{DEV_PRIMITIVE_NEW}.toml"
+    override.parent.mkdir(parents=True)
+    override.write_text(extra, encoding="utf-8")
+    # an override beside the user copy is not the project's and is never read
+    stray = home / install_mod.CUSTOMIZE_DIR / f"{DEV_PRIMITIVE_NEW}.toml"
+    stray.parent.mkdir(parents=True)
+    stray.write_text(extra.replace("extra", "stray"), encoding="utf-8")
+    scope = _user_scope("codex", home, on=True)
+
+    resolved = resolve_review_layers(project, scope)
+
+    assert resolved is not None
+    assert set(resolved.required) == {"bmad-review", "bmad-review-extra"}
+    assert resolve_review_layers(project, _user_scope("codex", home, on=False)) is None
+
+
+def test_user_root_skill_ids_keep_only_bmad_module_skills(tmp_path):
+    """A personal skill in the same root stays out. Ablation: collect every folder of
+    the user root instead of the candidates + module records and this fails."""
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    _install_skills(
+        home,
+        ".agents/skills",
+        {DEV_PRIMITIVE_NEW: (), "bmad-agent-po": (), "my-notes": (), "bmad-loop-sweep": ()},
+    )
+    _bmod_method(home, ".agents/skills", "6.13.0")
+    record = home / ".agents/skills/bmod-method/bmod.toml"
+    record.write_text(
+        '[bmod]\nversion = "6.13.0"\nskills = ["bmad-agent-po", "../escape", "*"]\n',
+        encoding="utf-8",
+    )
+    # the project copy of the sweep skill wins under codex's project-first lookup
+    _install_skills(project, ".agents/skills", {"bmad-loop-sweep": ()})
+    scope = _user_scope("codex", home, on=True)
+
+    ids = install_mod.user_root_skill_ids(project, scope, "bmad-loop-sweep")
+
+    assert DEV_PRIMITIVE_NEW in ids and "bmad-agent-po" in ids
+    assert "my-notes" not in ids
+    assert "bmad-loop-sweep" not in ids
+    assert not any(".." in i or "*" in i for i in ids)
+    assert install_mod.user_root_skill_ids(project, _user_scope("codex", home, on=False)) == ()
+
+
+def test_skill_root_findings_name_the_resolving_root(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    _install_skills(home, ".agents/skills", {**_era_catalog(DEV_PRIMITIVE_NEW), "bmad-review": ()})
+    scope = _user_scope("codex", home, on=True)
+
+    lines = install_mod.skill_root_findings(project, [scope])
+
+    assert lines and all(f.check == "skills.root" and f.severity == "ok" for f in lines)
+    by_skill = {f.detail["skill"]: f.detail for f in lines}
+    assert by_skill[DEV_PRIMITIVE_NEW] == {
+        "tree": ".agents/skills",
+        "skill": DEV_PRIMITIVE_NEW,
+        "root": "~/.agents/skills",
+        "origin": "user",
+    }
+    # never part of the preflight's finding list
+    assert not _checks(missing_base_skills(project, [scope]), "skills.root")
+
+
+def test_skill_trees_outside_skips_user_root_skills(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    _install_skills(home, ".agents/skills", {**_era_catalog(DEV_PRIMITIVE_NEW), "bmad-review": ()})
+    scope = _user_scope("codex", home, on=True)
+
+    assert install_mod.skill_trees_outside(project, project, [scope], isolation="worktree") == []

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import builtins
+import dataclasses
 import importlib
+import json
 import os
 import subprocess
 import sys
@@ -12,16 +14,25 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    DEFAULT_TREE,
+    V7_USER_CONFIG_REL,
+    FakeTicketTree,
     install_bmad_central_config,
     install_bmad_config,
+    install_bmad_v7,
     refuse_to_resolve,
+    ticket_row,
+    v7_layout,
+    write_plan,
     write_sprint,
+    write_ticket_tree,
 )
 
-from bmad_loop import bmadconfig, deferredwork, platform_util, policy
+from bmad_loop import bmadconfig, platform_util, policy
 from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, save_state
 from bmad_loop.model import RunState
 from bmad_loop.runs import RUNS_DIR
+from bmad_loop.tickettree import TicketsTimeout
 from bmad_loop.tui import data
 
 
@@ -93,7 +104,8 @@ def test_pending_missed_decisions_reads_and_caches(project, monkeypatch):
     _write_triage_decision(run_dir)
 
     pending = data.pending_missed_decisions(project.project)
-    assert [d.id for d in pending] == ["DW-1"]
+    assert pending.fault is None
+    assert [d.id for d in pending.items] == ["DW-1"]
     # cached: same object back while ledger/store/run-set are unchanged
     assert data.pending_missed_decisions(project.project) is pending
 
@@ -118,7 +130,7 @@ def test_pending_missed_decisions_uses_loaded_project_root(project, monkeypatch)
 
     pending = data.pending_missed_decisions(original_spelling)
 
-    assert [decision.id for decision in pending] == ["DW-1"]
+    assert [decision.id for decision in pending.items] == ["DW-1"]
     assert data.pending_missed_decisions(original_spelling) is pending
     assert paths.project in data._missed_cache
     assert original_spelling not in data._missed_cache
@@ -141,7 +153,7 @@ def test_pending_missed_decisions_survives_an_undecodable_triage(project):
     bad = make_run(project.project, "20260102-000000-bbbb")
     (bad / "triage.json").write_bytes(b'{"workflow": "deferred-sweep-triage", "x": "\xff"}')
 
-    assert [d.id for d in data.pending_missed_decisions(project.project)] == ["DW-1"]
+    assert [d.id for d in data.pending_missed_decisions(project.project).items] == ["DW-1"]
 
 
 def test_pending_missed_decisions_survives_a_nested_null_triage(project):
@@ -180,11 +192,18 @@ def test_pending_missed_decisions_survives_a_nested_null_triage(project):
         encoding="utf-8",
     )
 
-    assert [d.id for d in data.pending_missed_decisions(project.project)] == ["DW-1"]
+    assert [d.id for d in data.pending_missed_decisions(project.project).items] == ["DW-1"]
 
 
-def test_pending_missed_decisions_empty_for_uninitialized(tmp_path):
-    assert data.pending_missed_decisions(tmp_path) == []
+def test_pending_missed_decisions_faults_for_uninitialized(tmp_path):
+    """DW-473: a project whose BMAD config cannot be loaded has no answer to give,
+    so the reader says so instead of answering "none pending".
+
+    Ablation: return `MissedDecisions([])` on the `_project_paths is None` arm and
+    this reddens on the fault assertion."""
+    missed = data.pending_missed_decisions(tmp_path)
+    assert missed.items == []
+    assert missed.fault is not None and "BMAD config not found" in missed.fault
 
 
 # ------------------------------------------------------------ no textual dep
@@ -242,6 +261,35 @@ def test_watcher_state_keeps_last_good_parse(tmp_path):
     )
     save_state(run_dir, state)
     assert watcher.state().current_epic == 2
+
+
+def test_sweep_outcomes_reads_both_fields_off_state_json(tmp_path):
+    """DW-366: the TUI reads the auto-sweep ledger off the same parsed state.json
+    `status`/`diagnose` use, in file order, refusals kept apart from deliveries.
+
+    Ablation: drop the `not in state.sweeps_refused` filter — the `triggered`
+    assert fails on epic-2, the latched-then-failed trigger. Return
+    `SweepOutcomes()` instead and both populated-run asserts fail."""
+    from bmad_loop.model import SWEEP_REFUSED_DIRTY, SWEEP_REFUSED_FAILED
+
+    # epic-2 is the engine's real `failed` shape: latched into sweeps_triggered
+    # when the child started, then recorded refused when it failed.
+    run_dir = make_run(
+        tmp_path,
+        "20260611-100000-aaaa",
+        sweeps_triggered=["epic-1", "epic-2"],
+        sweeps_refused={"epic-2": SWEEP_REFUSED_FAILED, "run-end": SWEEP_REFUSED_DIRTY},
+    )
+    outcomes = data.sweep_outcomes(data.RunWatcher(run_dir).state())
+    assert outcomes.triggered == ("epic-1",)  # a failed child was not delivered
+    assert outcomes.refused == (("epic-2", "failed"), ("run-end", "dirty"))
+
+    # A state.json written before #501 carries neither key: empty, not a crash.
+    legacy = make_run(tmp_path, "20260611-100000-bbbb")
+    raw = json.loads((legacy / "state.json").read_text(encoding="utf-8"))
+    del raw["sweeps_triggered"], raw["sweeps_refused"]
+    (legacy / "state.json").write_text(json.dumps(raw), encoding="utf-8")
+    assert data.sweep_outcomes(data.RunWatcher(legacy).state()) == data.SweepOutcomes()
 
 
 def test_watcher_state_none_before_first_write(tmp_path):
@@ -371,17 +419,6 @@ def test_journal_tail_marker_matches_the_journal_entries_marker(tmp_path):
     tail_entries = data.JournalTail(tmp_path).read_new()
     assert tail_entries == Journal(tmp_path).entries()
     assert tail_entries[0] == {"kind": UNREADABLE_LINE_KIND, "bytes": 15}
-
-
-def test_journal_tail_withholds_a_fragment_until_its_newline_lands(tmp_path):
-    """The byte offset only advances past complete lines, so a partially flushed
-    record is not read as a truncated entry — and `Journal.append`'s heal is what
-    guarantees that newline eventually arrives on the fragment's OWN line."""
-    path = tmp_path / "journal.jsonl"
-    path.write_text('{"ts": 1, "kind": "run-start"}\n{"ts": 2, "kind": "unit-merge-star')
-    tail = data.JournalTail(tmp_path)
-    assert [e["kind"] for e in tail.read_new()] == ["run-start"]
-    assert tail.read_new() == []  # nothing new; the fragment is still withheld
 
 
 def test_journal_tail_sees_both_records_after_a_healed_append(tmp_path):
@@ -560,17 +597,32 @@ def test_log_view_styles(tmp_path):
     assert styled["X"].name == "#ff0000"
 
 
-def test_log_view_strips_private_marker_sgr(tmp_path):
-    # XTMODKEYS `CSI > 4 ; 2 m` (modifyOtherKeys, emitted at session start by
-    # Claude Code et al.) is not an SGR. pyte 0.8.2 ignores the `>` marker and
-    # misreads the `4` as underline-on with no matching off, underlining the whole
-    # log; we strip private-marker sequences before pyte sees them.
+@pytest.mark.parametrize(
+    ("raw", "text"),
+    [
+        # XTMODKEYS `CSI > 4 ; 2 m` (modifyOtherKeys, emitted at session start by
+        # Claude Code et al.) is not an SGR. pyte 0.8.2 ignores the `>` marker and
+        # misreads the `4` as underline-on with no matching off, underlining the
+        # whole log; we strip private-marker sequences before pyte sees them.
+        pytest.param(b"\x1b[>4;2mhello world\r\n", "hello world", id="xtmodkeys"),
+        # gemini's XTMODKEYS reply `CSI > 4 ; ? m` carries the `?` marker *inside*
+        # the params. Unstripped, pyte 0.8.2 dispatches it with private=True and
+        # select_graphic_rendition rejects the kwarg — the TypeError that killed
+        # the whole TUI in #111.
+        pytest.param(b"\x1b[>4;?mhello world\r\n", "hello world", id="gemini-111-mid-params"),
+        # `CSI ? 4 m` (vim 9+, upstream selectel/pyte#202): marker in first
+        # position but final `m` — must be stripped, not read as underline or
+        # crash pyte.
+        pytest.param(b"\x1b[?4mhello\r\n", "hello", id="vim9-pyte202"),
+    ],
+)
+def test_log_view_strips_private_marker_sgr(tmp_path, raw, text):
     path = tmp_path / "task.log"
-    path.write_bytes(b"\x1b[>4;2mhello world\r\n")
+    path.write_bytes(raw)
     view = data.LogView(path)
     assert view.read_new() is True
     line = view.render()
-    assert "hello world" in line.plain
+    assert text in line.plain
     assert not any(style.underline for _, _, style in line.spans)
 
 
@@ -602,20 +654,6 @@ def test_log_view_strips_private_marker_sgr_split_across_reads(tmp_path):
     assert not any(style.underline for _, _, style in line.spans)
 
 
-def test_log_view_strips_private_marker_mid_params(tmp_path):
-    # gemini's XTMODKEYS reply `CSI > 4 ; ? m` carries the `?` marker *inside* the
-    # params. Unstripped, pyte 0.8.2 dispatches it with private=True and
-    # select_graphic_rendition rejects the kwarg — the TypeError that killed the
-    # whole TUI in #111.
-    path = tmp_path / "task.log"
-    path.write_bytes(b"\x1b[>4;?mhello world\r\n")
-    view = data.LogView(path)
-    assert view.read_new() is True
-    line = view.render()
-    assert "hello world" in line.plain
-    assert not any(style.underline for _, _, style in line.spans)
-
-
 def test_log_view_survives_gemini_startup_preamble(tmp_path):
     # The exact byte prefix from the #111 traceback: the gemini CLI's terminal
     # capability negotiation burst, including the crashing `CSI > 4 ; ? m`.
@@ -626,18 +664,6 @@ def test_log_view_survives_gemini_startup_preamble(tmp_path):
     view = data.LogView(path)
     assert view.read_new() is True
     assert "ready to work" in view.render().plain
-
-
-def test_log_view_strips_vim9_private_sgr(tmp_path):
-    # `CSI ? 4 m` (vim 9+, upstream selectel/pyte#202): marker in first position
-    # but final `m` — must be stripped, not read as underline or crash pyte.
-    path = tmp_path / "task.log"
-    path.write_bytes(b"\x1b[?4mhello\r\n")
-    view = data.LogView(path)
-    assert view.read_new() is True
-    line = view.render()
-    assert "hello" in line.plain
-    assert not any(style.underline for _, _, style in line.spans)
 
 
 def test_log_view_strips_private_marker_mid_params_split_across_reads(tmp_path):
@@ -831,30 +857,6 @@ def test_active_task_id_falls_back_to_newest_log(tmp_path):
     assert data.active_task_id(tmp_path, []) == "t-new"
 
 
-def test_active_task_id_matches_open_session_start(tmp_path):
-    # Regression: extracting _open_session_start must leave active_task_id
-    # byte-identical, including the logs/ fallback tail.
-    entries = [
-        {"kind": "session-start", "task_id": "t1"},
-        {"kind": "session-end", "task_id": "t1"},
-        {"kind": "session-start", "task_id": "t2"},
-    ]
-    assert data.active_task_id(tmp_path, entries) == "t2"
-    assert data._open_session_start(entries) is entries[-1]  # the open entry itself
-
-    closed = entries + [{"kind": "session-end", "task_id": "t2"}]
-    assert data.active_task_id(tmp_path, closed) is None
-    assert data._open_session_start(closed) is None
-
-    # nothing open in the journal -> newest-log fallback still fires
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    (logs / "t-old.log").write_text("old")
-    (logs / "t-new.log").write_text("new")
-    os.utime(logs / "t-old.log", ns=(1, 1))
-    assert data.active_task_id(tmp_path, closed) == "t-new"
-
-
 def test_active_task_id_ignores_verifier_streams(tmp_path):
     """The newest-log fallback sees pane logs only: verifier streams are not tasks.
 
@@ -876,8 +878,9 @@ def test_active_task_id_ignores_verifier_streams(tmp_path):
     os.utime(logs / "1-1-a-dev-1.log", ns=(1, 1))  # older than anything written below
 
     journal = Journal(tmp_path)
-    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stdout.log", "out")
-    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stderr.log", "err")
+    record = platform_util.root_identity_record(tmp_path)
+    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stdout.log", "out", run_dir_identity=record)
+    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stderr.log", "err", run_dir_identity=record)
 
     # a dev session that has ended -> no open session -> the fallback fires
     ended = [
@@ -1000,6 +1003,195 @@ def test_active_agent_idle_since_ignores_other_tasks_and_earlier_sessions():
     assert agent is not None and agent.idle_since is None
 
 
+def test_active_agent_reported_model_from_session_model_row():
+    """#859: the latest `session-model` for the open session's task sets
+    `reported_model`; one for another task, or one left behind by an EARLIER
+    session (before this session-start), is not this session's, and without one
+    `reported_model` stays None while the configured `model` is untouched.
+
+    ABLATION: drop the `_reported_model` fill in `active_agent` and the first
+    assertion reddens; drop the task_id filter and the `other` row wins."""
+    task = "1-1-alpha-dev-3"
+    stale = {"kind": "session-model", "task_id": task, "model": "claude-old"}
+    first = {"kind": "session-model", "task_id": task, "model": "claude-opus-4-6[1m]"}
+    latest = {"kind": "session-model", "task_id": task, "model": "claude-opus-5-5"}
+    other = {"kind": "session-model", "task_id": "2-2-beta-dev-1", "model": "gpt-5.5"}
+    agent = data.active_agent([stale, _stamped_start(), first, latest, other], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert agent.reported_model == "claude-opus-5-5"
+    assert agent.model == "opus"
+
+    agent = data.active_agent([stale, _stamped_start(), other], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert agent.reported_model is None
+    assert agent.model == "opus"
+
+
+def test_open_quota_wait_renders_as_quota_wait_not_idle():
+    """DW-396/#610: the last `quota-wait-started` for the open session's task,
+    not closed by a later `quota-wait-ended`, sets `quota_wait_since` to its
+    journal `ts` and `quota_resets_at` to its `resets_at` — alongside the open
+    idle stretch the wait necessarily has, which the header then renders as a
+    quota wait instead. A wait can re-open after it ends: the latest wins.
+
+    ABLATION: drop the `_quota_wait` derivation from `active_agent` and the
+    first assertion reddens."""
+    task = "1-1-alpha-dev-3"
+    idle = {"kind": "session-idle", "task_id": task, "since_ts": 5030.0}
+    started = {
+        "kind": "quota-wait-started",
+        "task_id": task,
+        "ts": 5090.0,
+        "resets_at": "2026-10-25T19:20:00+00:00",
+    }
+    ended = {"kind": "quota-wait-ended", "task_id": task, "ts": 5600.0, "how": "transcript-active"}
+    agent = data.active_agent([_stamped_start(), idle, started], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert (agent.quota_wait_since, agent.quota_resets_at) == (5090.0, "2026-10-25T19:20:00+00:00")
+    assert agent.idle_since == 5030.0  # still idle: the header chooses the wait
+
+    agent = data.active_agent([_stamped_start(), idle, started, ended], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert (agent.quota_wait_since, agent.quota_resets_at) == (None, None)
+
+    reopened = {"kind": "quota-wait-started", "task_id": task, "ts": 6000.0}
+    agent = data.active_agent([_stamped_start(), started, ended, reopened], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert (agent.quota_wait_since, agent.quota_resets_at) == (6000.0, None)
+
+    # another task's wait, an earlier session's, and a session-end all read as none
+    other = dict(started, task_id="2-2-beta-dev-1")
+    for entries in (
+        [_stamped_start(), other],
+        [started, _stamped_start()],
+        [_stamped_start(), started, {"kind": "session-end", "task_id": task}],
+    ):
+        agent = data.active_agent(entries, None)
+        assert not isinstance(agent, data.ActiveAgent) or agent.quota_wait_since is None
+
+
+def test_open_quota_wait_never_raises_on_malformed_entry():
+    """A `quota-wait-started` without a finite numeric `ts` is skipped without
+    erasing an earlier open wait; a non-string `resets_at` reads as none."""
+    task = "1-1-alpha-dev-3"
+    good = {"kind": "quota-wait-started", "task_id": task, "ts": 5090.0, "resets_at": 7}
+    for ts in (None, "soon", True, float("nan"), float("inf"), 10**1000):
+        bad = {"kind": "quota-wait-started", "task_id": task, "ts": ts, "resets_at": "x"}
+        agent = data.active_agent([_stamped_start(), bad], None)
+        assert isinstance(agent, data.ActiveAgent) and agent.quota_wait_since is None
+        agent = data.active_agent([_stamped_start(), good, bad], None)
+        assert isinstance(agent, data.ActiveAgent)
+        assert (agent.quota_wait_since, agent.quota_resets_at) == (5090.0, None)
+
+
+def _parked(task="1-1-alpha-dev-3", ts=5100.0, **fields):
+    entry = {"kind": "session-parked", "task_id": task, "ts": ts, "pane": "%7"}
+    entry.update(subtype="permission_prompt", auto_deny_at=5220.0)
+    entry.update(fields)
+    return entry
+
+
+def test_active_agent_projects_open_parked_prompt():
+    """#855: the newest `session-parked` for the open session's task sets
+    `parked_since` (its journal `ts`), `parked_auto_deny_at` and `parked_pane`;
+    the pure projection exposes the subtype too. A re-latch (or the adapter's
+    countdown retry) re-journals without an unpark between: the newest wins."""
+    agent = data.active_agent([_stamped_start(), _parked()], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert (agent.parked_since, agent.parked_auto_deny_at, agent.parked_pane) == (
+        5100.0,
+        5220.0,
+        "%7",
+    )
+    retry = _parked(ts=5105.0, auto_deny_at=5225.0, pane="%8", subtype=None)
+    entries = [_stamped_start(), _parked(auto_deny_at=None), retry]
+    assert data._parked_prompt(entries, 0, "1-1-alpha-dev-3") == data.ParkedPrompt(
+        since=5105.0, auto_deny_at=5225.0, pane="%8", subtype=None
+    )
+    # no deadline parsed reads as unknown, not as a wrong number
+    agent = data.active_agent([_stamped_start(), _parked(auto_deny_at=None)], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert agent.parked_since == 5100.0 and agent.parked_auto_deny_at is None
+    assert data.active_agent([_stamped_start()], None).parked_since is None
+
+
+@pytest.mark.parametrize(
+    "closer",
+    [
+        {"kind": "session-unparked", "how": "stop"},
+        {"kind": "parked-answered", "choice": "approve"},
+    ],
+    ids=lambda c: c["kind"],
+)
+def test_parked_prompt_closed_by_newer_closer(closer):
+    """A `session-unparked` or `parked-answered` for the same
+    task AFTER the newest `session-parked` closes it; a park journaled after the
+    closer reopens it.
+
+    ABLATION: drop the closer arm of `parked.parked_prompt` and every case
+    reddens."""
+    task = "1-1-alpha-dev-3"
+    closing = dict(closer, task_id=task, ts=5200.0)
+    agent = data.active_agent([_stamped_start(), _parked(), closing], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert (agent.parked_since, agent.parked_auto_deny_at, agent.parked_pane) == (None,) * 3
+    reopened = _parked(ts=5300.0)
+    agent = data.active_agent([_stamped_start(), _parked(), closing, reopened], None)
+    assert isinstance(agent, data.ActiveAgent) and agent.parked_since == 5300.0
+    # another task's closer leaves this task's park open
+    foreign = dict(closing, task_id="2-2-beta-dev-1")
+    agent = data.active_agent([_stamped_start(), _parked(), foreign], None)
+    assert isinstance(agent, data.ActiveAgent) and agent.parked_since == 5100.0
+
+
+def test_session_active_after_the_latch_leaves_the_park_open():
+    """The transcript write that raised the prompt can close an idle stretch on
+    the heartbeat after the latch: that `session-active` is not the CLI working
+    again (the adapter's latch-time baseline already holds it), so the park
+    stays open until the adapter's own `session-unparked`.
+
+    ABLATION: add `session-active` back to `parked.PARK_CLOSERS` and the park
+    reads closed."""
+    task = "1-1-alpha-dev-3"
+    active = {"kind": "session-active", "task_id": task, "idle_s": 900.0, "ts": 5200.0}
+    agent = data.active_agent([_stamped_start(), _parked(), active], None)
+    assert isinstance(agent, data.ActiveAgent) and agent.parked_since == 5100.0
+
+
+def test_parked_prompt_ignores_earlier_session_and_other_task():
+    """A park left behind by an EARLIER session with the same task id (before
+    this session-start), or one for another task, is not this session's; a
+    session-end closes the session outright."""
+    task = "1-1-alpha-dev-3"
+    for entries in (
+        [_parked(ts=4000.0), _stamped_start()],
+        [_stamped_start(), _parked(task="2-2-beta-dev-1")],
+    ):
+        agent = data.active_agent(entries, None)
+        assert isinstance(agent, data.ActiveAgent) and agent.parked_since is None
+    ended = {"kind": "session-end", "task_id": task}
+    assert data.active_agent([_stamped_start(), _parked(), ended], None) is None
+
+
+def test_parked_prompt_skips_malformed_entry():
+    """A `session-parked` without a finite numeric `ts` is skipped without
+    erasing an earlier open park; ill-typed fields read as unrecorded; a
+    non-dict entry is skipped. Never raises."""
+    task = "1-1-alpha-dev-3"
+    good = _parked()
+    for ts in (None, "soon", True, float("nan"), float("inf"), 10**1000):
+        bad = _parked(ts=ts)
+        agent = data.active_agent([_stamped_start(), bad], None)
+        assert isinstance(agent, data.ActiveAgent) and agent.parked_since is None
+        agent = data.active_agent([_stamped_start(), good, bad], None)
+        assert isinstance(agent, data.ActiveAgent) and agent.parked_since == 5100.0
+    odd = _parked(pane=7, subtype=["x"], auto_deny_at="2:00")
+    assert data._parked_prompt([_stamped_start(), odd], 0, task) == data.ParkedPrompt(
+        since=5100.0, auto_deny_at=None, pane=None, subtype=None
+    )
+    assert data._parked_prompt([_stamped_start(), good, "junk", 3], 0, task) is not None
+
+
 def test_active_agent_idle_since_never_raises_on_malformed_entry():
     """A `session-idle` without a numeric `since_ts` is skipped (the TUI ages the
     text from it); the agent itself is still derived."""
@@ -1035,6 +1227,58 @@ def test_active_agent_idle_since_never_raises_on_malformed_entry():
     assert agent is not None and agent.idle_since == 5030.0
 
 
+def test_active_agent_idle_tool_from_open_idle_stretch():
+    """The open stretch's `session-idle` `in_tool` slug sets `idle_tool`; a
+    `session-idle` without one (a CLI that cannot tell) and no stretch at all
+    both leave it None, the default.
+
+    ABLATION: drop the `_idle_tool` derivation and the first assertion reddens."""
+    idle = {
+        "kind": "session-idle",
+        "task_id": "1-1-alpha-dev-3",
+        "since_ts": 5030.0,
+        "in_tool": "Bash",
+    }
+    agent = data.active_agent([_stamped_start(), idle], None)
+    assert agent is not None and agent.idle_tool == "Bash"
+    unlabelled = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5030.0}
+    agent = data.active_agent([_stamped_start(), unlabelled], None)
+    assert agent is not None and agent.idle_tool is None
+    assert data.active_agent([_stamped_start()], None).idle_tool is None
+
+
+def test_active_agent_idle_tool_cleared_by_session_active():
+    """A `session-active` closes the stretch and its label; a later stretch
+    carries its own, and a later UNLABELLED one never inherits the old slug.
+
+    ABLATION: drop the `session-active` arm of `_idle_tool` and the first
+    assertion reddens."""
+    idle = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "in_tool": "Bash"}
+    active = {"kind": "session-active", "task_id": "1-1-alpha-dev-3", "idle_s": 120.0}
+    agent = data.active_agent([_stamped_start(), idle, active], None)
+    assert agent is not None and agent.idle_tool is None
+    later = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "in_tool": "mcp"}
+    agent = data.active_agent([_stamped_start(), idle, active, later], None)
+    assert agent is not None and agent.idle_tool == "mcp"
+    bare = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "since_ts": 5150.0}
+    agent = data.active_agent([_stamped_start(), idle, active, bare], None)
+    assert agent is not None and agent.idle_tool is None
+    other = {"kind": "session-idle", "task_id": "2-2-beta-dev-1", "in_tool": "Bash"}
+    agent = data.active_agent([_stamped_start(), other], None)
+    assert agent is not None and agent.idle_tool is None
+
+
+def test_active_agent_idle_tool_never_raises_on_malformed_entry():
+    """A non-string `in_tool` reads as None — never rendered, never raised —
+    and the agent itself is still derived.
+
+    ABLATION: pass the raw value through and the non-string rows leak it."""
+    for raw in (None, 7, True, ["Bash"], {"name": "Bash"}):
+        bad = {"kind": "session-idle", "task_id": "1-1-alpha-dev-3", "in_tool": raw}
+        agent = data.active_agent([_stamped_start(), bad], None)
+        assert isinstance(agent, data.ActiveAgent) and agent.idle_tool is None
+
+
 def test_active_agent_none_without_resolvable_snapshot():
     # Unstamped entry + no trustworthy snapshot: an all-"claude" reconstruction
     # would mislabel a run that predates stamping, so the agent is unknown.
@@ -1067,23 +1311,25 @@ def test_pending_decision_missing_fields():
 # ------------------------------------------------------------ sprint overview
 
 
-def test_project_paths_degrades_and_recovers_from_root_resolve_refusal(project, monkeypatch):
+def test_project_paths_degrades_and_recovers_from_root_resolve_refusal(project_tree, monkeypatch):
     """A dead provider yields unavailable readers without poisoning recovery.
 
     INVERSE ablation: restore bare ``project.resolve()`` in ``_project_paths``
     and this test raises the stubbed WinError 64 on its first observation rather
     than returning empty panes and recovering after the provider is healthy.
     """
-    install_bmad_config(project)
-    write_sprint(project, {"1-1-a": "ready-for-dev"})
-    root = project.project
+    install_bmad_config(project_tree)
+    write_sprint(project_tree, {"1-1-a": "ready-for-dev"})
+    root = project_tree.project
 
     with monkeypatch.context() as refusal:
         refuse_to_resolve(refusal, root)
         assert data._project_paths(root) is None
         assert data.sprint_overview(root) is None
         assert data.deferred_entries(root) is None
-        assert data.pending_missed_decisions(root) == []
+        missed = data.pending_missed_decisions(root)
+        assert missed.items == [] and missed.fault is not None
+        assert "cannot canonicalize" in missed.fault
         assert root not in data._paths_cache
 
     paths = data._project_paths(root)
@@ -1093,15 +1339,15 @@ def test_project_paths_degrades_and_recovers_from_root_resolve_refusal(project, 
     assert data.sprint_overview(root) is not None
 
 
-def test_project_paths_uses_one_canonical_cache_key(project):
+def test_project_paths_uses_one_canonical_cache_key(project_tree):
     """Healthy aliases share one ProjectPaths snapshot under the canonical root.
 
     INVERSE ablation: key ``_paths_cache`` with the pre-canonical spelling while
     loading from the stable root and this test finds the ``..`` spelling as a
     second cache key instead of reusing the canonical entry.
     """
-    install_bmad_config(project)
-    root = project.project.resolve()
+    install_bmad_config(project_tree)
+    root = project_tree.project.resolve()
     alternate_spelling = root / ".." / root.name
 
     paths = data._project_paths(alternate_spelling)
@@ -1120,32 +1366,32 @@ def _override_implementation_artifacts(project, rel: str) -> None:
     )
 
 
-def test_project_paths_sees_a_toml_layer_edit_in_a_mixed_install(project):
+def test_project_paths_sees_a_toml_layer_edit_in_a_mixed_install(project_tree):
     """#769: the TOML layers outrank the legacy YAML the v6.12 installer still writes
     beside them, so an override-layer edit must invalidate the cached snapshot.
 
     Ablation: stat-gate on config.yaml alone and the second call serves the stale
     artifact dir from cache.
     """
-    install_bmad_config(project)
-    install_bmad_central_config(project)
-    root = project.project.resolve()
+    install_bmad_config(project_tree)
+    install_bmad_central_config(project_tree)
+    root = project_tree.project.resolve()
     before = data._project_paths(root)
     assert before is not None
     assert data._project_paths(root) is before
 
-    _override_implementation_artifacts(project, "moved-impl")
+    _override_implementation_artifacts(project_tree, "moved-impl")
 
     after = data._project_paths(root)
     assert after is not None
     assert after.implementation_artifacts == root / "moved-impl"
 
 
-def test_project_paths_caches_and_invalidates_a_toml_only_install(project):
+def test_project_paths_caches_and_invalidates_a_toml_only_install(project_tree):
     """With no config.yaml there is still a source to stat-gate on: the snapshot is
     cached (it used to be reloaded on every call) and a layer edit invalidates it."""
-    install_bmad_central_config(project)
-    root = project.project.resolve()
+    install_bmad_central_config(project_tree)
+    root = project_tree.project.resolve()
     assert not (root / bmadconfig.LEGACY_CONFIG_REL).exists()
 
     first = data._project_paths(root)
@@ -1153,7 +1399,7 @@ def test_project_paths_caches_and_invalidates_a_toml_only_install(project):
     assert data._paths_cache[root][1] is first
     assert data._project_paths(root) is first
 
-    _override_implementation_artifacts(project, "moved-impl")
+    _override_implementation_artifacts(project_tree, "moved-impl")
 
     second = data._project_paths(root)
     assert second is not None
@@ -1162,10 +1408,10 @@ def test_project_paths_caches_and_invalidates_a_toml_only_install(project):
     assert data._paths_cache[root][1] is second
 
 
-def test_sprint_overview(project):
-    install_bmad_config(project)
+def test_sprint_overview(project_tree):
+    install_bmad_config(project_tree)
     write_sprint(
-        project,
+        project_tree,
         {
             "epic-1": "in-progress",
             "1-1-a": "ready-for-dev",
@@ -1175,7 +1421,7 @@ def test_sprint_overview(project):
             "2-1-c": "backlog",
         },
     )
-    ss = data.sprint_overview(project.project)
+    ss = data.sprint_overview(project_tree.project)
     assert ss.epics == {1: "in-progress", 2: "backlog"}
     assert [(s.key, s.status) for s in ss.stories] == [
         ("1-1-a", "ready-for-dev"),
@@ -1185,21 +1431,21 @@ def test_sprint_overview(project):
     assert ss.retros == {1: "optional"}
 
     # cached result (same object) until the file changes, then re-parsed
-    assert data.sprint_overview(project.project) is ss
-    write_sprint(project, {"1-1-a": "done"})
-    assert [s.status for s in data.sprint_overview(project.project).stories] == ["done"]
+    assert data.sprint_overview(project_tree.project) is ss
+    write_sprint(project_tree, {"1-1-a": "done"})
+    assert [s.status for s in data.sprint_overview(project_tree.project).stories] == ["done"]
 
 
-def test_sprint_overview_unavailable(tmp_path, project):
+def test_sprint_overview_unavailable(tmp_path, project_tree):
     assert data.sprint_overview(tmp_path) is None  # no _bmad config at all
-    install_bmad_config(project)  # config but no sprint file
-    assert data.sprint_overview(project.project) is None
+    install_bmad_config(project_tree)  # config but no sprint file
+    assert data.sprint_overview(project_tree.project) is None
 
     # LLM-maintained file: malformed content must come back None, not raise
-    project.sprint_status.write_text("{ not: valid: yaml: [")
-    assert data.sprint_overview(project.project) is None
-    project.sprint_status.write_text("- just\n- a\n- list\n")
-    assert data.sprint_overview(project.project) is None
+    project_tree.sprint_status.write_text("{ not: valid: yaml: [")
+    assert data.sprint_overview(project_tree.project) is None
+    project_tree.sprint_status.write_text("- just\n- a\n- list\n")
+    assert data.sprint_overview(project_tree.project) is None
 
 
 # ------------------------------------------------- stories mode: pause + board
@@ -1237,12 +1483,466 @@ def test_stories_overview_none_when_unavailable(tmp_path):
     assert data.stories_overview(tmp_path, "bad") is None  # invalid manifest, no raise
 
 
+# ------------------------------------------------------------- tickets board
+# Every tickets-board test reads a FakeTicketTree through `_board_ticket_tree`:
+# real-spawn budget 0 (the Windows leg's budget).
+
+
+def _tickets_state(root: Path, initiative: str = "init-a") -> RunState:
+    return RunState(
+        run_id="r1",
+        project=str(root),
+        started_at="2026-06-11T10:00:00",
+        source="tickets",
+        initiative=initiative,
+        initiative_folder=str(root / "_bmad-output" / initiative) if initiative else "",
+    )
+
+
+def _fake_board_tree(monkeypatch, root: Path) -> FakeTicketTree:
+    tree = FakeTicketTree.from_rows(
+        root,
+        initiative="init-a",
+        ready_to_start=(ticket_row("1.2", plan_checkpoint=True),),
+        others=(ticket_row("1.1", status="done"),),
+        pinned_initiative="init-a",
+    )
+    seen: list[tuple[Path, str]] = []
+
+    def board_tree(project: Path, initiative: str, *, folder: Path | None = None) -> FakeTicketTree:
+        seen.append((project, initiative))
+        return tree
+
+    monkeypatch.setattr(data, "_board_ticket_tree", board_tree)
+    monkeypatch.setattr(data, "_tickets_cache", {})
+    tree.seen = seen  # type: ignore[attr-defined]
+    return tree
+
+
+def _write_plan(path: Path, status: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"---\nstatus: {status}\n---\n", encoding="utf-8")
+
+
+def test_tickets_overview_stat_gated(tmp_path, monkeypatch):
+    """The board spawns `tickets.py status` once while the initiative's files
+    are unchanged, and again when a plan (two levels down) or a `tickets.toml`
+    changes; a file the script does not read changes nothing.
+
+    Ablation (performed): drop the signature check in `initiative_board` and the
+    second call spawns again — this FAILS."""
+    tree = _fake_board_tree(monkeypatch, tmp_path)
+    folder = tmp_path / "_bmad-output" / "init-a"
+    plan = folder / "epic-cart" / "story-cart-model-plan.md"
+    _write_plan(plan, "ready-for-dev")
+    (folder / "tickets.toml").write_text("[[epic]]\n", encoding="utf-8")
+    state = _tickets_state(tmp_path)
+
+    first = data.tickets_overview(tmp_path, state)
+    assert first.fault is None
+    assert first.initiative == "init-a"
+    assert [r.ref for r in first.rows] == ["1.2", "1.1"]
+    assert data.tickets_overview(tmp_path, state) is first
+    assert tree.calls == [("status",)]
+    assert tree.seen == [(tmp_path, "init-a")]  # pinned to the run's initiative
+
+    (folder / "notes.txt").write_text("not read by tickets.py\n", encoding="utf-8")
+    assert data.tickets_overview(tmp_path, state) is first
+    assert len(tree.calls) == 1
+
+    _write_plan(plan, "in-progress")
+    later = plan.stat().st_mtime_ns + 1_000_000_000
+    os.utime(plan, ns=(later, later))
+    data.tickets_overview(tmp_path, state)
+    assert len(tree.calls) == 2
+
+    (folder / "tickets.toml").write_text("[[epic]]\n# edited\n", encoding="utf-8")
+    data.tickets_overview(tmp_path, state)
+    assert len(tree.calls) == 3
+
+
+def test_tickets_overview_rereads_a_plan_in_the_tickets_folder_layout(tmp_path, monkeypatch):
+    """In the current upstream layout a plan sits four levels below the
+    initiative (`tickets/epic-x/tickets/*-plan.md`); editing it re-reads the
+    board. Ablation (performed): cap the signature walk at two levels and the
+    cached board is served — this FAILS."""
+    tree = _fake_board_tree(monkeypatch, tmp_path)
+    folder = tmp_path / "_bmad-output" / "init-a"
+    plan = folder / "tickets" / "epic-cart" / "tickets" / "story-cart-model-plan.md"
+    _write_plan(plan, "ready-for-dev")
+    state = _tickets_state(tmp_path)
+
+    first = data.tickets_overview(tmp_path, state)
+    assert data.tickets_overview(tmp_path, state) is first
+    assert len(tree.calls) == 1
+
+    _write_plan(plan, "in-progress")
+    later = plan.stat().st_mtime_ns + 1_000_000_000
+    os.utime(plan, ns=(later, later))
+    data.tickets_overview(tmp_path, state)
+    assert len(tree.calls) == 2
+
+
+def test_tickets_overview_rereads_when_config_utils_changes(tmp_path, monkeypatch):
+    """`tickets.py` execs the project's `config_utils.py` to resolve the store and
+    initiative, so an upgraded helper re-reads a cached board.
+
+    Ablation (performed): drop `V7_CONFIG_UTILS_REL` from the signature sources
+    and the cached board is served — this FAILS."""
+    tree = _fake_board_tree(monkeypatch, tmp_path)
+    _write_plan(tmp_path / "_bmad-output" / "init-a" / "epic-cart" / "story-a-plan.md", "done")
+    helper = tmp_path / bmadconfig.V7_CONFIG_UTILS_REL
+    helper.parent.mkdir(parents=True)
+    helper.write_text("# v1\n", encoding="utf-8")
+    state = _tickets_state(tmp_path)
+
+    data.tickets_overview(tmp_path, state)
+    data.tickets_overview(tmp_path, state)
+    assert len(tree.calls) == 1
+
+    helper.write_text("# v2, repaired\n", encoding="utf-8")
+    data.tickets_overview(tmp_path, state)
+    assert len(tree.calls) == 2
+
+
+def test_tickets_overview_follows_a_moved_project(tmp_path, monkeypatch):
+    """A run recorded under a project that has since moved watches the live
+    initiative folder: a plan edit there re-reads the board.
+
+    Ablation (performed): drop the rebase in `tickets_overview` and the signature
+    stats the vanished folder, so the edit never re-reads — this FAILS."""
+    old, live = tmp_path / "old", tmp_path / "live"
+    tree = _fake_board_tree(monkeypatch, live)
+    plan = live / "_bmad-output" / "init-a" / "epic-cart" / "story-cart-model-plan.md"
+    _write_plan(plan, "ready-for-dev")
+    state = _tickets_state(old)
+
+    data.tickets_overview(live, state)
+    assert data.tickets_overview(live, state).fault is None
+    assert len(tree.calls) == 1
+
+    _write_plan(plan, "in-progress")
+    later = plan.stat().st_mtime_ns + 1_000_000_000
+    os.utime(plan, ns=(later, later))
+    data.tickets_overview(live, state)
+    assert len(tree.calls) == 2
+
+
+def test_tickets_overview_carries_fault(tmp_path, monkeypatch):
+    """A tree that cannot be read is a board with `fault` set and no rows —
+    never None and never an empty board. The fault is cached like an answer,
+    but retried once `TICKETS_FAULT_RETRY_S` has passed with no file changed.
+
+    Ablation (performed): return `TicketsBoard(rows=(), fault=None, ...)` on the
+    error and the fault assertion FAILS; drop the retry window and the
+    recovered read never happens — the last assertion FAILS."""
+    tree = _fake_board_tree(monkeypatch, tmp_path)
+    (tmp_path / "_bmad-output" / "init-a").mkdir(parents=True)
+    tree.faults["status"] = TicketsTimeout("tickets.py status took longer than 60s")
+    state = _tickets_state(tmp_path)
+
+    board = data.tickets_overview(tmp_path, state)
+    assert board is not None
+    assert board.rows == ()
+    assert board.fault == "tickets.py timeout: tickets.py status took longer than 60s"
+    assert data.tickets_overview(tmp_path, state) is board  # within the window
+    assert len(tree.calls) == 1
+
+    del tree.faults["status"]
+    monkeypatch.setattr(data, "TICKETS_FAULT_RETRY_S", 0.0)
+    recovered = data.tickets_overview(tmp_path, state)
+    assert recovered.fault is None
+    assert len(recovered.rows) == 2
+
+
+def test_tickets_overview_unavailable_without_initiative(tmp_path, monkeypatch):
+    """A run that pinned no initiative has no tree to read: the board says so in
+    `fault` and spawns nothing. A project with no v7 active initiative gives the
+    start-run preview a fault the same way.
+
+    Ablation (performed): drop the initiative check in `tickets_overview` and
+    the tree is read for initiative "" — this FAILS."""
+
+    def no_tree(project: Path, initiative: str, *, folder: Path | None = None):
+        raise AssertionError(f"read the tree for {initiative!r}")
+
+    monkeypatch.setattr(data, "_board_ticket_tree", no_tree)
+    monkeypatch.setattr(data, "_tickets_cache", {})
+    board = data.tickets_overview(tmp_path, _tickets_state(tmp_path, initiative=""))
+    assert board.rows == ()
+    assert board.fault == "this run pinned no initiative"
+
+    preview = data.project_tickets_overview(tmp_path)  # no BMAD config at all
+    assert preview.rows == ()
+    assert preview.fault is not None and preview.fault.startswith("BMAD config unreadable")
+
+
+def test_project_tickets_overview_resolves_a_mixed_install_as_tickets_mode(tmp_path, monkeypatch):
+    """A v7 install with the v6 keys left behind resolves v6 for an auto-detecting
+    read but v7 for a tickets run (`load_paths(want_tickets=True)`). The start-run
+    preview shows the board that run would start from, so it reads the v7 active
+    initiative rather than answering "no v7 active initiative".
+
+    Ablation (performed): resolve the preview with `_project_paths(project)` (no
+    `want_tickets`) and this FAILS on the fault."""
+    root = tmp_path / "mixed"
+    root.mkdir()
+    layout = install_bmad_v7(root)
+    (root / "_bmad" / "custom" / "config.toml").write_text(
+        "[modules.bmm]\n"
+        'planning_artifacts = "{project-root}/_bmad-output/planning-artifacts"\n'
+        'implementation_artifacts = "{project-root}/_bmad-output/implementation-artifacts"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(data, "_paths_cache", {})
+    monkeypatch.setattr(data, "_tickets_paths_cache", {})
+    read: list[tuple[str, Path]] = []
+
+    def board(project: Path, initiative: str, folder: Path) -> data.TicketsBoard:
+        read.append((initiative, folder))
+        return data.TicketsBoard((), None, initiative)
+
+    monkeypatch.setattr(data, "initiative_board", board)
+    sprint_paths = data._project_paths(root)
+    assert sprint_paths is not None and sprint_paths.era == "v6"  # the auto-detect stays v6
+
+    preview = data.project_tickets_overview(root)
+    assert preview.fault is None
+    assert read == [(layout.initiative, layout.initiative_folder.resolve())]
+    assert data._project_paths(root) is sprint_paths  # its own cache entry, untouched
+
+
+# ------------------------------------------------------------- initiative chains
+# A v7 parent initiative over the sliced children AUTH and BILLING (after AUTH),
+# each holding `DEFAULT_TREE`, read by the real vendored `tickets.py`. Real-spawn
+# budget: 10 (`next <parent>` + the first child's `status` for the preview, for the
+# drained preview and for each of the two second-dependent rows, one `next <parent>`
+# for the blocked preview, one `status` for the chained run's board).
+
+CHAIN_PARENT = "initiative-platform"
+CHAIN_AUTH, CHAIN_BILLING = "initiative-auth", "initiative-billing"
+CHAIN_PLANS = (
+    ("epic-cart", "story-cart-model-plan", 1),
+    ("epic-cart", "story-cart-rules-plan", 2),
+    ("epic-checkout", "story-checkout-form-plan", 1),
+    ("epic-checkout", "bug-checkout-crash-plan", 2),
+)
+
+
+def _chain_project(root: Path, monkeypatch) -> Path:
+    """`tests/test_cli.py`'s `_chain_config` shape under ``root``, with the board
+    and paths caches cleared. Returns the parent initiative's folder."""
+    root.mkdir(parents=True, exist_ok=True)
+    install_bmad_v7(root, initiative=CHAIN_PARENT)
+    parent = v7_layout(root, initiative=CHAIN_PARENT).initiative_folder
+    (parent / "tickets").mkdir(parents=True, exist_ok=True)
+    (parent / f"{CHAIN_PARENT}.md").write_text(
+        "---\ntype: initiative\ntitle: Platform\nparent: none\n---\n\n# Platform\n",
+        encoding="utf-8",
+    )
+    (parent / "tickets" / "tickets.toml").write_text(
+        f'[[initiative]]\nid = 1\nslug = "{CHAIN_AUTH}"\ntitle = "Auth"\n\n'
+        f'[[initiative]]\nid = 2\nslug = "{CHAIN_BILLING}"\ntitle = "Billing"\n'
+        'after = [{ initiative = 1, needs = "auth live" }]\n',
+        encoding="utf-8",
+    )
+    for slug in (CHAIN_AUTH, CHAIN_BILLING):
+        write_ticket_tree(v7_layout(root, initiative=slug), DEFAULT_TREE)
+    monkeypatch.setattr(data, "_tickets_cache", {})
+    monkeypatch.setattr(data, "_tickets_paths_cache", {})
+    monkeypatch.setattr(data, "_tickets_paths_fault", {})
+    return parent
+
+
+def _chained_state(root: Path) -> RunState:
+    """A chained child run of AUTH, as `bmad-loop run` on the parent records it."""
+    return RunState(
+        run_id="r-chain",
+        project=str(root),
+        started_at="2026-10-28T10:00:00",
+        source="tickets",
+        initiative=CHAIN_AUTH,
+        initiative_folder=str(v7_layout(root, initiative=CHAIN_AUTH).initiative_folder),
+        parent_initiative=CHAIN_PARENT,
+    )
+
+
+def test_tickets_overview_reads_a_chained_run_through_its_child(tmp_path, monkeypatch):
+    """A chained child run's board is its child's tree, read pinned to the parent
+    (the live `[core] active_initiative` still names it) through the child's folder,
+    as `bmad-loop status` reads it (`runs.recorded_tree_pin`). With the live config
+    switched off the parent the board carries the fault — no spawn, no raise.
+
+    Ablation (performed): drop the `recorded_tree_pin` read in `tickets_overview`
+    and the child pin is refused against the live parent — the first assertion
+    FAILS."""
+    root = tmp_path / "proj"
+    _chain_project(root, monkeypatch)
+    state = _chained_state(root)
+
+    board = data.tickets_overview(root, state)
+    assert board.fault is None, board.fault
+    assert board.initiative == CHAIN_AUTH
+    assert sorted(r.ref for r in board.rows) == ["1.1", "1.2", "2.1", "2.2"]
+
+    (root / V7_USER_CONFIG_REL).write_text(
+        f'[core]\nactive_initiative = "{CHAIN_BILLING}"\n', encoding="utf-8"
+    )
+    switched = data.tickets_overview(root, state)
+    assert switched.rows == ()
+    assert switched.fault is not None and f"set it back to {CHAIN_PARENT!r}" in switched.fault
+
+
+def test_project_tickets_overview_previews_a_parent_initiative(tmp_path, monkeypatch):
+    """On a parent active initiative the start-run preview names the parent, its
+    children in build order with their tags, and the board of the child a run
+    builds first — AUTH, read through its folder with the tree pinned to the parent.
+
+    Ablation (performed): drop the parent branch in `project_tickets_overview` and
+    `tickets.py status` refuses the parent — the board is a fault and this FAILS."""
+    root = tmp_path / "proj"
+    _chain_project(root, monkeypatch)
+
+    board = data.project_tickets_overview(root)
+    assert board.fault is None, board.fault
+    assert board.parent == CHAIN_PARENT
+    assert [(c.slug, c.tag, c.status) for c in board.children] == [
+        (CHAIN_AUTH, "first ready", "open"),
+        (CHAIN_BILLING, "waiting", "open"),
+    ]
+    assert [(c.closed, c.total) for c in board.children] == [(0, 4), (0, 4)]
+    assert [(w.prerequisite, w.status) for w in board.children[1].waiting_on] == [
+        (CHAIN_AUTH, "open")
+    ]
+    assert board.initiative == CHAIN_AUTH
+    assert board.chain_end is None
+    assert sorted(r.ref for r in board.rows) == ["1.1", "1.2", "2.1", "2.2"]
+
+
+def test_project_tickets_overview_closes_a_drained_child_first(tmp_path, monkeypatch):
+    """A child with every ticket and epic closed and its initiative file still
+    open is drained: a run marks it done before its first pick, so the preview
+    tags it `closes first` and previews the child after it — BILLING, no longer
+    waiting — never `no child can start`.
+
+    Ablation (performed): pick with `next_child` and `drained` as the probe in
+    `_parent_board` (no re-judge) and BILLING still waits, the chain ends
+    `waiting` — this FAILS."""
+    root = tmp_path / "proj"
+    _chain_project(root, monkeypatch)
+    auth = v7_layout(root, initiative=CHAIN_AUTH)
+    write_ticket_tree(auth, tuple(dataclasses.replace(e, status="done") for e in DEFAULT_TREE))
+    for epic, stem, ticket in CHAIN_PLANS:
+        write_plan(auth, epic, stem, ticket, "done")
+
+    board = data.project_tickets_overview(root)
+    assert board.fault is None, board.fault
+    assert [(c.slug, c.tag) for c in board.children] == [
+        (CHAIN_AUTH, "closes first"),
+        (CHAIN_BILLING, "first ready"),
+    ]
+    assert (board.children[0].closed, board.children[0].total) == (4, 4)
+    assert board.children[1].waiting_on == ()
+    assert board.chain_end is None
+    assert board.initiative == CHAIN_BILLING
+    assert sorted(r.ref for r in board.rows) == ["1.1", "1.2", "2.1", "2.2"]
+
+
+@pytest.mark.parametrize(("folder", "tag"), [(True, "ready"), (False, "no folder")])
+def test_project_tickets_overview_tags_each_dependent_of_a_closed_child(
+    tmp_path, monkeypatch, folder, tag
+):
+    """AUTH drained, BILLING and REPORTS both after it: the preview shows BILLING's
+    board, and REPORTS — no longer waiting once a run closes AUTH — is tagged
+    `ready` with no waits, or `no folder` when it is declared but not sliced.
+    AUTH's status stays the tree as it reads now (`open`), as in `run --dry-run`.
+
+    Ablation (performed): build the children from `view.initiatives` (the
+    unclosed tree) in `_parent_board` and REPORTS reads `waiting` — both rows
+    FAIL."""
+    root = tmp_path / "proj"
+    parent = _chain_project(root, monkeypatch)
+    toml = parent / "tickets" / "tickets.toml"
+    toml.write_text(
+        toml.read_text(encoding="utf-8")
+        + '\n[[initiative]]\nid = 3\nslug = "initiative-reports"\ntitle = "Reports"\n'
+        'after = [{ initiative = 1, needs = "auth live" }]\n',
+        encoding="utf-8",
+    )
+    if folder:
+        write_ticket_tree(v7_layout(root, initiative="initiative-reports"), DEFAULT_TREE)
+    auth = v7_layout(root, initiative=CHAIN_AUTH)
+    write_ticket_tree(auth, tuple(dataclasses.replace(e, status="done") for e in DEFAULT_TREE))
+    for epic, stem, ticket in CHAIN_PLANS:
+        write_plan(auth, epic, stem, ticket, "done")
+
+    board = data.project_tickets_overview(root)
+    assert board.fault is None, board.fault
+    assert [(c.slug, c.status, c.tag, c.waiting_on) for c in board.children] == [
+        (CHAIN_AUTH, "open", "closes first", ()),
+        (CHAIN_BILLING, "open", "first ready", ()),
+        ("initiative-reports", "open" if folder else "no-folder", tag, ()),
+    ]
+    assert board.initiative == CHAIN_BILLING and board.chain_end is None
+
+
+def test_project_tickets_overview_keeps_a_blocked_chain_blocked(tmp_path, monkeypatch):
+    """BILLING waits on AUTH, open with every ticket left and itself waiting on
+    IDENTITY, declared but not sliced: nothing is drained, nothing closes, and no
+    child can start."""
+    root = tmp_path / "proj"
+    parent = _chain_project(root, monkeypatch)
+    (parent / "tickets" / "tickets.toml").write_text(
+        '[[initiative]]\nid = 3\nslug = "initiative-identity"\ntitle = "Identity"\n\n'
+        f'[[initiative]]\nid = 1\nslug = "{CHAIN_AUTH}"\ntitle = "Auth"\n'
+        'after = [{ initiative = 3, needs = "accounts" }]\n\n'
+        f'[[initiative]]\nid = 2\nslug = "{CHAIN_BILLING}"\ntitle = "Billing"\n'
+        'after = [{ initiative = 1, needs = "auth live" }]\n',
+        encoding="utf-8",
+    )
+
+    board = data.project_tickets_overview(root)
+    assert board.fault is None, board.fault
+    assert [(c.slug, c.tag) for c in board.children] == [
+        ("initiative-identity", "no folder"),
+        (CHAIN_AUTH, "waiting"),
+        (CHAIN_BILLING, "waiting"),
+    ]
+    assert [(w.prerequisite, w.status) for w in board.children[2].waiting_on] == [
+        (CHAIN_AUTH, "open")
+    ]
+    assert board.rows == ()
+    assert board.initiative == ""
+    assert board.chain_end == "waiting"
+
+
+def test_project_tickets_overview_faults_on_an_unreadable_parent_breakdown(tmp_path, monkeypatch):
+    """A `tickets.toml` the parent detection cannot parse is the preview's fault —
+    no spawn, no raise.
+
+    Ablation (performed): ignore the fault from `_initiative_children` and the
+    tree is read for the active initiative — the spawn guard FAILS."""
+    root = tmp_path / "proj"
+    parent = _chain_project(root, monkeypatch)
+    (parent / "tickets" / "tickets.toml").write_text("[[initiative]\n", encoding="utf-8")
+
+    def no_tree(*args, **kwargs):
+        raise AssertionError("spawned tickets.py on an unreadable parent breakdown")
+
+    monkeypatch.setattr(data, "_board_ticket_tree", no_tree)
+    monkeypatch.setattr(data, "_parent_view", no_tree)
+    board = data.project_tickets_overview(root)
+    assert board.rows == ()
+    assert board.fault is not None and board.fault.startswith("cannot read ")
+    assert "TOMLDecodeError" in board.fault
+
+
 # ------------------------------------------------------------- deferred work
 
 
-def test_deferred_entries(project):
-    install_bmad_config(project)
-    project.deferred_work.write_text(
+def test_deferred_entries(project_tree):
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_text(
         "# Deferred Work\n\n"
         "### DW-1: High severity item\n\n"
         "origin: test, 2026-06-01\nlocation: src.txt:1\n"
@@ -1260,7 +1960,7 @@ def test_deferred_entries(project):
         "origin: test, 2026-06-01\nlocation: src.txt:5\nreason: test.\n",
         encoding="utf-8",
     )
-    items = data.deferred_entries(project.project)
+    items = data.deferred_entries(project_tree.project)
     assert [(i.id, i.severity, i.done) for i in items] == [
         ("DW-1", "high", False),
         ("DW-2", "critical", False),
@@ -1272,18 +1972,18 @@ def test_deferred_entries(project):
     assert "origin: test" in items[0].body
 
     # cached result (same object) until the file changes, then re-parsed
-    assert data.deferred_entries(project.project) is items
-    project.deferred_work.write_text("# Deferred Work\n\nfreeform, no entries\n")
-    assert data.deferred_entries(project.project) == []
+    assert data.deferred_entries(project_tree.project) is items
+    project_tree.deferred_work.write_text("# Deferred Work\n\nfreeform, no entries\n")
+    assert data.deferred_entries(project_tree.project) == []
 
 
-def test_deferred_entries_unavailable(tmp_path, project):
+def test_deferred_entries_unavailable(tmp_path, project_tree):
     assert data.deferred_entries(tmp_path) is None  # no _bmad config at all
-    install_bmad_config(project)  # config but no ledger file
-    assert data.deferred_entries(project.project) is None
+    install_bmad_config(project_tree)  # config but no ledger file
+    assert data.deferred_entries(project_tree.project) is None
 
 
-def test_deferred_entries_undecodable_ledger_is_unavailable(project):
+def test_deferred_entries_undecodable_ledger_is_unavailable(project_tree):
     """The pane already had an "unavailable" degrade (`items = None`), but reached it
     only for `OSError` — and `UnicodeDecodeError` is a `ValueError` (DW-146), so
     undecodable bytes escaped the whole refresh instead of rendering the pane
@@ -1291,45 +1991,30 @@ def test_deferred_entries_undecodable_ledger_is_unavailable(project):
     it could not read.
     Ablation: revert the except tuple to `OSError` alone and this reddens with
     `UnicodeDecodeError` escaping rather than `None`."""
-    install_bmad_config(project)
-    project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
 
-    assert data.deferred_entries(project.project) is None
-
-
-def test_severity_extraction():
-    cases = {
-        "severity: high\n": "high",
-        "Severity: HIGH\n": "high",
-        "priority: blocker\n": "critical",
-        "severity: med\n": "medium",
-        "severity:low\n": "low",
-        "severity: banana\n": None,
-        "no field here\n": None,
-        "the word severity: high inline does not count\n": None,
-    }
-    for body, expected in cases.items():
-        assert deferredwork.field_severity(f"### DW-9: t\n\n{body}status: open\n") == expected, body
+    assert data.deferred_entries(project_tree.project) is None
 
 
-def test_deferred_entries_does_not_read_severity_from_a_fenced_example(project):
-    install_bmad_config(project)
-    project.deferred_work.write_text(
+def test_deferred_entries_does_not_read_severity_from_a_fenced_example(project_tree):
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_text(
         "# Deferred Work\n\n"
         "### DW-1: quoted severity\n\n"
         "```markdown\nseverity: critical\n```\nstatus: open\n",
         encoding="utf-8",
     )
 
-    items = data.deferred_entries(project.project)
+    items = data.deferred_entries(project_tree.project)
 
     assert items is not None
     assert items[0].severity is None
 
 
-def test_deferred_entries_legacy_ledger(project):
-    install_bmad_config(project)
-    project.deferred_work.write_text(
+def test_deferred_entries_legacy_ledger(project_tree):
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_text(
         "# Deferred Work\n\n"
         "## Deferred from: code review of story 1.2 (2026-04-06)\n\n"
         "- ~~**Old fixed thing** — was broken, then repaired~~ → fixed in 1.3\n"
@@ -1337,7 +2022,7 @@ def test_deferred_entries_legacy_ledger(project):
         "- **Open bold-titled thing here** — details that run on and on\n",
         encoding="utf-8",
     )
-    items = data.deferred_entries(project.project)
+    items = data.deferred_entries(project_tree.project)
     assert [(i.id, i.done, i.severity, i.legacy) for i in items] == [
         ("L1", True, None, True),
         ("W9", False, "high", True),
@@ -1348,12 +2033,12 @@ def test_deferred_entries_legacy_ledger(project):
     assert items[2].title == "Open bold-titled thing here"
     assert all(i.option_key and i.option_key.startswith("legacy:") for i in items)
     # option keys never collide with DW ids and stay stable across refreshes
-    assert data.deferred_entries(project.project) is items
+    assert data.deferred_entries(project_tree.project) is items
 
 
-def test_deferred_entries_mixed_ledger_in_file_order(project):
-    install_bmad_config(project)
-    project.deferred_work.write_text(
+def test_deferred_entries_mixed_ledger_in_file_order(project_tree):
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_text(
         "# Deferred Work\n\n"
         "## Deferred from: epic 1 review (2026-04-06)\n\n"
         "- legacy item first in the file\n\n"
@@ -1361,7 +2046,7 @@ def test_deferred_entries_mixed_ledger_in_file_order(project):
         "origin: test, 2026-06-01\nseverity: high\nreason: t.\nstatus: open\n",
         encoding="utf-8",
     )
-    items = data.deferred_entries(project.project)
+    items = data.deferred_entries(project_tree.project)
     assert [(i.id, i.legacy) for i in items] == [("L1", True), ("DW-1", False)]
     assert items[1].option_key is None  # canonical rows key on the DW id
     assert items[1].severity == "high"
@@ -1470,15 +2155,15 @@ def test_story_key_from_task_id_grammar_including_the_generation_suffix():
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
-def test_project_paths_invalidates_when_a_dangling_link_appears_at_an_absent_layer(project):
+def test_project_paths_invalidates_when_a_dangling_link_appears_at_an_absent_layer(project_tree):
     """`_stat_sig` follows links and folds every OSError into None, so a dangling
     link created at a layer path that was absent signs exactly like the absence and
     the cache served stale paths. `load_paths` refuses that link, so must the TUI.
 
     Ablation: sign config sources with `_stat_sig` and the stale paths come back."""
-    install_bmad_config(project)
-    install_bmad_central_config(project)
-    root = project.project.resolve()
+    install_bmad_config(project_tree)
+    install_bmad_central_config(project_tree)
+    root = project_tree.project.resolve()
     layer = root / bmadconfig.CENTRAL_LAYERS_REL[3]
     layer.unlink()  # an optional layer the operator never wrote
     assert data._project_paths(root) is not None
@@ -1486,3 +2171,501 @@ def test_project_paths_invalidates_when_a_dangling_link_appears_at_an_absent_lay
     layer.symlink_to("missing.toml")
 
     assert data._project_paths(root) is None
+
+
+# ------------------------------------------- folded read faults (DW-472..475)
+
+
+def _refuse_stat(monkeypatch, target: Path) -> None:
+    """`target.stat()` raises EACCES; every other path stats normally."""
+    real = Path.stat
+
+    def fake(self, *args, **kwargs):
+        if self == target:
+            raise PermissionError(13, "stubbed: permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake)
+
+
+def test_classified_sig_tells_absence_from_a_stat_fault(tmp_path, monkeypatch):
+    present = tmp_path / "f"
+    present.write_text("x")
+    assert data._classified_sig(present)[0] is not None
+    assert data._classified_sig(present)[1] is None
+    assert data._classified_sig(tmp_path / "missing") == (None, None)
+    assert data._classified_sig(present / "under-a-file") == (None, None)  # ENOTDIR
+    _refuse_stat(monkeypatch, present)
+    sig, fault = data._classified_sig(present)
+    assert sig is None and fault is not None and "PermissionError" in fault
+
+
+def test_watcher_flags_a_persisting_state_parse_fault(tmp_path):
+    """DW-472: the last good state survives a bad state.json, but once the SAME
+    signature has failed twice the watcher says the shown state is stale — and the
+    next good parse clears it. One failed look is forgiven (a torn read the next
+    write heals).
+
+    Ablation: drop `self.state_fault = why` in `_note_state_fault` and the second
+    look's assertion reddens."""
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa", current_epic=1)
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.state().current_epic == 1 and watcher.state_fault is None
+
+    (run_dir / "state.json").write_text("{ broken for good")
+    assert watcher.state().current_epic == 1
+    assert watcher.state_fault is None  # first failed look: maybe torn, not flagged
+    assert watcher.state().current_epic == 1  # still the last good...
+    assert watcher.state_fault is not None  # ...but now marked stale
+    assert "state.json unreadable" in watcher.state_fault
+    assert "JSONDecodeError" in watcher.state_fault
+
+    save_state(
+        run_dir,
+        RunState(run_id=run_dir.name, project=str(tmp_path), started_at="t", current_epic=2),
+    )
+    assert watcher.state().current_epic == 2
+    assert watcher.state_fault is None
+
+
+def test_watcher_forgives_a_torn_state_read_the_next_write_heals(tmp_path):
+    """A failure at one signature followed by a good write at a new one never flags:
+    the two-look rule compares signatures, not failure counts."""
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa", current_epic=1)
+    watcher = data.RunWatcher(run_dir)
+    watcher.state()
+    (run_dir / "state.json").write_text("{ torn")
+    watcher.state()
+    save_state(
+        run_dir,
+        RunState(run_id=run_dir.name, project=str(tmp_path), started_at="t", current_epic=3),
+    )
+    assert watcher.state().current_epic == 3
+    assert watcher.state_fault is None
+
+
+def test_watcher_flags_state_json_gone_after_a_good_read(tmp_path):
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa", current_epic=1)
+    watcher = data.RunWatcher(run_dir)
+    watcher.state()
+    (run_dir / "state.json").unlink()
+    watcher.state()
+    assert watcher.state().current_epic == 1
+    assert watcher.state_fault == "state.json is gone"
+
+
+def test_watcher_clears_a_stat_fault_when_state_json_recovers_unchanged(tmp_path, monkeypatch):
+    """A flagged stat fault clears once the last good read's file stats back at the
+    SAME signature: a finished or paused run never rewrites state.json, so no fresh
+    parse would ever arrive to clear it.
+
+    Ablation: drop the clears in `state()`'s `sig == self._state_sig` branch and
+    the recovered look's assertion reddens."""
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa", current_epic=1)
+    watcher = data.RunWatcher(run_dir)
+    watcher.state()
+    with monkeypatch.context() as m:
+        _refuse_stat(m, run_dir / "state.json")
+        watcher.state()
+        watcher.state()
+        assert watcher.state_fault is not None and "PermissionError" in watcher.state_fault
+    for _ in range(3):
+        assert watcher.state().current_epic == 1
+        assert watcher.state_fault is None
+    # The recovery also retired the suspect: one fresh failed look is forgiven again.
+    with monkeypatch.context() as m:
+        _refuse_stat(m, run_dir / "state.json")
+        watcher.state()
+        assert watcher.state_fault is None
+
+
+def test_watcher_state_never_written_is_not_stale(tmp_path):
+    watcher = data.RunWatcher(tmp_path / "nope")
+    for _ in range(3):
+        assert watcher.state() is None
+    assert watcher.state_fault is None
+
+
+def test_watcher_state_fault_names_a_never_parsed_state(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "state.json").write_text("not json")
+    watcher = data.RunWatcher(run_dir)
+    watcher.state()
+    assert watcher.state() is None
+    assert watcher.state_fault is not None and "state.json unreadable" in watcher.state_fault
+
+
+def test_watcher_attention_flags_an_unreadable_file(tmp_path):
+    """DW-475: a read fault keeps the last text but is named in
+    `attention_fault`, cleared by the next good read; absence is no fault.
+
+    Ablation: drop the `attention_fault` assignment in the read arm and the
+    directory-case assertion reddens."""
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.attention() == "" and watcher.attention_fault is None
+
+    (run_dir / "ATTENTION").mkdir()  # stats fine, cannot be read as a file
+    assert watcher.attention() == ""
+    assert watcher.attention_fault is not None
+    assert "ATTENTION unreadable" in watcher.attention_fault
+
+    (run_dir / "ATTENTION").rmdir()
+    (run_dir / "ATTENTION").write_text("[ts] gate: epic boundary\n", encoding="utf-8")
+    assert watcher.attention() == "[ts] gate: epic boundary\n"
+    assert watcher.attention_fault is None
+
+
+def test_watcher_attention_undecodable_bytes_are_a_fault_not_a_crash(tmp_path):
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
+    (run_dir / "ATTENTION").write_bytes(b"\xff\xfe not utf-8\n")
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.attention() == ""
+    assert watcher.attention_fault is not None
+    assert "UnicodeDecodeError" in watcher.attention_fault
+
+
+def test_watcher_attention_stat_fault_keeps_text_and_flags(tmp_path, monkeypatch):
+    run_dir = make_run(tmp_path, "20260611-100000-aaaa")
+    (run_dir / "ATTENTION").write_text("[ts] one\n", encoding="utf-8")
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.attention() == "[ts] one\n"
+    _refuse_stat(monkeypatch, run_dir / "ATTENTION")
+    assert watcher.attention() == "[ts] one\n"
+    assert watcher.attention_fault is not None and "cannot be stat'd" in watcher.attention_fault
+
+
+def test_journal_tail_stat_fault_keeps_the_offset(tmp_path, monkeypatch):
+    """DW-475: a stat FAULT is not absence — the offset survives it, so recovery
+    reads only what is new, and the fault is named until then.
+
+    Ablation: reset `_offset` on the fault arm and the post-recovery read returns
+    all three entries (re-delivering two), reddening the last assertion."""
+    journal = Journal(tmp_path)
+    journal.append("run-start")
+    journal.append("story-start", story="1-1-a")
+    tail = data.JournalTail(tmp_path)
+    assert len(tail.read_new()) == 2
+
+    with monkeypatch.context() as m:
+        _refuse_stat(m, tmp_path / "journal.jsonl")
+        assert tail.read_new() == []
+        assert tail.fault is not None and "journal.jsonl cannot be stat'd" in tail.fault
+
+    journal.append("story-done", story="1-1-a")
+    assert [e["kind"] for e in tail.read_new()] == ["story-done"]
+    assert tail.fault is None
+
+
+def test_journal_tail_open_fault_keeps_the_offset(tmp_path, monkeypatch):
+    journal = Journal(tmp_path)
+    journal.append("run-start")
+    tail = data.JournalTail(tmp_path)
+    assert len(tail.read_new()) == 1
+    journal.append("story-start", story="1-1-a")
+
+    real_open = Path.open
+
+    def refuse(self, *args, **kwargs):
+        if self == tmp_path / "journal.jsonl":
+            raise PermissionError(13, "stubbed: permission denied", str(self))
+        return real_open(self, *args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(Path, "open", refuse)
+        assert tail.read_new() == []
+        assert tail.fault is not None and "journal.jsonl unreadable" in tail.fault
+
+    assert [e["kind"] for e in tail.read_new()] == ["story-start"]
+    assert tail.fault is None
+
+
+def test_journal_tail_absence_still_resets_without_a_fault(tmp_path):
+    journal = Journal(tmp_path)
+    journal.append("run-start")
+    journal.append("story-start")
+    tail = data.JournalTail(tmp_path)
+    assert len(tail.read_new()) == 2
+    (tmp_path / "journal.jsonl").unlink()
+    assert tail.read_new() == []
+    assert tail.fault is None
+    Journal(tmp_path).append("run-resume")
+    assert [e["kind"] for e in tail.read_new()] == ["run-resume"]
+
+
+def test_log_view_prefix_scan_fault_is_flagged(tmp_path, monkeypatch):
+    """DW-475: a cold-open prefix scan that cannot read leaves `altscreen_seen`
+    False — which then means "not looked", so the fault is recorded for the pane.
+
+    Ablation: drop the `altscreen_scan_fault` assignment and this reddens."""
+    path = tmp_path / "task.log"
+    path.write_bytes(b"\x1b[?1049h" + b"filler\r\n" * 2000 + b"THE-END\r\n")
+    real_open = Path.open
+    calls = {"n": 0}
+
+    def fail_first(self, *args, **kwargs):
+        if self == path:
+            calls["n"] += 1
+            if calls["n"] == 1:  # the prefix scan opens first
+                raise PermissionError(13, "stubbed: permission denied", str(self))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_first)
+    view = data.LogView(path, max_bytes=1024)
+    assert view.read_new() is True
+    assert view.altscreen_seen is False
+    assert view.altscreen_scan_fault is not None
+    assert "PermissionError" in view.altscreen_scan_fault
+
+
+def test_log_view_clean_scan_records_no_fault(tmp_path):
+    path = tmp_path / "task.log"
+    path.write_bytes(b"filler\r\n" * 2000)
+    view = data.LogView(path, max_bytes=1024)
+    assert view.read_new() is True
+    assert view.altscreen_scan_fault is None
+
+
+def test_active_agent_malformed_entry_is_unreadable_not_absent():
+    """DW-474: a malformed entry answers `UnreadableAgent` with the fault, never
+    `None` (which means no session is open).
+
+    Ablation: return None from the narrowed except arm and this reddens."""
+    agent = data.active_agent([_stamped_start(), None], None)  # type: ignore[list-item]
+    assert isinstance(agent, data.UnreadableAgent)
+    assert "AttributeError" in agent.error
+
+
+def test_active_agent_does_not_swallow_an_unexpected_exception(monkeypatch):
+    """DW-474: only the malformed-data faults are caught; a bug propagates.
+
+    Ablation: widen the except back to `Exception` and this reddens."""
+
+    def bug(*_args, **_kwargs):
+        raise RuntimeError("programming error")
+
+    monkeypatch.setattr(data, "_idle_since", bug)
+    with pytest.raises(RuntimeError, match="programming error"):
+        data.active_agent([_stamped_start()], None)
+
+
+def test_pending_missed_decisions_read_fault_is_named_and_not_cached(project, monkeypatch):
+    """DW-473: a raising read answers a fault, not an empty list, and is not
+    cached — the next call, with nothing on disk changed, reads for real.
+
+    Ablation: cache the fault result (or return it without `fault`) and one of the
+    two assertions reddens."""
+    from conftest import write_ledger
+
+    from bmad_loop import decisions
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _write_triage_decision(make_run(project.project, "20260101-000000-aaaa"))
+
+    with monkeypatch.context() as m:
+
+        def boom(_project, _paths=None):
+            raise PermissionError(13, "stubbed: permission denied")
+
+        m.setattr(decisions, "pending_missed_decisions", boom)
+        missed = data.pending_missed_decisions(project.project)
+        assert missed.items == []
+        assert missed.fault is not None and "PermissionError" in missed.fault
+
+    missed = data.pending_missed_decisions(project.project)
+    assert missed.fault is None
+    assert [d.id for d in missed.items] == ["DW-1"]
+
+
+def test_pending_missed_decisions_unreadable_ledger_is_a_fault(project_tree):
+    """DW-473: `decisions.pending_missed_decisions` reads an undecodable ledger as
+    "no open ids" and answers []; the TUI reader probes the ledger the way
+    `cmd_decisions` does and names the fault instead.
+
+    Ablation: drop the `read_for_observation` probe and `fault` is None."""
+    from conftest import UNDECODABLE_LEDGER
+
+    install_bmad_config(project_tree)
+    project_tree.deferred_work.write_bytes(UNDECODABLE_LEDGER)
+    _write_triage_decision(make_run(project_tree.project, "20260101-000000-aaaa"))
+    missed = data.pending_missed_decisions(project_tree.project)
+    assert missed.items == []
+    assert missed.fault is not None and "deferred-work ledger unreadable" in missed.fault
+    assert "UnicodeDecodeError" in missed.fault
+
+
+def _deny_stat_under(monkeypatch, root: Path) -> None:
+    """Every `stat()` of `root` or below raises EACCES — an unreadable dir, as
+    3.14's `is_dir`/`is_file` would fold it into False."""
+    real = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self == root or root in self.parents:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_pending_missed_decisions_incomplete_run_listing_is_a_fault(project, monkeypatch):
+    """DW-468: a run dir the listing cannot read holds triage this reader never
+    saw, so the readable run's DW-1 is not the whole answer — the reader names the
+    fault instead, and does not cache it: once the run reads again, so does DW-1.
+
+    Ablation: drop the `listing_fault` return in `pending_missed_decisions` and
+    this reddens — `fault` is None over a partial listing."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _write_triage_decision(make_run(project.project, "20260101-000000-aaaa"))
+    bad = make_run(project.project, "20260102-000000-bbbb")
+
+    with monkeypatch.context() as m:
+        _deny_stat_under(m, bad)
+        missed = data.pending_missed_decisions(project.project)
+        assert missed.items == []
+        assert missed.fault is not None and "run listing incomplete" in missed.fault
+        assert "20260102-000000-bbbb" in missed.fault
+
+    missed = data.pending_missed_decisions(project.project)
+    assert missed.fault is None
+    assert [d.id for d in missed.items] == ["DW-1"]
+
+
+def test_pending_missed_decisions_none_pending_is_an_answer(project):
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "done 2026-06-01"})
+    missed = data.pending_missed_decisions(project.project)
+    # `ledger` names what the (empty) listing was read from, for the answer's
+    # `listed_ledger` guard.
+    assert missed == data.MissedDecisions([], ledger=project.deferred_work)
+
+
+# ----------------------------------------- pinned reads in the observer (DW-564)
+
+
+def _swap_runs_dir_for_a_foreign_tree(root: Path, run_id: str) -> Path:
+    """Swap `runs/` for a link to an outside tree holding a REAL `<run_id>/` with its
+    own state.json and journal.jsonl; return that outside run dir."""
+    outside = root.parent / f"{root.name}-outside"
+    foreign = outside / run_id
+    save_state(
+        foreign,
+        RunState(run_id=run_id, project="elsewhere", started_at="t", current_epic=99),
+    )
+    Journal(foreign).append("foreign-row")
+    runs_dir = root / RUNS_DIR
+    runs_dir.rename(runs_dir.with_name("runs-aside"))
+    runs_dir.symlink_to(outside, target_is_directory=True)
+    return foreign
+
+
+def _minted_run(root: Path, run_id: str = "20260611-100000-aaaa") -> tuple[Path, RunState]:
+    run_dir = root / RUNS_DIR / run_id
+    run_dir.mkdir(parents=True)
+    state = RunState(
+        run_id=run_id,
+        project=str(root),
+        started_at="t",
+        current_epic=1,
+        run_dir_identity=platform_util.root_identity_record(run_dir),
+    )
+    save_state(run_dir, state)
+    Journal(run_dir, pin=state).append("run-start")
+    return run_dir, state
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_journal_tail_flags_a_swapped_run_dir_and_keeps_reading(tmp_path):
+    """An observer never refuses: with the run's held state, a `runs/` swapped for a
+    link to a foreign tree still yields rows (read by path), but `fault` names the
+    swap so the pane is not presented as this run's. An intact dir sets no fault.
+
+    Ablation (run): drop `self.fault = self._swap_fault(pin)` in `read_new` and the
+    swapped look's `fault` assertion fails with None."""
+    run_dir, state = _minted_run(tmp_path)
+    tail = data.JournalTail(run_dir)
+    assert [e["kind"] for e in tail.read_new(pin=state)] == ["run-start"]
+    assert tail.fault is None
+
+    _swap_runs_dir_for_a_foreign_tree(tmp_path, run_dir.name)
+    tail = data.JournalTail(run_dir)
+    assert [e["kind"] for e in tail.read_new(pin=state)] == ["foreign-row"]
+    assert tail.fault is not None and "no longer the directory" in tail.fault
+    assert [e["kind"] for e in data.JournalTail(run_dir).read_new()] == ["foreign-row"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_journal_tail_flags_a_linked_journal_file(tmp_path):
+    """`journal.jsonl` itself replaced by a link: rows still returned, `fault` set."""
+    run_dir, state = _minted_run(tmp_path)
+    outside = tmp_path / "elsewhere.jsonl"
+    outside.write_text('{"ts": 1, "kind": "foreign-row"}\n', encoding="utf-8")
+    (run_dir / "journal.jsonl").unlink()
+    (run_dir / "journal.jsonl").symlink_to(outside)
+
+    tail = data.JournalTail(run_dir)
+    assert [e["kind"] for e in tail.read_new(pin=state)] == ["foreign-row"]
+    assert tail.fault is not None and "journal.jsonl is a link" in tail.fault
+
+
+def test_journal_tail_pin_tolerates_a_stale_device_or_absent_record(tmp_path):
+    """A renumbered `st_dev` alone (the writers' degrade) and a state with no record
+    are not swaps: no fault."""
+    run_dir, state = _minted_run(tmp_path)
+    dev, ino = state.run_dir_identity
+    for record in ((dev + 1, ino), None):
+        state.run_dir_identity = record
+        tail = data.JournalTail(run_dir)
+        assert [e["kind"] for e in tail.read_new(pin=state)] == ["run-start"]
+        assert tail.fault is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_watcher_refuses_a_foreign_state_after_a_runs_dir_swap(tmp_path):
+    """The watcher's reloads are pinned to its last good parse: `runs/` swapped for a
+    link to a tree holding a real `<id>/state.json` keeps the last good state and,
+    once the fault persists, names the refusal — never shows the foreign record.
+
+    Ablation (run): drop `pin=self._state` from `RunWatcher.state`'s `load_state`
+    and the second look returns `current_epic == 99`."""
+    run_dir, _ = _minted_run(tmp_path)
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.state().current_epic == 1
+
+    _swap_runs_dir_for_a_foreign_tree(tmp_path, run_dir.name)
+    assert watcher.state().current_epic == 1
+    assert watcher.state().current_epic == 1
+    assert watcher.state_fault is not None
+    assert "UnconfinedReadError" in watcher.state_fault
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("linked", ["journal", "run-dir"])
+def test_journal_tail_flags_a_link_on_a_no_record_run(tmp_path, linked):
+    """A pin with no `run_dir_identity` has no identity to compare, but the pinned
+    readers still refuse a link at the run dir or at `journal.jsonl` there — so the
+    pane flags both, too.
+
+    Ablation (run): return None from `_swap_fault` when the pin has no record and
+    both rows fail with `fault` None."""
+    run_dir, state = _minted_run(tmp_path)
+    state.run_dir_identity = None
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "journal.jsonl").write_text('{"ts": 1, "kind": "foreign-row"}\n', encoding="utf-8")
+    if linked == "journal":
+        (run_dir / "journal.jsonl").unlink()
+        (run_dir / "journal.jsonl").symlink_to(outside / "journal.jsonl")
+    else:
+        run_dir.rename(run_dir.with_name("aside"))
+        run_dir.symlink_to(outside, target_is_directory=True)
+
+    tail = data.JournalTail(run_dir)
+    assert [e["kind"] for e in tail.read_new(pin=state)] == ["foreign-row"]
+    assert tail.fault is not None and "is a link" in tail.fault

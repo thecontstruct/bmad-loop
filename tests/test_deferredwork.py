@@ -20,6 +20,7 @@ from bmad_loop.deferredwork import (
     append_decision,
     append_entries,
     append_entry,
+    apply_reopenable_close,
     archive_closed,
     classify,
     field_line_present,
@@ -418,6 +419,30 @@ def test_mark_open_reopens_only_closes_from_this_operation(tmp_path):
     assert entries["DW-3"].open
 
 
+def test_apply_reopenable_close_is_the_text_the_reopenable_writer_publishes(tmp_path):
+    """The pure projection a sweep's verify-reuse ledger pin is built from is
+    exactly what `mark_done_many_reopenable` publishes over the same text —
+    already-done (DW-2) and missing (DW-9) ids skipped the same way — and an
+    all-skipped batch projects the text unchanged.
+
+    Ablation: build the projection with no undo owner (the plain `mark_done_many`
+    fold); the `resolution-undo:` line is missing and the texts differ."""
+    path = write_ledger(tmp_path)
+    ids = ["DW-1", "DW-2", "DW-3", "DW-9"]
+    projected = apply_reopenable_close(LEDGER, ids, "2026-06-11", "by dw-a", OPERATION_ID)
+
+    assert mark_done_many_reopenable(path, ids, "2026-06-11", "by dw-a", OPERATION_ID) == [
+        "DW-1",
+        "DW-3",
+    ]
+    assert path.read_text(encoding="utf-8") == projected
+    assert apply_reopenable_close(projected, ids, "2026-06-11", "by dw-a", OPERATION_ID) == (
+        projected
+    )
+    with pytest.raises(ValueError):
+        apply_reopenable_close(LEDGER, ids, "11/06/2026", "by dw-a", OPERATION_ID)
+
+
 def test_mark_open_refuses_the_wrong_operation_id(tmp_path):
     path = write_ledger(tmp_path)
     close_reopenable(path, "DW-1", "by dw-a")
@@ -605,23 +630,6 @@ def test_append_decision_then_mark_done(tmp_path):
 def test_append_decision_missing_file(tmp_path):
     assert not append_decision(tmp_path / "nope.md", "DW-1", "2026-06-11", "x", "y")
     assert not mark_done(tmp_path / "nope.md", "DW-1", "2026-06-11", "x")
-
-
-def test_append_decision_write_failure_raises_and_keeps_the_ledger(tmp_path, monkeypatch):
-    """#328. `Path.write_text` opens `'w'` (truncate) and only THEN encodes, so a
-    failure anywhere in that window left the whole ledger at zero bytes. The
-    atomic helper builds the replacement beside the target, so a raise leaves the
-    original exactly as it was."""
-    path = write_ledger(tmp_path)
-    before = path.read_bytes()
-
-    def boom(path, text):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(deferredwork, "atomic_write_text", boom)
-    with pytest.raises(OSError, match="disk full"):
-        append_decision(path, "DW-3", "2026-06-11", "Keep cap", "frozen intent stands")
-    assert path.read_bytes() == before
 
 
 # ------------------------------------------------- line-break injection (#305)
@@ -1009,6 +1017,50 @@ def test_flat_append_after_canonical_stays_visible_to_legacy_parser():
     assert legacy.title == "later flat finding"
 
 
+def test_flat_source_plan_append_after_canonical_stays_visible():
+    """The v7 attended `bmad-build` opens its flat block with `source_plan:`; the
+    block ends DW-1's span and reaches the legacy parser like a v6 one."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: canonical\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n\n"
+        "- source_plan: `epic-auth/story-login-plan.md`\n"
+        "  summary: later v7 finding\n"
+        "  evidence: must not be swallowed by DW-1\n"
+    )
+
+    (canonical,) = parse_ledger(text)
+    (legacy,) = parse_legacy(text)
+
+    assert canonical.open
+    assert "later v7 finding" not in canonical.body
+    assert legacy.title == "later v7 finding"
+    assert has_legacy(text)
+
+
+def test_flat_source_plan_status_not_absorbed_into_previous_entry():
+    """A v7 flat block after a CLOSED entry must stay an open legacy finding, not
+    become dead text inside DW-1's done span, where no reader — the strict view,
+    the legacy parser, the sweep's migrate step — would ever see it again.
+    Ablation: revert `_FLAT_SOURCE_BODY` to `source_spec:[ \\t]` and this FAILS."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: closed canonical\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: done\n\n"
+        "- source_plan: `epic-auth/story-login-plan.md`\n"
+        "  summary: open v7 finding\n"
+        "  evidence: filed after DW-1 was closed\n"
+    )
+
+    (canonical,) = parse_ledger(text)
+
+    assert canonical.status == "done"
+    assert "open v7 finding" not in canonical.body
+    assert has_legacy(text)
+    (legacy,) = parse_legacy(text)
+    assert legacy.title == "open v7 finding" and not legacy.done
+
+
 # The canonical-span boundary has to recognize every flat shape parse_legacy
 # does (#304): a boundary keyed on the full three-line block leaves the bug in
 # place for the partial ones — and those are not hypothetical, they are the
@@ -1028,18 +1080,21 @@ FLAT_TAIL_SHAPES = {
 }
 
 
+@pytest.mark.parametrize("key", ["source_spec", "source_plan"])
 @pytest.mark.parametrize("shape", sorted(FLAT_TAIL_SHAPES), ids=sorted(FLAT_TAIL_SHAPES))
-def test_flat_append_visible_for_every_shape_parse_legacy_accepts(shape):
+def test_flat_append_visible_for_every_shape_parse_legacy_accepts(shape, key):
+    """Both flat openers — v6 `source_spec:` and v7 `source_plan:` — in every shape."""
+    tail = FLAT_TAIL_SHAPES[shape].replace("source_spec", key).replace("SOURCE_SPEC", key.upper())
     text = (
         "# Deferred Work\n\n### DW-1: canonical\n\n"
-        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n\n" + FLAT_TAIL_SHAPES[shape]
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n\n" + tail
     )
 
     (canonical,) = parse_ledger(text)
     (legacy,) = parse_legacy(text)
 
     assert canonical.open, "the boundary must not cost DW-1 its status"
-    assert "source_spec" not in canonical.body
+    assert key not in canonical.body.lower()
     assert legacy.body.lstrip().startswith(("- ", "* ", "-\t"))
 
 
@@ -1204,6 +1259,49 @@ def test_field_severity_forms():
     assert field_severity("no field here") is None
 
 
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("severity: high\n", "high"),
+        ("Severity: HIGH\n", "high"),
+        ("priority: blocker\n", "critical"),
+        ("severity: med\n", "medium"),
+        ("severity:low\n", "low"),
+        ("severity: banana\n", None),
+        ("no field here\n", None),
+        ("the word severity: high inline does not count\n", None),
+    ],
+)
+def test_field_severity_in_a_multiline_entry(body, expected):
+    """The field is read from a whole multi-line entry, anchored to the line start:
+    an inline mention of `severity: high` mid-sentence does not count."""
+    assert field_severity(f"### DW-9: t\n\n{body}status: open\n") == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("high (unverified)", "high"),
+        ("Medium (unverified)", "medium"),
+        ("**major**", "high"),
+        ("high-if-true", "high"),
+        ("med.", "medium"),
+        ("blocker: confirmed", "critical"),
+        ("highest", None),
+        ("critical1", None),
+        ("high_priority", None),
+        ("lowé", None),
+        ("_high_", "high"),
+        ("P1", None),
+        ("unknown", None),
+        ("", None),
+        ("   ", None),
+    ],
+)
+def test_leading_severity_reads_the_leading_word(text, expected):
+    assert deferredwork.leading_severity(text) == expected
+
+
 def test_canonical_severity_uses_the_whole_file_fence_index():
     text = """\
 # Deferred Work
@@ -1287,6 +1385,34 @@ def test_next_seq_past_highest():
 def test_next_seq_empty_starts_at_one():
     assert next_seq("") == 1
     assert next_seq("# Deferred Work\n") == 1
+
+
+def test_next_seq_ignores_ids_mentioned_outside_headings(tmp_path):
+    """DW-384: a far-higher id named in prose, a body field or a heading's own
+    title does not steer allocation — only heading ids do. Ablation: scan the
+    whole text again and this mints DW-901."""
+    text = (
+        "# Deferred Work\n\nSee DW-900 in the old tracker.\n\n"
+        "### DW-3: supersedes DW-800\norigin: o\nreason: dup of DW-900\nstatus: open\n"
+    )
+    assert next_seq(text) == 4
+    p = tmp_path / "deferred-work.md"
+    p.write_text(text, encoding="utf-8")
+    assert append_entry(p, title="t", origin="o2", source_spec="s.md", reason="r") == "DW-4"
+
+
+def test_next_seq_counts_malformed_headings():
+    """A heading `parse_ledger` cannot read still spoke for its number, so it is
+    never reused."""
+    for heading in (
+        "### DW-9 no colon",
+        "### DW-9:",
+        "###  DW-9: two spaces",
+        "###\tDW-9: tab",
+        "   ### DW-9: indented",
+        "```\n### DW-9: fenced example\n```",
+    ):
+        assert next_seq(f"### DW-2: a\n\n{heading}\nstatus: open\n") == 10, heading
 
 
 def test_append_entry_numbers_and_writes(tmp_path):
@@ -1595,7 +1721,12 @@ def test_append_entry_leaves_a_clean_value_byte_identical(tmp_path):
 
 
 def test_append_entry_write_failure_raises_and_keeps_the_ledger(tmp_path, monkeypatch):
-    """#328, the `append_entry` half — see the `append_decision` twin above."""
+    """#328. `Path.write_text` opens `'w'` (truncate) and only THEN encodes, so a
+    failure anywhere in that window left the whole ledger at zero bytes. The
+    atomic helper builds the replacement beside the target, so a raise leaves the
+    original exactly as it was. This is the `append_entry` half; the
+    `append_decision` half is the [append_decision] row of
+    `test_a_failed_publish_leaves_as_a_typed_ledger_write_error`."""
     path = write_ledger(tmp_path)
     before = path.read_bytes()
 
@@ -1644,18 +1775,101 @@ def test_append_entry_encode_failure_cannot_truncate_the_ledger(tmp_path, monkey
 
 
 def test_field_line_present_matches_field_not_substring():
-    body = (
+    (entry,) = parse_ledger(
         "### DW-1: x\norigin: review-budget-followup\n"
         "source_spec: `spec-foo.md`\nreason: mentions spec-foobar.md and review-budget-followup-x\n"
         "status: open\n"
     )
     # exact field-line matches (plain and backtick-wrapped)
-    assert field_line_present(body, "origin", "review-budget-followup")
-    assert field_line_present(body, "source_spec", "spec-foo.md")
+    assert field_line_present(entry, "origin", "review-budget-followup")
+    assert field_line_present(entry, "source_spec", "spec-foo.md")
     # a superstring value must not match the shorter field line
-    assert not field_line_present(body, "origin", "review-budget")
+    assert not field_line_present(entry, "origin", "review-budget")
     # a value that only appears incidentally inside `reason:` is not a field line
-    assert not field_line_present(body, "source_spec", "spec-foobar.md")
+    assert not field_line_present(entry, "source_spec", "spec-foobar.md")
+
+
+FENCED_KEYS_LEDGER = (
+    "# Deferred Work\n\n"
+    "### DW-1: documents the dedupe keys\n\n"
+    "origin: something else\n"
+    "```markdown\n"
+    "origin: harvest x\n"
+    "source_spec: `spec-y.md`\n"
+    "```\n"
+    "reason: quotes a worked example\n"
+    "status: open\n"
+)
+
+
+def test_field_line_present_skips_fenced_examples():
+    """DW-408. A fenced example's `origin:`/`source_spec:` lines sit in column 0,
+    where the anchor looks, but a quoted example is no key the entry holds.
+
+    Ablation: drop the `_quoted` filter in `field_line_present` and this fails."""
+    (entry,) = parse_ledger(FENCED_KEYS_LEDGER)
+    assert not field_line_present(entry, "origin", "harvest x")
+    assert not field_line_present(entry, "source_spec", "spec-y.md")
+    assert field_line_present(entry, "origin", "something else")  # the live line still counts
+
+
+def test_append_entry_not_suppressed_by_a_fenced_origin(tmp_path):
+    """DW-408. The appender's idempotence scan reads through the same fence rule,
+    so an open entry quoting the marker does not swallow a legitimate append.
+
+    Ablation: drop the `_quoted` filter in `field_line_present` and this returns
+    None instead of minting DW-2."""
+    path = write_ledger(tmp_path, FENCED_KEYS_LEDGER)
+    minted = append_entry(
+        path, title="real finding", origin="harvest x", source_spec="spec-y.md", reason="r"
+    )
+    assert minted == "DW-2"
+    assert "### DW-2: real finding" in path.read_text(encoding="utf-8")
+
+
+ONLY_FENCED_KEYS_LEDGER = (
+    "# Deferred Work\n\n"
+    "### DW-1: quotes its only dedupe keys\n\n"
+    "```markdown\n"
+    "origin: harvest x\n"
+    "source_spec: `spec-y.md`\n"
+    "```\n"
+    "reason: every origin/source_spec line is an example\n"
+    "status: open\n"
+)
+
+
+def test_fenced_only_origin_is_no_key(tmp_path):
+    """DW-408. An open entry whose ONLY `origin:` and `source_spec:` lines are
+    fenced holds no dedupe key: the predicate says so, and the appender mints.
+
+    Ablation: drop the `_quoted` filter in `field_line_present` and both halves
+    fail."""
+    (entry,) = parse_ledger(ONLY_FENCED_KEYS_LEDGER)
+    assert entry.open
+    assert not field_line_present(entry, "origin", "harvest x")
+    assert not field_line_present(entry, "source_spec", "spec-y.md")
+    path = write_ledger(tmp_path, ONLY_FENCED_KEYS_LEDGER)
+    minted = append_entry(
+        path, title="real finding", origin="harvest x", source_spec="spec-y.md", reason="r"
+    )
+    assert minted == "DW-2"
+
+
+def test_append_entry_still_dedupes_against_a_live_origin(tmp_path):
+    """The fence rule narrows the match to live lines; it does not stop a live
+    `origin:` + `source_spec:` pair from deduping."""
+    path = write_ledger(
+        tmp_path,
+        "# Deferred Work\n\n### DW-1: live keys\n\n"
+        "origin: harvest x\nsource_spec: `spec-y.md`\nreason: r\nstatus: open\n",
+    )
+    before = path.read_bytes()
+    minted = append_entry(
+        path, title="replay", origin="harvest x", source_spec="spec-y.md", reason="r"
+    )
+    assert minted is None
+    assert path.read_bytes() == before
 
 
 # ------------------------------ closes_deferred declaration primitives (#234)
@@ -1785,36 +1999,24 @@ def test_mark_done_many_writes_once_and_reports_what_landed(tmp_path):
         assert "resolution: resolved by story 1" in entries[dw].body
 
 
-def test_mark_done_many_is_all_or_nothing_on_a_write_failure(tmp_path, monkeypatch):
-    """A per-id read-modify-write loop leaves earlier marks on disk when it raises
-    partway through — a half-applied closure the caller never gets to journal, so
-    the ledger claims resolutions the run has no record of."""
-    p = tmp_path / "deferred-work.md"
-    p.write_text(LEDGER, encoding="utf-8")
-    before = p.read_bytes()
-    monkeypatch.setattr(
-        "bmad_loop.deferredwork.atomic_write_text",
-        lambda path, text: (_ for _ in ()).throw(OSError("disk full")),
-    )
-
-    # the raise must REACH the caller, not just leave the file alone: a swallowed
-    # error returning [] reads as "nothing declared was open" — the engine disarms
-    # its restore snapshot and no journal line ever records the failed write
-    with pytest.raises(OSError):
-        mark_done_many(p, ["DW-1", "DW-3"], "2026-07-24", "note")
-
-    assert p.read_bytes() == before  # nothing partially applied
-
-
 @pytest.mark.parametrize(
     "mutate",
     [
+        # two ids: a per-id read-modify-write loop would leave the earlier mark on
+        # disk when it raises partway through — a half-applied closure the caller
+        # never gets to journal, so the ledger claims resolutions the run has no
+        # record of. The closure is all or nothing.
         pytest.param(
-            lambda p: mark_done_many(p, ["DW-1"], "2026-07-24", "note"), id="mark_done_many"
+            lambda p: mark_done_many(p, ["DW-1", "DW-3"], "2026-07-24", "note"),
+            id="mark_done_many",
         ),
         pytest.param(
             lambda p: record_decision(p, "DW-1", "2026-07-24", "Keep", "why"),
             id="record_decision",
+        ),
+        pytest.param(
+            lambda p: append_decision(p, "DW-1", "2026-07-24", "Keep", "why"),
+            id="append_decision",
         ),
     ],
 )
@@ -1823,7 +2025,10 @@ def test_a_failed_publish_leaves_as_a_typed_ledger_write_error(tmp_path, monkeyp
     every `except OSError` caller keeps its degrade — that a caller which must fail
     loud on a lost publish can name AHEAD of that arm, where a bare `OSError` was
     indistinguishable from the lock's. The original fault stays chained as
-    `__cause__` and named in the message, and nothing partial reaches disk.
+    `__cause__` and named in the message, and nothing partial reaches disk. The
+    raise must REACH the caller, not just leave the file alone: a swallowed error
+    returning [] reads as "nothing declared was open" — the engine disarms its
+    restore snapshot and no journal line ever records the failed write.
 
     Ablation: make `_publish` a bare `atomic_write_text` call and the
     `isinstance(..., LedgerWriteError)` assertion reds while `OSError` still
@@ -2412,6 +2617,34 @@ def test_gates_stop_at_the_canonical_span_boundary():
     assert deferredwork.gates(entry).tokens == ()
 
 
+def test_field_values_reads_live_dedupe_keys_and_skips_fenced_examples():
+    """DW-363. `validate_migration` holds a rewrite to what this returns, so a
+    fenced worked example's `origin:` must not become a key the entry owns (a
+    faithful rewrite that trimmed the example would be refused), and the
+    backtick-wrapped `source_spec` must unwrap to the value `field_line_present`
+    matches. Indented or capitalised spellings are not keys: the dedupe scan's
+    column-0 anchor never matched them either.
+
+    Ablation: drop the `_quoted` skip and the fenced `origin: quoted` appears;
+    drop the unwrap and `spec.md` keeps its backticks."""
+    text = (
+        "# Deferred Work\n\n### DW-1: keyed\n\n"
+        "origin: live, 2026-06-01\n"
+        "source_spec: `spec.md`\n"
+        "reason: quotes an example:\n\n"
+        "```markdown\norigin: quoted\n```\n\n"
+        "  origin: indented\nOrigin: capitalised\n"
+        "origin: live, 2026-06-01  \n"
+        "status: open\n"
+    )
+
+    (entry,) = parse_ledger(text)
+
+    assert deferredwork.field_values(entry, "origin") == ("live, 2026-06-01",)
+    assert deferredwork.field_values(entry, "source_spec") == ("spec.md",)
+    assert deferredwork.field_values(entry, "gate") == ()
+
+
 # ------------------------------------------- ATX heading boundary shapes (#516)
 
 
@@ -2550,6 +2783,221 @@ def test_a_tail_below_an_indented_heading_reaches_the_legacy_parser():
 )
 def test_gates_story_matches_on_key_boundaries(token, story_key, gated):
     assert deferredwork.gates_story(token, story_key) is gated
+
+
+def _ticket_gated(*lines: str):
+    """`_gated` under the ticket grammar."""
+    text = (
+        "# Deferred Work\n\n### DW-1: gated entry\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n"
+        + "".join(f"{x}\n" for x in lines)
+    )
+    (entry,) = parse_ledger(text)
+    return deferredwork.gates(entry, grammar="ticket")
+
+
+def test_ticket_gate_shapes_agree_with_the_vendored_tickets_py(monkeypatch):
+    """The four ticket-grammar shapes are copies of `tickets.py`'s own patterns
+    (`CROSS_RE`, `ID_RE`, `EPIC_RE`, `NAME_RE`), pinned to the vendored upstream
+    rather than to a comment: if upstream widens a ref shape, a gate written in it
+    would start reporting `malformed` and refuse nothing. Loaded from the fixture
+    file, never from `stories` or the installed project script, and never run —
+    and without bytecode, which would land a `__pycache__` beside the pinned
+    files and fail `test_vendored_bmad_v7_matches_pin`."""
+    import importlib.util
+
+    from conftest import V7_FIXTURE
+
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+
+    spec = importlib.util.spec_from_file_location("_vendored_tickets", V7_FIXTURE / "tickets.py")
+    assert spec is not None and spec.loader is not None
+    upstream = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(upstream)
+
+    assert deferredwork._TICKET_REF_RE.pattern == upstream.CROSS_RE.pattern
+    assert deferredwork._TICKET_ID_RE.pattern == upstream.ID_RE.pattern
+    assert deferredwork._EPIC_FOLDER_RE.pattern == upstream.EPIC_RE.pattern
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "1.2",  # E.M: an entry of a listed epic, the unit key
+        "2.6a",  # an id with a letter
+        "1",  # a bare epic id
+        "epic-cart",  # an epic folder
+        "epic-cart.v2",  # EPIC_RE admits any folder character a line can carry
+    ],
+)
+def test_ticket_grammar_accepts_refs(token):
+    """Every shape a dispatched ticket answers to is a token under the ticket grammar."""
+    g = _ticket_gated(f"gate: {token}")
+    assert (g.tokens, g.malformed) == ((token,), ())
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "3-2",  # a stories-mode id
+        "3-2-invite-link",  # a sprint key
+        "3-2a-split-half",
+        "1.2.3",  # one dot too many for E.M
+        "1.",  # a ref missing its entry id
+        "task-cart.md",  # not a leaf type
+        "epic-",  # an epic folder with no slug
+    ],
+)
+def test_ticket_grammar_rejects_story_keys(token):
+    """A v6 story key names no ticket, so under the ticket grammar it is
+    `malformed` rather than a token that gates nothing in silence. Ablation
+    (performed): read the story arms under `"ticket"` too and `3-2` lands in
+    `tokens`, turning this red."""
+    g = _ticket_gated(f"gate: {token}")
+    assert (g.tokens, g.malformed) == ((), (token,))
+
+
+@pytest.mark.parametrize("token", ["story-login.md", "bug-crash-on-save.md", "spike-cache.md"])
+def test_ticket_grammar_rejects_backlog_file_names(token):
+    """A backlog leaf file name gates nothing: a tickets run never dispatches a
+    backlog row, and one moved into an epic is dispatched by its `E.M` ref. So it
+    is `malformed` (validate warns `deferred.hard-gate-unstructured`) rather than
+    a token that reads as a gate in force. Ablation (performed): accept the
+    leaf-name shape (`tickets.py` `NAME_RE`) under `"ticket"` and this FAILS."""
+    g = _ticket_gated(f"gate: {token}")
+    assert (g.tokens, g.malformed) == ((), (token,))
+
+
+@pytest.mark.parametrize("token", ["true", "false", "true.1", "1.false"])
+def test_ticket_grammar_rejects_boolean_ids(token):
+    """`tickets.py` `_id` refuses `true` and `false` (frontmatter reads them as
+    booleans), so no epic or ticket carries either id and a gate naming one, bare
+    or as a ref half, is `malformed` rather than a gate that is always clear.
+    Ablation (performed): drop the boolean-id check and this FAILS."""
+    g = _ticket_gated(f"gate: {token}")
+    assert (g.tokens, g.malformed) == ((), (token,))
+
+
+def test_ticket_grammar_keeps_capitalised_boolean_words():
+    """Only the lowercase spellings are booleans to `tickets.py`; `True` is a
+    legal id there, so it stays a token."""
+    g = _ticket_gated("gate: True, True.1")
+    assert (g.tokens, g.malformed) == (("True", "True.1"), ())
+
+
+@pytest.mark.parametrize("token", ["1.2", "2.6a"])
+def test_story_grammar_still_rejects_dotted_ref(token):
+    """The grammar is a parameter, not a union: a ticket ref on a sprint or stories
+    project is a token no story key can match, so it stays `malformed` there.
+    Ablation (performed): accept the ticket arms under `"story"` and this FAILS."""
+    g = _gated(f"gate: {token}")
+    assert (g.tokens, g.malformed) == ((), (token,))
+    assert deferredwork._matchable_token(token, "ticket") is True
+
+
+def test_legacy_story_tokens_are_story_keys_the_ticket_grammar_cannot_read():
+    """`legacy_story_tokens` names exactly the story-shaped tokens the ticket
+    grammar drops: a bare word both grammars read is a ticket token, and a token
+    neither reads is only malformed."""
+    text = (
+        "# Deferred Work\n\n### DW-1: migrated\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n"
+        "gate: 3-2, 1.2, auth, 3-2-invite-link, x y\n"
+    )
+    (entry,) = parse_ledger(text)
+    assert deferredwork.legacy_story_tokens(entry) == ("3-2", "3-2-invite-link")
+
+
+@pytest.mark.parametrize(
+    ("token", "claims", "resolved"),
+    [
+        # exact: the token is one entry's v6_key
+        ("3-2-invite-link", [("3-2-invite-link", "1.1"), ("3-3-x", "1.2")], "1.1"),
+        # a stories-mode v6_key: the exact id
+        ("CC-2", [("CC-2", "1.3"), ("CC-3", "1.4")], "1.3"),
+        # prefix: the bare N-M of one entry's key
+        ("3-2", [("3-2-invite-link", "1.1"), ("3-3-x", "1.2")], "1.1"),
+        # split: one entry's split key is claimed through the split arm
+        ("3-2", [("3-2a-x", "2.4")], "2.4"),
+        # split, ambiguous: both halves of a split claim the bare N-M
+        ("3-2", [("3-2a-x", "1.1"), ("3-2b-y", "1.2")], None),
+        # ambiguous: the exact key on two entries
+        ("3-2-x", [("3-2-x", "1.1"), ("3-2-x", "2.1")], None),
+        # unclaimed: no entry carries a matching key
+        ("3-2", [("4-1-x", "1.1")], None),
+        # numeric neighbour: `3-20-x` is a different story
+        ("3-2", [("3-20-x", "1.1")], None),
+        # the sole claimant has no `E.M` ref (its epic is unlisted)
+        ("3-2", [("3-2-x", None)], None),
+        # a ref-less claimant still makes a ref'd one ambiguous
+        ("3-2", [("3-2-x", "1.1"), ("3-2-y", None)], None),
+        # no claims at all
+        ("3-2", [], None),
+    ],
+)
+def test_partition_legacy_tokens(token, claims, resolved):
+    """A v6 token resolves to a ticket only when exactly one `(v6_key, ref)` claim
+    satisfies `gates_story(token, v6_key)` and that claim has a ref; every other
+    token stays unresolved. Ablation (performed): return every token as
+    unresolved and the four resolving rows FAIL; resolve to the first claimant
+    regardless of count and the ambiguous rows FAIL."""
+    got = deferredwork.partition_legacy_tokens((token,), claims)
+    if resolved is None:
+        assert got == ((), (token,))
+    else:
+        assert got == (((token, resolved),), ())
+
+
+def test_partition_legacy_tokens_keeps_order_and_the_written_token():
+    """Each side keeps the tokens' order, and a resolved token is reported as
+    written, beside its ref."""
+    claims = [("3-2-invite-link", "1.1"), ("4-1-y", "2.1")]
+    assert deferredwork.partition_legacy_tokens(("4-1", "9-9", "3-2"), claims) == (
+        (("4-1", "2.1"), ("3-2", "1.1")),
+        ("9-9",),
+    )
+
+
+@pytest.mark.parametrize(
+    ("token", "ref", "gated"),
+    [
+        ("1.2", "1.2", True),  # the ticket itself
+        ("1.06", "1.6", True),  # ids compare as tickets.py compares them
+        ("01.6", "1.6", True),
+        ("1.2", "1.3", False),
+        ("1", "1.3", True),  # the epic by its initiative id
+        ("01", "1.3", True),
+        ("2", "1.3", False),
+        ("epic-cart", "1.3", True),  # the epic by its folder
+        ("epic-carts", "1.3", False),
+    ],
+)
+def test_gates_ticket_epic_id_and_slug_arms(token, ref, gated):
+    assert deferredwork.gates_ticket(token, ref, epic_id="1", epic_slug="epic-cart") is gated
+
+
+def test_gates_ticket_epic_arms_need_a_known_epic():
+    """An unlisted epic (no initiative id) and a missing binding (no folder) leave
+    only the ref arm, rather than an empty id or slug matching every ticket."""
+    assert deferredwork.gates_ticket("1", "1.3", epic_id="", epic_slug="") is False
+    assert deferredwork.gates_ticket("epic-cart", "1.3", epic_id="1", epic_slug="") is False
+    assert deferredwork.gates_ticket("1.3", "1.3", epic_id="", epic_slug="") is True
+
+
+@pytest.mark.parametrize(
+    ("token", "ref"),
+    [
+        ("2.6", "2.6a"),  # `2.6a` is its own ticket, not a split of `2.6`
+        ("1.2", "1.20"),  # no numeric neighbour
+        ("1.2", "1.2a"),
+        ("2", "2a.1"),  # an epic id is opaque too
+    ],
+)
+def test_gates_ticket_no_split_arm(token, ref):
+    """Ticket ids are opaque letters and digits: no prefix or split arm, unlike
+    `gates_story`. Ablation (performed): give `gates_ticket` a `startswith` arm
+    and `2.6` gates `2.6a`, turning this red."""
+    assert deferredwork.gates_ticket(token, ref, epic_id="2", epic_slug="epic-x") is False
 
 
 @pytest.mark.parametrize(
@@ -2823,20 +3271,6 @@ def test_archive_skips_already_archived_stubs(tmp_path):
     assert archive_closed(path, archive_date="2026-08-25") == []
     archive_path = path.parent / ARCHIVE_REL
     assert "archived: 2026-08-25" not in archive_path.read_text(encoding="utf-8")
-
-
-def test_archive_default_archive_date_is_today(tmp_path):
-    """When archive_date is not supplied, the stub and archive carry today's date."""
-    from datetime import date as calendar_date
-
-    path = write_ledger(tmp_path)
-    archive_closed(path)
-    today = calendar_date.today().isoformat()
-
-    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
-    assert f"archived: {today}" in entries["DW-2"].body
-    archive_path = path.parent / ARCHIVE_REL
-    assert f"archived: {today}" in archive_path.read_text(encoding="utf-8")
 
 
 def test_archive_multi_entry_reparse(tmp_path):
@@ -3198,7 +3632,8 @@ def test_archive_crash_recovery_edited_entry_keeps_both_bodies(tmp_path):
 
 
 def test_archive_default_date_flake_fixed(tmp_path, monkeypatch):
-    """`calendar_date` is patched to a fixed clock (both `today()` and
+    """When archive_date is not supplied, the stub and archive carry today's date.
+    `calendar_date` is patched to a fixed clock (both `today()` and
     `fromisoformat()`), so a midnight rollover mid-call cannot fail the
     assertion (docs/testing.md flake policy)."""
     from datetime import date as real_date
@@ -3214,6 +3649,8 @@ def test_archive_default_date_flake_fixed(tmp_path, monkeypatch):
     assert f"archived: {FixedDate.today().isoformat()}" in (path.parent / ARCHIVE_REL).read_text(
         encoding="utf-8"
     )
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert f"archived: {FixedDate.today().isoformat()}" in entries["DW-2"].body
 
 
 def test_archive_fenced_heading_in_archive_does_not_suppress_reclose(tmp_path):
@@ -3351,6 +3788,166 @@ def test_mark_open_leaves_a_pointer_to_the_archived_body(tmp_path):
     assert len(blocks) == 1
     assert "location: src/x.py:1" in blocks[0].body
     assert "reason: waiting on the codec seam" in blocks[0].body
+
+
+SEVERITY_STUB_LEDGER = (
+    "# Deferred Work\n\n"
+    "### DW-1: metadata recovered on reopen\n\n"
+    "origin: a\n"
+    "location: src/x.py:1\n"
+    "reason: waiting on the codec seam\n"
+    "severity: high\n"
+    "status: open\n"
+)
+
+
+def _archived_stub(tmp_path: Path, name: str, *, legacy: bool, text: str = SEVERITY_STUB_LEDGER):
+    """Close DW-1 reopenably and archive it, leaving a stub stamped 2026-08-24.
+    `legacy` deletes the stub's preserved severity line — the shape a stub had
+    before 695d4d6e — while the archive keeps its block intact."""
+    root = tmp_path / name
+    root.mkdir()
+    path = write_ledger(root, text)
+    close_reopenable(path, "DW-1", "bundle close")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    if legacy:
+        stub_text = path.read_text(encoding="utf-8")
+        stub = parse_ledger(stub_text)[0]
+        assert "severity: high\n" in stub.body
+        path.write_text(stub_text.replace("severity: high\n", "", 1), encoding="utf-8")
+        assert parse_ledger(path.read_text(encoding="utf-8"))[0].severity is None
+    return path
+
+
+def test_mark_open_recovers_severity_of_a_legacy_stub_from_its_archive_block(tmp_path):
+    """DW-334/DW-394. A stub written before severity preservation reopens with
+    the severity its archive block carries, byte-identical to reopening the
+    modern stub, so a severity-floored sweep still selects it.
+
+    Ablation: drop the `restored` prefix, or the `_needs_severity_recovery`
+    check, inside `_apply_open` and the reopened legacy stub has no severity,
+    failing both the bytes and the selection. The read gate in `mark_open_many`
+    is pinned separately, by `test_mark_open_modern_stub_never_reads_the_archive`."""
+    modern = _archived_stub(tmp_path, "modern", legacy=False)
+    legacy = _archived_stub(tmp_path, "legacy", legacy=True)
+
+    assert mark_open(modern, "DW-1", "bundle close", OPERATION_ID) is True
+    assert mark_open(legacy, "DW-1", "bundle close", OPERATION_ID) is True
+
+    assert legacy.read_bytes() == modern.read_bytes()
+    reopened = parse_ledger(legacy.read_text(encoding="utf-8"))[0]
+    assert reopened.open
+    assert reopened.severity == "high"
+    assert "severity: high\narchived-body: 2026-08-24\n" in reopened.body
+    selection = select_entries([reopened], min_severity="high")
+    assert [entry.id for entry in selection.selected] == ["DW-1"]
+
+
+def test_mark_open_recovers_severity_from_the_last_stamp_matching_block(tmp_path):
+    """Several blocks per id is by design; the stub's stamp narrows, and file
+    order (closure order) breaks a same-stamp tie — the LAST match wins."""
+    path = _archived_stub(tmp_path, "several", legacy=True)
+    block = "### DW-1: metadata recovered on reopen\n\nstatus: done 2026-06-11\n"
+    (path.parent / ARCHIVE_REL).write_text(
+        "# Deferred Work Archive\n\n"
+        f"{block}archived: 2026-08-01\nseverity: low\n\n"
+        f"{block}archived: 2026-08-24\nseverity: high\n\n"
+        "### DW-2: another id, same stamp\n\nstatus: done 2026-06-11\n"
+        "archived: 2026-08-24\nseverity: critical\n\n"
+        f"{block}archived: 2026-08-24\nseverity: medium\n\n"
+        f"{block}archived: 2026-09-01\nseverity: critical\n",
+        encoding="utf-8",
+    )
+    assert mark_open(path, "DW-1", "bundle close", OPERATION_ID) is True
+    reopened = parse_ledger(path.read_text(encoding="utf-8"))[0]
+    assert reopened.severity == "medium"
+    assert [ln for ln in reopened.body.splitlines() if "severity" in ln] == ["severity: medium"]
+
+
+def test_mark_open_does_not_recover_a_fenced_archive_severity(tmp_path):
+    """A block whose only severity line is a fenced example has nothing a modern
+    stub would have preserved, so nothing is restored."""
+    text = SEVERITY_STUB_LEDGER.replace("severity: high\n", "```\nseverity: high\n```\n")
+    path = _archived_stub(tmp_path, "fenced", legacy=False, text=text)
+    assert "severity: high" in (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    assert mark_open(path, "DW-1", "bundle close", OPERATION_ID) is True
+    reopened = parse_ledger(path.read_text(encoding="utf-8"))[0]
+    assert reopened.open
+    assert reopened.severity is None
+    assert "severity" not in reopened.body
+
+
+@pytest.mark.parametrize("archive_state", ["missing", "no-matching-block"])
+def test_mark_open_legacy_stub_without_an_archive_block_reopens_severity_less(
+    tmp_path, archive_state
+):
+    """No archive, or no block for the id under the stub's stamp: the reopen
+    still succeeds and simply restores nothing."""
+    path = _archived_stub(tmp_path, archive_state, legacy=True)
+    archive_path = path.parent / ARCHIVE_REL
+    if archive_state == "missing":
+        archive_path.unlink()
+    else:
+        archive_text = archive_path.read_text(encoding="utf-8")
+        assert "archived: 2026-08-24" in archive_text
+        archive_path.write_text(
+            archive_text.replace("archived: 2026-08-24", "archived: 2026-08-23"),
+            encoding="utf-8",
+        )
+    assert mark_open(path, "DW-1", "bundle close", OPERATION_ID) is True
+    reopened = parse_ledger(path.read_text(encoding="utf-8"))[0]
+    assert reopened.open
+    assert reopened.severity is None
+    assert "archived-body: 2026-08-24" in reopened.body
+
+
+def test_mark_open_modern_stub_never_reads_the_archive(tmp_path):
+    """A stub that already carries its severity needs nothing from the archive,
+    so an undecodable archive cannot block its reopen."""
+    reference = _archived_stub(tmp_path, "reference", legacy=False)
+    path = _archived_stub(tmp_path, "modern", legacy=False)
+    (path.parent / ARCHIVE_REL).write_bytes(b"\xff")
+    assert mark_open(reference, "DW-1", "bundle close", OPERATION_ID) is True
+    assert mark_open(path, "DW-1", "bundle close", OPERATION_ID) is True
+    assert path.read_bytes() == reference.read_bytes()
+
+
+def test_mark_open_legacy_stub_over_an_undecodable_archive_refuses(tmp_path):
+    """When the recovery IS needed, an archive that exists but cannot be read
+    escalates and nothing is published — a severity-less reopen there is the
+    silent degrade the recovery exists to end."""
+    path = _archived_stub(tmp_path, "undecodable", legacy=True)
+    (path.parent / ARCHIVE_REL).write_bytes(b"\xff")
+    before = path.read_bytes()
+    with pytest.raises(deferredwork.LedgerReadError):
+        mark_open(path, "DW-1", "bundle close", OPERATION_ID)
+    assert path.read_bytes() == before
+
+
+def test_mark_open_many_recovers_only_the_legacy_stub(tmp_path):
+    """One locked pass, mixed stubs: the legacy one gets its block's severity,
+    the modern one keeps its own, and nothing else is rehydrated."""
+    text = SEVERITY_STUB_LEDGER + (
+        "\n### DW-2: modern stub\n\norigin: b\nlocation: src/y.py:2\n"
+        "reason: other\nseverity: low\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert mark_done_many_reopenable(
+        path, ["DW-1", "DW-2"], "2026-06-11", "bundle close", OPERATION_ID
+    ) == ["DW-1", "DW-2"]
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1", "DW-2"]
+    stubbed = path.read_text(encoding="utf-8")
+    path.write_text(stubbed.replace("severity: high\n", "", 1), encoding="utf-8")
+
+    assert mark_open_many(path, ["DW-1", "DW-2"], "bundle close", OPERATION_ID) == [
+        "DW-1",
+        "DW-2",
+    ]
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-1"].severity == "high"
+    assert entries["DW-2"].severity == "low"
+    assert "reason:" not in entries["DW-1"].body  # severity only, never the body
+    assert "location:" not in entries["DW-1"].body
 
 
 def test_archive_reopened_stub_recloses_and_archives(tmp_path):
@@ -3744,6 +4341,125 @@ def test_cross_spec_advisory_suppression_is_rechecked_under_the_lock(tmp_path, m
     assert not entries[0].open and entries[1].open
 
 
+# --------------------------------------------- dedupe_any_status (DW-388)
+
+RETRO_ORIGIN = "retro action item epic-1-retro-item-1-add-x"
+
+RETRO_SEED = """\
+# Deferred Work
+
+### DW-1: Add X to the checklist
+origin: retro action item epic-1-retro-item-1-add-x
+location: n/a
+source_spec: `docs/retro-epic-1.md`
+severity: low
+reason: retrospective action item.
+status: {status}
+"""
+
+
+def _retro_spec(source_spec: str = "docs/retro-epic-1.md", **over) -> EntrySpec:
+    return EntrySpec(
+        title="Add X to the checklist",
+        origin=RETRO_ORIGIN,
+        source_spec=source_spec,
+        reason="retrospective action item.",
+        severity="low",
+        **over,
+    )
+
+
+@pytest.mark.parametrize("status", ["open", "done 2026-06-01"], ids=["open", "done"])
+def test_any_status_dedupe_suppresses_open_and_closed_twins(tmp_path, status):
+    """An any-status spec is suppressed by a twin of ANY status — and by origin
+    alone, so a twin filed under another `source_spec` counts too.
+
+    Ablation: drop the `dedupe_any_status` arm in `_apply_append` and the `done`
+    row files DW-2 (the default arm is open-only); the `open` row still dedupes
+    only because the source_spec matches, which the cross-spec row below pins."""
+    path = write_ledger(tmp_path, RETRO_SEED.format(status=status))
+    before = path.read_bytes()
+
+    assert append_entries(path, [_retro_spec(dedupe_any_status=True)]) == [None]
+    assert path.read_bytes() == before
+
+
+def test_any_status_dedupe_matches_origin_across_source_specs(tmp_path):
+    """Ablation: drop the `dedupe_any_status` arm and the differing
+    `source_spec` makes the default exact-pair scan miss the twin, minting DW-2."""
+    path = write_ledger(tmp_path, RETRO_SEED.format(status="done 2026-06-01"))
+
+    spec = _retro_spec(source_spec="sprint-status.yaml", dedupe_any_status=True)
+    assert append_entries(path, [spec]) == [None]
+
+
+def test_any_status_dedupe_suppresses_an_archived_stub_twin(tmp_path):
+    """An `archive_closed` stub keeps `origin:`, and that line alone must keep a
+    finished item from being re-filed after its body moved to the archive.
+
+    Ablation: drop the `dedupe_any_status` arm and this mints DW-2."""
+    path = write_ledger(tmp_path, RETRO_SEED.format(status="done 2026-06-01"))
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    (stub,) = parse_ledger(path.read_text(encoding="utf-8"))
+    assert "reason:" not in stub.body  # premise: the body really was archived
+    assert f"origin: {RETRO_ORIGIN}" in stub.body
+
+    assert append_entries(path, [_retro_spec(dedupe_any_status=True)]) == [None]
+    assert [e.id for e in parse_ledger(path.read_text(encoding="utf-8"))] == ["DW-1"]
+
+
+def test_any_status_dedupe_files_an_unseen_origin(tmp_path):
+    """The opt-in only suppresses on a real twin: a different origin files."""
+    path = write_ledger(tmp_path, RETRO_SEED.format(status="done 2026-06-01"))
+    spec = EntrySpec(
+        title="Something else",
+        origin="retro action item epic-1-retro-item-2-other",
+        source_spec="docs/retro-epic-1.md",
+        reason="r",
+        dedupe_any_status=True,
+    )
+    assert append_entries(path, [spec]) == ["DW-2"]
+
+
+def test_any_status_dedupe_no_op_takes_no_lock(tmp_path, monkeypatch):
+    """The advisory pre-lock no-op stays in force for an any-status batch: its
+    twin cannot vanish before the lock (entries are never deleted, stubs keep
+    `origin:`), so a replay is answered from one read.
+
+    Ablation: widen the early return's exclusion to `dedupe_any_status` specs and
+    the lock is acquired."""
+    path = write_ledger(tmp_path, RETRO_SEED.format(status="done 2026-06-01"))
+    acquisitions = []
+    real_lock = deferredwork.ledger_lock
+
+    @contextlib.contextmanager
+    def counting_lock(p):
+        acquisitions.append(p)
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", counting_lock)
+
+    assert append_entries(path, [_retro_spec(dedupe_any_status=True)]) == [None]
+    assert acquisitions == []
+
+
+def test_appended_text_equals_what_append_entries_publishes(tmp_path):
+    """`appended_text` is the writer's own fold, so a caller recomputing what a batch
+    WROTE (the DW-355 carry proof) lands on exactly the published text — including a
+    batch where one spec dedupes against an already-open entry (`BATCH_SPECS`' second
+    spec, minted None)."""
+    path = write_ledger(tmp_path, BATCH_SEED)
+    specs = [EntrySpec(**spec) for spec in BATCH_SPECS]
+
+    minted, published, _ = deferredwork.append_entries_published(path, specs)
+
+    assert None in minted  # the batch really does carry a deduped spec
+    assert published is not None
+    assert deferredwork.appended_text(BATCH_SEED, specs) == published
+    assert deferredwork.appended_text(BATCH_SEED, []) == BATCH_SEED
+
+
 def test_append_entries_validates_all_specs_before_writing(tmp_path, monkeypatch):
     """A bad spec anywhere in the sequence writes nothing — and is caught before
     the lock is even taken.
@@ -3817,27 +4533,6 @@ def test_an_empty_batch_takes_no_lock(tmp_path, monkeypatch, call):
     assert path.read_text(encoding="utf-8") == before
 
 
-def test_archive_closed_takes_no_lock_for_a_missing_ledger(tmp_path, monkeypatch):
-    """No ledger means no write, and so no lock — `advance`'s rule, one module over.
-
-    `bmad-loop sweep --archive` reports a project that has no ledger as SUCCESS
-    ("no deferred-work ledger at ..."). With the acquisition first, that answer
-    became a FAILURE wherever the state root cannot be derived: a released
-    behavior changed by a lock taken for a file that is not there. The guard under
-    the hold stays, deletion being able to race this one.
-
-    Ablation: move the presence guard (`_ledger_present`, since DW-255) back below
-    `with ledger_lock(path):` — the spy fires and this reds."""
-    path = tmp_path / "deferred-work.md"  # deliberately never created
-    acquisitions = []
-
-    with _counting_lock(monkeypatch, acquisitions):
-        assert archive_closed(path, archive_date="2026-08-24") == []
-
-    assert acquisitions == []
-    assert not path.exists()  # and nothing was created on the way past
-
-
 def test_mark_open_many_matches_serial_mark_open_bytes(tmp_path, monkeypatch):
     """A batched reopen writes what a serial `mark_open` loop writes, in one
     acquisition and one write, skipping the ids it cannot reopen.
@@ -3876,25 +4571,38 @@ def test_mark_open_many_matches_serial_mark_open_bytes(tmp_path, monkeypatch):
     assert seed.read_text(encoding="utf-8") == twin.read_text(encoding="utf-8")
 
 
-def test_mark_open_many_writes_nothing_when_no_id_is_eligible(tmp_path, monkeypatch):
-    """A replayed rollback over already-open entries leaves the file untouched —
-    and, since #736, takes no lock to establish that.
+def test_held_reopenable_closes_names_exactly_what_mark_open_many_would_reopen(tmp_path):
+    """`held_reopenable_closes` is the read-only twin of `mark_open_many`'s decision:
+    a close this operation wrote is held, while an entry that is still open, was
+    closed by another operation or by a human, or is missing is not. It writes
+    nothing, and `mark_open_many` then reopens exactly the ids it named.
 
-    Ablation: delete `mark_open_many`'s pre-lock probe block — the acquisition
-    assertion reds. NOT the `if not reopened: return []` guard, whose documented
-    ablation used to live here and now goes GREEN: the probe answers these exact
-    inputs above the lock, so the write spy never reaches that guard. Its
-    ablation moved to `test_a_failing_probe_read_falls_through_to_the_locked_path`,
-    which faults the probe read so the same inputs reach the hold."""
+    Ablation: return `dw_ids` unfiltered (skip the `_apply_open_many` fold) and
+    the DW-2 / DW-3 / DW-99 rows fail."""
     path = write_ledger(tmp_path)
-    writes, acquisitions = [], []
-    _counting_write(monkeypatch, writes)
+    close_reopenable(path, "DW-1", "by dw-a")
+    close_reopenable(path, "DW-3", "by dw-b", operation_id="other-run/dw-b")
+    text = path.read_text(encoding="utf-8")
+    ids = ["DW-1", "DW-2", "DW-3", "DW-99"]
 
-    with _counting_lock(monkeypatch, acquisitions):
-        assert mark_open_many(path, ["DW-1", "DW-99"], "by dw-a", OPERATION_ID) == []
+    held = deferredwork.held_reopenable_closes(text, ids, "by dw-a", OPERATION_ID)
 
-    assert writes == []
-    assert acquisitions == []
+    assert held == ["DW-1"]
+    assert path.read_text(encoding="utf-8") == text  # read-only
+    assert mark_open_many(path, ids, "by dw-a", OPERATION_ID) == held
+    reopened = path.read_text(encoding="utf-8")
+    assert deferredwork.held_reopenable_closes(reopened, ids, "by dw-a", OPERATION_ID) == []
+
+
+def test_held_reopenable_closes_requires_the_matching_note(tmp_path):
+    """The note is part of the decision, as it is for `mark_open_many`: the same
+    operation id under a different note holds nothing."""
+    path = write_ledger(tmp_path)
+    close_reopenable(path, "DW-1", "by dw-a")
+    text = path.read_text(encoding="utf-8")
+
+    assert deferredwork.held_reopenable_closes(text, ["DW-1"], "by dw-z", OPERATION_ID) == []
+    assert deferredwork.held_reopenable_closes(text, ["DW-1"], "by dw-a", OPERATION_ID) == ["DW-1"]
 
 
 def test_record_decision_close_matches_the_serial_pair_bytes(tmp_path, monkeypatch):
@@ -4072,29 +4780,6 @@ def test_record_decision_require_open_still_records_on_an_open_entry(tmp_path):
     assert "decision: 2026-06-11 close — moot" in entry.body
 
 
-def test_record_decision_returns_false_for_a_missing_entry(tmp_path, monkeypatch):
-    """A missing id records nothing, writes nothing, and takes no lock (#736).
-
-    Ablation: delete `record_decision`'s pre-lock probe block — the acquisition
-    assertion reds. The ablation this docstring used to carry ("write
-    unconditionally after the appliers") now goes GREEN: the probe answers a
-    missing id above the lock, so the write spy never reaches the under-lock
-    `if updated is None` guard. That guard's ablation moved to
-    `test_a_failing_probe_read_falls_through_to_the_locked_path`, which faults
-    the probe read so this same call reaches the hold."""
-    path = write_ledger(tmp_path)
-    before = path.read_text(encoding="utf-8")
-    writes, acquisitions = [], []
-    _counting_write(monkeypatch, writes)
-
-    with _counting_lock(monkeypatch, acquisitions):
-        assert record_decision(path, "DW-99", "2026-06-11", "keep", "x", close_note="y") is False
-
-    assert writes == []
-    assert acquisitions == []
-    assert path.read_text(encoding="utf-8") == before
-
-
 def test_mark_done_many_per_id_notes(tmp_path, monkeypatch):
     """`notes[i]` supplies `dw_ids[i]`'s resolution note, still in one write.
 
@@ -4239,55 +4924,33 @@ def test_every_mutator_holds_the_ledger_lock(tmp_path, monkeypatch, name):
     `ledger_lock` that yielded without taking anything would satisfy the call
     count and exclude nobody.
 
+    The count grades the whole call graph a public name reaches, thin wrappers
+    included, and the spy tells apart the two ways it can exceed one. A wrapper
+    that re-pairs two locked primitives instead of delegating to a single leaf
+    acquires twice in sequence — count 2, depth 0, so `probed == [True, True]`.
+    A wrapper that takes the lock and then calls a mutator under it acquires
+    while already held — `ledger_lock`'s own guard turns that into a
+    `RuntimeError` rather than the POSIX self-deadlock it would otherwise be, but
+    the depth check names the offending mutator before the guard is even
+    reached, so a lost guard reds this row instead of hanging it.
+
     Ablation: delete this mutator's `with ledger_lock(path):` and dedent its
-    body — the spy never fires, `probed` stays empty, and the row reds."""
+    body — the spy never fires, `probed` stays empty, and the row reds. Re-pair
+    `record_decision` as `append_decision(...)` + `mark_done(...)` at the
+    wrapper and that row's count becomes 2 and it reds."""
     path = _seed_for(tmp_path, name)
     real_lock = deferredwork.ledger_lock
     probed = []
-
-    @contextlib.contextmanager
-    def spy_lock(p):
-        with real_lock(p):
-            probed.append(_lock_is_held(p))
-            yield
-
-    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
-
-    LOCKED_MUTATORS[name](path)
-
-    assert probed == [True]
-
-
-@pytest.mark.parametrize("name", sorted(LOCKED_MUTATORS))
-def test_mutators_acquire_exactly_once_and_never_nest(tmp_path, monkeypatch, name):
-    """One public call is one acquisition, at depth zero, for every entry point
-    including the thin wrappers.
-
-    What this adds over the row above is the *shape* of the failure it can name.
-    That test grades the leaf's hold from inside; this one grades the whole call
-    graph a public name reaches, and distinguishes the two ways the count can
-    exceed one. A wrapper that re-pairs two locked primitives instead of
-    delegating to a single leaf acquires twice in sequence — count 2, depth 0. A
-    wrapper that takes the lock and then calls a mutator under it acquires while
-    already held — `ledger_lock`'s own guard turns that into a `RuntimeError`
-    rather than the POSIX self-deadlock it would otherwise be, but the spy names
-    the offending mutator before the guard is even reached.
-
-    Ablation: re-pair `record_decision` as `append_decision(...)` +
-    `mark_done(...)` at the wrapper — that row's count becomes 2 and it reds."""
-    path = _seed_for(tmp_path, name)
-    real_lock = deferredwork.ledger_lock
     depth = 0
-    acquisitions = 0
 
     @contextlib.contextmanager
     def spy_lock(p):
-        nonlocal depth, acquisitions
+        nonlocal depth
         assert depth == 0, f"{name} nested a ledger_lock acquisition"
-        acquisitions += 1
         depth += 1
         try:
             with real_lock(p):
+                probed.append(_lock_is_held(p))
                 yield
         finally:
             depth -= 1
@@ -4296,7 +4959,7 @@ def test_mutators_acquire_exactly_once_and_never_nest(tmp_path, monkeypatch, nam
 
     LOCKED_MUTATORS[name](path)
 
-    assert acquisitions == 1
+    assert probed == [True]
 
 
 def test_ledger_lock_is_not_reentrant(tmp_path, monkeypatch):
@@ -4680,12 +5343,14 @@ def test_a_read_dependent_noop_takes_no_lock(tmp_path, monkeypatch, name):
     path = _noop_seed_for(tmp_path, name)
     before = path.read_text(encoding="utf-8")
     call, expected = NOOP_MUTATORS[name]
-    acquisitions = []
+    acquisitions, writes = [], []
+    _counting_write(monkeypatch, writes)
 
     with _counting_lock(monkeypatch, acquisitions):
         assert call(path) == expected
 
     assert acquisitions == []
+    assert writes == []
     assert path.read_text(encoding="utf-8") == before
     assert not (path.parent / ARCHIVE_REL).exists()
 
@@ -4754,11 +5419,19 @@ def test_a_failing_probe_read_falls_through_to_the_locked_path(tmp_path, monkeyp
             False,
             id="record_decision",
         ),
+        pytest.param(
+            lambda p: archive_closed(p, archive_date="2026-08-24"), [], id="archive_closed"
+        ),
     ],
 )
 def test_mutators_take_no_lock_for_a_missing_ledger(tmp_path, monkeypatch, call, expected):
-    """No ledger means no write, and so no lock — `archive_closed`'s rule, now
-    kept by its three siblings too.
+    """No ledger means no write, and so no lock — `archive_closed`'s rule
+    (`advance`'s, one module over), now kept by its three siblings too.
+
+    `bmad-loop sweep --archive` reports a project that has no ledger as SUCCESS
+    ("no deferred-work ledger at ..."). With the acquisition first, that answer
+    became a FAILURE wherever the state root cannot be derived: a released
+    behavior changed by a lock taken for a file that is not there.
 
     These ids are real and these arguments are valid, so nothing but the absent
     file can be answering: it is the presence guard (`_ledger_present`, since
@@ -5188,21 +5861,6 @@ def test_ledger_read_error_is_not_caught_by_an_existing_handler():
     assert not issubclass(deferredwork.LedgerReadError, ValueError)
 
 
-def test_read_for_write_wraps_oserror(tmp_path, monkeypatch):
-    """DW-279: refused repair reads preserve the original OS fault as cause.
-
-    Removing the corresponding OS wrap must fail this regression.
-    """
-    path = write_ledger(tmp_path)
-    fault_read_text(monkeypatch, path)
-
-    with pytest.raises(deferredwork.LedgerReadFault) as raised:
-        deferredwork.read_for_write(path)
-
-    assert isinstance(raised.value.__cause__, PermissionError)
-    assert str(path) in str(raised.value)
-
-
 @pytest.mark.parametrize("error_number", [errno.EACCES, errno.EIO, errno.ESTALE, errno.EBADF])
 def test_read_for_write_propagates_a_refused_metadata_probe(tmp_path, monkeypatch, error_number):
     """Refused metadata is a fault, never absence (DW-221/253/279).
@@ -5506,7 +6164,9 @@ def test_observe_ledger_attributes_a_fault_with_no_text(tmp_path, monkeypatch):
 def test_read_for_observation_degrades_on_undecodable_bytes(tmp_path):
     """The OBSERVATION arm never raises — it hands back an empty text plus an
     ATTRIBUTED fault, so a caller holding a journal records which fault it degraded
-    on rather than reporting an empty ledger.
+    on rather than reporting an empty ledger. An unreadable LOCATION degrades the same
+    way (`test_observe_ledger_attributes_a_fault_with_no_text`), attributed by class so
+    the two stay distinguishable downstream.
     Ablation: drop `UnicodeDecodeError` from the except tuple and this reddens with
     that exception escaping instead of a `("", fault)` pair."""
     path = tmp_path / "deferred-work.md"
@@ -5516,20 +6176,6 @@ def test_read_for_observation_degrades_on_undecodable_bytes(tmp_path):
 
     assert text == ""
     assert fault is not None and fault.startswith("UnicodeDecodeError: ")
-
-
-def test_read_for_observation_degrades_on_oserror(tmp_path, monkeypatch):
-    """The other half of the OBSERVATION arm's tuple, and the reason it is a tuple
-    rather than a bare `str`: an unreadable LOCATION degrades the same way as
-    unreadable bytes, attributed by class so the two are distinguishable downstream.
-    Ablation: drop `OSError` from the except tuple and this reddens."""
-    path = write_ledger(tmp_path)
-    fault_read_text(monkeypatch, path)
-
-    text, fault = deferredwork.read_for_observation(path)
-
-    assert text == ""
-    assert fault is not None and fault.startswith("PermissionError: ")
 
 
 def test_read_for_observation_degrades_on_a_metadata_fault(tmp_path, monkeypatch):
@@ -5621,7 +6267,8 @@ def test_mark_done_many_raises_on_an_undecodable_ledger_and_writes_nothing(tmp_p
 def test_read_for_write_wraps_text_read_faults_even_when_the_probe_would_absorb_them(
     tmp_path, monkeypatch, fault
 ):
-    """A successful regular-file probe never licenses synthesizing empty text.
+    """A successful regular-file probe never licenses synthesizing empty text, and a
+    refused repair read keeps the original OS fault as its cause (DW-279).
 
     Ablation: remove the text-read wrap; every row raises the original OSError.
     Reusing probe_absence here also fails the disappearance/type-change rows.

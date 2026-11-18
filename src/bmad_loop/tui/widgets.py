@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -25,20 +26,27 @@ from textual.widgets.option_list import Option
 from textual.widgets.tree import TreeNode
 
 from .. import policy
-from ..escalation import display_pause_reason
+from ..escalation import cleared_pause_escalation_keys, display_pause_reason
 from ..journal import UNREADABLE_LINE_KIND
 from ..model import (
+    PAUSE_ENVIRONMENT,
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
     PAUSE_PLAN_CHECKPOINT,
     PAUSE_SPEC_APPROVAL,
     PAUSE_STORY_CHECKPOINT,
     PAUSE_STORY_GATE,
+    PAUSE_TICKET_HITL,
+    PAUSE_TICKET_REFINE,
+    PAUSE_TICKET_TREE,
     Phase,
     RunState,
 )
 from ..sprintstatus import SprintStatus, Story
 from ..stories import StoryRow
+from ..ticketmodel import TicketRow
+from ..tickets_source import needs_refine, row_label
+from ..worksource import SOURCE_TICKETS
 from . import data
 
 STATUS_GLYPHS = {
@@ -78,6 +86,17 @@ _PAUSE_BADGES: dict[str, tuple[str, str, str]] = {
     PAUSE_EPIC_BOUNDARY: ("epic", "epic gate", "yellow"),
     PAUSE_STORY_GATE: ("gate", "story gate", "yellow"),
     PAUSE_ESCALATION: ("esc", "escalation", "bold red"),
+    PAUSE_ENVIRONMENT: ("env", "environment fault", "bold red"),
+    PAUSE_TICKET_HITL: ("hitl", "hitl ticket", "yellow"),
+    PAUSE_TICKET_REFINE: ("refine", "ticket needs refining", "yellow"),
+    PAUSE_TICKET_TREE: ("tree", "ticket tree", "bold red"),
+}
+
+# Tickets mode reuses `epic-boundary` for an epic awaiting closure (its
+# retrospective verdict), not a sprint epic gate. The runs table has no source
+# per row, so only the full label (run header, gate viewer title) says so.
+_TICKETS_PAUSE_LABELS: dict[str, str] = {
+    PAUSE_EPIC_BOUNDARY: "epic closure",
 }
 
 
@@ -90,9 +109,13 @@ def pause_tag(stage: str) -> Text:
     return Text(tag, style=style)
 
 
-def pause_label(stage: str) -> tuple[str, str]:
-    """(full label, rich style) for a pause stage, for the run-header badge."""
+def pause_label(stage: str, *, source: str = "") -> tuple[str, str]:
+    """(full label, rich style) for a pause stage, for the run-header badge.
+    `source` is the run's `RunState.source`: a tickets run words a reused stage
+    for what it means there."""
     _tag, label, style = _PAUSE_BADGES.get(stage, (stage, stage, "yellow"))
+    if source == SOURCE_TICKETS:
+        label = _TICKETS_PAUSE_LABELS.get(stage, label)
     return label, style
 
 
@@ -123,6 +146,28 @@ def _format_age(seconds: float) -> str:
     if minutes < 60:
         return f"{minutes}m"
     return f"{minutes // 60}h{minutes % 60:02d}m"
+
+
+def _format_countdown(seconds: float) -> str:
+    """A parked prompt's remaining auto-deny time for the header's
+    `· auto-denies in M:SS` text (#855): whole seconds, so it reads like the
+    CLI's own on-screen countdown. Callers clamp a past deadline first."""
+    whole = max(0, int(seconds))
+    return f"{whole // 60}:{whole % 60:02d}"
+
+
+def _format_reset(value: str) -> str:
+    """A quota wait's reset for the header's `· resets <time>` text (#610): an
+    aware ISO-8601 value as this host's local weekday and time (`Mon 12:50`),
+    so the operator reads it in the clock they see; anything else — the raw
+    clause of a reset that did not resolve — as given."""
+    try:
+        at = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if at.tzinfo is None:
+        return value
+    return at.astimezone().strftime("%a %H:%M")
 
 
 class RunHeader(Static):
@@ -157,8 +202,13 @@ class RunHeader(Static):
         state: RunState | None,
         decision: tuple[str, str] | None = None,
         stopping: bool = False,
-        agent: data.ActiveAgent | None = None,
+        agent: data.ActiveAgent | data.UnreadableAgent | None = None,
+        state_fault: str | None = None,
+        read_faults: tuple[str, ...] = (),
     ) -> None:
+        """``state_fault`` (DW-472) marks the state shown as the last good read of a
+        state.json that no longer parses; ``read_faults`` (DW-475) are the other
+        run-dir files the poll could not read this tick, each already a sentence."""
         text = Text()
         text.append(run_id, style="bold")
         if state is not None and state.run_type != "story":
@@ -170,8 +220,15 @@ class RunHeader(Static):
         )
         if state is None:
             text.append("\nstate unavailable", style="dim")
+            if state_fault:
+                text.append(f" — {state_fault}", style="dim")
+            _append_read_faults(text, read_faults)
             self.update(text)
             return
+        if state_fault:
+            text.append(
+                f"\n⚠ state stale — {state_fault}; showing the last good read", style="yellow"
+            )
         text.append(f"  started {state.started_at}", style="dim")
         if state.current_epic is not None:
             text.append(f"  epic {state.current_epic}", style="dim")
@@ -198,23 +255,72 @@ class RunHeader(Static):
         text.append(f"  {weighted:,} tokens ({raw:,} raw)", style="dim")
 
         # The agent line: who is driving (or, when idle, who is configured to).
-        if agent is not None:
+        if isinstance(agent, data.UnreadableAgent):
+            # A session is open but its identity could not be derived (DW-474): say
+            # so, rather than fall through to the configured-agents line, which is
+            # what "no session open" looks like.
+            text.append("\nagent unreadable", style="yellow")
+            text.append(f" — {agent.error}", style="dim")
+        elif agent is not None:
             # A session is open: show the live agent, its model and stage role.
             text.append("\nagent ", style="dim")
             text.append(agent.name, style="bold cyan")
-            if agent.model:
-                text.append(f" · {agent.model}", style="cyan")
+            # The CLI-reported model (#859) when the hook sent one, else the
+            # configured one (omitted when "", the CLI default).
+            shown_model = agent.reported_model if agent.reported_model is not None else agent.model
+            if shown_model:
+                text.append(f" · {shown_model}", style="cyan")
             if agent.role:
                 text.append(f" · {agent.role}", style="dim")
-            if agent.idle_since is not None:
+            if agent.parked_since is not None:
+                # The CLI is parked on a permission prompt (#855): nothing moves
+                # until someone answers it or the CLI's own countdown denies it,
+                # so this outranks the quota and idle notices. The countdown is
+                # the CLI's parsed deadline; one already past is clamped to
+                # `auto-deny due` (the deny lands on the CLI's next repaint), and
+                # a prompt whose countdown was never parsed says so rather than
+                # implying it waits forever.
+                text.append(
+                    " · parked on permission prompt"
+                    f" {_format_age(time.time() - agent.parked_since)}",
+                    style="yellow",
+                )
+                if agent.parked_auto_deny_at is None:
+                    text.append(" · auto-deny time unknown", style="yellow")
+                else:
+                    remaining = agent.parked_auto_deny_at - time.time()
+                    if remaining <= 0:
+                        text.append(" · auto-deny due", style="yellow")
+                    else:
+                        text.append(
+                            f" · auto-denies in {_format_countdown(remaining)}", style="yellow"
+                        )
+            elif agent.quota_wait_since is not None:
+                # A usage-limit quota wait is open (DW-396): the CLI is waiting
+                # out a usage-window reset it continues from by itself, with the
+                # session timeout frozen. Its transcript sits still by design, so
+                # this replaces the idle notice — the session is neither idle
+                # nor stuck. `· resets <time>` names the parsed reset (#610).
+                text.append(
+                    f" · quota wait {_format_age(time.time() - agent.quota_wait_since)}",
+                    style="yellow",
+                )
+                if agent.quota_resets_at:
+                    text.append(f" · resets {_format_reset(agent.quota_resets_at)}", style="yellow")
+            elif agent.idle_since is not None:
                 # The transcript has sat still past the stall grace (#680): the
                 # pane may still be repainting a spinner, so this is the one
                 # surface that separates a session working from one parked in a
                 # tool call. Yellow, not red — it is a notice, not a verdict, and
-                # nothing bounds the stretch.
+                # nothing bounds the stretch. `· in <tool>` names the unanswered
+                # tool call the silence is waiting on (a running tool and a hung
+                # one look alike, so it says which to suspect); `none` — the turn
+                # is over — adds nothing, and `unknown` means the read failed.
                 text.append(
                     f" · idle {_format_age(time.time() - agent.idle_since)}", style="yellow"
                 )
+                if agent.idle_tool and agent.idle_tool != "none":
+                    text.append(f" · in {agent.idle_tool}", style="yellow")
         else:
             # No session open: show the configured adapters from the run's policy
             # snapshot. Skip the line entirely when the snapshot can't be rebuilt
@@ -234,6 +340,20 @@ class RunHeader(Static):
                     line += f" triage {agent_label(triage.name, triage.model)}"
                 text.append(line, style="dim")
 
+        # Auto-sweep outcome (#603): a refused sweep must not read like one that
+        # ran — the deferred work it would have drained is still sitting there.
+        # Wording mirrors `cmd_status`; the delivered line stays dim.
+        sweeps = data.sweep_outcomes(state)
+        if sweeps.refused:
+            detail = ", ".join(f"{trigger} ({why})" for trigger, why in sweeps.refused)
+            text.append(
+                f"\n⚠ auto-sweep not run: {detail} — deferred work is untouched",
+                style="bold yellow",
+            )
+            text.append("\n  run `bmad-loop sweep` with a clean worktree", style="dim")
+        if sweeps.triggered:
+            text.append(f"\nauto-sweep ran: {', '.join(sweeps.triggered)}", style="dim")
+
         if stopping:
             # A RUNNING or UNKNOWN run with a pending graceful-stop request: it never
             # enters the PAUSED/CRASHED/INTERRUPTED branches below, so this stands on
@@ -246,7 +366,7 @@ class RunHeader(Static):
         if status == data.PAUSED:
             text.append("\n⏸ paused", style="bold yellow")
             if state.paused_stage:
-                label, badge_style = pause_label(state.paused_stage)
+                label, badge_style = pause_label(state.paused_stage, source=state.source)
                 text.append("  ")
                 text.append(f"[{label}]", style=f"bold {badge_style}")
             if state.paused_reason:
@@ -266,6 +386,14 @@ class RunHeader(Static):
                 "\n✖ engine gone — run was interrupted · press e to resume",
                 style="bold red",
             )
+        # #958: a story left escalated behind a run that reads as not paused —
+        # `cmd_status`'s hint, under resolve's own admission predicate.
+        for key in cleared_pause_escalation_keys(state):
+            text.append(
+                f"\nescalated: story '{key}' awaiting resolve — press R "
+                f"(bmad-loop resolve {state.run_id})",
+                style="bold yellow",
+            )
         if decision is not None and status not in (
             data.FINISHED,
             data.INTERRUPTED,
@@ -276,7 +404,15 @@ class RunHeader(Static):
             if question:
                 text.append(f" — {_short(question, 100)}", style="yellow")
             text.append("\n  press a to attach and answer", style="bold yellow")
+        _append_read_faults(text, read_faults)
         self.update(text)
+
+
+def _append_read_faults(text: Text, read_faults: tuple[str, ...]) -> None:
+    # Dim, like the other observation notes: the view may be incomplete, nothing is
+    # wrong with the run itself.
+    for fault in read_faults:
+        text.append(f"\n⚠ {fault}", style="dim")
 
 
 # ------------------------------------------------------------ journal lines
@@ -290,6 +426,7 @@ _UNREADABLE_LINE_STYLE = "red"
 # kind substrings -> style, first match wins; anything else renders dim
 _JOURNAL_STYLES = (
     ("escalation-resolved", "green"),  # positive — must precede the "escalat" -> red rule
+    ("escalation-adopted", "green"),  # positive (DW-386) — same ordering constraint
     ("escalat", "red"),
     ("failed", "red"),
     ("done", "green"),
@@ -849,6 +986,145 @@ class StoriesTable(DataTable):
                 r.id, "chk", story_checkpoint_cell(r.spec_checkpoint, r.done_checkpoint)
             )
             self.update_cell(r.id, "title", _short(r.title, 48))
+
+
+# ------------------------------------------------------------- tickets table
+
+# A ticket's board state -> glyph + style. Keyed on the plan's status when the
+# ticket has a plan, else on the row's derived state (`planned`, `backlog`, or a
+# tracker's mirrored word), plus `refine` for a plan-less ticket that must be
+# refined before a build can start.
+TICKET_GLYPHS = {
+    "planned": "·",
+    "backlog": "·",
+    "refine": "✎",
+    "draft": "◦",
+    "ready-for-dev": "○",
+    "in-progress": "▶",
+    "in-review": "◆",
+    "review": "◆",
+    "built": "●",
+    "done": "✓",
+    "blocked": "✖",
+    "dropped": "–",
+}
+
+TICKET_STYLES = {
+    "planned": "dim",
+    "backlog": "dim",
+    "refine": "yellow",
+    "draft": "dim",
+    "ready-for-dev": "cyan",
+    "in-progress": "cyan",
+    "in-review": "magenta",
+    "review": "magenta",
+    "built": "green",
+    "done": "green",
+    "blocked": "bold red",
+    "dropped": "dim strike",
+}
+
+
+def ticket_state_cell(status: str, state: str) -> Text:
+    """A ticket's board state: its plan ``status`` when it has a plan, else the
+    row's derived ``state``."""
+    key = status or state
+    return Text(f"{TICKET_GLYPHS.get(key, '?')} {key}", style=TICKET_STYLES.get(key, "dim"))
+
+
+def ticket_flags_cell(hitl: bool, plan_cp: bool, done_cp: bool) -> Text:
+    """The flags a tickets run pauses on, positionally like
+    :func:`story_checkpoint_cell`: `H` (hitl — built with a person, yellow), `P`
+    (plan checkpoint, magenta), `D` (done checkpoint, cyan), dim `·` when unset."""
+    text = Text()
+    for mark, on, style in (
+        ("H", hitl, "yellow"),
+        ("P", plan_cp, "magenta"),
+        ("D", done_cp, "cyan"),
+    ):
+        text.append(mark if on else "·", style=style if on else "dim")
+    return text
+
+
+def _ticket_cells(row: TicketRow) -> tuple[Text, Text]:
+    state = "refine" if not row.status and needs_refine(row) else row.state
+    return (
+        ticket_state_cell(row.status, state),
+        ticket_flags_cell(row.hitl, row.plan_checkpoint, row.done_checkpoint),
+    )
+
+
+def _ticket_keys(rows: tuple[TicketRow, ...]) -> list[str]:
+    """One unique row key per ticket: its operator label, suffixed on a repeat
+    so two rows the tree prints alike still get rows of their own."""
+    keys: list[str] = []
+    seen: dict[str, int] = {}
+    for row in rows:
+        label = row_label(row)
+        n = seen.get(label, 0)
+        seen[label] = n + 1
+        keys.append(label if n == 0 else f"{label}#{n + 1}")
+    return keys
+
+
+class TicketsTable(DataTable):
+    """The tickets-mode board — one row per ticket of the run's initiative, as
+    ``tickets.py status`` prints it (build order within each epic), replacing the
+    sprint tree when a tickets-mode run is selected.
+
+    Reconciles in place like :class:`StoriesTable` (row key = the ticket's ref):
+    an unchanged ref list only updates cells, keeping the cursor. A board that
+    could not be read shows its fault, never an empty table."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.cursor_type = "row"
+        self.zebra_stripes = True
+        self._row_keys: list[str] | None = None  # None: placeholder/empty shown
+
+    def on_mount(self) -> None:
+        self.add_column("state", key="state", width=15)
+        self.add_column("ref", key="ref", width=8)
+        self.add_column("epic", key="epic", width=14)
+        self.add_column("⚑", key="flags", width=3)
+        self.add_column("title", key="title")
+
+    def _placeholder(self, label: str, style: str = "dim") -> None:
+        self.clear()
+        self.add_row(Text(label, style=style), "", "", "", "")
+        self._row_keys = None
+
+    def update_tickets(self, board: data.TicketsBoard | None) -> None:
+        if board is None:
+            self._placeholder("tickets board loading…")
+            return
+        if board.fault is not None:
+            self._placeholder(f"tickets board unavailable: {board.fault}", "red")
+            return
+        if not board.rows:
+            self._placeholder("no tickets")
+            return
+        keys = _ticket_keys(board.rows)
+        if self._row_keys != keys:
+            self.clear()
+            for key, row in zip(keys, board.rows):
+                state, flags = _ticket_cells(row)
+                self.add_row(
+                    state,
+                    row_label(row),
+                    _short(row.epic, 14),
+                    flags,
+                    _short(row.title, 48),
+                    key=key,
+                )
+            self._row_keys = keys
+            return
+        for key, row in zip(keys, board.rows):
+            state, flags = _ticket_cells(row)
+            self.update_cell(key, "state", state)
+            self.update_cell(key, "epic", _short(row.epic, 14))
+            self.update_cell(key, "flags", flags)
+            self.update_cell(key, "title", _short(row.title, 48))
 
 
 # ------------------------------------------------------------ deferred work

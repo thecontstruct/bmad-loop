@@ -265,6 +265,105 @@ def test_artifact_size_refusal_keeps_counts_but_drops_path_and_error():
     assert secret_path not in json.dumps(scrubbed)
 
 
+def test_ticket_pick_journals_keep_tokens_but_drop_free_text():
+    """The tickets pick's records keep the closed tokens (cause, stage, skip,
+    phase, status), alias the ticket ref (it can be a plan's file name), and drop
+    the halt's free-text detail — it can quote a plan's `blocked_reason` or a
+    tickets.py error naming a path."""
+    secret_path = "/home/canaryuser/AcmeSecret/plan.md"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    halt = diagnostics._scrub_entry(
+        {
+            "kind": "ticket-pick-halt",
+            "ref": "1.2",
+            "cause": "tree-fault",
+            "stage": "ticket-tree",
+            "detail": f"tickets.py crashed: {secret_path}",
+        },
+        pseudo,
+        {},
+        None,
+    )
+    skipped = diagnostics._scrub_entry(
+        {"kind": "ticket-skipped", "ref": "1.1", "skip": "touched", "phase": "deferred"},
+        pseudo,
+        {},
+        None,
+    )
+    foreign = diagnostics._scrub_entry(
+        {"kind": "ticket-foreign-active", "ref": "2.1", "status": "built"},
+        pseudo,
+        {},
+        None,
+    )
+
+    assert (halt["cause"], halt["stage"]) == ("tree-fault", "ticket-tree")
+    assert all(e["ref"].startswith("ticket-") for e in (halt, skipped, foreign))
+    assert halt["detail_present"] is True
+    assert secret_path not in json.dumps(halt)
+    assert (skipped["skip"], skipped["phase"]) == ("touched", "deferred")
+    assert foreign["status"] == "built"
+
+
+def test_ticket_epic_retro_journals_alias_the_epic_slug():
+    """Tickets mode's epic-boundary rows carry the epic slug in `epic_ref`, which
+    names the customer's epic: it is aliased in its own `epic` namespace (one
+    alias across the retro and its closure), while `epic` 0 and the closed
+    verdict token stay readable."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    finished = diagnostics._scrub_entry(
+        {
+            "kind": "retro-auto-finished",
+            "epic": 0,
+            "epic_ref": "epic-acme-vault",
+            "docs": ["epic-acme-vault-retrospective.md"],
+            "verdict": "rejected",
+        },
+        pseudo,
+        {},
+        None,
+    )
+    closure = diagnostics._scrub_entry(
+        {"kind": "ticket-epic-closure", "epic_ref": "epic-acme-vault", "verdict": "rejected"},
+        pseudo,
+        {},
+        None,
+    )
+
+    assert "acme" not in json.dumps([finished, closure])
+    assert finished["epic_ref"] == closure["epic_ref"]
+    assert str(finished["epic_ref"]).startswith("epic-")
+    assert (finished["epic"], finished["verdict"], closure["verdict"]) == (
+        0,
+        "rejected",
+        "rejected",
+    )
+
+
+def test_ticket_status_write_refusal_keeps_its_closed_tokens():
+    """A refused engine status write keeps the site, the plan status it targeted
+    and the refusal token — all closed vocabularies — so a bundle shows which
+    writer tickets mode turned away."""
+    refused = diagnostics._scrub_entry(
+        {
+            "kind": "ticket-status-write-refused",
+            "story_key": "1.1",
+            "site": "salvage",
+            "target": "built",
+            "cause": "no-plan-reason",
+        },
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert (refused["site"], refused["target"], refused["cause"]) == (
+        "salvage",
+        "built",
+        "no-plan-reason",
+    )
+
+
 def test_artifact_size_refusal_rejects_malformed_safe_fields():
     scrubbed = diagnostics._scrub_entry(
         {
@@ -903,6 +1002,89 @@ def test_the_two_commit_probe_records_alias_one_baseline_to_one_name():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
+def test_the_two_migration_reset_refusals_alias_one_snapshot_ref():
+    """`snapshot_ref` names the worktree snapshot `sweep._migration_reset` parked
+    before refusing its reset (DW-435), on both of that refusal's records. It is a
+    ref NAME embedding the story slug and a baseline prefix, so it is aliased in a
+    `ref` namespace of its own — one snapshot, one alias across both kinds — rather
+    than left to `scrub_json`, which redacts it only because of its `/`.
+
+    Ablation: drop `"snapshot_ref"` from `_JOURNAL_ALIAS_FIELDS` and the test dies at
+    the `next(...)` alias lookup with `StopIteration`."""
+    ref = f"refs/attempt-preserve-dirty/{PROPRIETARY}-{SHA[:8]}-2"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    probe_failed = diagnostics._scrub_entry(
+        {
+            "ts": 1.0,
+            "kind": "ledger-snapshot-probe-failed",
+            "story_key": STORY_KEY,
+            "snapshot_ref": ref,
+            "error": f"GitError: git show {ref}:ledger failed in {HOME_PATH}",
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+    diverged = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "sweep-migration-restore-diverged",
+            "story_key": STORY_KEY,
+            "ledger": f"{HOME_PATH}/deferred-work.md",
+            "snapshot_ref": ref,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    alias = next(a for ns, orig, a in pseudo.entries() if ns == "ref" and orig == ref)
+    assert probe_failed["snapshot_ref"] == diverged["snapshot_ref"] == alias != ref
+    assert "error" not in probe_failed and probe_failed["error_present"] is True
+
+    rendered = json.dumps([probe_failed, diverged])
+    for canary in (ref, SHA[:8], PROPRIETARY, HOME_PATH, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_the_park_failure_records_alias_one_head_to_one_name():
+    """`head` is the attempt HEAD sha a rollback could not park
+    (`attempt-preserve-failed`) or fell through past on a re-drive
+    (`attempt-preserve-fallthrough`, DW-481) — the sha a reflog rescue starts from.
+    It left the routing guard's benign inventory for the `commit` namespace, so one
+    HEAD gets one alias across both kinds; `leg` is a closed token and ships as-is.
+
+    Ablation: drop `"head"` from `_JOURNAL_ALIAS_FIELDS` and the test dies at the
+    `next(...)` alias lookup with `StopIteration`."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    failed = diagnostics._scrub_entry(
+        {"ts": 1.0, "kind": "attempt-preserve-failed", "story_key": STORY_KEY, "head": SHA},
+        pseudo,
+        {},
+        1.0,
+    )
+    fallthrough = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "attempt-preserve-fallthrough",
+            "story_key": STORY_KEY,
+            "leg": "commits-park",
+            "head": SHA,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    alias = next(a for ns, orig, a in pseudo.entries() if ns == "commit" and orig == SHA)
+    assert failed["head"] == fallthrough["head"] == alias != SHA
+    assert fallthrough["leg"] == "commits-park"
+
+    rendered = json.dumps([failed, fallthrough])
+    for canary in (SHA, PROPRIETARY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
 def test_remaining_journal_shapes_route_by_kind_and_preserve_safe_structure():
     """The overloaded names are handled according to the producer shape, not by
     their generic scalar fallback."""
@@ -972,6 +1154,150 @@ def test_non_string_sentinel_is_safely_pseudonymized():
     assert pseudo.entries() == [("spec", str(raw), scrubbed["sentinel"])]
 
 
+def test_ticket_mark_ref_is_pseudonymized():
+    """A ticket key is the plan's title slug and identifier-shaped.
+
+    Ablation: remove the `ticket-mark` kind route and `scrub_json` ships the key
+    verbatim.
+    """
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": "ticket-mark", "ref": "story-acme-vault-rotation", "outcome": "marked"},
+        pseudo,
+        {},
+        None,
+    )
+
+    assert scrubbed["ref"].startswith("ticket-")
+    assert "acme" not in json.dumps(scrubbed)
+    assert pseudo.entries() == [("ticket", "story-acme-vault-rotation", scrubbed["ref"])]
+
+
+def test_initiative_mark_aliases_slugs_and_drops_the_file_path():
+    """`initiative-mark` names two initiative folders and the closed child's file:
+    both slugs alias in one `initiative` namespace, the path collapses to presence,
+    and the status/outcome tokens stay readable.
+
+    Ablation: drop the kind's `_JOURNAL_KIND_SCHEMAS` row and `file` ships through
+    `scrub_json`; drop its alias row and the slugs ship verbatim."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    raw = {
+        "kind": "initiative-mark",
+        "parent": "initiative-acme-platform",
+        "slug": "initiative-acme-auth",
+        "file": "/home/acme/store/initiative-acme-auth/initiative-acme-auth.md",
+        "before": "in-progress",
+        "after": "done",
+        "outcome": "written",
+    }
+
+    scrubbed = diagnostics._scrub_entry(raw, pseudo, {}, None)
+
+    assert scrubbed["parent"].startswith("initiative-") and scrubbed["slug"].startswith(
+        "initiative-"
+    )
+    assert scrubbed["parent"] != scrubbed["slug"]
+    assert "file" not in scrubbed and scrubbed["file_present"] is True
+    assert (scrubbed["before"], scrubbed["after"], scrubbed["outcome"]) == (
+        "in-progress",
+        "done",
+        "written",
+    )
+    assert "acme" not in json.dumps(scrubbed)
+
+
+def test_initiative_chain_rows_alias_every_slug_and_keep_their_tokens():
+    """The chain's kinds name the parent and child initiatives as scalars and
+    as lists: every slug aliases in the one `initiative` namespace (so the parent
+    and `initiative-mark`'s `parent` read alike), the pass-over and end tokens and
+    the prerequisite statuses and the previous run id stay readable, and `error`
+    is dropped.
+
+    Ablation: drop the kinds' alias rows and the scalars ship verbatim; drop their
+    keylist rows and the slug lists do."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    parent, auth, billing = (
+        "initiative-acme-platform",
+        "initiative-acme-auth",
+        "initiative-acme-billing",
+    )
+    rows = [
+        {
+            "kind": "initiative-chain-next",
+            "parent": parent,
+            "from_child": auth,
+            "to_child": billing,
+            "passed_over": [auth],
+            "passed_over_why": ["drained"],
+        },
+        {
+            "kind": "initiative-chain-end",
+            "parent": parent,
+            "end": "fault",
+            "waiting": [billing],
+            "waiting_child": [billing],
+            "waiting_on": [auth],
+            "waiting_on_status": ["dropped"],
+            "passed_over": [auth],
+            "passed_over_why": ["no-folder"],
+            "error": f"tickets.py fault: /home/acme/{auth}",
+        },
+        {
+            "kind": "initiative-chain",
+            "parent": parent,
+            "previous_run": "20261028-000000-beef",
+            "previous_child": auth,
+        },
+        {"kind": "initiative-mark", "parent": parent, "slug": auth, "outcome": "written"},
+        {
+            "kind": "initiative-close-skipped",
+            "parent": parent,
+            "slug": auth,
+            "why": "run-unfinished",
+            "blocking_run": "20261028-000000-cafe",
+            "detail": f"run in /home/acme/{auth} is paused",
+        },
+    ]
+
+    nxt, end, link, mark, skipped = (diagnostics._scrub_entry(r, pseudo, {}, None) for r in rows)
+
+    assert "acme" not in json.dumps([nxt, end, link, mark, skipped])
+    assert (skipped["parent"], skipped["slug"]) == (mark["parent"], mark["slug"])
+    assert (skipped["why"], skipped["blocking_run"]) == ("run-unfinished", "20261028-000000-cafe")
+    assert "detail" not in skipped
+    assert nxt["parent"] == end["parent"] == link["parent"] == mark["parent"]
+    assert nxt["from_child"] == nxt["passed_over"][0] == link["previous_child"] == mark["slug"]
+    assert nxt["to_child"] == end["waiting"][0] != nxt["from_child"]
+    assert (nxt["passed_over_why"], end["passed_over_why"]) == (["drained"], ["no-folder"])
+    assert end["waiting_child"] == end["waiting"] and end["waiting_on"] == [nxt["from_child"]]
+    assert end["waiting_on_status"] == ["dropped"]
+    assert (end["end"], link["previous_run"]) == ("fault", "20261028-000000-beef")
+    assert "error" not in end and end["error_present"] is True
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "ticket-foreign-active",
+        "ticket-skipped",
+        "ticket-hitl-pause",
+        "ticket-refine-pause",
+        "ticket-pick-halt",
+        "ticket-story-approved",
+    ],
+)
+def test_ticket_engine_kinds_pseudonymize_their_ref(kind):
+    """The tickets engine's pick and pause records carry the same ticket key.
+
+    Ablation: remove a kind's route and its row ships the key verbatim."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": kind, "ref": "story-acme-vault-rotation"}, pseudo, {}, None
+    )
+    assert scrubbed["ref"].startswith("ticket-")
+    assert "acme" not in json.dumps(scrubbed)
+
+
 def test_journal_alias_routes_accept_lone_unicode_surrogates(project):
     run_dir = _seed_run(project.project)
     sentinel_value = chr(0xDC80)
@@ -992,6 +1318,73 @@ def test_journal_alias_routes_accept_lone_unicode_surrogates(project):
     assert len(set(commits["commits"])) == len(commit_values)
     assert sentinel_value not in rendered
     assert all(value not in rendered for value in commit_values)
+
+
+@pytest.mark.parametrize(
+    ("kind", "field", "values"),
+    [
+        ("retro-auto-dirty", "paths", ["src/AcmePayroll.py", "AcmeVault.txt"]),
+        ("retro-auto-finished", "docs", ["epic-1-retro-AcmeVault.md"]),
+    ],
+)
+def test_auto_retro_path_lists_reduce_to_counts(kind, field, values):
+    """DW-389: the auto retrospective's path lists (the leftover dirty paths, the
+    retro doc names) ship as counts, never as names.
+
+    Ablation: drop the kind's row from `_JOURNAL_KIND_COUNTLIST_FIELDS` and the
+    identifier-shaped names ride `scrub_json` into the dump."""
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": kind, "epic": 1, field: values},
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert scrubbed == {"kind": kind, "epic": 1, f"{field}_count": len(values)}
+    assert all(value not in json.dumps(scrubbed) for value in values)
+
+
+def test_unrecognized_severity_items_reduce_to_a_count():
+    """#913: the harvest's unrecognized-severity items carry the dev session's own
+    summary and severity text, so a dump ships their count, never the text.
+
+    Ablation: drop the kind's row from `_JOURNAL_KIND_COUNTLIST_FIELDS` and the
+    one-word values ride `scrub_json` into the dump."""
+    items = [{"summary": "AcmeVault", "declared": "AcmePriority"}]
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": "spec-deferrals-severity-unrecognized", "items": items},
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert scrubbed == {"kind": "spec-deferrals-severity-unrecognized", "items_count": 1}
+    assert "Acme" not in json.dumps(scrubbed)
+
+
+@pytest.mark.parametrize("verdict", ["accepted", "accepted-with-open-items", "rejected", "unknown"])
+def test_auto_retro_verdict_ships_as_its_closed_token(verdict):
+    """DW-487: `retro-auto-finished`'s `verdict` is a closed token the engine
+    normalizes (never doc text), declared benign on that kind, so a dump keeps it
+    verbatim beside the doc count — the value a maintainer reads the record for."""
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "kind": "retro-auto-finished",
+            "epic": 1,
+            "docs": ["epic-1-retro-2026-09-26.md"],
+            "verdict": verdict,
+        },
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert scrubbed == {
+        "kind": "retro-auto-finished",
+        "epic": 1,
+        "docs_count": 1,
+        "verdict": verdict,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1096,6 +1489,173 @@ def test_unrelated_raw_presence_field_is_not_suppressed():
     assert scrubbed["patch_present"] is False
 
 
+def test_session_end_models_survive_scrub():
+    """`session-end` `models` (#859) keeps each model-id-shaped element — an
+    opencode `provider/model` and a claude `…[1m]` id included, which the
+    `scrub_json` fallback would blank — and redacts a secret-shaped or path-ish
+    element on its own; `models_unresolved` is a bool and passes as is.
+
+    Ablation: drop the `models` branch in `_scrub_entry` and `scrub_json`
+    redacts the `/` and `[1m]` ids, failing the first assertion."""
+    # Model-id shaped, so only `looks_like_secret` stands between it and the dump.
+    secret = "sk-ant-api03-" + "Zx8Qw3Rt7Yu1Io5Pa9Sd2Fg6Hj0Kl4ZxCvBn"
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "kind": "session-end",
+            "models": [
+                "claude-opus-5-5",
+                "anthropic/claude-sonnet-4-5",
+                "claude-opus-4-6[1m]",
+                secret,
+                "/home/alice/.claude/model",
+                "has space",
+                7,
+            ],
+            "models_unresolved": True,
+        },
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+    assert scrubbed["models"] == [
+        "claude-opus-5-5",
+        "anthropic/claude-sonnet-4-5",
+        "claude-opus-4-6[1m]",
+        "<redacted:str>",
+        "<redacted:str>",
+        "<redacted:str>",
+        "<redacted:str>",
+    ]
+    assert scrubbed["models_unresolved"] is True
+    for value in ("claude-opus-5-5", "x\n"):
+        not_a_list = diagnostics._scrub_entry(
+            {"kind": "session-end", "models": value},
+            sanitize.Pseudonymizer(salt=b"fixed"),
+            {},
+            None,
+        )
+        assert not_a_list["models"] == "<redacted:str>"
+    assert diagnostics._scrub_model_id("claude-opus-5-5\n") == "<redacted:str>"
+
+
+def test_session_end_tokens_by_model_survive_scrub():
+    """DW-618: `session-end` `tokens_by_model` keeps a model-id-shaped key (and
+    the engine's `<unattributed>` sentinel) with its four int counts; a key
+    that redacts merges into `<redacted:str>` by summing, and a value keeps
+    only int counts of the four token fields.
+
+    Ablation: drop the `tokens_by_model` branch in `_scrub_entry` and
+    `scrub_json` blanks the `provider/model` key, failing the assertion."""
+    secret = "sk-ant-api03-" + "Zx8Qw3Rt7Yu1Io5Pa9Sd2Fg6Hj0Kl4ZxCvBn"
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "kind": "session-end",
+            "tokens_by_model": {
+                "anthropic/claude-sonnet-4-5": {
+                    "input_tokens": 3,
+                    "output_tokens": 2,
+                    "cache_read_tokens": 1,
+                    "cache_creation_tokens": 0,
+                    "note": "/home/alice/x",
+                },
+                "<unattributed>": {"input_tokens": 4, "output_tokens": True},
+                secret: {"input_tokens": 5},
+                "/home/alice/.claude/model": {"input_tokens": 6, "output_tokens": "7"},
+                "claude-opus-5-5": "garbled",
+            },
+        },
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+    assert scrubbed["tokens_by_model"] == {
+        "anthropic/claude-sonnet-4-5": {
+            "input_tokens": 3,
+            "output_tokens": 2,
+            "cache_read_tokens": 1,
+            "cache_creation_tokens": 0,
+        },
+        "<unattributed>": {"input_tokens": 4},
+        "<redacted:str>": {"input_tokens": 11},
+        "claude-opus-5-5": {},
+    }
+    for value in ("claude-opus-5-5", ["m"], None):
+        not_a_map = diagnostics._scrub_entry(
+            {"kind": "session-end", "tokens_by_model": value},
+            sanitize.Pseudonymizer(salt=b"fixed"),
+            {},
+            None,
+        )
+        assert not_a_map["tokens_by_model"] == "<redacted:str>"
+
+
+def test_session_model_row_keeps_model_id():
+    """`session-model` `model` (#859) keeps a model-id-shaped value — a claude
+    `…[1m]` id included, which the `scrub_json` fallback would blank — and
+    redacts a secret-shaped or non-string one.
+
+    Ablation: drop the `session-model` branch in `_scrub_entry` and `scrub_json`
+    redacts the `[1m]` id, failing the first assertion."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    secret = "sk-ant-api03-" + "Zx8Qw3Rt7Yu1Io5Pa9Sd2Fg6Hj0Kl4ZxCvBn"
+    kept = diagnostics._scrub_entry(
+        {"kind": "session-model", "model": "claude-opus-4-6[1m]", "cli": "claude"},
+        pseudo,
+        {},
+        None,
+    )
+    assert kept["model"] == "claude-opus-4-6[1m]"
+    assert kept["cli"] == "claude"
+    for value in (secret, "/home/alice/model", 7, None):
+        redacted = diagnostics._scrub_entry(
+            {"kind": "session-model", "model": value}, pseudo, {}, None
+        )
+        assert redacted["model"] == "<redacted:str>"
+
+
+def test_unpinned_artifact_observation_keeps_the_fs_type_and_drops_the_paths():
+    """`artifact-observation-unpinned` (DW-444) names the absolute artifacts root
+    and a filesystem label that embeds its volume path — both host paths, routed
+    presence-only for `repo`'s reason. The filesystem TYPE rides its own
+    `fs_type` field and survives as a value; `count` is a benign integer.
+
+    Graded on ABSENCE, as `stories_root` is: the canary sweep alone is a false
+    green because `scrub_json` already collapses a separator-bearing path.
+
+    Ablation: drop `root` or `filesystem` from `_JOURNAL_DROP_FIELDS` and the
+    matching presence assertion reddens; drop the `fs_type` branch in
+    `_scrub_entry` and the path-shaped `fs_type` row ships redacted-by-accident
+    rather than None, while a route that returns None unconditionally loses
+    `NTFS`."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+
+    def scrub(fs_type):
+        return diagnostics._scrub_entry(
+            {
+                "ts": 2.0,
+                "kind": "artifact-observation-unpinned",
+                "story_key": STORY_KEY,
+                "root": f"{HOME_PATH}/_bmad-output/implementation-artifacts",
+                "filesystem": f"NTFS at {HOME_PATH}",
+                "fs_type": fs_type,
+                "count": 3,
+            },
+            pseudo,
+            {},
+            1.0,
+        )
+
+    scrubbed = scrub("NTFS")
+    assert "root" not in scrubbed and scrubbed["root_present"] is True
+    assert "filesystem" not in scrubbed and scrubbed["filesystem_present"] is True
+    assert scrubbed["fs_type"] == "NTFS"
+    assert scrubbed["count"] == 3
+    rendered = json.dumps(scrubbed)
+    for canary in (HOME_PATH, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+    assert scrub(f"NTFS at {HOME_PATH}")["fs_type"] is None
+
+
 def test_sentinel_upstream_record_drops_the_stories_root_it_names():
     """`rearm-upstream-write-unreachable` carries an absolute host path naming the
     folder a sentinel's upstream correction has to land in.
@@ -1164,6 +1724,12 @@ _PATCH_PATH_ROUTING_ROWS = (
         "patch",
         f"{HOME_PATH}/.bmad-loop/runs/r1/failed/{STORY_KEY}/changes.patch",
     ),
+    ("restore-patch-evacuated", "patch", f"{HOME_PATH}/artifacts/epic-x/story-x-plan.patch"),
+    (
+        "restore-patch-evacuated",
+        "stashed_to",
+        f"{HOME_PATH}/.bmad-loop/runs/r1/restore/{STORY_KEY}.patch",
+    ),
     (
         "deferred-artifacts-stashed",
         "stashed_to",
@@ -1211,6 +1777,25 @@ def test_patch_and_stash_path_fields_are_dropped_at_the_routing_seam(kind, field
     legend = json.dumps(pseudo.legend())
     for canary in (value, HOME_PATH, SPEC_NAME, PROPRIETARY, *CANARIES):
         assert canary not in legend, f"LEAK via legend: {canary!r}"
+
+
+def test_pinned_config_edit_descriptions_are_dropped_at_the_routing_seam():
+    """`pinned-config-edit-refused` (DW-368) lists free-text edit descriptions that
+    quote config paths, the operator's settings keys and error text; a dump keeps
+    only their presence. Ablation: remove `edits` from ``_JOURNAL_DROP_FIELDS`` and
+    the absence assertion fails."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    edits = [f".claude/settings.json: changed outside the relay hooks (keys: {PROPRIETARY})"]
+    scrubbed = diagnostics._scrub_entry(
+        {"ts": 2.0, "kind": "pinned-config-edit-refused", "story_key": STORY_KEY, "edits": edits},
+        pseudo,
+        {},
+        1.0,
+    )
+
+    assert "edits" not in scrubbed
+    assert scrubbed["edits_present"] is True
+    assert PROPRIETARY not in json.dumps(scrubbed)
 
 
 def test_patch_and_stash_paths_are_absent_from_public_diagnostic_renders(project):
@@ -1530,6 +2115,58 @@ def test_a_withheld_ledger_publish_keeps_its_file_through_a_dump(project):
     assert message_value not in markdown
 
 
+def test_the_engine_ledger_commit_rows_keep_their_identity_through_a_dump(project):
+    """#772: the engine's own pre-session ledger bookkeeping commits — published,
+    failed, refused — are collected into the Markdown dump's JSON block beside the
+    sweep's `_commit_ledger` rows. `site` (the closed session role, or `defer`),
+    the bare `added` boolean and the closed `refuse_cause` survive verbatim;
+    `story_key` and `commit` alias; the free-text `error` collapses to presence.
+
+    Ablation: remove any one of the three kinds from the Markdown collected-kind
+    set and its `next(...)` lookup finds no entry. Drop `site` from its kind's
+    `_JOURNAL_KIND_SCHEMAS` row and that row's `site` assertion fails."""
+    run_dir = _seed_run(project.project)
+    error_value = f"fatal: unable to write {HOME_PATH}/deferred-work.md"
+    journal = Journal(run_dir)
+    journal.append(
+        "engine-ledger-commit", story_key=STORY_KEY, site="review", commit="a" * 40, added=True
+    )
+    journal.append(
+        "engine-ledger-commit-failed", story_key=STORY_KEY, site="dev", error=error_value
+    )
+    journal.append(
+        "engine-ledger-commit-refused",
+        story_key=STORY_KEY,
+        site="defer",
+        refuse_cause="target-unreadable",
+        error=error_value,
+    )
+
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    markdown = diagnostics.render_markdown(diag, pseudo=pseudo)
+    blocks = re.findall(r"```json\n(.*?)\n```", markdown, flags=re.DOTALL)
+    assert len(blocks) == 1
+    entries = json.loads(blocks[0])
+
+    published = next(e for e in entries if e["kind"] == "engine-ledger-commit")
+    failed = next(e for e in entries if e["kind"] == "engine-ledger-commit-failed")
+    refused = next(e for e in entries if e["kind"] == "engine-ledger-commit-refused")
+    assert published["site"] == "review"
+    assert published["added"] is True
+    assert published["commit"].startswith("commit-")  # aliased, not shipped
+    assert failed["site"] == "dev"
+    assert refused["site"] == "defer"
+    assert refused["refuse_cause"] == "target-unreadable"
+    story_alias = next(a for ns, orig, a in pseudo.entries() if ns == "story" and orig == STORY_KEY)
+    for entry in (published, failed, refused):
+        assert entry["story_key"] == story_alias
+    for entry in (failed, refused):
+        assert entry["error_present"] is True and "error" not in entry
+    for canary in (STORY_KEY, error_value, HOME_PATH, "a" * 40):
+        assert canary not in markdown, f"LEAK: {canary!r}"
+
+
 def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
     """`target` is a BRANCH on the merge kinds and a sprint STATUS on `board-advance-*`.
 
@@ -1640,6 +2277,13 @@ def test_integration_receipt_identities_are_pseudonymized_in_merge_records():
     assert operation_aliases == [operation_aliases[0]] * 3
     assert operation_aliases[0] != operation
     assert scrubbed[0]["pre_target_revision"] != revision
+    # DW-318: `source` is the same revision namespace — one SHA, one alias across
+    # every merge kind and `pre_target_revision`. Ablation: drop the `source` rows
+    # from `_JOURNAL_KIND_ALIAS_FIELDS` and the 40-hex value survives `scrub_json`.
+    commit_alias = scrubbed[0]["pre_target_revision"]
+    assert commit_alias.startswith("commit-")
+    assert [entry["source"] for entry in scrubbed] == [commit_alias] * 3
+    assert revision not in json.dumps(scrubbed), "LEAK: raw merge revision"
     assert any(ns == "operation" and original == operation for ns, original, _ in pseudo.entries())
     assert any(ns == "commit" and original == revision for ns, original, _ in pseudo.entries())
 
@@ -2241,16 +2885,43 @@ def test_markdown_sweep_unknown_key_fails_closed_before_the_backstop(project):
             },
         ),
         ("sweep-repeat-done", {"cycles": 2, "reason": "no-open", "stop_cause": "no-open"}),
+        (
+            "sweep-bundles-withheld",
+            {
+                "cycle": 3,
+                "bundles_not_run": 2,
+                "reason": "ledger-unreadable",
+                "story_keys": [STORY_KEY],
+            },
+        ),
+        (
+            "engine-ledger-commit",
+            {"story_key": STORY_KEY, "site": "review", "commit": "a" * 40, "added": True},
+        ),
+        (
+            "engine-ledger-commit-failed",
+            {"story_key": STORY_KEY, "site": "dev", "error": "fatal"},
+        ),
+        (
+            "engine-ledger-commit-refused",
+            {
+                "story_key": STORY_KEY,
+                "site": "defer",
+                "refuse_cause": "target-unreadable",
+                "error": "fatal",
+            },
+        ),
     ],
 )
 def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared):
-    """The six kinds `render_markdown` prints as a JSON block carry a declared
+    """The ten kinds `render_markdown` prints as a JSON block carry a declared
     schema, so a field a future producer adds WITHOUT routing collapses to a
     presence marker instead of riding `scrub_json` into the pasted dump. Graded
     both ways, as the `preference-escalation` row is: the off-schema value is GONE
     and the declared identity fields (`file`, `refuse_cause`, `stop_cause`,
-    `cycles`) are NOT — a schema that flattened the record would pass an
-    absence-only assertion while destroying what the block is rendered for.
+    `cycles`, `cycle`, `bundles_not_run`, `site`, `added`) are NOT — a schema that flattened the
+    record would pass an absence-only assertion while destroying what the block is
+    rendered for.
 
     Ablation: drop `kind`'s row from `_JOURNAL_KIND_SCHEMAS` and the `AcmeVault`
     absence assertion reds — `scrub_json` is the identity on that string."""
@@ -2262,7 +2933,16 @@ def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared)
     assert "customer" not in scrubbed
     assert scrubbed["customer_present"] is True
     assert "AcmeVault" not in json.dumps(scrubbed), "LEAK: off-schema sweep value"
-    for name in ("file", "refuse_cause", "stop_cause", "cycles"):
+    for name in (
+        "file",
+        "refuse_cause",
+        "stop_cause",
+        "cycles",
+        "cycle",
+        "bundles_not_run",
+        "site",
+        "added",
+    ):
         if name in declared:
             assert scrubbed[name] == declared[name]
     for name in ("message", "repo", "error", "reason"):
@@ -2273,6 +2953,12 @@ def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared)
     if "dw_ids" in declared:
         # the keylist route runs ahead of the schema: aliased, never collapsed
         assert len(scrubbed["dw_ids"]) == 1 and "DW-7" not in json.dumps(scrubbed)
+    if "story_keys" in declared:
+        # same precedence for the story-key list on `sweep-bundles-withheld`
+        assert len(scrubbed["story_keys"]) == 1 and STORY_KEY not in json.dumps(scrubbed)
+    if "story_key" in declared:
+        assert scrubbed["story_key"].startswith("story-")
+        assert STORY_KEY not in json.dumps(scrubbed)
 
 
 def test_env_tmux_version_folds_a_multi_line_probe(monkeypatch):
@@ -3044,13 +3730,63 @@ def test_the_markdown_report_carries_the_split_root_and_the_generation(project):
     assert names[4] == "gen"
     assert names[5] == "esc-upto"
     # header, separator and row must agree on width or the table renders skewed
-    assert len(cells) == len(names) == len(rule.strip("|").split("|")) == 13
+    assert len(cells) == len(names) == len(rule.strip("|").split("|")) == 14
     assert cells[3] == "2"  # attempt, seeded by `_seed_run`
     assert cells[4] == "2"  # generation — NOT the review cycle, which is 1
     assert cells[5] == "3"  # the DW-11 watermark, in its own column
     assert cells[6] == "1"  # review cycle, still in its own column
     # still a flag and a counter: the path itself never renders
     assert "code-tree" not in md
+
+
+def test_diag_task_carries_the_usage_relaunch_refunds(project):
+    """DW-614: `attempt` / `review_cycle` count the #959 uncharged usage-limit
+    relaunches, so without the refund counters a dump shows `att` past
+    `max_dev_attempts` and reads as a broken cap. Both counters reach the
+    `--json` collector (`asdict(TaskDiag)`) and the markdown `relaunch` cell
+    (`dev/review`, beside `rev`).
+
+    Seeded to values that are neither the attempt (2), the review cycle (1) nor
+    each other, so a field reading a neighbour cannot pass.
+
+    Ablation: drop `dev_usage_relaunches=` from `_task_diag` and this reddens as a
+    TypeError at construction; drop the `relaunch` row cell (keeping its header) and
+    it reddens on the width comparison.
+    """
+    run_dir = _seed_run(project.project)
+    state = load_state(run_dir)
+    state.tasks[STORY_KEY].dev_usage_relaunches = 3
+    state.tasks[STORY_KEY].review_usage_relaunches = 4
+    save_state(run_dir, state)
+
+    pseudo = sanitize.Pseudonymizer()
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
+    (run,) = diag.runs
+    assert run.tasks[0].dev_usage_relaunches == 3
+    assert run.tasks[0].review_usage_relaunches == 4
+
+    md = diagnostics.render_markdown(diag, pseudo=pseudo)
+    cells = _md_task_row(md)
+    (header,) = [ln for ln in md.splitlines() if ln.startswith("| alias |")]
+    names = [c.strip() for c in header.strip("|").split("|")]
+    assert names[6] == "rev"
+    assert names[7] == "relaunch"
+    assert len(cells) == len(names)
+    assert cells[6] == "1"  # review cycle, unshifted
+    assert cells[7] == "3/4"
+
+
+def test_diag_task_usage_relaunches_default_to_zero(project):
+    """A run that never relaunched (or predates #959) dumps `0` / `0/0`, not a
+    missing field: a hardcoded nonzero would pass the sibling above."""
+    run_dir = _seed_run(project.project)
+    pseudo = sanitize.Pseudonymizer()
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
+    (run,) = diag.runs
+    assert run.tasks[0].dev_usage_relaunches == 0
+    assert run.tasks[0].review_usage_relaunches == 0
+    md = diagnostics.render_markdown(diag, pseudo=pseudo)
+    assert _md_task_row(md)[7] == "0/0"
 
 
 def test_the_markdown_report_says_no_for_the_ordinary_layout(project):

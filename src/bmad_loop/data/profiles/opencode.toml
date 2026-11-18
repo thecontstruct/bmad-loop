@@ -1,7 +1,9 @@
 # OpenCode (opencode.ai) driven over its local HTTP server (`opencode serve`) —
 # hookless: the adapter owns the server process and observes turn completion via
 # SSE + polling, so no hook scripts or config merges are ever written.
-# API facts pinned against opencode 1.18.2 (2026-07-16): see the adapters/opencode_http.py docstring.
+# Speaks both server APIs, picked from `opencode --version`: 1.x (`opencode-ai`, verified
+# 1.18.2–1.19.x) and 2.x (`@opencode/cli`, verified 2.0.21–2.0.27). The pinned API facts per
+# major live in the adapters/opencode_protocol.py docstring.
 name = "opencode-http"
 binary = "opencode"
 # Driven by the bundled HTTP/SSE adapter class (adapters/registry.py), not the
@@ -12,6 +14,10 @@ adapter = "opencode-http"
 prompt_template = "Use the {skill} skill now: {args}"
 usage_parser = "none"
 skill_tree = ".claude/skills"
+# The skills CLI (`npx skills add`) installs opencode's project skills into
+# .agents/skills, while bmad-loop init seeds .claude/skills: the session reads
+# both (V1 `skills.paths`, V2 `skills` plus an allow rule per id), primary first.
+extra_skill_trees = [".agents/skills"]
 first_run_note = "run `opencode auth login` once on this machine; headless servers reuse the stored credentials"
 
 # Transport/provider environment-fault classification (#194). Unlike the tmux
@@ -45,10 +51,87 @@ first_run_note = "run `opencode auth login` once on this machine; headless serve
 # logfmt field, so an unrelated `AI_APICallError: Invalid API key` on a line whose
 # trailing fields mention a quota path classifies as a quota outage. In every
 # captured line the cause is inside the quotes, so nothing real is lost.
+#
+# OpenCode 2.x writes no server-log line per provider retry (one only when it
+# gives up, ~90 s in), so the adapter itself writes logs/<task_id>.provider-errors.log,
+# scanned beside .server.out: one line per session.retry.scheduled /
+# session.step.failed / session.execution.failed frame, built from the frame's
+# structured error fields — event, `type`, `status`, the retry `attempt`, then
+# the provider's message quoted LAST with every line break escaped (never its
+# response body). The V2 pattern anchors on the line START plus the typed
+# error: nothing before `message=` is provider- or model-sourced, and an
+# escaped message cannot begin a line, so this one is position-anchored on
+# purpose — unlike the stream above, this file is adapter-authored whole lines.
+# Only the types captured live are listed (across this list and
+# usage_limit_patterns below): against 2.0.27 (2026-10-12, zero
+# tokens, a local mock OpenAI-compatible provider) an HTTP 429 rate limit read
+# provider.rate-limit, a 429 or 402 `insufficient_quota` read provider.quota,
+# and a refused connection read provider.transport. The lines, as written:
+#   provider-error event=session.retry.scheduled type=provider.rate-limit status=429 attempt=2 message="Rate limit reached for requests"
+#   provider-error event=session.execution.failed type=provider.quota status=402 attempt=- message="You exceeded your current quota, please check your plan and billing details."
+#   provider-error event=session.retry.scheduled type=provider.transport status=- attempt=2 message="ConnectionRefused: Unable to connect. Is the computer able to access the url?"
+# Against 2.0.32 (2026-10-28, zero tokens, the same mock provider), an HTTP 500,
+# 502 or 503 read provider.internal (retried 10 times, then failed); a 401 or
+# 403 read provider.auth, and a session model with no route (an unconfigured
+# provider, or a variant the model lacks) read provider.no-route (both failed at
+# once, never retried). The lines, as written:
+#   provider-error event=session.retry.scheduled type=provider.internal status=500 attempt=2 message="The server had an error while processing your request. Sorry about that!"
+#   provider-error event=session.execution.failed type=provider.internal status=502 attempt=- message="Provider request failed with HTTP 502"
+#   provider-error event=session.step.failed type=provider.auth status=401 attempt=- message="Incorrect API key provided: x. You can find your API key at https://platform.openai.com/account/api-keys."
+#   provider-error event=session.execution.failed type=provider.no-route status=- attempt=- message="Model unavailable: nosuch/mock-1"
+# All five are env faults: a provider outage that a later retry clears
+# (rate-limit, transport, internal), or operator configuration that charging
+# the story's attempts cannot fix (auth, no-route). provider.quota is a usage
+# limit instead (usage_limit_patterns below). Captured but deliberately NOT
+# seeded, because what the session sent can cause them: provider.invalid-request
+# (an HTTP 400) and provider.invalid-output (a malformed or truncated stream).
+# Not provoked, so not seeded: provider.timeout (2.0.32 raises it only for media
+# generation polling), content-filter, unsupported-operation, unknown and error.
+# A hung provider reads as provider.transport instead, and only under a
+# provider `timeout` / `headerTimeout` / `chunkTimeout` setting (unset, nothing
+# fires in 300 s and the session times out):
+#   provider-error event=session.retry.scheduled type=provider.transport status=- attempt=2 message="Timed out waiting for response headers"
+# The server log's `level=ERROR message="Failed to drain Session"` line is not
+# seeded either: 2.0.32 writes it for every failed execution, the
+# invalid-request and invalid-output ones included, with no error type, only
+# the provider's own message, so nothing in it tells an outage from a refusal.
 env_fault_patterns = [
   'error[.]error="AI_APICallError: [^"]{0,400}?(?i:usage limit reached|429|too many requests|rate[ _-]?limit|quota|overloaded)',
   'error[.]error="AI_APICallError: [^"]{0,400}?(?i:cannot connect to api|socket connection was closed|connection ?(error|refused|reset|timed ?out)|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN)',
+  '^provider-error event=\S+ type=provider[.](?:rate-limit|transport|internal|auth|no-route) ',
 ]
+# usage_limit_patterns — BLOCKED, no auto-continue: an operator must add credit
+# or switch model. The adapter matches each provider-error line against this
+# list as it writes it, so a match is a LIVE sighting (the frame was this
+# session's, seen while it ran) and exempts the verdict from the token veto; the
+# post-mortem tail scan reads it too, as an ordinary family. Verified in the
+# opencode 2.0.32 binary: its QuotaExceeded reason maps to provider.quota, is
+# built from the provider codes insufficient_quota, usage_not_included,
+# billing_error, gousagelimiterror, freeusagelimiterror and creditlimitexceeded,
+# and its retry predicate answers false for QuotaExceeded (true for RateLimit) —
+# credit or billing exhaustion, never a window that resets. The frame carries no
+# reset time. No usage_wait_patterns: no 2.x type is a resetting window.
+usage_limit_patterns = ['^provider-error event=\S+ type=provider[.]quota ']
+# AI_RetryError (ai-sdk's wrapper once its own retries are exhausted) is
+# deliberately NOT seeded. ai-sdk documents the class
+# (https://ai-sdk.dev/docs/reference/ai-sdk-errors/ai-retry-error — properties
+# only, no example message), but no documented or captured opencode server-log
+# line carrying it exists, and a pattern is seeded only from a real line
+# (tests/test_env_fault_patterns.py).
 
 [hooks]
 dialect = "none"
+
+# The home-relative skill folders OpenCode loads on its own, read only with
+# `[skills] user_roots = true` (see bmad_loop.skill_locate). XDG_CONFIG_HOME moves
+# the first away from ~/.config.
+# Source: https://opencode.ai/docs/skills/ (2026-11-15).
+[user_skills]
+precedence = "project"
+roots = [
+  { path = "~/.config/opencode/skills", disabled_by = [
+    "XDG_CONFIG_HOME",
+  ] },
+  "~/.agents/skills",
+  "~/.claude/skills",
+]

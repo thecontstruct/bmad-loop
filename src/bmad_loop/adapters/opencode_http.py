@@ -5,92 +5,13 @@ HTTP server (``opencode serve``) exposing an OpenAPI 3.1 API. This adapter
 drives sessions entirely over that API (``injection="http"``,
 ``observation="sse"``).
 
-API contract — every fact below was pinned live against the real 1.18.2
-binary (2026-07-16; the full probe record and the archived OpenAPI spec live
-in git history, commit b85d8ca / PR #167). This list wins over memory:
-
-- Readiness target is ``GET /global/health`` (``/health`` is the web-UI SPA
-  shell). With ``OPENCODE_SERVER_PASSWORD`` set *every* endpoint 401s, health
-  included — basic-auth username is literally ``opencode``; Bearer is
-  rejected.
-- SSE ``GET /event``: flat ``data:``-only frames, first frame
-  ``server.connected``, ``server.heartbeat`` ≈ every 10 s, no server-side
-  filtering — clients filter by ``properties.sessionID``.
-- ``session.idle`` fires even when aborting an idle session, so an idle event
-  alone is never proof a turn ran — it must pair with an assistant message
-  whose ``time.completed`` post-dates the last prompt sent.
-- Poll fallback ``GET /session/status`` returns a ``{sessionID: status}`` map
-  in which idle sessions are simply **absent** — the rule is "absent ⇒ not
-  busy", never "wait for idle".
-- Per-prompt ``model`` is the object form ``{providerID, modelID}``; the
-  ``"provider/model"`` string form belongs only to the config-file ``model``
-  key.
-- ``OPENCODE_CONFIG_CONTENT`` outranks the project's ``opencode.json``
-  (applied as a final local-scope merge over all config files).
-- Hermetic skills need ``OPENCODE_DISABLE_EXTERNAL_SKILLS=1`` **plus**
-  ``skills.paths=["<worktree>/.claude/skills"]`` inside the config content —
-  by default every server also sees the operator's personal
-  ``~/.claude/skills`` and ``~/.agents/skills``.
-- ``opencode serve`` survives parent SIGKILL (reparents to init and keeps
-  serving); SIGTERM exits it cleanly.
-- All ``time.*`` fields are epoch **milliseconds**; ``POST /session/:id/abort``
-  returns ``200 true`` even when nothing is running.
-
-``/event`` frame types the run-log renderer reads — pinned by a second live
-probe of 1.18.2 (2026-07-25, 388 frames over 5 turns across two servers; the
-full evidence table is posted on PR #279). Cross-checked against the server's
-own OpenAPI at ``GET /doc``, whose ``Event`` union has 89 variants and is the
-static contract — worth re-dumping on any version bump:
-
-- ``message.updated`` — turn metadata only, no text. Carries ``info.id`` +
-  ``info.role``; **re-emits out of order** (a stale re-emit for the user
-  message lands mid-assistant-turn), so role must be keyed by message id, never
-  tracked as "last role seen".
-- ``message.part.updated`` — **complete-once, NOT cumulative.** A part fires
-  exactly twice: once at creation with ``text: ""``, then once carrying the
-  full final text. Held at 4 / 711 / 5689 chars (2 fires each, 1 non-empty).
-  Rendering on this frame therefore yields one clean line per statement, with
-  no de-duplication needed. **Tool execution also surfaces here** — and only
-  here — as ``part.type == "tool"`` with ``part.tool`` and a ``state`` whose
-  ``status`` steps pending → running → terminal (``state.input`` throughout,
-  ``state.output`` on ``completed``, ``state.error`` on ``error``). Tool parts
-  carry no ``part.text``, so the tool branch must sit ABOVE the empty-text
-  bail-out in ``_inline_line`` to be reachable at all. ``ToolState`` is a
-  4-variant union (pending / running / completed / error), so rendering on the
-  terminal pair is exhaustively once-per-tool-call; ``error`` is included from
-  the static contract (no tool failed during the live probe) so a failed call
-  cannot vanish from the transcript.
-- ``message.part.delta`` — the separate per-token stream. At 5689 chars its 50
-  deltas concatenate **byte-exactly** to the single ``part.updated`` text, so
-  it is pure redundancy: never rendered inline, and excluded from the SSE trace
-  (``logs/`` is never trimmed by retention).
-- ``command.executed`` — the **slash-command** surface, kept as that and nothing
-  more. It does **not** fire for agent tool use: 0 frames across live ``bash`` /
-  ``write`` / ``read`` / ``edit`` calls. Payload is ``name`` / ``arguments`` /
-  ``messageID`` / ``sessionID`` (all required, so it needs no allowlist).
-- ``file.edited`` — payload is exactly ``{"file": "/abs/path"}``, schema-pinned
-  ``additionalProperties: false`` over that one key, so it carries **no
-  ``sessionID``** and the ``properties.sessionID`` filter would drop it before
-  either sink. It is reachable only through the explicit ``_SESSIONLESS_TYPES``
-  allowlist, sound here only because bmad-loop runs one server per session.
-  ``file.watcher.updated`` is session-less too and deliberately NOT allowlisted
-  (see that constant).
-- ``permission.asked`` — the ask frame. There is **no ``permission.updated``** in
-  1.18.2. Payload is a ``permission`` **string** plus ``patterns`` /
-  ``metadata`` / ``always`` / ``tool`` / ``id`` / ``sessionID`` — not a nested
-  object with ``type`` / ``pattern``.
-- ``permission.replied`` — carries **``reply``**, not ``response`` (plus
-  ``sessionID`` / ``requestID``).
-- ``permission.v2.asked`` / ``permission.v2.replied`` exist in the union and are
-  **deliberately not consumed**: neither was seen live, and the v2 ask is a
-  different payload (``action`` / ``resources`` / ``save`` / ``metadata`` /
-  ``source``), so a branch for it would be written from the schema alone —
-  exactly the guess that made the three corrections above necessary. The v2
-  reply is shape-identical to the v1 one, but consuming it without the ask would
-  log a decision with no request. Add both together once a live sighting pins
-  what ``action`` / ``resources`` actually hold.
-- There is **no ``tool.call`` / ``tool.response``** on this surface —
-  confirmed both statically in the 89-variant union and live.
+The wire contract — what each OpenCode server API answers, pinned live per
+major — lives in :mod:`.opencode_protocol`'s module docstring, beside the
+codecs that implement it. The major is detected from ``opencode --version``
+before the server is spawned (:meth:`OpencodeHttpAdapter._protocol_for`):
+1.x (``opencode-ai``, verified 1.18.2–1.19.x) and 2.x (``@opencode/cli``,
+verified 2.0.21–2.0.27) are driven; any other major is refused. Everything
+below is the transport every major shares.
 
 Transport shape (the settled design drivers):
 
@@ -101,22 +22,28 @@ Transport shape (the settled design drivers):
   re-picked on a bind race.
 - **Config injected via ``OPENCODE_CONFIG_CONTENT``** (outranks the project's
   ``opencode.json``): a blanket permission allow (the bypass-flags
-  analogue), the hermetic-skills recipe above (project ``.claude/skills``
-  only — without it every session sees the operator's personal skills), and
+  analogue), the hermetic-skills recipe (see the protocol module; project
+  ``.claude/skills`` only — without it every session sees the operator's
+  personal skills), and
   the policy model when set. Reasoning effort (``SessionSpec.effort``, #643)
   deliberately does NOT ride the config: the config schema has no top-level
   ``variant``, and its only effort key (``agent.<name>.variant``) applies solely
   when that agent table also pins its own ``model`` — inert otherwise, which is
-  the measured negative result in #643. It is sent instead as the per-call
-  ``variant`` in every ``prompt_async`` body (``_prompt``), initial prompt and
-  nudges alike, and omitted entirely when empty. A per-session
+  the measured negative result in #643. On V1 it is sent instead as the
+  per-call ``variant`` in every ``prompt_async`` body (``_prompt``), initial
+  prompt and nudges alike, omitted entirely when empty, and passed through
+  unvalidated. V2's prompt has no variant: the effort rides the session's
+  model ref at create, and an effort that is not one of that model's variants
+  fails the session start (see the protocol module). A per-session
   ``OPENCODE_SERVER_PASSWORD`` makes the health poll self-discriminating against
   a foreign server on a reused port and keeps other local processes from
   driving an allow-all server.
-- **SSE ``session.idle`` ≙ the Stop hook**, filtered to this session's id —
-  child/subagent sessions share the stream and emit their own idles. SSE is
-  lossy upstream, so a silent or reconnecting stream degrades to an HTTP poll
-  (``GET /session/status`` + message-level proof-of-work): an idle event alone
+- **The SSE turn end ≙ the Stop hook** (V1 ``session.idle``, V2
+  ``session.execution.*`` — the protocol's ``idle_types``), filtered to this
+  session's id — child/subagent sessions share the stream and emit their own
+  turn ends. SSE is lossy upstream, so a silent or reconnecting stream
+  degrades to an HTTP poll (the protocol's busy probe — V1
+  ``GET /session/status`` — + message-level proof-of-work): an idle event alone
   is NOT proof a turn ran (abort emits one on an idle session),
   so the fallback demands an assistant message completed *after* the last
   prompt this adapter sent. OpenCode timestamps are epoch **milliseconds**.
@@ -124,10 +51,18 @@ Transport shape (the settled design drivers):
   stall verdicts under a live server pin ``accept_result=False`` — the
   #48/#53 artifact-distrust invariant, unchanged.
 - **Usage is read over HTTP before teardown** (server state is sqlite, not a
-  readable file tree): assistant-message token sums, stashed by session id,
-  raw messages dumped to ``tasks/<task_id>/messages.json`` as the transcript.
-  Child-session (subagent) tokens are not counted — the API scopes messages
-  per session.
+  readable file tree): V1 sums assistant-message tokens, V2 reads the
+  session's token aggregate plus every descendant (subagent) session's;
+  stashed by session id, the raw messages (V2: every page, oldest first)
+  dumped to ``tasks/<task_id>/messages.json`` as the transcript. V1 counts no
+  child-session tokens — its API scopes messages per session. Under a stall
+  grace (the dev adapters) a turn end first waits, up to that grace, while a
+  V2 descendant (a ``background: true`` subagent) is still running
+  (``descendant-wait-*`` crumbs); a probe fault is never read as "none
+  active". A V2 child still running at capture is journaled as
+  ``usage-child-active``; V2's
+  ``models`` add each descendant's model ref after the parent's, and a
+  malformed ref is journaled as ``usage-models-partial``.
 - ``opencode serve`` survives parent death, so teardown is
   authoritative: kill in ``run()``'s finally plus an atexit sweep. On Windows
   the binary is an npm ``.cmd`` shim, so the kill goes straight to the
@@ -140,6 +75,7 @@ import atexit
 import json
 import os
 import queue
+import re
 import secrets
 import shutil
 import socket
@@ -147,17 +83,20 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .. import gates
+from .. import childrun, gates
 from ..bmadconfig import ProjectPaths
 from ..journal import LOGS_DIR, TASK_CYCLE_ARTIFACTS
 from ..model import TokenUsage
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
 from .base import (
+    USAGE_LIMIT_BLOCKED,
+    USAGE_LIMIT_WAIT,
     CodingCLIAdapter,
     SessionHandle,
     SessionResult,
@@ -166,7 +105,13 @@ from .base import (
     validate_adapter_artifact_paths,
     validated_task_directory,
 )
-from .env_fault import EnvFaultMixin
+from .env_fault import (
+    ENV_FAULT_MATCH_TIMEOUT_S,
+    ENV_FAULT_STATUSES,
+    ENV_FAULT_TAIL_BYTES,
+    EnvFaultMixin,
+    _excerpt,
+)
 from .generic import (
     BUDGET_NUDGE_TEXT,
     HEARTBEAT_INTERVAL_S,
@@ -175,6 +120,28 @@ from .generic import (
     STALL_NUDGE_TEXT,
     _DevSynthesisMixin,
     _ResultFileMixin,
+)
+from .multiplexer import MultiplexerError
+
+# The `name as name` imports are re-exports: the V1 codec helpers moved to
+# `opencode_protocol` keep their historical import path for callers and tests.
+from .opencode_protocol import _RESET as _RESET
+from .opencode_protocol import _TOOL_COLOR as _TOOL_COLOR
+from .opencode_protocol import (
+    OpencodeProtocol,
+    OpencodeServerError,
+    V1Protocol,
+    V2Protocol,
+)
+from .opencode_protocol import _role_color as _role_color
+from .opencode_protocol import _sum_args as _sum_args
+from .opencode_protocol import _sum_usage as _sum_usage
+from .opencode_protocol import _tally_messages as _tally_messages
+from .opencode_protocol import (
+    format_version,
+    parse_opencode_version,
+    support_verdict,
+    supported_ranges,
 )
 from .profile import CLIProfile
 
@@ -194,6 +161,10 @@ KILL_WAIT_S = 5.0
 REAP_POLL_S = 0.1
 SPAWN_ATTEMPTS = 3
 POLL_TICK_S = 5.0  # max event-queue wait per loop tick (generic's cadence)
+# Re-probe cadence of `_await_descendants` while a turn end waits on a still-
+# running descendant (a V2 background subagent); also how often that wait
+# re-checks a hard stop, the session deadline and server death.
+DESCENDANT_POLL_S = 2.0
 # Structured SSE trace (``logs/<task_id>.sse.jsonl``). Tier-1 knob deliberately:
 # a module default plus the ``sse_trace`` instance attribute, NOT a policy field
 # in core.toml. It changes nothing about how a run behaves — it only decides
@@ -201,6 +172,11 @@ POLL_TICK_S = 5.0  # max event-queue wait per loop tick (generic's cadence)
 # an operator flips in a REPL or a subclass, not in the run contract every
 # settings file has to carry. Off means the sink is never opened.
 SSE_TRACE = True
+# The adapter-authored provider-error lines (`_note_provider_error`), scanned by
+# the env-fault classifier beside `.server.out`. Created at spawn on every
+# protocol, so a session that saw no provider error leaves an empty file — a
+# clean answer — rather than a missing one, which the scan reads as a fault.
+PROVIDER_ERRORS_SUFFIX = ".provider-errors.log"
 
 # Capacity bound for the `_usage` stash (DW-117). `_usage` is written once per
 # session in `_capture_usage` and never popped, so without a ceiling it grows
@@ -220,30 +196,121 @@ SSE_TRACE = True
 # a live read ever losing its entry.
 USAGE_STASH_CAP = 256
 
-# ``/event`` frame types that carry NO ``properties.sessionID`` but are still
-# attributed to this session, exempting them from the sessionID filter in
-# `_dispatch_sse`. Sound ONLY because bmad-loop spawns one `opencode serve` per
-# session (see the transport notes in the module docstring): the server is
-# single-tenant, so a server-global frame is unambiguously this session's. Any
-# design that ever shares a server across sessions must empty this set.
-#
-# Deliberately an allowlist and not "allow every session-less frame": the live
-# probe's session-less traffic was overwhelmingly noise that says nothing about
-# the run — `plugin.added` alone was 90 of 388 frames, plus `server.heartbeat`,
-# `catalog.updated`, `server.connected`, `reference.updated` and
-# `integration.updated`. `file.watcher.updated` is excluded on purpose too: it
-# is the editor-integration watcher firing for any change under the project
-# (our own git operations, a build, an editor save), so it is not evidence the
-# agent did anything, and for the changes the agent DID make it just
-# double-reports what `file.edited` already carries.
-_SESSIONLESS_TYPES = frozenset({"file.edited"})
-
 # Fixed basic-auth username in OPENCODE_SERVER_PASSWORD mode (Bearer is rejected).
 AUTH_USER = "opencode"
 
+# The codec a caller with no session in hand reads (the name-stable delegators
+# below); stateless, so one instance serves every such call.
+_V1 = V1Protocol()
 
-class OpencodeServerError(Exception):
-    """An ``opencode serve`` instance could not be spawned, readied or driven."""
+# The codec per supported major (`opencode_protocol.SUPPORTED`'s keys).
+_PROTOCOLS: dict[int, type[OpencodeProtocol]] = {1: V1Protocol, 2: V2Protocol}
+
+# Where every version refusal sends the operator.
+_VERSION_REMEDY = "see docs/setup-guide.md#opencode-versions"
+
+# What a 1.x server prints before it exits during startup on a database a 2.x
+# server initialised: both majors keep their store at the same
+# `$XDG_DATA_HOME/opencode/opencode.db`, so this is the downgrade path back from
+# 2.x. `_spawn_server` scans the spawn's own server-log tail for it so the
+# give-up error names the database and the remedy, not just "rc=1".
+_V1_DB_DOWNGRADE_MARKER = b"Database is not empty and has no session table"
+
+# `opencode --version` budget for the pre-spawn protocol detection — probe's
+# `binary_runs` default, which bounds the same call in `bmad-loop validate`.
+VERSION_TIMEOUT_S = 10.0
+
+# The argv tokens `_serve_argv` owns: the subcommand and the three flags it
+# appends. A `launch_args` token equal to one of these (or the `--flag=value`
+# spelling of one) collides with what the adapter assigns — a second `serve`
+# becomes a positional, a second `--port` fights the port the health poll dials,
+# a `--print-logs=false` silences the server log the env-fault classifier reads.
+# `extra_args` land AFTER the owned flags, so there only the flags collide (a
+# later `--port` wins over the adapter's; a trailing `serve` is a positional to
+# `serve`, not a second subcommand) — DW-483.
+# Kept beside `_serve_argv` so the two cannot drift apart.
+_SERVE_OWNED_FLAGS = frozenset({"--port", "--hostname", "--print-logs"})
+SERVE_OWNED_TOKENS = _SERVE_OWNED_FLAGS | {"serve"}
+_SERVE_OWNED_VALUED = ("--port=", "--hostname=", "--print-logs=")
+
+# Binaries that need a PROGRAM before `serve`: interpreters and package runners,
+# matched on the basename (split on `/` and `\`, lowercased, one of
+# `.exe`/`.cmd`/`.bat`/`.com` stripped). Given no program in `launch_args`,
+# `_serve_argv` hands them `serve` as the program — an interpreter reads it as a
+# script path resolved against the workspace cwd (see `runsetup.config_digest`),
+# a package runner fetches the package named `serve`. A closed name set, never a
+# probe: `bmad-loop validate` must not execute a project-controlled binary.
+_NEEDS_PROGRAM_BASENAME = re.compile(
+    r"python(?:\d+(?:\.\d+)?)?|pythonw|py|pypy(?:\d+(?:\.\d+)?)?"
+    r"|sh|bash|zsh|dash|node|nodejs|bun|deno|perl|ruby|env|npx|bunx|pnpx"
+)
+_WINDOWS_LAUNCHER_SUFFIXES = (".exe", ".cmd", ".bat", ".com")
+
+
+def launch_args_unservable(binary: str, launch_args: tuple[str, ...] | list[str]) -> str | None:
+    """Why ``[binary, *launch_args, "serve", …]`` cannot run an opencode server,
+    or None when the shape is servable. Pure: `bmad-loop validate` reports the
+    reason as ``adapter.launch-args-unservable`` (warning) for opencode-http
+    profiles.
+
+    Two shapes are unservable: a ``launch_args`` token repeating an adapter-owned
+    one (:data:`SERVE_OWNED_TOKENS`, or a ``--flag=`` spelling), and an
+    interpreter / package-runner ``binary`` with no program — ``launch_args``
+    empty or options only (``python3 -u``, ``python3 -m``, ``node --inspect``
+    still leave ``serve`` in the script/module slot). Wrappers that name a
+    program (``npx -y opencode-ai``, ``node /opt/x.js``, ``python3 -m
+    launcher``) are servable."""
+    collision = _owned_collision("launch_args", launch_args, SERVE_OWNED_TOKENS)
+    if collision is not None:
+        return collision
+    base = re.split(r"[\\/]", binary)[-1].lower()
+    for suffix in _WINDOWS_LAUNCHER_SUFFIXES:
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    no_program = all(token.startswith("-") for token in launch_args)
+    if no_program and _NEEDS_PROGRAM_BASENAME.fullmatch(base):
+        return (
+            f"binary {binary!r} needs a program in launch_args — 'serve' would run "
+            "as the program (a script from the workspace, or a package named serve)"
+        )
+    return None
+
+
+def extra_args_unservable(extra_args: tuple[str, ...] | list[str]) -> str | None:
+    """Why a role's resolved ``extra_args`` collide with the serve argv, or None.
+    Pure: `bmad-loop validate` reports the reason as
+    ``policy.extra-args-unservable`` (warning), per role, for opencode-http
+    profiles (DW-483).
+
+    ``_serve_argv`` appends ``extra_args`` after the owned flags, so a repeated
+    ``--port`` / ``--hostname`` / ``--print-logs`` (or a ``--flag=`` spelling)
+    overrides what the adapter assigns — the health poll then dials a port the
+    server is not on. ``serve`` is not owned here: after the subcommand it is a
+    positional, not a second subcommand."""
+    return _owned_collision("extra_args", extra_args, _SERVE_OWNED_FLAGS)
+
+
+def _owned_collision(
+    field: str, tokens: tuple[str, ...] | list[str], owned: frozenset[str]
+) -> str | None:
+    """The first token of ``tokens`` repeating one of ``owned`` (or a ``--flag=``
+    spelling of an owned flag), worded for ``field``; None when there is none."""
+    for token in tokens:
+        if token in owned or token.startswith(_SERVE_OWNED_VALUED):
+            return (
+                f"{field} token {token!r} collides with the `serve --port … "
+                "--hostname 127.0.0.1 --print-logs` argv the adapter assigns"
+            )
+    return None
+
+
+class OpencodeNudgeSendError(MultiplexerError):
+    """A nudge :meth:`OpencodeHttpAdapter.send_text` could not deliver (DW-503).
+
+    A :class:`MultiplexerError` so the shared nudge call sites (the
+    ``_DevSynthesisMixin`` contract nudge) catch it at the seam-level type and
+    crumb ``nudge-send-failed`` instead of reporting the nudge as sent."""
 
 
 def _require_httpx():
@@ -276,74 +343,46 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _parse_sse_lines(lines) -> Any:
+def _parse_sse_lines(
+    lines,
+    on_drop: Callable[[str], None] | None = None,
+    on_comment: Callable[[], None] | None = None,
+) -> Any:
     """Minimal SSE frame parser: accumulate ``data:`` lines until a blank line,
     then yield the JSON-decoded payload. Tolerates comments, unknown fields and
-    undecodable payloads (skipped) — the stream is advisory, never trusted."""
+    undecodable payloads (skipped) — the stream is advisory, never trusted.
+    A skipped payload is reported to ``on_drop`` as ``"<ExcType>: <message>"``
+    (DW-462), so the reader can count what the stream lost. A comment line
+    (``:``-prefixed — V2's ``: heartbeat``) yields nothing but is reported to
+    ``on_comment``: it proves the stream alive."""
     data: list[str] = []
     for line in lines:
+        if line.startswith(":"):
+            if on_comment is not None:
+                on_comment()
+            continue
         if line == "":
             if data:
                 try:
                     yield json.loads("\n".join(data))
-                except (json.JSONDecodeError, ValueError):
-                    pass
+                except (json.JSONDecodeError, ValueError) as e:
+                    if on_drop is not None:
+                        on_drop(f"{type(e).__name__}: {e}")
                 data = []
             continue
         if line.startswith("data:"):
             data.append(line[5:].lstrip())
 
 
-def _sum_args(arguments: Any) -> str:
-    """Compact one-line summary of an arbitrary event payload value (a tool
-    part's ``state.input``, a ``permission.asked`` ``patterns``, a
-    ``command.executed`` ``arguments``, a ``session.error`` ``error``) for the
-    inline run log. Truncates long dicts/strings so a single line never explodes
-    the tail view, and accepts any shape — these payloads are server-controlled
-    and not all of them have a pinned schema."""
-    if not arguments:
-        return ""
-    try:
-        if isinstance(arguments, (dict, list)):
-            text = json.dumps(arguments, ensure_ascii=False)
-        else:
-            text = str(arguments)
-    except (TypeError, ValueError):
-        text = str(arguments)
-    if len(text) > 120:
-        text = text[:119] + "\u2026"
-    return text
-
-
-# ANSI colors for inline-log marker lines, keyed by message role. The bmad-loop
-# TUI renders <task>.log through a pyte terminal emulator (tui/data.py LogView),
-# which dispatches SGR to per-Char styles and maps pyte named colors via
-# _rich_color straight through to Rich — so every [bmad] marker shows colored in
-# the LogView. A plain `cat`/editor shows the escape bytes; the structured trace
-# stays uncoloured in <task>.sse.jsonl. Keys are opencode message.info.role
-# values; an unseen role falls back to _ROLE_COLOR_DEFAULT so it still renders
-# distinctly — add it to the map to pin its hue.
-_ROLE_COLORS = {
-    "user": "\x1b[33m",  # SGR 33 = yellow
-    "assistant": "\x1b[36m",  # SGR 36 = cyan
-}
-_ROLE_COLOR_DEFAULT = "\x1b[35m"  # SGR 35 = magenta — unseen roles
-_TOOL_COLOR = "\x1b[32m"  # SGR 32 = green — tool/cmd/file/permission (role-less)
-_RESET = "\x1b[0m"
-
-# Tool-part statuses that end a tool call. `ToolState` is a 4-variant union in
-# the 1.18.2 OpenAPI (`pending`, `running`, `completed`, `error`), so these two
-# are exhaustively the terminal ones — a tool call reaches exactly one of them,
-# which is what makes "render on terminal" equal to "one line per tool". The
-# live probe only ever saw pending → running → completed (nothing failed during
-# it); `error` comes from the static contract, and including it is what keeps a
-# FAILED tool call from vanishing from the transcript entirely.
-_TOOL_TERMINAL_STATES = frozenset({"completed", "error"})
-
-
-def _role_color(role: str) -> str:
-    """ANSI color for a message role; unseen roles fall back to magenta."""
-    return _ROLE_COLORS.get(role, _ROLE_COLOR_DEFAULT)
+def _opencode_db_path(env: dict[str, str]) -> Path:
+    """The sqlite store a server spawned with ``env`` opens — the one both
+    majors share: ``$XDG_DATA_HOME/opencode/opencode.db``, with the XDG default
+    ``$HOME/.local/share`` when the variable is unset or empty."""
+    data_home = env.get("XDG_DATA_HOME") or ""
+    if not data_home:
+        home = env.get("HOME") or str(Path.home())
+        data_home = str(Path(home) / ".local" / "share")
+    return Path(data_home) / "opencode" / "opencode.db"
 
 
 @dataclass
@@ -381,7 +420,8 @@ class _ServerSession:
     # per-call `variant` on EVERY prompt_async body this session issues (initial
     # prompt and nudges — a nudge dropping back to the provider default mid-session
     # would be silent drift). "" = omit the key, so the body is byte-identical to
-    # an effort-less session's.
+    # an effort-less session's. V2 ignores it: the variant rides the session's
+    # model ref at create, which every later prompt inherits.
     variant: str = ""
     events: queue.Queue = field(default_factory=queue.Queue)
     sse_thread: threading.Thread | None = None
@@ -398,6 +438,15 @@ class _ServerSession:
     # this are stale (a dead reader thread leaves it stale, preserving the
     # degraded path).
     last_frame_monotonic: float = 0.0
+    # SSE frames whose payload would not decode, running count over the session
+    # (DW-462): the parser skips them, so without this a server shipping garbage
+    # reads as a quiet stream. Written by the reader thread, read by the wait
+    # loop's heartbeat (a plain int bump, like `activity`).
+    sse_frames_dropped: int = 0
+    # The reader's running streak of stream attempts that raised; the streak's
+    # transitions are crumbed (`sse-stream-failed` / `sse-stream-recovered`),
+    # never each failed reconnect (DW-462). Reader thread only.
+    sse_failures: int = 0
     # Monotonic completion floor in epoch ms: the poll fallback only
     # synthesizes an idle for an assistant message completed strictly after
     # this. Starts at prompt-send, advances on every prompt this adapter sends
@@ -405,6 +454,31 @@ class _ServerSession:
     # message re-synthesizes idle on every probe (each fake "Stop" refills the
     # stall budget) and the session livelocks or burns its nudges.
     floor_ms: int = 0
+    # The server API codec, chosen by the major `--version` reported before the
+    # spawn (`_protocol_for`). Defaults to V1 so a bare session built without a
+    # spawn (unit tests) reads the V1 wire.
+    protocol: OpencodeProtocol = field(default_factory=V1Protocol)
+    # The `X.Y.Z` `--version` reported for this server; "" for a bare session.
+    server_version: str = ""
+    # Why the last health poll failed, when it is more specific than "not
+    # healthy in time" (an HTML answer: the wrong server API) — read by
+    # `_spawn_server` for its give-up error.
+    health_fault: str = ""
+    # The task this server runs (``spec.task_id``), naming the lifecycle file
+    # the reader thread's crumbs land in; empty for a bare session.
+    lifecycle_task: str = ""
+    # `logs/<task_id>.provider-errors.log`, created at spawn and appended by the
+    # reader (`_note_provider_error`); None for a bare session.
+    provider_errors_path: Path | None = None
+    # Whether a provider-errors append has failed this session: the first
+    # failure is crumbed (`provider-errors-write-failed`), the rest only lost.
+    provider_errors_write_failed: bool = False
+    # The session's first live usage-limit sighting (DW-592): a provider-error
+    # line `_note_provider_error` formatted that matched the profile's usage
+    # lists, as ``(evidence, usage_limit_class)``; None = none seen. Written once
+    # by the reader thread, read by `wait_for_completion` — one tuple assignment,
+    # like the `activity` bump, so the wait thread reads nothing or the whole pair.
+    usage_sighting: tuple[str, str] | None = None
 
 
 class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
@@ -416,6 +490,12 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     # that a story quoting a provider error verbatim cannot reach the scanned
     # bytes. Point this at the transcript and both properties break at once.
     ENV_FAULT_LOG_SUFFIX = ".server.out"
+    # ...plus the provider-errors log: OpenCode 2.x logs no provider retry to
+    # stdout (one line only once it gives up, ~90 s in — after most session
+    # clocks have run out), so the adapter writes one line per provider-error SSE frame
+    # itself, from structured fields only (`format_provider_error`) — model-free
+    # by construction, which is what lets the profile anchor on its prefix.
+    ENV_FAULT_LOG_SUFFIXES = (".server.out", PROVIDER_ERRORS_SUFFIX)
 
     injection = "http"
     observation = "sse"
@@ -469,6 +549,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         self.reconnect_sleep_s = RECONNECT_SLEEP_S
         self.kill_wait_s = KILL_WAIT_S
         self.poll_tick_s = POLL_TICK_S
+        self.descendant_poll_s = DESCENDANT_POLL_S
         self.sse_trace = SSE_TRACE  # False = never open the .sse.jsonl sink
         self.result_grace_s: float | None = None  # None = the mixin default
         self.tasks_dir = run_dir / "tasks"
@@ -476,6 +557,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self._sessions: dict[str, _ServerSession] = {}
+        # `_protocol_for`'s cache: binary identity -> the version it reported.
+        self._version_cache: dict[tuple[str, int, int], tuple[int, int, int]] = {}
         # Bounded at its write site by `_stash_usage`; see USAGE_STASH_CAP.
         self._usage: dict[str, TokenUsage] = {}
         # opencode serve survives parent death: sweep whatever is
@@ -486,11 +569,20 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     # ------------------------------------------------------------- spawning
 
     def _serve_argv(self, resolved_binary: str, port: int) -> list[str]:
-        """argv for one server. A seam: tests monkeypatch it to launch the
-        FakeOpencode sidecar wrapper-free."""
+        """argv for one server: ``[binary, *launch_args, "serve", <owned flags>,
+        *extra_args]``. ``launch_args`` sits between the binary and ``serve`` so a
+        wrapper profile (``binary = "npx"``, ``launch_args = ["-y",
+        "opencode-ai"]``) launches ``npx -y opencode-ai serve …``. The adapter owns
+        ``serve`` and the three flags (:data:`SERVE_OWNED_TOKENS`); validate warns
+        on launch_args shapes that collide with them (:func:`launch_args_unservable`)
+        and on a role's extra_args repeating an owned flag
+        (:func:`extra_args_unservable`).
+        A seam: tests monkeypatch it to launch the FakeOpencode sidecar
+        wrapper-free."""
         extra = self.extra_args or ()
         return [
             resolved_binary,
+            *self.profile.launch_args,
             "serve",
             "--port",
             str(port),
@@ -500,29 +592,35 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             *extra,
         ]
 
-    def _config_content(self, spec: SessionSpec) -> str:
-        """The OPENCODE_CONFIG_CONTENT JSON for this session:
-        blanket permission allow (the bypass-flags analogue), the hermetic
-        skills path (project skills only, paired with
-        OPENCODE_DISABLE_EXTERNAL_SKILLS=1 in the env), and the model when the
-        policy sets one (config-file model is the "provider/model" string
-        form)."""
-        config: dict[str, Any] = {
-            "permission": "allow",
-            "skills": {"paths": [str(Path(spec.cwd) / self.profile.skill_tree)]},
-        }
-        if spec.model:
-            config["model"] = spec.model
-        return json.dumps(config)
+    def _config_content(self, spec: SessionSpec, protocol: OpencodeProtocol | None = None) -> str:
+        """The OPENCODE_CONFIG_CONTENT JSON for this session, in ``protocol``'s
+        dialect (V1 when omitted): see :meth:`V1Protocol.config_content`."""
+        primary, extras = self._skill_dirs(spec)
+        return (protocol or _V1).config_content(
+            spec, primary, extra_skill_dirs=extras, user_skill_ids=spec.user_skill_ids
+        )
 
-    def _session_env(self, spec: SessionSpec, password: str) -> dict[str, str]:
+    def _skill_dirs(self, spec: SessionSpec) -> tuple[Path, list[Path]]:
+        """``(primary, extras)`` — the session's project skill trees under its
+        cwd: the profile's ``skill_tree`` (always), then each of its
+        ``extra_skill_trees`` that exists. A missing extra tree holds no skill
+        to load, so leaving it out keeps a single-tree project's config what
+        it always was."""
+        cwd = Path(spec.cwd)
+        extras = [cwd / t for t in self.profile.extra_skill_trees]
+        return cwd / self.profile.skill_tree, [d for d in extras if d.is_dir()]
+
+    def _session_env(
+        self, spec: SessionSpec, password: str, protocol: OpencodeProtocol | None = None
+    ) -> dict[str, str]:
+        protocol = protocol or _V1
         return {
             **os.environ,
             **self.profile.env,
             **spec.env,
-            "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
+            **protocol.extra_env(),
             "OPENCODE_SERVER_PASSWORD": password,
-            "OPENCODE_CONFIG_CONTENT": self._config_content(spec),
+            "OPENCODE_CONFIG_CONTENT": self._config_content(spec, protocol),
         }
 
     def _make_client(self, sess: _ServerSession):
@@ -542,10 +640,35 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # `opencode.cmd` shim that a bare-name Popen (which appends only
             # .exe) would never find.
             raise OpencodeServerError(
-                f"opencode binary {self.binary!r} not found on PATH; " f"see `bmad-loop validate`"
+                f"opencode binary {self.binary!r} not found on PATH; see `bmad-loop validate`"
             )
+        protocol, version = self._protocol_for(resolved)
+        self._note_lifecycle(
+            spec.task_id,
+            "opencode-server-version",
+            version=format_version(version),
+            major=protocol.major,
+            verdict=support_verdict(version)[0],
+        )
+        if spec.user_skill_ids:
+            if protocol.major < 2:
+                raise OpencodeServerError(
+                    f"opencode {format_version(version)} cannot load skills from user roots "
+                    f"(it runs with OPENCODE_DISABLE_EXTERNAL_SKILLS): install "
+                    f"{', '.join(spec.user_skill_ids)} per project (`npx skills add` without -g) "
+                    f"or upgrade to opencode 2.x"
+                )
+            self._note_lifecycle(
+                spec.task_id, "skill-ids-user-allowed", ids=list(spec.user_skill_ids)
+            )
+        primary, extras = self._skill_dirs(spec)
+        refused = protocol.refused_skill_ids(
+            primary, extra_skill_dirs=extras, user_skill_ids=spec.user_skill_ids
+        )
+        if refused:
+            self._note_lifecycle(spec.task_id, "skill-ids-refused", ids=refused)
         password = secrets.token_urlsafe(16)
-        env = self._session_env(spec, password)
+        env = self._session_env(spec, password, protocol)
         log_path = self.logs_dir / f"{spec.task_id}.log"
         log_fh = log_path.open("ab")  # append: retries share one log
         event_fh = None
@@ -572,13 +695,20 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # give-up error below names this path, not log_path.
             server_path = self.logs_dir / f"{spec.task_id}.server.out"
             server_fh = server_path.open("ab")  # append: retries share one server log
+            provider_errors_path = self.logs_dir / f"{spec.task_id}{PROVIDER_ERRORS_SUFFIX}"
+            provider_errors_path.touch()  # kept, like the others, across spawn retries
         except BaseException:
             self._close_spawn_sinks(log_fh, server_fh, event_fh)
             raise
         last_error = "server did not become healthy"
+        died_at_startup = False
+        attempt_offset = 0
         try:
             for _ in range(SPAWN_ATTEMPTS):
                 port = _free_port()
+                # Where this attempt's output starts in the shared server log, so a
+                # startup-death diagnosis reads the final attempt only.
+                attempt_offset = os.fstat(server_fh.fileno()).st_size
                 process = subprocess.Popen(  # argv built from profile
                     self._serve_argv(resolved, port),
                     cwd=str(spec.cwd),
@@ -595,6 +725,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     log_fh=log_fh,
                     server_fh=server_fh,
                     event_fh=event_fh,
+                    protocol=protocol,
+                    server_version=format_version(version),
+                    lifecycle_task=spec.task_id,
+                    provider_errors_path=provider_errors_path,
                 )
                 if self._await_healthy(sess):
                     sess.client = self._make_client(sess)
@@ -602,18 +736,108 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # Died or never readied: reap and try a fresh port. A live-but-
                 # unhealthy server is killed too — never leak what we spawned.
                 if process.poll() is None:
-                    last_error = "server did not become healthy in time"
+                    last_error = sess.health_fault or "server did not become healthy in time"
+                    died_at_startup = False
                     self._kill_process(sess)
                 else:
                     last_error = f"server exited rc={process.returncode} during startup"
+                    died_at_startup = True
         except BaseException:
             self._close_spawn_sinks(log_fh, server_fh, event_fh)
             raise
         self._close_spawn_sinks(log_fh, server_fh, event_fh)
+        if died_at_startup and protocol.major == 1:
+            cause = self._startup_death_cause(spec.task_id, server_path, env, attempt_offset)
+            if cause:
+                last_error = f"{last_error}: {cause}"
+        launched = " ".join((self.binary, *self.profile.launch_args))
         raise OpencodeServerError(
-            f"could not start `{self.binary} serve` after {SPAWN_ATTEMPTS} attempts "
+            f"could not start `{launched} serve` after {SPAWN_ATTEMPTS} attempts "
             f"({last_error}); server log: {server_path}"
         )
+
+    def _startup_death_cause(
+        self, task_id: str, server_path: Path, env: dict[str, str], start: int
+    ) -> str:
+        """The known cause of a 1.x server's death during startup, read from
+        the bounded server-log tail past ``start`` (the final attempt's first
+        byte), or "" when none is recognised. Every attempt appends to the same
+        log, so an earlier attempt's marker never explains the final death.
+
+        Only the database-downgrade refusal is recognised. An unreadable log
+        is crumbed (``server-log-unread``) and reads as no cause — the give-up
+        error still names the log, so the generic message stays accurate."""
+        try:
+            with server_path.open("rb") as fh:
+                size = fh.seek(0, os.SEEK_END)
+                fh.seek(max(start, size - ENV_FAULT_TAIL_BYTES))
+                tail = fh.read()
+        except OSError as e:
+            self._note_lifecycle(
+                task_id,
+                "server-log-unread",
+                path=str(server_path),
+                error=f"{type(e).__name__}: {e}",
+            )
+            return ""
+        if _V1_DB_DOWNGRADE_MARKER not in tail:
+            return ""
+        return (
+            f"OpenCode 1.x refuses the database at {_opencode_db_path(env)} because a "
+            f'2.x server initialised it ("{_V1_DB_DOWNGRADE_MARKER.decode()}"); '
+            f"move that file aside, {_VERSION_REMEDY}"
+        )
+
+    def _protocol_for(self, resolved: str) -> tuple[OpencodeProtocol, tuple[int, int, int]]:
+        """``(protocol, version)`` for the server ``resolved`` would start, read
+        from ``<resolved> <launch_args> --version`` before anything is spawned —
+        V1 and V2 share the binary name (the V2 installer replaces the V1
+        binary), so the major is the only way to pick the wire. A seam: tests
+        monkeypatch it to skip the probe.
+
+        Cached per binary identity ``(path, st_mtime_ns, st_size)``, so an
+        upgrade in the middle of a run is re-detected on the next spawn while an
+        unchanged binary is asked once. Run through ``childrun.run_argv`` for
+        the same never-hang reasons as ``probe.binary_runs``.
+
+        Raises :class:`OpencodeServerError` when ``--version`` cannot run, its
+        output carries no version, or the major is not one this adapter speaks.
+        A supported major older than its verified floor proceeds — ``bmad-loop
+        validate`` warns about it."""
+        stat = os.stat(resolved)
+        key = (resolved, stat.st_mtime_ns, stat.st_size)
+        version = self._version_cache.get(key)
+        if version is None:
+            version = self._detect_version(resolved)
+            self._version_cache[key] = version
+        verdict, message = support_verdict(version)
+        if verdict == "unsupported-major":
+            raise OpencodeServerError(f"{message}; {_VERSION_REMEDY}")
+        return _PROTOCOLS[version[0]](), version
+
+    def _detect_version(self, resolved: str) -> tuple[int, int, int]:
+        argv = [resolved, *self.profile.launch_args, "--version"]
+        shown = " ".join((self.binary, *self.profile.launch_args, "--version"))
+        try:
+            run = childrun.run_argv(argv, cwd=None, timeout=VERSION_TIMEOUT_S)
+        except (OSError, subprocess.SubprocessError, ProcessHostError) as e:
+            raise OpencodeServerError(
+                f"`{shown}` could not be run ({type(e).__name__}: {e}); {_VERSION_REMEDY}"
+            ) from e
+        if run.timed_out or run.interrupted:
+            raise OpencodeServerError(
+                f"`{shown}` did not finish within {VERSION_TIMEOUT_S:g}s; {_VERSION_REMEDY}"
+            )
+        output = ((run.stdout or "") + (run.stderr or "")).strip()
+        first_line = output.splitlines()[0] if output else ""
+        version = parse_opencode_version(first_line) if run.returncode == 0 else None
+        if version is None:
+            raise OpencodeServerError(
+                f"could not read an OpenCode version from `{shown}` "
+                f"(exit {run.returncode}, first line {first_line[:200]!r}); "
+                f"supported: {supported_ranges()}; {_VERSION_REMEDY}"
+            )
+        return version
 
     @staticmethod
     def _close_spawn_sinks(log_fh: Any, server_fh: Any, event_fh: Any) -> None:
@@ -636,25 +860,40 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 pass
 
     def _await_healthy(self, sess: _ServerSession) -> bool:
-        """Poll /global/health (authenticated) until it answers healthy. The
-        process liveness is re-checked after *every* probe: a foreign server
-        answering 200 on a stolen port must not mask our own corpse, and the
-        auth + shape check means a foreign 200 without our password never
-        reads as ready."""
+        """Poll the protocol's health endpoint (authenticated) until it answers
+        healthy. The process liveness is re-checked after *every* probe: a
+        foreign server answering 200 on a stolen port must not mask our own
+        corpse, and the auth + shape check means a foreign 200 without our
+        password never reads as ready.
+
+        A server still answering ``200 text/html`` at the deadline is the web-UI
+        shell each major serves for the other major's routes: ``--version``
+        named one API and the server speaks another. That lands in
+        ``sess.health_fault`` so the give-up error says so instead of the bare
+        "not healthy in time" — the opaque failure an unrecognized server API
+        used to produce."""
         deadline = time.monotonic() + self.health_timeout_s
+        sess.health_fault = ""
+        html = False
         with self._make_client(sess) as client:
             while time.monotonic() < deadline:
                 healthy = False
                 try:
-                    resp = client.get("/global/health")
-                    healthy = resp.status_code == 200 and resp.json().get("healthy") is True
+                    probe = sess.protocol.health(client)
+                    healthy, html = probe.healthy, probe.html
                 except Exception:  # not up yet (conn refused, junk)
-                    healthy = False
+                    healthy, html = False, False
                 if sess.process.poll() is not None:
                     return False
                 if healthy:
                     return True
                 time.sleep(self.health_poll_s)
+        if html:
+            sess.health_fault = (
+                f"opencode answered HTML on the {sess.protocol.major}.x health endpoint — "
+                "the server speaks a different OpenCode API than `--version` reported "
+                f"({sess.server_version or 'unknown'}); {_VERSION_REMEDY}"
+            )
         return False
 
     # -------------------------------------------------------------- adapter
@@ -671,6 +910,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         log_paths = [
             self.logs_dir / f"{spec.task_id}.log",
             self.logs_dir / f"{spec.task_id}.server.out",
+            self.logs_dir / f"{spec.task_id}{PROVIDER_ERRORS_SUFFIX}",
         ]
         if self.sse_trace:
             log_paths.append(self.logs_dir / f"{spec.task_id}.sse.jsonl")
@@ -694,8 +934,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         #
         # Unlinked HERE and not in _spawn_server, which deliberately opens the file
         # "ab" so a spawn retry (free-port collision) keeps its predecessor's
-        # diagnostics inside the SAME session.
-        self._env_fault_log_path(spec.task_id).unlink(missing_ok=True)
+        # diagnostics inside the SAME session. Every scanned file, the
+        # provider-errors log included — its stale line pauses just the same.
+        for scanned in self._env_fault_log_paths(spec.task_id):
+            scanned.unlink(missing_ok=True)
 
         launched_ns = time.time_ns()
         sess = self._spawn_server(spec)
@@ -705,21 +947,16 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # start_session has returned a handle.
         self._sessions[spec.task_id] = sess
         try:
-            resp = sess.client.post("/session", json={"title": spec.task_id})
-            if resp.status_code != 200:
-                raise OpencodeServerError(
-                    f"POST /session failed: {resp.status_code} {resp.text[:200]}"
-                )
-            sess.session_id = resp.json()["id"]
+            sess.session_id = sess.protocol.create_session(sess.client, spec)
 
-            self._start_sse_reader(sess)
+            self._start_sse_reader(sess, spec.task_id)
             # Wait for the stream to actually attach before prompting: a fast
             # turn can emit session.idle before the subscription exists, and a
             # lost idle degrades every completion to the (slow) poll fallback.
             if not sess.sse_connected.wait(timeout=self.health_timeout_s):
                 raise OpencodeServerError("event stream did not connect")
 
-            self._prompt(sess, self.profile.render_prompt(spec.prompt))
+            self._prompt(sess, self.profile.render_prompt(spec.prompt, skill_dir=spec.skill_dir))
         except Exception:
             self._sessions.pop(spec.task_id, None)
             self._teardown(sess)
@@ -736,46 +973,50 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         starts no new turn, and consuming the floor for it would discard
         still-valid completion evidence of the previous turn."""
         sent_ms = _now_ms()  # sampled before the POST: it precedes the new turn
-        body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
-        # Reasoning effort is a per-call PromptInput key (#643); the key is
-        # omitted, not sent empty, so an effort-less session's body is unchanged.
-        if sess.variant:
-            body["variant"] = sess.variant
-        resp = sess.client.post(f"/session/{sess.session_id}/prompt_async", json=body)
-        if resp.status_code != 204:
-            raise OpencodeServerError(f"prompt_async failed: {resp.status_code} {resp.text[:200]}")
+        sess.protocol.prompt(sess.client, sess.session_id, text, sess.variant)
         sess.floor_ms = max(sess.floor_ms, sent_ms)
 
     def send_text(self, handle: SessionHandle, text: str) -> None:
-        """Nudge the running session. Best-effort: a server that died between
-        the liveness probe and the nudge is caught as `crashed` on the next
-        tick, not by blowing up the completion loop."""
+        """Nudge the running session. An undelivered nudge raises
+        :class:`OpencodeNudgeSendError` (chained from the ``_prompt`` fault) so
+        no caller reports it as sent (DW-503); the wait loop's own nudge sites
+        catch it, crumb ``nudge-send-failed`` and carry on — a server that died
+        between the liveness probe and the nudge is caught as `crashed` on the
+        next tick, not by blowing up the completion loop."""
         sess = self._sessions.get(handle.task_id)
         if sess is None:
-            return
+            raise OpencodeNudgeSendError(f"no live opencode session for task {handle.task_id!r}")
         try:
             self._prompt(sess, text)
-        except Exception:  # nosec B110 - next tick's poll() settles liveness
-            pass
+        except Exception as exc:
+            raise OpencodeNudgeSendError(f"{type(exc).__name__}: {exc}") from exc
 
-    def _start_sse_reader(self, sess: _ServerSession) -> None:
+    def _start_sse_reader(self, sess: _ServerSession, task_id: str) -> None:
         thread = threading.Thread(
             target=self._sse_loop,
-            args=(sess,),
+            args=(sess, task_id),
             name=f"opencode-sse-{sess.port}",
             daemon=True,
         )
         sess.sse_thread = thread
         thread.start()
 
-    def _sse_loop(self, sess: _ServerSession) -> None:
+    def _sse_loop(self, sess: _ServerSession, task_id: str) -> None:
         """SSE reader: owns its own client (created and closed here — kill()
         never touches it; killing the server is what unblocks the read, with
         the read timeout as backstop). Filters idle/error to this session's id
         (child sessions share the stream), counts every other non-heartbeat
         frame as activity, and turns any disconnect into a single `gap`
         sentinel so the wait loop probes over HTTP for what the stream may
-        have dropped."""
+        have dropped.
+
+        The fallback to polling is unchanged, but a raising stream is not a
+        silent gap (DW-462): its first failure crumbs `sse-stream-failed`
+        (``error``, ``frames_dropped``) and the next successful connect crumbs
+        `sse-stream-recovered` (``failures``) — once per break, never once per
+        failed reconnect against a dead server. A raise after `sse_stop` is the
+        teardown closing the socket, not a fault, and is not crumbed. ``task_id``
+        names the lifecycle file those crumbs land in."""
         httpx = self._httpx
         while not sess.sse_stop.is_set():
             try:
@@ -784,41 +1025,77 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     auth=(AUTH_USER, sess.password),
                     timeout=httpx.Timeout(5.0, read=self.sse_read_timeout_s),
                 ) as client:
-                    with client.stream("GET", "/event") as resp:
+                    event_path = sess.protocol.event_path
+                    with client.stream("GET", event_path) as resp:
                         if resp.status_code != 200:
-                            raise OpencodeServerError(f"/event -> {resp.status_code}")
+                            raise OpencodeServerError(f"{event_path} -> {resp.status_code}")
                         # The server registers the subscriber once the response
                         # starts; events published after this are delivered.
                         sess.sse_connected.set()
-                        for event in _parse_sse_lines(resp.iter_lines()):
+                        if sess.sse_failures:
+                            self._note_lifecycle(
+                                task_id, "sse-stream-recovered", failures=sess.sse_failures
+                            )
+                            sess.sse_failures = 0
+                        for event in _parse_sse_lines(
+                            resp.iter_lines(),
+                            lambda error: self._note_sse_drop(sess, task_id, error),
+                            lambda: self._note_sse_comment(sess),
+                        ):
                             if sess.sse_stop.is_set():
                                 return
                             self._dispatch_sse(sess, event)
-            except Exception:  # nosec B110 - reader must never die silently
-                pass
+            except Exception as e:  # reader must never die; a break is crumbed
+                if not sess.sse_stop.is_set():
+                    sess.sse_failures += 1
+                    if sess.sse_failures == 1:
+                        self._note_lifecycle(
+                            task_id,
+                            "sse-stream-failed",
+                            error=f"{type(e).__name__}: {e}",
+                            frames_dropped=sess.sse_frames_dropped,
+                        )
             if sess.sse_stop.is_set():
                 return
             sess.events.put("gap")
             sess.sse_stop.wait(self.reconnect_sleep_s)
 
+    def _note_sse_drop(self, sess: _ServerSession, task_id: str, error: str) -> None:
+        """Count an undecodable SSE frame (DW-462); heartbeat.json carries the
+        running count, and the session's first drop is crumbed with its error
+        (`sse-frame-dropped`) — not every drop, so a garbage stream cannot flood
+        the lifecycle file."""
+        sess.sse_frames_dropped += 1
+        if sess.sse_frames_dropped == 1:
+            self._note_lifecycle(task_id, "sse-frame-dropped", error=error)
+
+    @staticmethod
+    def _note_sse_comment(sess: _ServerSession) -> None:
+        """An SSE comment line — V2's ``: heartbeat`` — is liveness, not agent
+        activity: it keeps the stream fresh for the wait loop's silence check
+        and never bumps ``activity`` (V1's ``server.heartbeat`` frame drop, for
+        a heartbeat that is not a frame)."""
+        sess.last_frame_monotonic = time.monotonic()
+
     def _dispatch_sse(self, sess: _ServerSession, event: Any) -> None:
         if not isinstance(event, dict):
             return
         sess.last_frame_monotonic = time.monotonic()
-        etype = event.get("type")
-        if etype in ("server.heartbeat", "server.connected"):
+        protocol = sess.protocol
+        etype = protocol.frame_type(event)
+        if etype in protocol.heartbeat_types:
             return
         # Any substantive frame — including child-session traffic — proves the
         # session tree is working (the parent is silent while a subagent
         # streams, exactly like subagent output in a tmux pane log).
         sess.activity += 1
-        props = event.get("properties") or {}
+        props, frame_session = protocol.frame_payload(event)
         # Session-scoped frames must name this session (child/subagent sessions
         # share the stream). A short allowlist of SESSION-LESS types passes
         # anyway: some frames worth logging carry no sessionID at all, so there
         # is no id to match and this filter would drop them before either sink.
-        # See `_SESSIONLESS_TYPES` for which ones, why it is an allowlist, and
-        # what deliberately stays out.
+        # See the protocol's `sessionless_types` (V1: `_SESSIONLESS_TYPES`) for
+        # which ones, why it is an allowlist, and what deliberately stays out.
         #
         # Both sinks sit below this gate, so an allowlisted frame is traced as
         # well as rendered. That is intended: the trace's contract is one record
@@ -826,13 +1103,13 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # a line in the transcript — a rendered line with no matching record
         # would make the two sinks disagree. It costs nothing here because the
         # allowlist admits one low-rate type, not the noisy session-less bulk.
-        if props.get("sessionID") != sess.session_id and not (
+        if frame_session != sess.session_id and not (
             # `in` on a frozenset raises TypeError for an unhashable value, and
             # `type` is server-controlled, so narrow before the membership test
             # (the isinstance check below this filter is deliberately kept there
             # — moving it up would change the activity counter above).
             isinstance(etype, str)
-            and etype in _SESSIONLESS_TYPES
+            and etype in protocol.sessionless_types
         ):
             return
         if not isinstance(etype, str):
@@ -842,6 +1119,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # keeps a malformed frame out of the trace — it is not a frame the
             # adapter acted on. Liveness/activity above already counted it.
             return
+        # The env-fault evidence first, and outside the logging guard below: the
+        # classifier reads this file after the session settles, so the line must
+        # land before the turn end it may precede is queued.
+        self._note_provider_error(sess, etype, props)
         # Before the control queue: emit a structured trace record and render
         # one human-readable line into the run log. Both helpers no-op on
         # unknown types, so unhandled frames leave both sinks byte-identical to
@@ -864,10 +1145,71 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             self._render_inline(sess, etype, props)
         except Exception:  # nosec B110 - logging must never disturb the queue puts below
             pass
-        if etype == "session.idle":
+        if etype in protocol.idle_types:
             sess.events.put("idle")
-        elif etype == "session.error":
+        elif etype in protocol.error_types:
             sess.events.put("error")
+
+    def _note_provider_error(self, sess: _ServerSession, etype: str, props: Any) -> None:
+        """Append this session's provider-error frame, as one adapter-authored
+        line (:func:`format_provider_error` — structured fields only, never the
+        provider's response body), to ``logs/<task_id>.provider-errors.log``:
+        the env-fault classifier's evidence on 2.x, whose server log carries no
+        line per retry. A frame of another type writes nothing. The line is
+        also this session's live usage-limit evidence (`_note_usage_sighting`),
+        sighted before the append so a lost line does not lose the sighting.
+
+        Never raises — the reader must not die — but a lost line is a lost
+        classification, so a failure is visible: a payload that will not format
+        or an append that fails crumbs ``provider-errors-write-failed``
+        (``frame``, ``error``) once per session."""
+        if sess.provider_errors_path is None:
+            return  # bare session: no sink
+        try:
+            line = sess.protocol.provider_error_line(etype, props)
+            if line is None:
+                return
+            self._note_usage_sighting(sess, line)
+            with sess.provider_errors_path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except Exception as e:  # the reader must never die; the loss is crumbed
+            if not sess.provider_errors_write_failed:
+                sess.provider_errors_write_failed = True
+                self._note_lifecycle(
+                    sess.lifecycle_task,
+                    "provider-errors-write-failed",
+                    frame=etype,
+                    error=f"{type(e).__name__}: {e}",
+                )
+
+    def _note_usage_sighting(self, sess: _ServerSession, line: str) -> None:
+        """Record ``line`` as this session's live usage-limit sighting (#610,
+        DW-592) when it matches the profile's ``usage_limit_patterns`` (class
+        blocked) or ``usage_wait_patterns`` (class wait) — blocked wins, as on
+        the pane (`GenericAdapter._usage_hit`). opencode has no pane: the typed
+        provider-error frame, seen while the session runs and filtered to its
+        id, is the live sighting. The first one sticks.
+
+        A search that blows ``ENV_FAULT_MATCH_TIMEOUT_S`` is no match for its
+        list, crumbed ``usage-limit-match-failed`` (``pattern``) — the reader
+        must not die, and the post-mortem tail scan still sees the line."""
+        if sess.usage_sighting is not None:
+            return
+        for patterns, limit_class in (
+            (self._usage_limit_patterns, USAGE_LIMIT_BLOCKED),
+            (self._usage_wait_patterns, USAGE_LIMIT_WAIT),
+        ):
+            for pat in patterns:
+                try:
+                    hit = pat.search(line, timeout=ENV_FAULT_MATCH_TIMEOUT_S)
+                except TimeoutError:
+                    self._note_lifecycle(
+                        sess.lifecycle_task, "usage-limit-match-failed", pattern=pat.pattern
+                    )
+                    continue
+                if hit is not None:
+                    sess.usage_sighting = (_excerpt(line, hit.start()), limit_class)
+                    return
 
     def _render_inline(self, sess: _ServerSession, etype: str, props: dict) -> None:
         """Append one human-readable progress line to the run log for the event
@@ -882,35 +1224,11 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         reader thread writes ``log_fh``, and each line is a single ``write()``
         plus ``flush()`` — so it always lands as a whole line at EOF.
 
-        Every event-type string below, and the payload shape each branch reads,
-        is pinned in the module docstring's ``/event`` section against a live
-        1.18.2 probe — read that before adding or changing a branch here. That
-        is deliberately the only copy of those facts: three of this renderer's
-        original branches named frames the server does not send, and a second
-        copy is a second thing to get wrong on the next version bump.
-
-        ``message.updated`` carries only turn metadata (notably ``info.role``
-        keyed by ``info.id``) and renders no inline line of its own — it just
-        records the role under the message id so the following
-        ``message.part.*`` lines resolve the right speaker. Keying by message
-        id (not "last role seen") is required because ``message.updated``
-        frames arrive out of order: a re-emit for the user message lands mid-
-        assistant-turn and would otherwise flip the prefix to ``user:`` on the
-        assistant's own reply text. That also avoids a flood of role-only
-        announce lines like ``[bmad] assistant: assistant``."""
-        if etype == "message.updated":
-            info = props.get("info") or {}
-            mid = info.get("id")
-            role = info.get("role")
-            if mid and role:
-                sess.msg_roles[mid] = role
-            return
-        role = "assistant"
-        if etype == "message.part.updated":
-            mid = (props.get("part") or {}).get("messageID")
-            if mid and mid in sess.msg_roles:
-                role = sess.msg_roles[mid]
-        line = self._inline_line(etype, props, role)
+        Which frames render, and how, is the protocol's
+        (:meth:`V1Protocol.render_line` — the pinned frame facts live beside
+        it); ``sess.msg_roles`` is the per-session role map it keys by message
+        id."""
+        line = sess.protocol.render_line(sess.msg_roles, etype, props)
         if line is None:
             return
         if sess.log_fh is None:  # bare-sess unit tests / disabled inline log
@@ -928,106 +1246,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             pass
 
     def _inline_line(self, etype: str, props: dict, role: str) -> str | None:
-        # ``message.updated`` is consumed in ``_render_inline`` (role refresh
-        # only); it renders no line here.
-        # assistant / user assembled text. Per-token ``message.part.delta``
-        # frames are NOT rendered inline: they concatenate to exactly the text
-        # ``message.part.updated`` already carries complete, so emitting both
-        # duplicates every statement as a one-word-per-line flood. For the same
-        # reason they are excluded from the SSE trace too (see ``_emit_event``);
-        # nothing consumes deltas anywhere in this adapter.
-        if etype == "message.part.updated":
-            part = props.get("part") or {}
-            # Tool execution rides this same frame as a `tool`-typed part —
-            # there is no tool.call/tool.response event on this surface, and
-            # `command.executed` never fires for it (both pinned live). Tool
-            # parts carry no `text`, so this branch MUST sit above the
-            # empty-text `return None` below or it can never be reached: that
-            # exact ordering is the difference between rendering the agent's
-            # actions and rendering nothing but its prose.
-            if part.get("type") == "tool":
-                return self._tool_line(part)
-            text = part.get("text") or ""
-            body = text.strip()  # drop surrounding blanks; keep internal structure
-            if not body:  # empty/non-text part — no value live
-                return None
-            role = role or "assistant"
-            # A blank line separates each turn from the previous one (the
-            # separator sits ABOVE the header, body follows directly beneath),
-            # and the role-colored marker line anchors the turn boundary.
-            # Internal newlines in the body are preserved so multi-paragraph
-            # reasoning reads as prose under the one header.
-            return f"\n{_role_color(role)}[bmad] {role}:{_RESET}\n{body}\n"
-        # The SLASH-COMMAND surface — NOT the tool surface. Agent tool use never
-        # reaches here (0 `command.executed` frames across live bash/write/read/
-        # edit calls); it renders from the `tool`-typed part above. Kept because
-        # a slash command invoked through this server is still worth a line and
-        # its payload is pinned (`name`/`arguments`/`messageID`, all required),
-        # but do not "fix" tool rendering back into this branch.
-        if etype == "command.executed":
-            args = _sum_args(props.get("arguments"))
-            return f"{_TOOL_COLOR}[bmad] cmd: {props.get('name') or '?'}{(' ' + args) if args else ''}{_RESET}\n"
-        if etype == "file.edited":
-            # Session-less: reachable only via `_SESSIONLESS_TYPES`.
-            return f"{_TOOL_COLOR}[bmad] file: {props.get('file') or '?'}{_RESET}\n"
-        # Permission surface. Field names are the live 1.18.2 ones: the ask frame
-        # is `permission.asked` (there is no `permission.updated`) carrying a
-        # `permission` STRING plus a `patterns` list — not a nested object with
-        # `type`/`pattern` — and the reply carries `reply`, not `response`.
-        # `metadata` (the concrete command) and `always` are left to the trace;
-        # `patterns` is what the permission actually matched on.
-        if etype == "permission.asked":
-            pats = _sum_args(props.get("patterns"))
-            return (
-                f"{_TOOL_COLOR}[bmad] perm ask: {props.get('permission') or '?'}"
-                f"{(' ' + pats) if pats else ''}{_RESET}\n"
-            )
-        if etype == "permission.replied":
-            return f"{_TOOL_COLOR}[bmad] perm reply: {props.get('reply') or '?'}{_RESET}\n"
-        # A failing turn is the one thing a reader most wants in the transcript:
-        # without this the log just stops mid-turn while the queue put below
-        # ends the session. Same green/tool hue as the other role-less markers —
-        # the color family is "not a speaker", not "severity". `error` has no
-        # pinned shape on this surface, so summarize whatever it carries rather
-        # than reaching into fields that may not exist.
-        if etype == "session.error":
-            detail = _sum_args(props.get("error"))
-            return f"{_TOOL_COLOR}[bmad] error:{(' ' + detail) if detail else ''}{_RESET}\n"
-        return None
-
-    @staticmethod
-    def _tool_line(part: dict) -> str | None:
-        """One line for a finished tool call, or None while it is still running.
-
-        A `tool`-typed ``message.part.updated`` part fires once per state
-        transition — ``pending`` → ``running`` → terminal — carrying the SAME
-        part id each time. Rendering every fire would print each tool call three
-        times, so the line is emitted only on a terminal status
-        (``_TOOL_TERMINAL_STATES``): a tool call reaches exactly one terminal
-        state, which makes that gate exactly "once per tool call". The gate is
-        the whole correctness argument here — a test that only asserts a tool
-        renders at all passes with it removed.
-
-        Same green/tool hue as the other role-less markers: a tool call is an
-        action, not a speaker. ``state.input`` is summarized inline (that is the
-        "what did the agent just do" the reader wants); ``state.output`` is
-        deliberately NOT — it is a full command's stdout or a whole file's text
-        on this surface, and the complete payload is in the SSE trace for anyone
-        who needs it. A failure appends the error, because a tool that failed
-        silently is exactly what a reader would go looking for."""
-        state = part.get("state") or {}
-        status = state.get("status")
-        if status not in _TOOL_TERMINAL_STATES:
-            return None
-        args = _sum_args(state.get("input"))
-        suffix = ""
-        if status == "error":
-            detail = _sum_args(state.get("error"))
-            suffix = f" -> error{(': ' + detail) if detail else ''}"
-        return (
-            f"{_TOOL_COLOR}[bmad] tool: {part.get('tool') or '?'}"
-            f"{(' ' + args) if args else ''}{suffix}{_RESET}\n"
-        )
+        """The V1 inline line for one frame — :meth:`V1Protocol.inline_line`."""
+        return _V1.inline_line(etype, props, role)
 
     def _emit_event(self, sess: _ServerSession, etype: str, props: dict) -> None:
         """Append one structured JSON object to the session's
@@ -1035,15 +1255,16 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         the per-token deltas, for post-hoc replay/debugging. No-ops when the
         sink is off (``event_fh is None``, i.e. the ``sse_trace`` knob is down).
 
-        ``message.part.delta`` is the one exclusion. Its text concatenates
-        byte-exactly to the ``message.part.updated`` record already in the file
-        (pinned live — see the module docstring), so every delta is bytes spent
+        The protocol's ``trace_skip_types`` are the exclusion — on V1,
+        ``message.part.delta``. Its text concatenates byte-exactly to the
+        ``message.part.updated`` record already in the file (pinned live — see
+        the protocol module docstring), so every delta is bytes spent
         re-storing text the trace already holds, and they dominate the frame
         count on any real turn. ``logs/`` is never trimmed by retention, so that
-        cost is permanent. Drop the branch to get them back."""
+        cost is permanent. Drop the type from the set to get them back."""
         if sess.event_fh is None:
             return
-        if etype == "message.part.delta":
+        if etype in sess.protocol.trace_skip_types:
             return
         sess.event_seq += 1
         record = {
@@ -1070,6 +1291,25 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         return self._await_result(handle.task_id)
 
     def wait_for_completion(self, handle: SessionHandle, spec: SessionSpec) -> SessionResult:
+        """`_wait_loop`, with the session's live usage-limit sighting (DW-592,
+        `_note_usage_sighting`) carried onto a result whose status is in
+        ``ENV_FAULT_STATUSES`` — one choke point, as generic's
+        `wait_for_completion` carries `quota_wait_s`, rather than a stamp at
+        each return site. Read before `run()`'s `kill` pops the session. Only
+        those statuses reach `_classify_env_fault` and its usage-limit pause, so
+        a completed, aborted or over_budget result is never stamped: the stamp
+        would be journaled as the evidence of a pause that never happens.
+        ``usage_limit_resets`` stays None — the provider-error frame carries no
+        reset time."""
+        result = self._wait_loop(handle, spec)
+        sess = self._sessions.get(handle.task_id)
+        sighting = sess.usage_sighting if sess is not None else None
+        if sighting is None or result.status not in ENV_FAULT_STATUSES:
+            return result
+        evidence, limit_class = sighting
+        return replace(result, usage_limited=evidence, usage_limit_class=limit_class)
+
+    def _wait_loop(self, handle: SessionHandle, spec: SessionSpec) -> SessionResult:
         sess = self._sessions.get(handle.task_id)
         if sess is None:
             raise OpencodeServerError(f"no live opencode server for task {handle.task_id!r}")
@@ -1092,6 +1332,11 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # Loop-owned silence clock: updated on every dequeue, so a dead reader
         # thread degrades to the poll fallback instead of disabling it.
         last_seen = time.monotonic()
+        # `activity` as of the last unresolved stream gap; None = no gap armed.
+        gap_activity: int | None = None
+        # monotonic ts of the gap's next slow re-probe, once a frame has moved
+        # `activity` past the gap; None = not armed.
+        gap_recheck_at: float | None = None
         # monotonic ts of the last heartbeat.json overwrite; None = not yet
         # written, so the first tick always stamps one.
         last_heartbeat: float | None = None
@@ -1106,6 +1351,161 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # freezes time.monotonic(), silently stretching the "bounded" wrap-up
         # window; the wall clock may EXPIRE the grace — never extend it.
         budget_wall_deadline: float | None = None
+        # the running streak of budget usage samples that failed (a transport
+        # error, a non-200, a malformed payload — DW-461); heartbeat.json carries
+        # it as of the previous sample (sampling follows the heartbeat write).
+        usage_failures = 0
+
+        def beat() -> bool:
+            """Overwrite heartbeat.json and run `_observe_tick` when the
+            HEARTBEAT_INTERVAL_S cadence is due; True when it fired. Shared with
+            `_await_descendants`, so a turn end held on a running subagent keeps
+            the session's proof-of-life cadence."""
+            nonlocal last_heartbeat
+            now = time.monotonic()
+            if last_heartbeat is not None and now - last_heartbeat < HEARTBEAT_INTERVAL_S:
+                return False
+            last_heartbeat = now
+            self._write_heartbeat(
+                handle.task_id,
+                {
+                    "ts": time.time(),
+                    "remaining_s": round(deadline - now, 3),
+                    "stall_armed": stall_deadline is not None,
+                    "stall_nudges_sent": stall_nudges_sent,
+                    # the running budget usage-sample failure streak (DW-461)
+                    "usage_sample_failures": usage_failures,
+                    # SSE frames the parser could not decode (DW-462)
+                    "sse_frames_dropped": sess.sse_frames_dropped,
+                },
+            )
+            # Mid-session spec-status transition sampling (#276 M2) rides the
+            # same heartbeat cadence — a no-op on the plain HTTP adapter; the
+            # OpencodeDevAdapter shares _DevSynthesisMixin, so the hook records
+            # transitions there exactly as on the generic dev adapter.
+            self._observe_tick(handle, spec)
+            return True
+
+        def sample_budget() -> SessionResult | None:
+            """One budget usage sample, taken when `beat` fired. Usage comes over
+            HTTP (server state is sqlite, not a file). Latches the first cap
+            crossing (journal + ATTENTION notify) and, in enforce mode, nudges
+            and arms the grace (`budget_deadline`); returns the session's
+            verdict only for a zero-grace enforce trip, else None. Shared with
+            `_await_descendants` (through `wait_tick`), so a turn end held on a
+            running subagent still samples the spend the subagent adds."""
+            nonlocal budget_tripped, budget_weighted, budget_deadline
+            nonlocal budget_wall_deadline, usage_failures
+            if (
+                not budget_tripped
+                and spec.token_budget is not None
+                and spec.token_budget_mode in ("warn", "enforce")
+            ):
+                weighted, usage_fault = self._sample_weighted_usage(sess, spec)
+                # A failed sample is still "no sample" this tick; its streak
+                # is crumbed at the transitions only (DW-461), the generic
+                # adapter's DW-452 model — a persistent fault leaves
+                # enforce mode off, which must not look like a quiet session.
+                if usage_fault is not None:
+                    usage_failures += 1
+                    if usage_failures == 1:
+                        self._note_lifecycle(
+                            handle.task_id, "usage-sample-failed", error=usage_fault
+                        )
+                else:
+                    if usage_failures:
+                        self._note_lifecycle(
+                            handle.task_id, "usage-sample-recovered", failures=usage_failures
+                        )
+                    usage_failures = 0
+                if weighted is not None and weighted > spec.token_budget:
+                    budget_tripped = True
+                    budget_weighted = weighted
+                    self._note_lifecycle(
+                        handle.task_id,
+                        "budget-tripped",
+                        weighted=weighted,
+                        budget=spec.token_budget,
+                        mode=spec.token_budget_mode,
+                    )
+                    try:
+                        gates.notify(
+                            self.policy,
+                            self.run_dir,
+                            "bmad-loop session over token budget",
+                            f"{handle.task_id}: weighted spend {weighted} crossed the "
+                            f"{spec.token_budget} per-session cap "
+                            f"(mode={spec.token_budget_mode})",
+                        )
+                    except OSError:
+                        # observe-degrade: an unwritable ATTENTION file is
+                        # observability, never a reason to break the loop
+                        # (the _write_heartbeat doctrine).
+                        pass
+                    # nosec below: bandit B105 pattern-matches the "token"
+                    # in token_budget_mode as a hardcoded-password compare;
+                    # it is a mode enum, not a credential.
+                    if spec.token_budget_mode == "enforce":  # nosec B105
+                        if spec.token_budget_grace_s <= 0:
+                            # zero grace = terminate at trip, no nudge — but
+                            # server death still wins (artifact honored via
+                            # the crash path), exactly like grace expiry.
+                            if sess.process.poll() is not None:
+                                transcript = self._capture_usage(handle, sess)
+                                return self._final(
+                                    handle,
+                                    spec,
+                                    "crashed",
+                                    session_id,
+                                    transcript,
+                                    budget_weighted=weighted,
+                                )
+                            self._note_lifecycle(
+                                handle.task_id,
+                                "over-budget-fired",
+                                weighted=weighted,
+                                budget=spec.token_budget,
+                                grace_s=spec.token_budget_grace_s,
+                                zero_grace=True,
+                            )
+                            self._abort(sess)
+                            transcript = self._capture_usage(handle, sess)
+                            return SessionResult(
+                                status="over_budget",
+                                session_id=session_id,
+                                transcript_path=transcript,
+                                budget_weighted=weighted,
+                            )
+                        try:
+                            self.send_text(handle, BUDGET_NUDGE_TEXT)
+                        except MultiplexerError as e:
+                            # a dead/hung server can't take the nudge; the
+                            # grace still arms — the next tick's process
+                            # poll scores a dead server crashed.
+                            self._note_nudge_send_failed(handle, "budget", e)
+                        budget_deadline = time.monotonic() + spec.token_budget_grace_s
+                        budget_wall_deadline = time.time() + spec.token_budget_grace_s
+            return None
+
+        def budget_due() -> bool:
+            """Whether an armed enforce-mode budget grace has expired (the wall
+            clock may expire it, never extend it — #157)."""
+            return budget_deadline is not None and (
+                time.monotonic() >= budget_deadline
+                or (budget_wall_deadline is not None and time.time() >= budget_wall_deadline)
+            )
+
+        # A zero-grace enforce verdict reached inside `_await_descendants`.
+        budget_verdict: SessionResult | None = None
+
+        def wait_tick() -> bool:
+            """`beat` plus the budget sample the loop takes when it fires, for
+            `_await_descendants`; True when the sample settled the session (a
+            zero-grace enforce trip: `budget_verdict`), which cuts the wait."""
+            nonlocal budget_verdict
+            if beat():
+                budget_verdict = sample_budget()
+            return budget_verdict is not None
 
         while True:
             remaining = deadline - time.monotonic()
@@ -1167,102 +1567,12 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     transcript_path=transcript,
                     budget_weighted=budget_weighted,
                 )
-            now = time.monotonic()
-            if last_heartbeat is None or now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
-                last_heartbeat = now
-                self._write_heartbeat(
-                    handle.task_id,
-                    {
-                        "ts": time.time(),
-                        "remaining_s": round(remaining, 3),
-                        "stall_armed": stall_deadline is not None,
-                        "stall_nudges_sent": stall_nudges_sent,
-                    },
-                )
-                # Mid-session spec-status transition sampling (#276 M2) rides the
-                # same heartbeat cadence — a no-op on the plain HTTP adapter; the
-                # OpencodeDevAdapter shares _DevSynthesisMixin, so the hook records
-                # transitions there exactly as on the generic dev adapter.
-                self._observe_tick(handle, spec)
+            if beat():
                 # Budget sampling rides the heartbeat cadence — no extra knob.
-                # Usage comes over HTTP (server state is sqlite, not a file).
-                if (
-                    not budget_tripped
-                    and spec.token_budget is not None
-                    and spec.token_budget_mode in ("warn", "enforce")
-                ):
-                    weighted = self._sample_weighted_usage(sess, spec)
-                    if weighted is not None and weighted > spec.token_budget:
-                        budget_tripped = True
-                        budget_weighted = weighted
-                        self._note_lifecycle(
-                            handle.task_id,
-                            "budget-tripped",
-                            weighted=weighted,
-                            budget=spec.token_budget,
-                            mode=spec.token_budget_mode,
-                        )
-                        try:
-                            gates.notify(
-                                self.policy,
-                                self.run_dir,
-                                "bmad-loop session over token budget",
-                                f"{handle.task_id}: weighted spend {weighted} crossed the "
-                                f"{spec.token_budget} per-session cap "
-                                f"(mode={spec.token_budget_mode})",
-                            )
-                        except OSError:
-                            # observe-degrade: an unwritable ATTENTION file is
-                            # observability, never a reason to break the loop
-                            # (the _write_heartbeat doctrine).
-                            pass
-                        # nosec below: bandit B105 pattern-matches the "token"
-                        # in token_budget_mode as a hardcoded-password compare;
-                        # it is a mode enum, not a credential.
-                        if spec.token_budget_mode == "enforce":  # nosec B105
-                            if spec.token_budget_grace_s <= 0:
-                                # zero grace = terminate at trip, no nudge — but
-                                # server death still wins (artifact honored via
-                                # the crash path), exactly like grace expiry.
-                                if sess.process.poll() is not None:
-                                    transcript = self._capture_usage(handle, sess)
-                                    return self._final(
-                                        handle,
-                                        spec,
-                                        "crashed",
-                                        session_id,
-                                        transcript,
-                                        budget_weighted=weighted,
-                                    )
-                                self._note_lifecycle(
-                                    handle.task_id,
-                                    "over-budget-fired",
-                                    weighted=weighted,
-                                    budget=spec.token_budget,
-                                    grace_s=spec.token_budget_grace_s,
-                                    zero_grace=True,
-                                )
-                                self._abort(sess)
-                                transcript = self._capture_usage(handle, sess)
-                                return SessionResult(
-                                    status="over_budget",
-                                    session_id=session_id,
-                                    transcript_path=transcript,
-                                    budget_weighted=weighted,
-                                )
-                            try:
-                                self.send_text(handle, BUDGET_NUDGE_TEXT)
-                            except Exception:  # nosec B110 - best-effort nudge
-                                # a dead/hung server can't take the nudge; the
-                                # grace still arms — the next tick's process
-                                # poll scores a dead server crashed.
-                                pass
-                            budget_deadline = time.monotonic() + spec.token_budget_grace_s
-                            budget_wall_deadline = time.time() + spec.token_budget_grace_s
-            if budget_deadline is not None and (
-                time.monotonic() >= budget_deadline
-                or (budget_wall_deadline is not None and time.time() >= budget_wall_deadline)
-            ):
+                verdict = sample_budget()
+                if verdict is not None:
+                    return verdict
+            if budget_due():
                 # Grace expired with no completion (wall co-bound included: a
                 # suspend-frozen monotonic clock must not stretch the window,
                 # #157). Server death ≙ window death (the crash path honors a
@@ -1322,8 +1632,9 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     budget_weighted=budget_weighted,
                 )
             if event == "error":
-                # session.error may precede a retry, not a turn-end (status
-                # "retry" exists); only a PROVABLY settled session reads as a
+                # V1 only (V2's terminal failure queues "idle"): session.error
+                # may precede a retry, not a turn-end (status "retry" exists);
+                # only a PROVABLY settled session reads as a
                 # result-less Stop — an errored turn may never get
                 # time.completed, so waiting on proof-of-work alone would burn
                 # the whole timeout. A dead server takes the crash path; an
@@ -1361,10 +1672,31 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     time.monotonic() - max(last_seen, sess.last_frame_monotonic)
                     > self.silence_threshold_s
                 )
-                if (event == "gap" or silent) and self._probe_completion(sess):
+                # A gap's single probe can run before the turn settles, and the
+                # reconnected stream never replays a turn end it missed — while
+                # heartbeats keep `silent` False for good. So a gap probes every
+                # tick until a substantive frame arrives (one probe after it).
+                # That frame may be child or session-less traffic, and the probe
+                # after it may read busy or fail, so the gap then re-probes every
+                # `silence_threshold_s` until completion or this session's own
+                # turn end.
+                if event == "gap":
+                    gap_activity = sess.activity
+                    gap_recheck_at = None
+                probe_activity = sess.activity
+                now = time.monotonic()
+                gap_due = gap_recheck_at is not None and now >= gap_recheck_at
+                if (event == "gap" or silent or gap_activity is not None or gap_due) and (
+                    self._probe_completion(sess)
+                ):
                     event = "idle"  # fall through to the Stop path below
                     last_seen = time.monotonic()
                 else:
+                    if gap_activity is not None and probe_activity != gap_activity:
+                        gap_activity = None
+                        gap_recheck_at = now + self.silence_threshold_s
+                    elif gap_due:
+                        gap_recheck_at = now + self.silence_threshold_s
                     if stall_deadline is not None:
                         # Re-arm on activity (any SSE traffic since arming) —
                         # a session streaming subagent work is working, not
@@ -1392,7 +1724,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                 # bounded budget converges to an honest stall.
                                 stall_nudges_left -= 1
                                 stall_nudges_sent += 1
-                                self.send_text(handle, STALL_NUDGE_TEXT)
+                                try:
+                                    self.send_text(handle, STALL_NUDGE_TEXT)
+                                except MultiplexerError as e:
+                                    self._note_nudge_send_failed(handle, "stall", e)
                                 stall_deadline = time.monotonic() + self._stall_grace_s
                                 last_activity = sess.activity
                                 continue
@@ -1423,6 +1758,21 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     continue
 
             if event == "idle":
+                # A turn end, from the stream or the probe, resolves any gap.
+                gap_activity = gap_recheck_at = None
+                # A V2 background subagent can outlive this turn end: hold it
+                # (bounded by the stall grace) until no descendant is running.
+                if not self._await_descendants(
+                    handle,
+                    sess,
+                    deadline=deadline,
+                    wall_deadline=wall_deadline,
+                    budget_due=budget_due,
+                    tick=wait_tick,
+                ):
+                    if budget_verdict is not None:
+                        return budget_verdict  # a zero-grace enforce trip mid-wait
+                    continue  # stop / deadline / budget / death: the loop's arms decide
                 result_json = self._result_json(handle, spec, wait=True)
                 if result_json is not None:
                     transcript = self._capture_usage(handle, sess)
@@ -1435,7 +1785,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     )
                 if nudges_left > 0:
                     nudges_left -= 1
-                    self.send_text(handle, NUDGE_TEXT)
+                    try:
+                        self.send_text(handle, NUDGE_TEXT)
+                    except MultiplexerError as e:
+                        self._note_nudge_send_failed(handle, "stop", e)
                     continue
                 if self._stall_grace_s <= 0:
                     transcript = self._capture_usage(handle, sess)
@@ -1457,20 +1810,145 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 stall_nudges_left = self._stall_nudges
                 continue
 
-    def _session_status(self, sess: _ServerSession) -> bool | None:
-        """Tri-state /session/status probe: True = busy/retrying, False =
-        provably settled (absent from the map or explicit idle),
-        None = unknowable (unreachable server, non-200). Unknown is not
-        settled: callers must not treat a failed probe as proof a turn ended
-        (the liveness-parity doctrine); the process poll settles real death."""
-        try:
-            resp = sess.client.get("/session/status")
-            if resp.status_code != 200:
-                return None
-            status = resp.json().get(sess.session_id) or {}
-            return status.get("type") in ("busy", "retry")
-        except Exception:  # probe is advisory
+    def _await_descendants(
+        self,
+        handle: SessionHandle,
+        sess: _ServerSession,
+        *,
+        deadline: float,
+        wall_deadline: float,
+        budget_due: Callable[[], bool],
+        tick: Callable[[], bool],
+    ) -> bool:
+        """Hold a turn end while a descendant session of this one is still
+        running. Under OpenCode 2.x a ``background: true`` subagent can work on
+        after its parent publishes ``session.execution.succeeded``; acting on
+        that turn end at once (reading the result, nudging, stalling) decides
+        the session before the child's work lands.
+
+        Polls the protocol's ``active_descendants`` every ``descendant_poll_s``
+        until none is active or ``_stall_grace_s`` passes; the bound is
+        ``min(grace, session deadline)``, each with its wall-clock co-bound
+        (#157), and the grace runs from before the first probe. Returns True
+        when the caller should act on the turn end now: nothing was active
+        (nothing journaled), the children finished (``descendant-wait-ended``
+        with ``waited_s``, ``probe_failures``), or the grace expired
+        (``descendant-wait-timeout`` with the last known active ``sessions`` —
+        null when no probe ever read — ``waited_s``, ``probe_failures``, plus
+        ``error`` when the last probe faulted). A wait that starts journals
+        ``descendant-wait-started`` (``sessions``, ``grace_s``; ``sessions:
+        null`` + ``error`` when the first probe faulted). Returns False only
+        when the wait is cut short — ``descendant-wait-cut`` with ``reason``
+        ``stop`` (a hard stop), ``timeout`` (the session deadline), ``budget``
+        (``budget_due``: an armed enforce-mode budget grace has expired, or
+        ``tick`` settled the session) or ``server-exited`` — and the wait
+        loop's own arms then take the verdict (aborted / timeout /
+        over_budget / crashed). The cut conditions are checked again after
+        every probe that reads "none active", the first one included, so a
+        stop, deadline or budget expiry that lands during a sleep or a probe
+        still wins; a cut on the first probe journals only
+        ``descendant-wait-cut`` (``sessions: []``).
+
+        A probe fault is never "none active": the first fault of each streak
+        is crumbed as ``descendant-probe-failed`` (``error``) and the wait runs
+        on to its bound. A grace of zero (the plain adapter) never probes; V1
+        answers ``([], None)`` without a request, so it never waits. ``tick``
+        keeps the heartbeat cadence and the budget sampling that rides it, so
+        a child spending past the cap trips the budget (and, in enforce mode,
+        arms its grace) as it would mid-turn; the True return of ``tick``
+        means the sample settled the session (a zero-grace enforce trip). The
+        stall/gap machinery pauses for the wait, which the grace bounds."""
+        grace = self._stall_grace_s
+        if grace <= 0:
+            return True
+        # The grace runs from before the first probe, so a slow probe is not
+        # granted a fresh full grace on top.
+        started = time.monotonic()
+        wait_end = min(started + grace, deadline)
+        wall_end = min(time.time() + grace, wall_deadline)
+        task_id = handle.task_id
+        known: list[str] | None = None
+
+        def waited() -> float:
+            return round(time.monotonic() - started, 3)
+
+        def cut_reason() -> str | None:
+            if self._hard_stop_requested():
+                return "stop"
+            if sess.process.poll() is not None:
+                return "server-exited"
+            if time.monotonic() >= deadline or time.time() >= wall_deadline:
+                return "timeout"
+            if budget_due():
+                return "budget"
             return None
+
+        def cut(reason: str) -> bool:
+            self._note_lifecycle(
+                task_id, "descendant-wait-cut", reason=reason, sessions=known, waited_s=waited()
+            )
+            return False
+
+        active, fault = sess.protocol.active_descendants(sess.client, sess.session_id)
+        known = active
+        if active is not None and not active:
+            # The first probe can outlast a stop, the deadline or the budget
+            # grace too: recheck before the empty answer reads as a turn end.
+            reason = cut_reason()
+            return True if reason is None else cut(reason)
+        failures = 0
+        last_fault: str | None = fault
+        started_fields: dict[str, Any] = {"sessions": active, "grace_s": grace}
+        if fault is not None:
+            started_fields["error"] = fault
+        self._note_lifecycle(task_id, "descendant-wait-started", **started_fields)
+        if fault is not None:
+            failures = 1
+            self._note_lifecycle(task_id, "descendant-probe-failed", error=fault)
+
+        while True:
+            reason = cut_reason()
+            if reason is not None:
+                return cut(reason)
+            if time.monotonic() >= wait_end or time.time() >= wall_end:
+                timeout_fields: dict[str, Any] = {
+                    "sessions": known,
+                    "waited_s": waited(),
+                    "probe_failures": failures,
+                }
+                if last_fault is not None:
+                    timeout_fields["error"] = last_fault
+                self._note_lifecycle(task_id, "descendant-wait-timeout", **timeout_fields)
+                return True
+            if tick():
+                return cut("budget")
+            time.sleep(max(0.0, min(self.descendant_poll_s, wait_end - time.monotonic())))
+            active, fault = sess.protocol.active_descendants(sess.client, sess.session_id)
+            if active is None:
+                failures += 1
+                if last_fault is None:
+                    self._note_lifecycle(task_id, "descendant-probe-failed", error=fault)
+                last_fault = fault
+                continue
+            last_fault = None
+            known = active
+            if not active:
+                # The sleep and the probe can outlast a stop, the deadline or
+                # the budget grace: an empty answer then must not read as done.
+                reason = cut_reason()
+                if reason is not None:
+                    return cut(reason)
+                self._note_lifecycle(
+                    task_id, "descendant-wait-ended", waited_s=waited(), probe_failures=failures
+                )
+                return True
+
+    def _session_status(self, sess: _ServerSession) -> bool | None:
+        """Tri-state busy probe — the protocol's ``session_busy``: True =
+        busy/retrying, False = provably settled, None = unknowable. Unknown is
+        not settled: callers must not treat a failed probe as proof a turn ended
+        (the liveness-parity doctrine); the process poll settles real death."""
+        return sess.protocol.session_busy(sess.client, sess.session_id)
 
     def _probe_completion(self, sess: _ServerSession) -> bool:
         """HTTP fallback for a lossy stream: the turn is finished
@@ -1481,18 +1959,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         completion can never be consumed twice."""
         if self._session_status(sess) is not False:
             return False
-        try:
-            resp = sess.client.get(f"/session/{sess.session_id}/message")
-            if resp.status_code != 200:
-                return False
-            completed = 0
-            for msg in resp.json():
-                info = msg.get("info") or {}
-                if info.get("role") != "assistant":
-                    continue
-                done_ms = (info.get("time") or {}).get("completed") or 0
-                completed = max(completed, int(done_ms))
-        except Exception:  # probe is advisory
+        completed = sess.protocol.latest_completed_ms(sess.client, sess.session_id)
+        if completed is None:  # the read failed: the probe is advisory
             return False
         if completed > sess.floor_ms:
             sess.floor_ms = completed
@@ -1503,46 +1971,97 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         if sess.client is None or not sess.session_id or sess.process.poll() is not None:
             return
         try:
-            sess.client.post(f"/session/{sess.session_id}/abort")
+            sess.protocol.abort(sess.client, sess.session_id)
         except Exception:  # nosec B110 - abort is best-effort
             pass
 
     # ----------------------------------------------------------------- usage
 
-    def _sample_weighted_usage(self, sess: _ServerSession, spec: SessionSpec) -> int | None:
-        """Mid-session cumulative weighted spend over HTTP, or None when the
-        guard must stay inert this tick (no live session yet, non-200, a
-        transport error). Never raises — sampling must not break the wait
-        loop."""
+    def _sample_weighted_usage(
+        self, sess: _ServerSession, spec: SessionSpec
+    ) -> tuple[int | None, str | None]:
+        """``(weighted, fault)``: the mid-session cumulative weighted spend over
+        HTTP, or None when the guard must stay inert this tick; ``fault`` names
+        why the sample failed (a transport error, a non-200, a malformed
+        payload), else None. Never raises — sampling must not break the wait
+        loop. No live session yet, or nothing tallied yet, is a clean None: the
+        fault is returned apart from it (DW-461) so the wait loop can crumb the
+        streak."""
         if sess.client is None or not sess.session_id:
-            return None
-        try:
-            resp = sess.client.get(f"/session/{sess.session_id}/message")
-            if resp.status_code != 200:
-                return None
-            usage = _sum_usage(resp.json())
-        except Exception:  # sampling is advisory
-            return None
-        return usage.weighted_total(spec.cache_read_weight)
+            return None, None
+        usage, fault = sess.protocol.sample_usage(sess.client, sess.session_id)
+        if usage is None:
+            return None, fault
+        return usage.weighted_total(spec.cache_read_weight), None
 
     def _capture_usage(self, handle: SessionHandle, sess: _ServerSession) -> str | None:
         """Read usage over HTTP before teardown (state is server-side sqlite):
         dump the raw messages as the transcript and stash the token sum by
         session id for read_usage(). Best-effort in full — the crashed path
-        runs this against a dead server and the verdict must not change."""
+        runs this against a dead server and the verdict must not change.
+
+        A fault with no usage leaves nothing stashed, so read_usage() answers None (untracked)
+        and never a zero; it is crumbed as `usage-capture-failed` with ``stage``
+        (``fetch`` — a GET, its status or its body; ``payload`` — a body of the
+        wrong shape: a malformed V1 message list or V2 session; ``dump`` — the
+        transcript write) and
+        ``error`` (DW-461). The tally is stashed before the dump, so an
+        unwritable transcript no longer costs the usage; nor does a failed
+        transcript read on a protocol whose usage is read apart from it (V2) —
+        that usage is still read, without the transcript (a zero total then
+        stays untracked), and only the dump is skipped.
+
+        A read usage counts each child session as far as it has landed; the
+        children still running (a V2 background subagent) are crumbed as
+        `usage-child-active` with their ``sessions`` ids, and a failure to
+        tell is crumbed as `usage-child-active-failed` with ``error``.
+
+        A usage read WITH a fault (stage ``models``: a V2 child's malformed
+        model ref) is still stashed — its token figure is whole — and the fault
+        is crumbed as `usage-models-partial` with ``stage`` and ``error``, never
+        as `usage-capture-failed`."""
         if sess.client is None or not sess.session_id:
             return None
-        try:
-            resp = sess.client.get(f"/session/{sess.session_id}/message")
-            if resp.status_code != 200:
+        messages, fault = sess.protocol.transcript(sess.client, sess.session_id)
+        if fault is not None:
+            self._note_usage_capture_failed(handle, "fetch", fault)
+            if sess.protocol.usage_reads_transcript:
                 return None
-            messages = resp.json()
+        usage, usage_fault = sess.protocol.usage(sess.client, sess.session_id, messages)
+        if usage is not None:
+            self._stash_usage(sess.session_id, usage)
+            if usage_fault is not None:
+                self._note_lifecycle(
+                    handle.task_id,
+                    "usage-models-partial",
+                    stage=usage_fault.stage,
+                    error=usage_fault.error,
+                )
+        elif usage_fault is not None:
+            self._note_usage_capture_failed(handle, usage_fault.stage, usage_fault.error)
+        if usage is not None or usage_fault is None:
+            self._note_active_children(handle, sess.protocol, sess.client, sess.session_id)
+        if fault is not None:
+            return None
+        try:
             path = self.tasks_dir / handle.task_id / "messages.json"
             path.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
-            self._stash_usage(sess.session_id, _sum_usage(messages))
-            return str(path)
-        except Exception:  # usage is metadata, never a gate
+        except Exception as e:  # the transcript is metadata too
+            self._note_usage_capture_failed(handle, "dump", f"{type(e).__name__}: {e}")
             return None
+        return str(path)
+
+    def _note_usage_capture_failed(self, handle: SessionHandle, stage: str, error: str) -> None:
+        self._note_lifecycle(handle.task_id, "usage-capture-failed", stage=stage, error=error)
+
+    def _note_active_children(
+        self, handle: SessionHandle, protocol: OpencodeProtocol, client: Any, session_id: str
+    ) -> None:
+        active, fault = protocol.active_descendants(client, session_id)
+        if active is None:
+            self._note_lifecycle(handle.task_id, "usage-child-active-failed", error=fault)
+        elif active:
+            self._note_lifecycle(handle.task_id, "usage-child-active", sessions=active)
 
     def _stash_usage(self, session_id: str, usage: TokenUsage) -> None:
         """Write into the capacity-bounded `_usage` stash (see USAGE_STASH_CAP).
@@ -1748,28 +2267,3 @@ class OpencodeDevAdapter(_DevSynthesisMixin, OpencodeHttpAdapter):
         # Never None: the live Popen handle pins the pid, so poll() is always
         # answerable — unlike a tmux transport there is no probe that can hang.
         return proc.poll() is None
-
-
-def _sum_usage(messages: Any) -> TokenUsage:
-    """Sum assistant-message token counts. Reasoning tokens are
-    billed as output; OpenCode's cache read/write map onto the claude-style
-    cache_read/cache_creation fields. Child-session (subagent) tokens are not
-    visible here — the messages endpoint is scoped per session."""
-    usage = TokenUsage()
-    if not isinstance(messages, list):
-        return usage
-    for msg in messages:
-        info = (msg or {}).get("info") or {}
-        if info.get("role") != "assistant":
-            continue
-        tokens = info.get("tokens") or {}
-        cache = tokens.get("cache") or {}
-        usage.add(
-            TokenUsage(
-                input_tokens=int(tokens.get("input") or 0),
-                output_tokens=int(tokens.get("output") or 0) + int(tokens.get("reasoning") or 0),
-                cache_read_tokens=int(cache.get("read") or 0),
-                cache_creation_tokens=int(cache.get("write") or 0),
-            )
-        )
-    return usage

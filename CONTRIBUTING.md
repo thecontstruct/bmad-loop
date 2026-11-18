@@ -81,7 +81,7 @@ git clone https://github.com/YOUR-USERNAME/bmad-loop.git
 cd bmad-loop
 uv sync --all-extras          # deps + all three extras (tui, non-linux, opencode) + dev tools
 uv run pytest -q              # unit + adapter scenarios + tmux integration (-n auto to parallelize)
-uv run pyright                # typecheck — CI runs this same pinned version as its own job
+uv run pyright                # typecheck — CI runs this same pinned version as its own job, also with --pythonplatform Windows/Darwin
 ```
 
 Never `pip install` — uv owns the environment. If you change dependencies, edit `pyproject.toml` and run `uv lock`; CI uses `uv sync --locked` and fails on a stale lock. The pyright version is pinned exactly in the `dev` group, so bump it deliberately — never with `uv lock --upgrade`.
@@ -111,7 +111,7 @@ Never open a new `## [X.Y.Z]` section yourself: a release _promotes_ `## [Unrele
 Releases are cut by maintainers with `scripts/release.py`, which is two-phase:
 
 - **`prepare X.Y.Z`** runs on a release branch. **Promote the CHANGELOG by hand first** — rename `## [Unreleased]` to `## [X.Y.Z] — <ISO date>` and reopen an empty `## [Unreleased]` above it; `prepare` does not do this for you and refuses to run until it is done. It then stamps the version everywhere via `sync_version.py`, regenerates TUI assets when they changed, and commits, leaving the branch ready for a PR.
-- **`publish`** runs on `main` after that PR merges (driven by `.github/workflows/release.yml`) — it creates the tag and GitHub release from the CHANGELOG, and is idempotent.
+- **`publish`** runs on `main` after that PR merges (driven by `.github/workflows/release.yml`) — it creates the tag and GitHub release from the CHANGELOG, and is idempotent. An existing tag is verified, not trusted: the commit it points to on origin must carry the version (or, when `gh release create` loses a race, be exactly the commit this run targeted), and a mismatch fails the publish.
 
 Version strings are stamped only by `scripts/sync_version.py`; never hand-edit them in `pyproject.toml`, `module.yaml`, `marketplace.json`, or `uv.lock`. The version is validated in CI — if you touch it, run `uv run --no-project python scripts/sync_version.py --check`.
 
@@ -208,7 +208,7 @@ Keep messages under 72 characters. Each commit = one logical change.
 - **Keep the control loop deterministic** — orchestration logic is plain Python, never an LLM call. LLMs only run inside disposable coding-CLI sessions.
 - **Python style** is enforced by trunk (ruff, black, isort) at line-length 100 — let `trunk fmt` handle formatting.
 - **Tests** live under `tests/`; add or update them for behavior changes. The mock adapter lets most of the loop run without a live CLI. Where a test belongs and the doctrines it must follow: [docs/testing.md](docs/testing.md).
-- **Skills** ship as markdown under `src/bmad_loop/data/skills/` (the `bmad-loop-*` automation skills).
+- **Skills** ship as markdown under `skills/` (the `bmad-loop-*` automation skills); the wheel bundles them and `npx skills add bmad-code-org/bmad-loop` installs them.
 - **Plugins** extend the orchestrator via a `plugin.toml` manifest — see the [plugin authoring guide](docs/plugin-authoring-guide.md).
 - **New coding CLIs** are usually a TOML profile, not Python — see the CLI adapter section in the [README](README.md) and the [adapter authoring guide](docs/adapter-authoring-guide.md) (use `bmad-loop probe-adapter` to collect the hook/transcript/token data a profile needs).
 

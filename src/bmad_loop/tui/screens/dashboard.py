@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import threading
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -35,8 +36,12 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option, OptionDoesNotExist
 
+from ... import parked_answer
 from ... import policy as policy_mod
 from ... import sprintstatus, stories
+from ...adapters import multiplexer
+from ...adapters.multiplexer import MultiplexerError
+from ...adapters.profile import ProfileError, get_profile
 from ...model import RunState, StoryTask
 from ...runs import RUNS_DIR
 from .. import data, launch
@@ -48,12 +53,40 @@ from ..widgets import (
     Splitter,
     SprintTree,
     StoriesTable,
+    TicketsTable,
     agent_label,
     pause_tag,
     status_cell,
     stopping_tag,
 )
 from .modals import DeferredEntryModal
+
+# `warnings.catch_warnings` swaps the process-wide filters and `showwarning`, so
+# two overlapping captures (the replan worker thread beside a UI-thread load) can
+# restore each other's state out of order; one capture at a time.
+_POLICY_LOAD_LOCK = threading.Lock()
+
+
+def load_policy_noting_deprecations(path: Path) -> tuple[policy_mod.Policy, tuple[str, ...]]:
+    """``policy.load(path)`` plus the text of each ``PolicyDeprecationWarning`` it
+    raised, for the app to toast: Textual captures stderr, so the warning's own
+    print never reaches a dashboard user (DW-603). Records as ``cmd_validate``
+    does — every emission, not once per location — and passes any other warning
+    through ``warnings.showwarning``, also when the load raises."""
+    deprecations: list[str] = []
+    caught: list[warnings.WarningMessage] = []
+    try:
+        with _POLICY_LOAD_LOCK, warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", policy_mod.PolicyDeprecationWarning)
+            pol = policy_mod.load(path)
+    finally:
+        for w in caught:
+            if issubclass(w.category, policy_mod.PolicyDeprecationWarning):
+                deprecations.append(str(w.message))
+            else:
+                warnings.showwarning(w.message, w.category, w.filename, w.lineno, w.file, w.line)
+    return pol, tuple(deprecations)
+
 
 # Resizable-pane geometry, in terminal cells. The MIN_* floors keep a pane from
 # collapsing to nothing when a boundary is dragged or the terminal shrinks; they
@@ -68,6 +101,7 @@ _HSPLITS = ("#split-runs", "#split-deferred", "#split-tasks")
 # Resize-mode actions gated off (key passes through to the focused widget) unless
 # the mode is active. Tab/Shift+Tab are intentionally absent: they stay live and
 # delegate to focus movement when not resizing.
+_PARKED_ACTIONS = frozenset({"approve_parked", "deny_parked"})
 _RESIZE_ACTIONS = frozenset(
     {"resize_up", "resize_down", "resize_left", "resize_right", "resize_done"}
 )
@@ -97,6 +131,14 @@ def _transcript_for_task(state: RunState, task_id: str) -> str | None:
     return found
 
 
+def _counter_cell(count: int, usage_relaunches: int) -> str:
+    """A task row's `dev` / `review` cell: `×N`, plus `↻M` when M of those N
+    sessions were uncharged usage-limit relaunches (#959) — why N can exceed its
+    cap. No `/cap`: `limits.max_usage_relaunches` is shared by both roles."""
+    cell = f"×{count}"
+    return f"{cell} ↻{usage_relaunches}" if usage_relaunches > 0 else cell
+
+
 class _PollContext:
     """Mutable state for polling one selected run. Constructed on the UI
     thread (constructors do no I/O), then mutated only inside the poll worker.
@@ -114,6 +156,16 @@ class _PollContext:
         self.entries: list[dict[str, Any]] = []
         self.log: data.LogView | None = None
         self.log_task: str | None = None
+        # (parked, answerable, fault) of the parked-prompt note the Log pane last
+        # rendered: a change re-renders the pane on a tick the log did not grow
+        self.log_parked_note: tuple[bool, bool, str | None] = (False, False, None)
+        # (adapter, parked_since) the answerable flag was resolved for, and that
+        # flag: the profile is read once per park, not on every tick (#855). A
+        # profile that would not resolve leaves the key unset so the next tick
+        # retries, and its fault is shown in the Log note meanwhile.
+        self.parked_key: tuple[str, float] | None = None
+        self.parked_answerable = False
+        self.parked_fault: str | None = None
         self.attention_seen = 0
         self.first_poll = True
         self.decision_toasted: str | None = None  # dw_id already announced
@@ -123,18 +175,24 @@ class _PollContext:
 class _Snapshot:
     generation: int
     runs: list[data.RunInfo] | None = None  # None: no rescan this tick
+    runs_fault: str | None = None  # the run listing is incomplete (DW-468)
     project_refreshed: bool = False  # sprint + deferred rescanned this tick
     missed_decisions: int = 0  # decisions past sweeps left unanswered
+    missed_decisions_fault: str | None = None  # why that count could not be read (DW-473)
     sprint: sprintstatus.SprintStatus | None = None
     deferred: list[data.DeferredItem] | None = None
     has_run: bool = False
     run_id: str = ""
     status: str = data.UNKNOWN
     stopping: bool = False  # selected run has a stop request pending, either mode (RUNNING only)
-    agent: data.ActiveAgent | None = None  # agent driving the selected run, live only
+    agent: data.ActiveAgent | data.UnreadableAgent | None = None  # live only
     state: RunState | None = None
+    state_fault: str | None = None  # the state shown is a stale last-good read (DW-472)
+    read_faults: tuple[str, ...] = ()  # run-dir files unreadable this tick (DW-475)
     stories_mode: bool = False  # selected run is stories mode (source == "stories")
     stories: list[stories.StoryRow] | None = None  # stories board rows, when stories_mode
+    tickets_mode: bool = False  # selected run is tickets mode (its loader gave a TicketsBoard)
+    tickets: data.TicketsBoard | None = None  # tickets board, when tickets_mode
     new_entries: list[dict[str, Any]] = field(default_factory=list)
     log_task: str | None = None
     log_reset: bool = False
@@ -143,6 +201,10 @@ class _Snapshot:
     log_pinned: bool = False
     log_altscreen: bool = False  # the capture entered a fullscreen (alt-screen) TUI
     log_transcript: str | None = None  # agent JSONL transcript, when an altscreen log has one
+    log_scan_fault: str | None = None  # the altscreen prefix scan could not read the log
+    log_parked: bool = False  # the log task is parked on a permission prompt (#855)
+    parked_answerable: bool = False  # the live park's profile has [parked_answers] (#855)
+    parked_fault: str | None = None  # why that profile could not be resolved (#855)
     attention_reset: bool = False
     new_attention: str = ""
     toast_attention: bool = False
@@ -154,6 +216,10 @@ class DashboardScreen(Screen[None]):
     BINDINGS = [
         Binding("escape", "unpin_log", "follow log", show=False),
         Binding("y", "copy_pane", "copy"),
+        # Answer a parked permission prompt (#855); check_action hides both unless
+        # the live session is parked and its profile has [parked_answers].
+        Binding("Y", "approve_parked", "approve"),
+        Binding("N", "deny_parked", "deny"),
         Binding("ctrl+w", "resize_mode", "resize"),
         # Priority so they beat the focused table/tree/list in resize mode;
         # check_action() disables them (key passes through) when not resizing.
@@ -182,9 +248,14 @@ class DashboardScreen(Screen[None]):
         # policy file degrades to defaults rather than blocking the dashboard. That
         # now covers a file whose BYTES are unreadable too — `policy.load` converts
         # the `UnicodeDecodeError` rather than letting a ValueError past a handler
-        # that runs before the app can draw anything.
+        # that runs before the app can draw anything. Its deprecation notices wait
+        # here for the app to toast once mounted.
+        self.policy_deprecations: tuple[str, ...] = ()
         try:
-            self._tui_policy = policy_mod.load(project / policy_mod.POLICY_FILE).tui
+            pol, self.policy_deprecations = load_policy_noting_deprecations(
+                project / policy_mod.POLICY_FILE
+            )
+            self._tui_policy = pol.tui
         except (policy_mod.PolicyError, OSError):
             self._tui_policy = policy_mod.TuiPolicy()
         self._seeded = False
@@ -210,12 +281,17 @@ class DashboardScreen(Screen[None]):
         # thread workers cancelled but cannot stop them, so without this two
         # threads could feed ctx.log's pyte stream at once (crash)
         self._poll_lock = threading.Lock()
+        # one parked answer in flight at a time: a double-tapped Y/N must not
+        # capture the pane before the first answer's keys land (#855)
+        self._answer_lock = threading.Lock()
         # journal -> log jump state, all owned by the UI thread
         self._log_index: data.LogIndex | None = None
         self._displayed_log_task: str | None = None
         self._pin_task: str | None = None  # show this task's log instead of the active one
         self._pending_jump: tuple[str, int] | None = None  # (task_id, log_pos)
         self._log_follow_tail = True  # stick to newest log lines until a jump pins us
+        self._runs_fault: str | None = None  # last listing fault toasted (DW-468)
+        self._parked_answerable = False  # Y/N live: see check_action (#855)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -226,7 +302,7 @@ class DashboardScreen(Screen[None]):
                 yield runs
                 # The section titles that used to ride each pane's border-top now
                 # ride the splitter bar above that pane (its border-top is dropped
-                # in CSS). split-runs' label tracks the sprint/stories toggle.
+                # in CSS). split-runs' label tracks the sprint/stories/tickets toggle.
                 yield Splitter(
                     horizontal=True,
                     label="Sprint",
@@ -236,6 +312,7 @@ class DashboardScreen(Screen[None]):
                 )
                 yield SprintTree("sprint", id="sprint-tree")
                 yield StoriesTable(id="stories-table")
+                yield TicketsTable(id="tickets-table")
                 yield Splitter(
                     horizontal=True,
                     label="Deferred Work",
@@ -276,14 +353,15 @@ class DashboardScreen(Screen[None]):
         runs.add_column("run", key="run")
         runs.add_column("type", key="type")
         runs.add_column("note", key="note", width=6)  # pause-kind badge for paused runs
-        # the stories board shares the sprint-tree slot; hidden until a stories-mode
-        # run is selected (the poll worker toggles both by the run's source).
+        # the stories and tickets boards share the sprint-tree slot; hidden until a
+        # run of that mode is selected (the poll worker toggles them by its source).
         self.query_one("#stories-table", StoriesTable).display = False
+        self.query_one("#tickets-table", TicketsTable).display = False
         tasks = self.query_one("#tasks", DataTable)
         tasks.add_column("story", key="story", width=30)
         tasks.add_column("phase", key="phase", width=16)
         tasks.add_column("agent", key="agent", width=13)
-        tasks.add_column("dev", key="dev", width=5)
+        tasks.add_column("dev", key="dev", width=6)  # room for `×NN ↻M`
         tasks.add_column("review", key="review", width=6)
         tasks.add_column("tokens", key="tokens", width=12)
         tasks.add_column("info", key="info")
@@ -451,6 +529,56 @@ class DashboardScreen(Screen[None]):
         self._log_follow_tail = True
         self._tick(force_rescan=False)
 
+    def action_approve_parked(self) -> None:
+        self._answer_parked("approve")
+
+    def action_deny_parked(self) -> None:
+        self._answer_parked("deny")
+
+    def _answer_parked(self, choice: parked_answer.Choice) -> None:
+        # The answer path re-checks everything on a fresh capture; this only
+        # refuses early when there is no backend or no run to answer in.
+        if not launch.mux_available():
+            self.notify("multiplexer backend unavailable — cannot answer", severity="error")
+            return
+        run_id = self.selected_run_id
+        if run_id is None:
+            self.notify("no run selected", severity="warning")
+            return
+        self._answer_parked_worker(run_id, choice)
+
+    @work(thread=True, exclusive=True, group="parked-answer")
+    def _answer_parked_worker(self, run_id: str, choice: parked_answer.Choice) -> None:
+        # Worker thread: the capture and send are mux round-trips, and notify()
+        # is marshalled back to the UI thread. exclusive=True cannot stop a
+        # running thread, so _answer_lock drops a press made while one is in
+        # flight instead of letting it capture the still-open dialog.
+        if not self._answer_lock.acquire(blocking=False):
+            self.app.call_from_thread(
+                self.notify,
+                f"{choice} not sent: an answer is already being sent",
+                severity="warning",
+            )
+            return
+        try:
+            outcome = parked_answer.answer(
+                self.project, run_id, choice, mux=multiplexer.get_multiplexer()
+            )
+        except MultiplexerError as e:
+            outcome = parked_answer.AnswerOutcome(False, str(e))
+        finally:
+            self._answer_lock.release()
+        if outcome.sent:
+            self.app.call_from_thread(self.notify, outcome.reason, markup=False)
+        else:
+            self.app.call_from_thread(
+                self.notify,
+                f"{choice} not sent: {outcome.reason} — attach (a) to answer",
+                severity="warning",
+                markup=False,
+                timeout=10,
+            )
+
     def action_copy_pane(self) -> None:
         """Copy the whole Log/Attention pane to the clipboard (mouse-free
         alternative to click-drag + ctrl+c). Only the two RichLog tabs hold
@@ -503,7 +631,7 @@ class DashboardScreen(Screen[None]):
 
     def _freeze_left(self) -> None:
         """Switch the left column to explicit Runs/Deferred heights with the
-        Sprint/Stories slot as the sole vertical flex. Idempotent."""
+        Sprint/Stories/Tickets slot as the sole vertical flex. Idempotent."""
         if self._left_frozen:
             return
         self._left_frozen = True
@@ -514,7 +642,7 @@ class DashboardScreen(Screen[None]):
         # #runs' titled border.
         runs_seed = max(_MIN_PANE, self.query_one("#runs").outer_size.height)
         deferred_seed = max(_MIN_PANE, self.query_one("#deferred").outer_size.height)
-        for wid in ("#sprint-tree", "#stories-table"):
+        for wid in ("#sprint-tree", "#stories-table", "#tickets-table"):
             self.query_one(wid).styles.height = "1fr"
         if self.runs_height <= 0:
             self.runs_height = runs_seed
@@ -665,6 +793,8 @@ class DashboardScreen(Screen[None]):
         # widget (Tab/Shift+Tab stay live — see action_resize_cycle).
         if action in _RESIZE_ACTIONS and not self._resize_mode:
             return False
+        if action in _PARKED_ACTIONS and not self._parked_answerable:
+            return False
         return True
 
     def action_resize_mode(self) -> None:
@@ -757,15 +887,18 @@ class DashboardScreen(Screen[None]):
         try:
             snap = _Snapshot(generation=generation)
             if rescan:
-                snap.runs = data.discover_runs(self.project)
+                snap.runs, snap.runs_fault = data.discover_runs(self.project)
                 snap.project_refreshed = True
                 snap.sprint = data.sprint_overview(self.project)
                 snap.deferred = data.deferred_entries(self.project)
-                snap.missed_decisions = len(data.pending_missed_decisions(self.project))
+                missed = data.pending_missed_decisions(self.project)
+                snap.missed_decisions = len(missed.items)
+                snap.missed_decisions_fault = missed.fault
             if ctx is not None:
                 snap.has_run = True
                 snap.run_id = ctx.run_dir.name
                 snap.state = ctx.watcher.state()
+                snap.state_fault = ctx.watcher.state_fault
                 snap.status = ctx.watcher.status()
                 # A pending stop is the control file's presence in either mode,
                 # meaningful while an engine is still around to consume it — RUNNING
@@ -774,12 +907,22 @@ class DashboardScreen(Screen[None]):
                 snap.stopping = (
                     snap.status in (data.RUNNING, data.UNKNOWN) and ctx.watcher.stopping()
                 )
-                if snap.state is not None and snap.state.source == "stories":
-                    # per-run board: re-derived each tick (only while a stories run
-                    # is selected) so it tracks the dev sessions writing story specs.
-                    snap.stories_mode = True
-                    snap.stories = data.stories_overview(self.project, snap.state.spec_folder)
-                snap.new_entries = ctx.journal.read_new()
+                # per-run board (`data.BOARD_LOADERS`): re-derived each tick (only while
+                # a stories or tickets run is selected) so it tracks the sessions
+                # writing specs and plans. The tickets loader is stat-gated and may
+                # spawn tickets.py, which is why it runs here, on the poll worker.
+                board = (
+                    data.BOARD_LOADERS.get(snap.state.source) if snap.state is not None else None
+                )
+                if snap.state is not None and board is not None:
+                    loaded = board(self.project, snap.state)
+                    if isinstance(loaded, data.TicketsBoard):
+                        snap.tickets_mode = True
+                        snap.tickets = loaded
+                    else:
+                        snap.stories_mode = True
+                        snap.stories = loaded
+                snap.new_entries = ctx.journal.read_new(pin=snap.state)
                 ctx.entries.extend(snap.new_entries)
                 del ctx.entries[:-_MAX_ENTRIES]
                 snap.decision = data.pending_decision(ctx.entries)
@@ -801,14 +944,35 @@ class DashboardScreen(Screen[None]):
                     )
                     snap.log_reset = True
                 snap.log_task = task
-                if ctx.log is not None and (ctx.log.read_new() or snap.log_reset):
+                live = snap.agent if isinstance(snap.agent, data.ActiveAgent) else None
+                snap.log_parked = (
+                    live is not None
+                    and live.parked_since is not None
+                    and task is not None
+                    and live.task_id == task
+                )
+                # The parked note sits above the log, so a park opening or closing
+                # re-renders the pane even on a tick the log itself did not grow.
+                snap.parked_answerable = self._parked_answerable_in(ctx, live)
+                snap.parked_fault = ctx.parked_fault
+                note = (snap.log_parked, snap.parked_answerable, snap.parked_fault)
+                parked_changed = note != ctx.log_parked_note
+                ctx.log_parked_note = note
+                if ctx.log is not None and (ctx.log.read_new() or snap.log_reset or parked_changed):
                     snap.log_lines = ctx.log.render()
                     snap.log_index = ctx.log.index()
                 if ctx.log is not None and ctx.log.altscreen_seen:
                     snap.log_altscreen = True
                     if snap.state is not None and task:
                         snap.log_transcript = _transcript_for_task(snap.state, task)
+                elif ctx.log is not None:
+                    snap.log_scan_fault = ctx.log.altscreen_scan_fault
                 attention = ctx.watcher.attention()
+                snap.read_faults = tuple(
+                    fault
+                    for fault in (ctx.journal.fault, ctx.watcher.attention_fault)
+                    if fault is not None
+                )
                 if len(attention) < ctx.attention_seen:
                     snap.attention_reset = True
                     snap.new_attention = attention
@@ -821,7 +985,34 @@ class DashboardScreen(Screen[None]):
         finally:
             self._poll_lock.release()
 
+    def _parked_answerable_in(self, ctx: _PollContext, live: data.ActiveAgent | None) -> bool:
+        """Whether `live` is parked on a permission prompt its profile can answer
+        (`[parked_answers]`). Worker-side; the profile is resolved once per park.
+        A profile that will not resolve offers no keys, records its fault in
+        `ctx.parked_fault` for the Log note, and is retried on the next tick;
+        the operator still has attach."""
+        if live is None or live.parked_since is None:
+            ctx.parked_key, ctx.parked_answerable, ctx.parked_fault = None, False, None
+            return False
+        key = (live.name, live.parked_since)
+        if key != ctx.parked_key:
+            try:
+                profile = get_profile(live.name, self.project)
+            except (ProfileError, OSError) as e:
+                ctx.parked_key, ctx.parked_answerable = None, False
+                ctx.parked_fault = f"profile {live.name!r} unresolved: {e}"
+            else:
+                ctx.parked_key = key
+                ctx.parked_answerable = profile.parked_answers is not None
+                ctx.parked_fault = None
+        return ctx.parked_answerable
+
     # ------------------------------------------------------------ applying
+
+    def _set_parked_answerable(self, answerable: bool) -> None:
+        if answerable != self._parked_answerable:
+            self._parked_answerable = answerable
+            self.refresh_bindings()
 
     def _apply(self, snap: _Snapshot) -> None:
         # A thread-worker poll delivers its snapshot here via call_from_thread; that
@@ -833,13 +1024,16 @@ class DashboardScreen(Screen[None]):
         if not self.is_running:
             return
         if snap.runs is not None:
-            self._apply_runs(snap.runs)
+            self._apply_runs(snap.runs, snap.runs_fault)
         if snap.project_refreshed:
             self._apply_sprint_tree(snap.sprint)
             self._apply_deferred(snap.deferred)
-            self._apply_missed_decisions(snap.missed_decisions)
+            self._apply_missed_decisions(snap.missed_decisions, snap.missed_decisions_fault)
+        if not snap.has_run:
+            self._set_parked_answerable(False)
         if not snap.has_run or snap.generation != self._generation:
             return  # selection changed mid-poll: per-run parts are stale
+        self._set_parked_answerable(snap.parked_answerable)
 
         self._decision = snap.decision
         header = self.query_one("#runheader", RunHeader)
@@ -855,10 +1049,13 @@ class DashboardScreen(Screen[None]):
                 snap.decision,
                 stopping=snap.stopping,
                 agent=snap.agent,
+                state_fault=snap.state_fault,
+                read_faults=snap.read_faults,
             )
         self._apply_board(snap)
         if snap.state is not None:
-            self._apply_tasks(snap.state, snap.agent)
+            live = snap.agent if isinstance(snap.agent, data.ActiveAgent) else None
+            self._apply_tasks(snap.state, live)
         if snap.toast_decision and snap.decision is not None:
             self.notify(
                 snap.decision[1] or snap.decision[0],
@@ -898,6 +1095,18 @@ class DashboardScreen(Screen[None]):
             if snap.log_task:
                 suffix = " (pinned — esc to follow)" if snap.log_pinned else ""
                 log.write(Text(f"— {snap.log_task}.log —{suffix}", style="dim"), scroll_end=False)
+            if snap.log_parked:
+                # The session is parked on a permission prompt (#855): the pane
+                # below shows the dialog, and nothing moves until it is answered
+                # in the session's window or the CLI's countdown denies it.
+                if snap.parked_answerable:
+                    keys = "Y approve · N deny · a attach"
+                elif snap.parked_fault:
+                    keys = f"a attach to answer (answer keys off: {snap.parked_fault})"
+                else:
+                    keys = "a attach to answer"
+                note = "⚠ parked on a permission prompt — " + keys
+                log.write(Text(note, style="yellow"), scroll_end=False)
             if snap.log_altscreen:
                 # A fullscreen (alt-screen) TUI repaints in place, so the emulated
                 # pane collapses to the final frame. Flag it so the partial view is
@@ -905,6 +1114,14 @@ class DashboardScreen(Screen[None]):
                 note = "⚠ fullscreen (alt-screen) session — this pane shows only the final frame"
                 if snap.log_transcript:
                     note += f"; full transcript: {snap.log_transcript}"
+                log.write(Text(note, style="yellow"), scroll_end=False)
+            elif snap.log_scan_fault:
+                # DW-475: the cold-open scan for a fullscreen switch could not read
+                # the log head, so "no warning above" is not "not fullscreen".
+                note = (
+                    "⚠ could not scan this log's head for a fullscreen switch"
+                    f" ({snap.log_scan_fault}) — this pane may show only the final frame"
+                )
                 log.write(Text(note, style="yellow"), scroll_end=False)
             if snap.log_lines is not None and snap.log_lines.plain:
                 log.write(snap.log_lines, scroll_end=at_end)
@@ -925,9 +1142,15 @@ class DashboardScreen(Screen[None]):
                 last = snap.new_attention.strip().splitlines()[-1]
                 self.notify(last, title="attention", severity="warning", timeout=10)
 
-    def _apply_runs(self, runs: list[data.RunInfo]) -> None:
+    def _apply_runs(self, runs: list[data.RunInfo], fault: str | None = None) -> None:
         table = self.query_one("#runs", DataTable)
-        self._apply_attention(table, runs)
+        self._apply_attention(table, runs, fault)
+        if fault != self._runs_fault:
+            # Toasted once per distinct fault, not every rescan; the border title
+            # keeps saying it for as long as it holds.
+            self._runs_fault = fault
+            if fault is not None:
+                self.notify(f"run listing incomplete: {fault}", severity="warning", markup=False)
         ids = [r.run_id for r in runs]
         if not runs:
             if self._run_rows:
@@ -984,8 +1207,8 @@ class DashboardScreen(Screen[None]):
             cells = {
                 "phase": str(task.phase),
                 "agent": self._agent_cell(task, key, agent),
-                "dev": f"×{task.attempt}",
-                "review": f"×{task.review_cycle}",
+                "dev": _counter_cell(task.attempt, task.dev_usage_relaunches),
+                "review": _counter_cell(task.review_cycle, task.review_usage_relaunches),
                 "tokens": tokens,
                 "info": info,
                 "raw": raw,  # must be last — matches add_column order
@@ -1003,35 +1226,47 @@ class DashboardScreen(Screen[None]):
         driving THIS task, else the last session that stamped an adapter identity
         (#153 phase 1), else "-" (no live agent and no stamped history)."""
         if agent is not None and agent.story_key == key:
-            return agent_label(agent.name, agent.model)
+            # The CLI-reported model (#859) when the hook sent one.
+            model = agent.reported_model if agent.reported_model is not None else agent.model
+            return agent_label(agent.name, model)
         for record in reversed(task.sessions):
             if record.adapter:
                 return agent_label(record.adapter, record.model)
         return "-"
 
-    def _apply_attention(self, table: DataTable, runs: list[data.RunInfo]) -> None:
+    def _apply_attention(
+        self, table: DataTable, runs: list[data.RunInfo], fault: str | None = None
+    ) -> None:
         """Global attention indicator: how many runs are paused awaiting a human.
         Shown on the runs-table border title, consistent with the per-run pause
-        badge and the ATTENTION-file notify machinery."""
+        badge and the ATTENTION-file notify machinery. An incomplete listing
+        (DW-468) says so there too: an empty table over an unreadable runs dir is
+        not "no runs"."""
         waiting = sum(1 for r in runs if r.status == data.PAUSED)
-        table.border_title = f"Runs — ⚑ {waiting} need attention" if waiting else "Runs"
+        title = f"Runs — ⚑ {waiting} need attention" if waiting else "Runs"
+        table.border_title = f"{title} — listing incomplete" if fault is not None else title
 
     def _apply_board(self, snap: _Snapshot) -> None:
-        """Toggle the sprint tree vs the stories board by the selected run's mode
-        and refresh whichever is live. The stories board is per-run (keyed by the
-        run's spec folder); the sprint tree is project-level and painted
-        separately on rescan."""
+        """Toggle the sprint tree, the stories board and the tickets board by the
+        selected run's mode and refresh whichever is live. The stories and
+        tickets boards are per-run (keyed by the run's spec folder or pinned
+        initiative); the sprint tree is project-level and painted separately on
+        rescan."""
         sprint_tree = self.query_one("#sprint-tree", SprintTree)
         stories_table = self.query_one("#stories-table", StoriesTable)
-        sprint_tree.display = not snap.stories_mode
+        tickets_table = self.query_one("#tickets-table", TicketsTable)
+        sprint_tree.display = not (snap.stories_mode or snap.tickets_mode)
         stories_table.display = snap.stories_mode
+        tickets_table.display = snap.tickets_mode
         # The splitter above this slot carries its section title; set_label already
         # no-ops when the label is unchanged (this runs every poll tick).
         self.query_one("#split-runs", Splitter).set_label(
-            "Stories" if snap.stories_mode else "Sprint"
+            "Tickets" if snap.tickets_mode else "Stories" if snap.stories_mode else "Sprint"
         )
         if snap.stories_mode:
             stories_table.update_stories(snap.stories)
+        elif snap.tickets_mode:
+            tickets_table.update_tickets(snap.tickets)
 
     def _apply_sprint_tree(self, ss: sprintstatus.SprintStatus | None) -> None:
         if ss is self._last_sprint:
@@ -1064,8 +1299,12 @@ class DashboardScreen(Screen[None]):
             except OptionDoesNotExist:
                 pass
 
-    def _apply_missed_decisions(self, count: int) -> None:
+    def _apply_missed_decisions(self, count: int, fault: str | None = None) -> None:
         deferred = self.query_one("#deferred", OptionList)
+        if fault is not None:
+            # DW-473: a read that failed is not "0 to answer"; `d` names the fault.
+            deferred.border_title = "Deferred Work — decisions unreadable (d)"
+            return
         deferred.border_title = (
             f"Deferred Work — {count} to answer (d)" if count else "Deferred Work"
         )

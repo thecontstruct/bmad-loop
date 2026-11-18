@@ -14,16 +14,18 @@ from conftest import (
     git,
     install_build_auto_skill,
     nested_repo_root_paths,
+    scripted_verify_runner,
     seed_outer_decoy_ledger,
     write_gated_ledger,
     write_ledger,
     write_spec,
+    write_sprint,
 )
 
 from bmad_loop import stories, verify
-from bmad_loop.adapters.base import SessionResult
+from bmad_loop.adapters.base import USAGE_LIMIT_WAIT, SessionResult
 from bmad_loop.adapters.mock import MockAdapter
-from bmad_loop.engine import Engine
+from bmad_loop.engine import USAGE_RELAUNCH_RESUME, Engine
 from bmad_loop.install import (
     DEV_PRIMITIVE_NEW,
     STORIES_PROBE_FILE,
@@ -32,6 +34,7 @@ from bmad_loop.install import (
 )
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import (
+    PAUSE_ENVIRONMENT,
     PAUSE_ESCALATION,
     PAUSE_PLAN_CHECKPOINT,
     PAUSE_SPEC_APPROVAL,
@@ -45,15 +48,18 @@ from bmad_loop.model import (
 from bmad_loop.plugins import PluginRegistry
 from bmad_loop.plugins.model import LoadedPlugin, PluginManifest, WorkflowSpec
 from bmad_loop.policy import (
+    EnvironmentPolicy,
     GatesPolicy,
+    LimitsPolicy,
     NotifyPolicy,
+    OperatorPolicy,
     Policy,
     ReviewPolicy,
     ScmPolicy,
     VerifyPolicy,
 )
 from bmad_loop.runs import STOP_REQUEST_FILE, graceful_stop_requested
-from bmad_loop.stories_engine import StoriesEngine
+from bmad_loop.stories_engine import StoriesEngine, _checkpoint_flags
 from bmad_loop.verify import read_frontmatter, rev_parse_head, status_of, worktree_clean
 
 QUIET = NotifyPolicy(desktop=False, file=True)
@@ -309,6 +315,36 @@ def test_two_story_happy_path(project):
     assert engine.state.tasks["2"].phase == Phase.DONE
 
 
+def test_run_end_retrospective_is_inert_in_stories_mode(project, monkeypatch):
+    """DW-488: stories mode has no epics (every picked story is the epic-0
+    sentinel), so run end fires no retrospective gate — even over a board whose
+    epic-0 stories all read done, which the Engine's gate would take as a
+    complete epic.
+
+    Ablation: delete the `has_epics` guard at the top of
+    `Engine._run_end_retrospective` and the gate reads the stories source's epic
+    progress, journaling `retro-run-end-skipped`."""
+    from bmad_loop import gates
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(gates, "notify", lambda _p, _d, title, msg, **_k: sent.append((title, msg)))
+    write_sprint(project, {"epic-0": "done", "0-1-x": "done", "epic-0-retrospective": "optional"})
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(
+        project,
+        [stories_dev_effect()],
+        policy=_stories_policy(gates=GatesPolicy(mode="none", retrospective="notify")),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and engine.state.finished
+    assert engine.state.current_epic == 0
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert not any(k.startswith("retro-") for k in kinds)
+    assert not any("retrospective" in f"{title} {msg}" for title, msg in sent)
+
+
 def test_story_review_gate_journals_its_verify_commands(project):
     """`StoriesEngine._verify_review` threads the base engine's review sink, so a
     stories-mode review-leg verifier pass lands the same `verify-command-result`
@@ -532,25 +568,6 @@ def test_skips_done_on_disk_and_resumes_later(project):
     assert dev_prompts == ["/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 2."]
 
 
-def test_blocked_on_disk_pauses_for_resolve(project):
-    folder = setup_stories(project, [entry("1"), entry("2")])
-    write_spec(folder / "stories" / "1-slug.md", "blocked", rev_parse_head(project.project))
-    git(project.project, "add", "-A")
-    git(project.project, "commit", "-q", "-m", "story 1 blocked")
-
-    engine, adapter = make_engine(project, [])  # no session should run
-    summary = engine.run()
-    assert summary.paused
-    persisted = load_state(engine.run_dir)
-    assert persisted.paused_stage == PAUSE_ESCALATION
-    assert persisted.paused_story_key == "1"
-    assert not any(s.role == "dev" for s in adapter.sessions)  # never leapfrogged to story 2
-    # an ESCALATED task is recorded (spec path attached) so resolve/rearm act on it
-    wedged = persisted.tasks["1"]
-    assert wedged.phase == Phase.ESCALATED
-    assert wedged.spec_file == str(folder / "stories" / "1-slug.md")
-
-
 def test_bare_resume_does_not_leapfrog_a_wedged_story(project):
     """MAJOR-A: a wedge (story 1 blocked on disk → ESCALATED task persisted) must
     not be leapfrogged by a plain `bmad-loop resume` that never resolved it. The
@@ -574,6 +591,50 @@ def test_bare_resume_does_not_leapfrog_a_wedged_story(project):
     assert persisted.paused_stage == PAUSE_ESCALATION
     assert persisted.paused_story_key == "1"  # re-paused on the SAME story, not story 2
     assert not any(s.role == "dev" for s in radapter.sessions)  # story 2 never dispatched
+
+
+def test_unresolved_escalation_key_matches_the_shared_seam(project):
+    """`CheckpointFlowMixin._unresolved_escalation_key` and resolve's admission
+    (#958) share `escalation.unresolved_escalation_keys`: a stories run skips an
+    attempt-0 wedge in both."""
+    from bmad_loop.escalation import unresolved_escalation_keys
+
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(project, [])
+    assert engine.state.source == "stories"
+    engine.state.tasks["w"] = StoryTask(story_key="w", epic=1, phase=Phase.ESCALATED, attempt=0)
+    assert engine._unresolved_escalation_key() is None
+    engine.state.tasks["x"] = StoryTask(story_key="x", epic=1, phase=Phase.ESCALATED, attempt=1)
+    assert unresolved_escalation_keys(engine.state) == ["x"]
+    assert engine._unresolved_escalation_key() == "x"
+
+
+def test_bare_resume_finishes_after_a_wedge_is_fixed_by_hand(project):
+    """A pick-time wedge's designed exit is a hand fix plus a bare resume. The
+    run-end never-finish-over-ESCALATED guard (DW-386) must not re-pause on the
+    stale attempt-0 wedge record once the drained schedule has cleared it —
+    the only way past would be a re-arm that re-drives the finished story."""
+    folder = setup_stories(project, [entry("1"), entry("2")])
+    sp1 = folder / "stories" / "1-slug.md"
+    write_spec(sp1, "blocked", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story 1 blocked")
+
+    engine, _ = make_engine(project, [])
+    assert engine.run().paused
+    assert load_state(engine.run_dir).tasks["1"].phase == Phase.ESCALATED
+
+    write_spec(sp1, "done", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story 1 finished by hand")
+
+    resumed, radapter = resume_engine(project, engine, [stories_dev_effect()])
+    rsummary = resumed.run()
+    assert not rsummary.paused and rsummary.done == 1  # story 2 only
+    persisted = load_state(resumed.run_dir)
+    assert persisted.finished
+    dev_prompts = [s.prompt for s in radapter.sessions if s.role == "dev"]
+    assert dev_prompts == ["/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 2."]
 
 
 def test_bare_resume_repauses_inrun_escalation_with_resumable_spec(project):
@@ -710,7 +771,7 @@ def test_plan_halt_leg_true_for_fresh_spec_checkpoint(project):
     setup_stories(project, [entry("1", spec_checkpoint=True)])
     engine, _ = make_engine(project, [])
     task = StoryTask(story_key="1", epic=0)
-    assert engine._plan_halt_leg(task, engine._entry_for(task)) is True
+    assert engine._plan_halt_leg(task, _checkpoint_flags(engine._entry_for(task))) is True
     assert "Halt after planning." in engine._dev_prompt(task, None)
 
 
@@ -720,7 +781,7 @@ def test_plan_halt_leg_false_once_plan_produced(project):
     write_spec(folder / "stories" / "1-slug.md", "ready-for-dev", rev_parse_head(project.project))
     engine, _ = make_engine(project, [])
     task = StoryTask(story_key="1", epic=0)
-    assert engine._plan_halt_leg(task, engine._entry_for(task)) is False
+    assert engine._plan_halt_leg(task, _checkpoint_flags(engine._entry_for(task))) is False
     assert "Halt after planning" not in engine._dev_prompt(task, None)
 
 
@@ -729,7 +790,7 @@ def test_plan_halt_leg_false_without_spec_checkpoint(project):
     setup_stories(project, [entry("1")])
     engine, _ = make_engine(project, [])
     task = StoryTask(story_key="1", epic=0)
-    assert engine._plan_halt_leg(task, engine._entry_for(task)) is False
+    assert engine._plan_halt_leg(task, _checkpoint_flags(engine._entry_for(task))) is False
 
 
 def test_plan_halt_env_only_on_leg_one(project):
@@ -740,6 +801,30 @@ def test_plan_halt_env_only_on_leg_one(project):
     assert engine._extra_session_env(task, "dev")["BMAD_LOOP_PLAN_HALT"] == "1"
     # review sessions never carry it
     assert "BMAD_LOOP_PLAN_HALT" not in engine._extra_session_env(task, "review")
+
+
+def test_review_demotion_park_is_inert_in_stories_mode(project):
+    """`[operator] on_review_demotion = "park"` with parking itself ENABLED: stories
+    mode still never takes a review demotion, because `_review_demotion_parks` keys
+    on the mode's `_operator_park_enabled` seam (False here), not on
+    `policy.operator.enabled` — and so its review prompt never offers the park.
+
+    Ablation: key `_review_demotion_parks` on `policy.operator.enabled` and both
+    assertions redden."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(
+        project,
+        [],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            operator=OperatorPolicy(enabled=True, on_review_demotion="park"),
+        ),
+    )
+    task = StoryTask(story_key="1", epic=0, spec_file=str(story_spec(project, "1")))
+
+    assert engine._review_demotion_parks() is False
+    assert "awaiting-operator" not in engine._review_prompt(task)
 
 
 def test_review_prompt_carries_no_sprint_board_clause(project):
@@ -775,6 +860,127 @@ def test_review_prompt_carries_no_sprint_board_clause(project):
         f"resolution."
     )
     assert prompt.endswith("the orchestrator owns their status and resolution.")
+
+
+def test_env_claim_clause_rides_stories_dev_prompts_only_with_probes(project, tmp_path):
+    """DW-523: the environment-claim clause ends the invocation line on both
+    stories legs (after `Halt after planning.`, before `invoke_dev_with`) while
+    probes are configured, and is absent — the prompt byte-identical — without.
+    Ablation: drop `env_sentence` from `_stories_dev_prompt` and the probed
+    prompts lose the clause."""
+    setup_stories(project, [entry("1", invoke_dev_with="Use Redis.")])
+    plain, _ = make_engine(project, [])
+    probed, _ = make_engine(
+        project, [], policy=Policy(environment=EnvironmentPolicy(probes=("exit 0",)))
+    )
+    clause = probed._environment_claim_instruction()
+    assert clause
+    task = StoryTask(story_key="1", epic=0)
+    fresh = probed._dev_prompt(task, None)
+    assert fresh == plain._dev_prompt(task, None).replace(
+        "Story id: 1.\n", f"Story id: 1. {clause}\n", 1
+    )
+    task.spec_file = str(story_spec(project, "1"))
+    story_spec(project, "1").parent.mkdir(parents=True, exist_ok=True)
+    write_spec(story_spec(project, "1"), "done", "abc")
+    feedback = tmp_path / "fb.md"
+    feedback.write_text("boom")
+    before = plain._dev_prompt(task, feedback)
+    assert clause not in before
+    assert probed._dev_prompt(task, feedback) == f"{before} {clause}"
+
+
+def test_usage_relaunch_prompt_keeps_the_fresh_legs_planner_channel(project, monkeypatch):
+    """DW-615 review: the kept-tree relaunch keeps what the fresh stories leg
+    carries — `Halt after planning.` on a plan-halt leg, the planner's
+    `invoke_dev_with` verbatim and the parked-work notice paragraph. Ablation
+    (performed): drop any of the three appends and this FAILS."""
+    setup_stories(project, [entry("1", invoke_dev_with="Use Redis.")])
+    engine, _ = make_engine(project, [])
+    spec = story_spec(project, "1")
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(spec, "draft", "abc")
+    task = StoryTask(story_key="1", epic=0)
+    monkeypatch.setattr(engine, "_plan_halt_leg", lambda _task, _flags: True)
+    monkeypatch.setattr(engine, "_retry_preserve_notice", lambda _task: "PARKED")
+
+    prompt = engine._usage_relaunch_prompt(task)
+
+    assert prompt == (
+        f"/bmad-dev-auto Resume the autonomous dev session on the spec at `{spec}`. "
+        f"{USAGE_RELAUNCH_RESUME} Halt after planning.\nUse Redis.\n\nPARKED"
+    )
+
+
+def test_usage_relaunch_prompt_names_the_story_spec_with_stories_clauses(project, tmp_path):
+    """DW-615: the kept-tree usage relaunch names the id-keyed spec and the
+    resume sentence, followed by this mode's clauses only (the environment
+    claim) — no sprint-board or park clause. None (roll back) until the spec is
+    on disk. The task carries no `spec_file`, as a stories dispatch leaves it
+    until a session completes: the spec is resolved by id. Ablation
+    (performed): drop the resume sentence, or require `task.spec_file`, and
+    this FAILS."""
+    setup_stories(project, [entry("1")])
+    probed, _ = make_engine(
+        project, [], policy=Policy(environment=EnvironmentPolicy(probes=("exit 0",)))
+    )
+    clause = probed._environment_claim_instruction()
+    spec = story_spec(project, "1")
+    task = StoryTask(story_key="1", epic=0)
+    assert probed._usage_relaunch_prompt(task) is None
+
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(spec, "in-progress", "abc")
+    assert probed._usage_relaunch_prompt(task) == (
+        f"/bmad-dev-auto Resume the autonomous dev session on the spec at `{spec}`. "
+        f"{USAGE_RELAUNCH_RESUME} {clause}"
+    )
+    assert read_frontmatter(spec)["status"] == "in-progress"
+
+
+def test_usage_relaunch_keeps_a_first_attempts_tree_and_names_the_spec_it_wrote(project):
+    """DW-615: a first stories attempt dispatched folder+id has no `spec_file`;
+    when a usage limit cuts it off after it wrote the id-keyed spec, the
+    relaunch keeps its tree and names that spec, and the story then lands.
+    ABLATION, performed: require `task.spec_file` in `_usage_relaunch_prompt`
+    and the relaunch rolls back (`no-spec`) onto a tree without the partial
+    file."""
+    setup_stories(project, [entry("1")])
+    evidence = "pane matched 'usage-pattern': session limi" + "t · resets 7:20pm"
+    seen: list[bool] = []
+    finish = stories_dev_effect()
+
+    def cut_off(spec) -> SessionResult:
+        cwd = Path(spec.cwd)
+        stories_dir = cwd / spec.env["BMAD_LOOP_SPEC_FOLDER"] / "stories"
+        stories_dir.mkdir(parents=True, exist_ok=True)
+        write_spec(stories_dir / "1-slug.md", "in-progress", rev_parse_head(cwd))
+        (cwd / "partial.txt").write_text("half done\n")
+        return SessionResult(
+            status="stalled",
+            parked=True,
+            parked_evidence=evidence,
+            usage_limited=evidence,
+            usage_limit_class=USAGE_LIMIT_WAIT,
+        )
+
+    def relaunched(spec) -> SessionResult:
+        seen.append((Path(spec.cwd) / "partial.txt").exists())
+        return finish(spec)
+
+    policy = _stories_policy(limits=LimitsPolicy(usage_limit_action="relaunch", max_dev_attempts=1))
+    engine, adapter = make_engine(project, [cut_off, relaunched], policy=policy)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert seen == [True]
+    spec = story_spec(project, "1")
+    assert adapter.sessions[1].prompt.startswith(
+        f"/bmad-dev-auto Resume the autonomous dev session on the spec at `{spec}`. "
+    )
+    rows = [e for e in engine.journal.entries() if e["kind"] == "dev-relaunch-tree"]
+    assert [(e["kept"], e["reason"]) for e in rows] == [(True, "spec-named")]
 
 
 def test_dev_prompt_repair_leg_is_explicit_spec_resume(project, tmp_path):
@@ -1057,6 +1263,84 @@ def test_plan_checkpoint_pause_then_resume_implements(project):
     leg2 = next(s for s in radapter.sessions if s.role == "dev")
     assert "Halt after planning" not in leg2.prompt
     assert "BMAD_LOOP_PLAN_HALT" not in leg2.env
+
+
+def test_leg2_dispatch_pause_keeps_the_plan(project, tmp_path):
+    """DW-523 x spec_checkpoint: the plan-checkpoint resume dispatches leg 2 (the
+    implement leg) through the dev dispatch gate. A failing probe there pauses at
+    `environment` with the task at PENDING — but `baseline_commit` is still leg 1's,
+    so the next resume must take the no-rollback `resume-env-dispatch` arm, not the
+    restart arm that resets to that baseline and throws the reviewed plan away.
+
+    The operator commits the reviewed (edited) plan while paused — the shape that
+    makes a rollback observable: the spec folder is under output_folder, so an
+    UNTRACKED plan would survive the reset either way, while a committed one is
+    reverted by it (and the re-drive would then be a plan-halt leg again).
+
+    Ablation, performed: delete the `env_role == "dev" and task.phase ==
+    Phase.PENDING` arm of `Engine._finish_inflight` and the final resume falls
+    through to `resume-restart` (rollback_on_failure=True, the `_stories_policy`
+    default): the reset reverts the operator's plan commit, so leg 2 dispatches as
+    a plan-halt leg on a missing spec and this test reds on the captured plan."""
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    marker = tmp_path / "env-up"
+    marker.write_text("", encoding="utf-8")
+    script = tmp_path / "probe.py"
+    script.write_text(
+        f"import os, sys\nsys.exit(0 if os.path.exists(r'{marker}') else 7)\n", encoding="utf-8"
+    )
+    policy = _stories_policy(
+        environment=EnvironmentPolicy(probes=(f'"{sys.executable}" "{script}"',))
+    )
+    engine, _ = make_engine(project, [stories_checkpoint_effect()], policy=policy)
+
+    # leg 1: probes healthy, plans, pauses for the plan review
+    assert engine.run().paused
+    assert load_state(engine.run_dir).paused_stage == PAUSE_PLAN_CHECKPOINT
+    spec = story_spec(project, "1")
+    assert status_of(read_frontmatter(spec)) == "ready-for-dev"
+    # the operator reviews + edits the plan and commits it
+    spec.write_text(spec.read_text(encoding="utf-8") + "\nOperator: approved.\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "reviewed plan")
+    plan = spec.read_text(encoding="utf-8")
+
+    # resume 1: the environment is down — leg 2's dispatch gate pauses
+    marker.unlink()
+    resumed, radapter = resume_engine(project, engine, [stories_checkpoint_effect()])
+    rsummary = resumed.run()
+    assert rsummary.paused and rsummary.done == 0
+    assert radapter.sessions == []  # no leg-2 session ran
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ENVIRONMENT
+    task = persisted.tasks["1"]
+    assert task.phase == Phase.PENDING
+    assert task.env_fault_site == "probe:dispatch:dev"
+    assert task.plan_checkpoint_pending is False
+    assert task.baseline_commit  # leg 1's baseline is still set — the rollback target
+    assert spec.read_text(encoding="utf-8") == plan
+
+    # resume 2: environment restored — leg 2 runs on the reviewed plan, no rollback
+    marker.write_text("", encoding="utf-8")
+    seen: list[str | None] = []
+    implement = stories_checkpoint_effect()
+
+    def leg2(session) -> SessionResult:
+        seen.append(spec.read_text(encoding="utf-8") if spec.exists() else None)
+        return implement(session)
+
+    final, fadapter = resume_engine(project, resumed, [leg2])
+    fsummary = final.run()
+    assert seen == [plan]  # the leg-1 plan (as reviewed) is what leg 2 started from
+    (dev,) = [s for s in fadapter.sessions if s.role == "dev"]
+    assert "Halt after planning" not in dev.prompt
+    assert "BMAD_LOOP_PLAN_HALT" not in dev.env
+    assert fsummary.done == 1 and not fsummary.paused
+    assert load_state(final.run_dir).tasks["1"].phase == Phase.DONE
+    kinds = [e["kind"] for e in final.journal.entries()]
+    assert "env-fault-cleared" in kinds
+    assert "resume-env-dispatch" in kinds
+    assert "resume-restart" not in kinds
 
 
 @pytest.mark.parametrize(
@@ -1536,44 +1820,6 @@ def test_story_checkpoint_pause_after_commit(project):
     assert load_state(resumed.run_dir).tasks["2"].phase == Phase.DONE
 
 
-def test_story_checkpoint_still_fires_when_manifest_unreadable_after_commit(project):
-    """A manifest that goes unreadable between the commit and the after-story
-    check makes the done_checkpoint flag unknowable — the conservative default is
-    to pause for review (mirroring _schedule_complete), never to silently drop a
-    checkpoint the manifest may set. The run cannot proceed past the broken
-    manifest anyway; only the human review could be lost by skipping."""
-    setup_stories(project, [entry("1", done_checkpoint=True), entry("2")])
-
-    def corrupting_effect(spec) -> SessionResult:
-        result = stories_dev_effect()(spec)
-        # the session's tree (== project: no isolation in this harness) ends up
-        # with an undecodable stories.yaml right before commit/after-story
-        (Path(spec.cwd) / SPEC_FOLDER / "stories.yaml").write_bytes(b"\xff\xfe not yaml \x80")
-        return result
-
-    engine, _ = make_engine(project, [corrupting_effect])
-    summary = engine.run()
-    assert summary.paused and summary.done == 1
-    persisted = load_state(engine.run_dir)
-    assert persisted.paused_stage == PAUSE_STORY_CHECKPOINT
-    assert persisted.paused_story_key == "1"
-    unreadable = _kinds(engine.journal, "stories-manifest-unreadable")
-    assert unreadable and unreadable[-1]["story_key"] == "1"
-
-
-def test_story_checkpoint_skipped_when_last(project):
-    """done_checkpoint on the final story does NOT pause — the run ends anyway, so
-    there is nothing to come back to review before."""
-    setup_stories(project, [entry("1"), entry("2", done_checkpoint=True)])
-    engine, _ = make_engine(project, [stories_dev_effect(), stories_dev_effect()])
-    summary = engine.run()
-
-    assert summary.done == 2 and not summary.paused
-    assert not load_state(engine.run_dir).paused
-    assert _kinds(engine.journal, "checkpoint-skip-last")
-    assert not _kinds(engine.journal, "checkpoint-pause")
-
-
 def test_done_checkpoint_skipped_when_graceful_stop_pending(project):
     """A pending graceful stop turns a done_checkpoint into a skip, not a pause: the
     loop-head check ends the run `stopped` on the next iteration, so pausing here
@@ -1605,29 +1851,384 @@ def test_done_checkpoint_skipped_when_graceful_stop_pending(project):
     assert stops and stops[-1]["graceful"] is True
 
 
-def test_both_checkpoints_pause_twice(project):
-    """A story with BOTH flags pauses at the plan checkpoint, then (after the
-    resumed implement leg commits) again at the story checkpoint — two pauses for
-    one story, because there is a later story still to dispatch."""
+# ---------------------------------- checkpoint-flow characterization (pinned)
+#
+# The rows above assert the checkpoint flows piecemeal (a kind here, one field
+# there). These pin each flow's observable output whole: every checkpoint-family
+# journal record with all of its fields, the ATTENTION notice text, the pause
+# stage, key and reason, and the task latches. They exist so the checkpoint
+# machinery can move between classes with a byte-identical stories run.
+
+_CHECKPOINT_KINDS = frozenset(
+    {
+        "plan-halt",
+        "checkpoint-pause",
+        "checkpoint-resume",
+        "checkpoint-skip-last",
+        "stories-manifest-unreadable",
+        "stories-wedged",
+        "stories-escalation-unresolved",
+    }
+)
+
+
+def _checkpoint_records(engine) -> list[dict]:
+    """The checkpoint-family journal records in order, minus the volatile stamps."""
+    volatile = {"ts", "log_task", "log_pos"}
+    return [
+        {k: v for k, v in e.items() if k not in volatile}
+        for e in engine.journal.entries()
+        if e.get("kind") in _CHECKPOINT_KINDS
+    ]
+
+
+_CHECKPOINT_NOTICES = (
+    "plan ready for review: ",
+    "plan review owed (already implemented): ",
+    "story committed — review checkpoint: ",
+    "story blocked: ",
+    "unresolved escalation: ",
+)
+
+
+def _attention_lines(engine) -> list[str]:
+    """The checkpoint-family ATTENTION notices with their ``[stamp] `` prefix
+    removed. The run-end summary (multi-line) is not one of them."""
+    path = engine.run_dir / "ATTENTION"
+    if not path.exists():
+        return []
+    notices = [
+        line.split("] ", 1)[1]
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.startswith("[") and "] " in line
+    ]
+    return [n for n in notices if n.startswith(_CHECKPOINT_NOTICES)]
+
+
+def test_pinned_plan_then_story_checkpoint_flow(project):
+    """Both checkpoints on one story, with a second story left to run: leg 1 halts and
+    pauses for plan review, the resume drives leg 2 and commits, the done_checkpoint
+    pauses, and the last resume finishes story 2."""
     setup_stories(project, [entry("1", spec_checkpoint=True, done_checkpoint=True), entry("2")])
     engine, _ = make_engine(project, [stories_checkpoint_effect()])
-    # pause 1: plan checkpoint
     assert engine.run().paused
-    assert load_state(engine.run_dir).paused_stage == PAUSE_PLAN_CHECKPOINT
+    spec = str(story_spec(project, "1"))
 
-    # pause 2: story checkpoint, after leg 2 implements + commits on resume
+    persisted = load_state(engine.run_dir)
+    assert (persisted.paused_stage, persisted.paused_story_key) == (PAUSE_PLAN_CHECKPOINT, "1")
+    assert persisted.paused_reason == "plan checkpoint for 1: review the spec, then resume"
+    task = persisted.tasks["1"]
+    assert (task.phase, task.plan_checkpoint_pending, task.plan_review_owed) == (
+        Phase.DEV_VERIFY,
+        True,
+        False,
+    )
+    assert _checkpoint_records(engine) == [
+        {"kind": "plan-halt", "story_key": "1", "spec_folder": SPEC_FOLDER},
+        {"kind": "checkpoint-pause", "story_key": "1", "checkpoint": "plan", "spec": spec},
+    ]
+    assert _attention_lines(engine) == [
+        f"plan ready for review: 1: review the planned spec {spec}, then "
+        "`bmad-loop resume test-run`"
+    ]
+
     resumed, _ = resume_engine(project, engine, [stories_checkpoint_effect()])
     s2 = resumed.run()
     assert s2.paused and s2.done == 1
-    persisted = load_state(resumed.run_dir)
-    assert persisted.paused_stage == PAUSE_STORY_CHECKPOINT
-    assert persisted.tasks["1"].phase == Phase.DONE
     assert status_of(read_frontmatter(story_spec(project, "1"))) == "done"
+    persisted = load_state(resumed.run_dir)
+    assert (persisted.paused_stage, persisted.paused_story_key) == (PAUSE_STORY_CHECKPOINT, "1")
+    assert persisted.paused_reason == "story checkpoint for 1: review, then resume"
+    task = persisted.tasks["1"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    assert (task.plan_checkpoint_pending, task.plan_review_owed) == (False, False)
+    assert _checkpoint_records(resumed)[2:] == [
+        {"kind": "checkpoint-resume", "story_key": "1", "checkpoint": "plan"},
+        {
+            "kind": "checkpoint-pause",
+            "story_key": "1",
+            "checkpoint": "story",
+            "commit": task.commit_sha,
+        },
+    ]
+    assert _attention_lines(resumed)[1:] == [
+        "story committed — review checkpoint: 1: review 1, then `bmad-loop resume test-run`"
+    ]
 
-    # final resume drives story 2, no more pauses
-    resumed2, _ = resume_engine(project, resumed, [stories_dev_effect()])
-    assert not resumed2.run().paused
-    assert load_state(resumed2.run_dir).tasks["2"].phase == Phase.DONE
+    final, _ = resume_engine(project, resumed, [stories_dev_effect()])
+    assert not final.run().paused
+    assert load_state(final.run_dir).finished
+    assert load_state(final.run_dir).tasks["2"].phase == Phase.DONE
+    assert len(_checkpoint_records(final)) == 4  # story 2 sets no checkpoint
+
+
+def test_pinned_plan_review_owed_flow(project):
+    """The skill overruns `Halt after planning.` to done: the owed-after-implement
+    pause, its record and notice, and the latches it leaves."""
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    overrun = _write_story_spec_effect("done", touch_code=True, result_over={"status": "done"})
+    engine, _ = make_engine(project, [overrun])
+    assert engine.run().paused
+    spec = str(story_spec(project, "1"))
+
+    persisted = load_state(engine.run_dir)
+    assert (persisted.paused_stage, persisted.paused_story_key) == (PAUSE_PLAN_CHECKPOINT, "1")
+    assert persisted.paused_reason == (
+        "plan review owed for 1: the skill implemented before the plan checkpoint — "
+        "review the spec, then resume"
+    )
+    task = persisted.tasks["1"]
+    assert (task.phase, task.plan_checkpoint_pending, task.plan_review_owed) == (
+        Phase.DEV_VERIFY,
+        False,
+        False,
+    )
+    assert _checkpoint_records(engine) == [
+        {"kind": "plan-halt", "story_key": "1", "spec_folder": SPEC_FOLDER},
+        {
+            "kind": "checkpoint-pause",
+            "story_key": "1",
+            "checkpoint": "plan",
+            "spec": spec,
+            "owed_after_implement": True,
+        },
+    ]
+    assert _attention_lines(engine) == [
+        "plan review owed (already implemented): 1: the story was implemented before its "
+        f"plan checkpoint fired — review {spec}, then `bmad-loop resume test-run`"
+    ]
+
+    # the human approved: the resume commits the implemented story, no re-drive
+    resumed, radapter = resume_engine(project, engine, [])
+    assert not resumed.run().paused
+    assert radapter.sessions == []
+    assert load_state(resumed.run_dir).tasks["1"].phase == Phase.DONE
+    assert _checkpoint_records(resumed)[2:] == []
+
+
+@pytest.mark.parametrize(
+    ("entries", "graceful", "max_stories", "skip", "done", "absent"),
+    [
+        # done_checkpoint on the final story does NOT pause — the run ends anyway,
+        # so there is nothing to come back to review before.
+        (
+            [entry("1"), entry("2", done_checkpoint=True)],
+            False,
+            None,
+            {"kind": "checkpoint-skip-last", "story_key": "2", "checkpoint": "story"},
+            2,
+            (),
+        ),
+        # MINOR-F: with --max-stories=1 the bound ends the run here, so the
+        # checkpoint is SKIPPED — otherwise the pause+resume would reset the loop
+        # counter and leapfrog story 2 past the cap.
+        (
+            [entry("1", done_checkpoint=True), entry("2")],
+            False,
+            1,
+            {"kind": "checkpoint-skip-last", "story_key": "1", "checkpoint": "story"},
+            1,
+            ("2",),
+        ),
+        (
+            [entry("1", done_checkpoint=True), entry("2")],
+            True,
+            None,
+            {
+                "kind": "checkpoint-skip-last",
+                "story_key": "1",
+                "checkpoint": "story",
+                "reason": "graceful-stop",
+            },
+            1,
+            ("2",),
+        ),
+    ],
+    ids=["last-story", "max-stories", "graceful-stop"],
+)
+def test_pinned_done_checkpoint_skip_records(
+    project, entries, graceful, max_stories, skip, done, absent
+):
+    """Each skip-if-last cause writes exactly one skip record, shaped as pinned, and
+    never pauses or notifies. The stories it ran are counted done, and a story the
+    run ended before is never dispatched."""
+    setup_stories(project, entries)
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+
+    def dev(spec) -> SessionResult:
+        result = stories_dev_effect()(spec)
+        if graceful:
+            (run_dir / STOP_REQUEST_FILE).write_text(
+                '{"requested_at": "2026-07-20T00:00:00", "mode": "graceful"}', encoding="utf-8"
+            )
+        return result
+
+    engine, _ = make_engine(project, [dev, dev], max_stories=max_stories)
+    summary = engine.run()
+    assert summary.done == done and not summary.paused
+    persisted = load_state(engine.run_dir)
+    assert not persisted.paused
+    assert all(key not in persisted.tasks for key in absent)  # never dispatched
+    assert _checkpoint_records(engine) == [skip]
+    assert _attention_lines(engine) == []
+
+
+def test_pinned_done_checkpoint_on_unreadable_manifest(project):
+    """An unreadable manifest after the commit: one unreadable record, then the
+    conservative pause, in that order.
+
+    The unreadable manifest makes the done_checkpoint flag unknowable, so the
+    conservative default is to pause for review (mirroring _schedule_complete), never
+    to silently drop a checkpoint the manifest may set. The run cannot proceed past
+    the broken manifest anyway; only the human review could be lost by skipping."""
+    setup_stories(project, [entry("1", done_checkpoint=True), entry("2")])
+
+    def corrupting_effect(spec) -> SessionResult:
+        result = stories_dev_effect()(spec)
+        # the session's tree (== project: no isolation in this harness) ends up
+        # with an undecodable stories.yaml right before commit/after-story
+        (Path(spec.cwd) / SPEC_FOLDER / "stories.yaml").write_bytes(b"\xff\xfe not yaml \x80")
+        return result
+
+    engine, _ = make_engine(project, [corrupting_effect])
+    summary = engine.run()
+    assert summary.paused and summary.done == 1
+    persisted = load_state(engine.run_dir)
+    assert (persisted.paused_stage, persisted.paused_story_key) == (PAUSE_STORY_CHECKPOINT, "1")
+    task = persisted.tasks["1"]
+    records = _checkpoint_records(engine)
+    assert [r["kind"] for r in records] == ["stories-manifest-unreadable", "checkpoint-pause"]
+    assert set(records[0]) == {"kind", "story_key", "error"}
+    assert records[0]["story_key"] == "1" and records[0]["error"]
+    assert records[1] == {
+        "kind": "checkpoint-pause",
+        "story_key": "1",
+        "checkpoint": "story",
+        "commit": task.commit_sha,
+    }
+
+
+def test_pinned_wedge_pause(project):
+    """A blocked spec on disk: the ESCALATED attempt-0 task, its record, its notice
+    and the pause reason."""
+    folder = setup_stories(project, [entry("1"), entry("2")])
+    spec = folder / "stories" / "1-slug.md"
+    write_spec(spec, "blocked", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story 1 blocked")
+
+    engine, adapter = make_engine(project, [])  # no session should run
+    assert engine.run().paused
+    assert not any(s.role == "dev" for s in adapter.sessions)  # never leapfrogged to story 2
+    persisted = load_state(engine.run_dir)
+    assert (persisted.paused_stage, persisted.paused_story_key) == (PAUSE_ESCALATION, "1")
+    assert persisted.paused_reason == (
+        f"story '1' needs resolution before the run can continue: "
+        f"story spec status 'blocked' at {spec}"
+    )
+    task = persisted.tasks["1"]
+    assert (task.phase, task.attempt, task.spec_file, task.sentinel_kind) == (
+        Phase.ESCALATED,
+        0,
+        str(spec),
+        "",
+    )
+    assert _checkpoint_records(engine) == [
+        {"kind": "stories-wedged", "story_key": "1", "state_kind": "present", "sentinel_kind": None}
+    ]
+    assert _attention_lines(engine) == [
+        f"story blocked: 1: story spec status 'blocked' at {spec} — resolve, then "
+        "`bmad-loop resume test-run`"
+    ]
+
+
+def test_pinned_inrun_escalation_repause(project):
+    """An in-run escalation (attempt > 0) re-pauses on resume: its record, notice and
+    reason, and the task left untouched."""
+    setup_stories(project, [entry("1"), entry("2")])
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1", epic=0)
+    task.phase = Phase.ESCALATED
+    task.attempt = 1
+    engine.state.tasks["1"] = task
+    engine._save()
+
+    resumed, _ = resume_engine(project, engine, [])
+    assert resumed.run().paused
+    persisted = load_state(resumed.run_dir)
+    reason = "story '1' escalated during this run and was not resolved — " + (
+        "run `bmad-loop resolve test-run`, then resume"
+    )
+    assert (persisted.paused_stage, persisted.paused_story_key) == (PAUSE_ESCALATION, "1")
+    assert persisted.paused_reason == reason
+    assert (persisted.tasks["1"].phase, persisted.tasks["1"].attempt) == (Phase.ESCALATED, 1)
+    assert _checkpoint_records(resumed) == [
+        {"kind": "stories-escalation-unresolved", "story_key": "1"}
+    ]
+    assert _attention_lines(resumed) == [f"unresolved escalation: 1: {reason}"]
+
+
+def _write_story_status(paths, story_id: str, status: str) -> None:
+    """An on-disk story spec carrying just the frontmatter `status:` the
+    scheduler's classifier reads."""
+    story_spec(paths, story_id).write_text(f"---\nstatus: {status}\n---\n", encoding="utf-8")
+
+
+def test_remaining_estimate_skips_retired_and_stops_at_first_wedge(project):
+    """Characterization pin for the WorkSource refactor: the stories
+    `_remaining_estimate` walks the manifest in list order, skips entries retired
+    this run (DONE / DEFERRED in `state.tasks`) or done on disk, counts pending and
+    resumable ones, and stops at the first wedged (blocked) entry — later entries
+    are unreachable until `resolve`, so they never count. A task in any other phase
+    (here DEV_RUNNING) is not retired and still counts."""
+    setup_stories(project, [entry(str(i)) for i in range(1, 8)])
+    _write_story_status(project, "2", "done")  # done on disk: skipped
+    _write_story_status(project, "4", "in-progress")  # resumable: counts
+    _write_story_status(project, "6", "blocked")  # the wedge: scan stops here
+    engine, _ = make_engine(project, [])
+    engine.state.tasks["1"] = StoryTask(story_key="1", epic=0, phase=Phase.DEFERRED)
+    engine.state.tasks["3"] = StoryTask(story_key="3", epic=0, phase=Phase.DONE)
+    engine.state.tasks["5"] = StoryTask(story_key="5", epic=0, phase=Phase.DEV_RUNNING)
+
+    assert engine._remaining_estimate() == 2  # 4 and 5; 7 sits behind the wedge
+
+    _write_story_status(project, "6", "ready-for-dev")  # wedge cleared
+    assert engine._remaining_estimate() == 4  # 4, 5, 6, 7
+
+
+def test_remaining_estimate_honors_story_id_filter(project):
+    """Characterization pin for the WorkSource refactor: under `--story <id>` the
+    estimate considers only that manifest entry — 1 while it is still actionable,
+    0 once it is done on disk — and an earlier wedged entry does not stop it."""
+    setup_stories(project, [entry("1"), entry("2"), entry("3")])
+    _write_story_status(project, "1", "blocked")
+    engine, _ = make_engine(project, [], story_filter="2")
+
+    assert engine._remaining_estimate() == 1
+
+    _write_story_status(project, "2", "done")
+    assert engine._remaining_estimate() == 0
+
+
+@pytest.mark.parametrize("fault", ["missing", "malformed", "duplicate-id"])
+def test_remaining_estimate_none_on_broken_manifest(project, fault):
+    """Characterization pin for the WorkSource refactor: a manifest the engine
+    cannot load makes `_remaining_estimate` return None (a hint, never a raise) —
+    not 0, which would read as "nothing left"."""
+    folder = setup_stories(project, [entry("1")])
+    engine, _ = make_engine(project, [])
+    manifest = folder / "stories.yaml"
+    if fault == "missing":
+        manifest.unlink()
+    elif fault == "malformed":
+        manifest.write_text("- id: [unclosed\n", encoding="utf-8")
+    else:
+        manifest.write_text(
+            yaml.safe_dump([entry("1"), entry("1", title="dup")], sort_keys=False),
+            encoding="utf-8",
+        )
+
+    assert engine._remaining_estimate() is None
 
 
 # ------------------------------------ blocked → resolve → re-dispatch (E2E)
@@ -1852,18 +2453,42 @@ def test_unknown_story_selector_pauses_not_crashes(project):
     assert _kinds(engine.journal, "stories-selector-unknown")
 
 
-def test_done_checkpoint_skipped_at_max_stories(project):
-    """MINOR-F: with --max-stories=1 a done_checkpoint on the only dispatched story
-    is SKIPPED (the bound ends the run here) — otherwise the pause+resume would
-    reset the loop counter and leapfrog story 2 past the cap."""
-    setup_stories(project, [entry("1", done_checkpoint=True), entry("2")])
-    engine, _ = make_engine(project, [stories_dev_effect()], max_stories=1)
-    summary = engine.run()
+def test_host_loss_in_unknown_selector_notify_leaves_the_pause_on_disk(project, monkeypatch):
+    """DW-629. An unknown `--story` id journals `stories-selector-unknown`, then
+    notifies. `_pause_unknown_selector` saves its ESCALATED selector task before
+    the notify, so a host loss inside a slow notify command leaves it on disk.
 
-    assert summary.done == 1 and not summary.paused
-    assert _kinds(engine.journal, "checkpoint-skip-last")
-    assert not _kinds(engine.journal, "checkpoint-pause")
-    assert "2" not in load_state(engine.run_dir).tasks  # capped, story 2 never dispatched
+    The test snapshots `state.json` inside the notify, because `run()`'s `finally`
+    save would otherwise persist the in-memory task and hide the boundary.
+
+    Ablation, performed: move `self._save()` back below `gates.notify` and no
+    `state.json` exists at the notify."""
+    from bmad_loop import gates
+
+    class HostLoss(BaseException):
+        pass
+
+    setup_stories(project, [entry("1"), entry("2")])
+    engine, adapter = make_engine(project, [], story_filter="99")
+    state_file = engine.run_dir / "state.json"
+    durable: list[bytes | None] = []
+
+    def host_dies_in_notify(*_args, **_kwargs):
+        if not durable and _kinds(engine.journal, "stories-selector-unknown"):
+            # The selector halts before anything else saves: without the early
+            # save there is no `state.json` at all.
+            durable.append(state_file.read_bytes() if state_file.exists() else None)
+            raise HostLoss
+
+    monkeypatch.setattr(gates, "notify", host_dies_in_notify)
+    with pytest.raises(HostLoss):
+        engine.run()
+    assert durable[0] is not None, "nothing was saved before the notify"
+    state_file.write_bytes(durable[0])
+
+    assert adapter.sessions == []
+    task = load_state(engine.run_dir).tasks.get("99")
+    assert task is not None and task.phase == Phase.ESCALATED
 
 
 def test_max_stories_survives_a_checkpoint_pause_resume(project):
@@ -2406,3 +3031,195 @@ def test_stories_retry_prompt_names_the_earlier_attempts_parked_work(project):
         f"preserved at `{parked['ref']}`."
     )
     assert f"`git diff {base} {parked['ref']}`" in second
+
+
+def test_relative_stories_folder_joins_the_project_under_a_nested_repo_root(project, tmp_path):
+    """DW-379: the spec folder is stored PROJECT-relative, so `_stories_folder` joins it
+    on `workspace.paths.project` — `<repo>/app` in place (where `workspace.root` is the
+    code root `<repo>`), and the mount project `<mount>/app` inside a unit worktree.
+
+    Ablation: join on `self.workspace.root` again and both assertions land one level
+    up, in the outer tree (`<repo>/<folder>`, `<mount>/<folder>`)."""
+    from bmad_loop.workspace import Workspace
+
+    paths = nested_repo_root_paths(project)
+    engine, _adapter = make_engine(paths, [])
+    assert not Path(engine._spec_folder_rel).is_absolute(), "premise: a relative folder"
+    assert engine.workspace.root == paths.repo_root, "premise: in place, root is the code root"
+
+    assert engine._stories_folder() == paths.project / engine._spec_folder_rel
+
+    wt = tmp_path / "mount"
+    wt.mkdir()
+    engine.workspace = Workspace(root=wt.resolve(), paths=paths.rebased(wt))
+    assert engine._stories_folder() == wt.resolve() / "app" / engine._spec_folder_rel
+
+
+# ----------------------------- [verify] reuse_unchanged in stories mode (#1002)
+
+_REUSE_CMD = "pytest -q"
+
+
+def _reuse_stories_policy(*, reuse=True, review=None) -> Policy:
+    return _stories_policy(
+        review=review if review is not None else ReviewPolicy(enabled=False),
+        verify=VerifyPolicy(commands=(_REUSE_CMD,), reuse_unchanged=reuse),
+    )
+
+
+def _green(out):
+    return [verify.CommandResult(_REUSE_CMD, 0, out, out, "")]
+
+
+def _script_reuse_verify_runs(monkeypatch, project, results):
+    """Script `run_verify_commands` from ``results`` (one list per pass) and
+    return the list of passes actually run — the count a reuse saves."""
+    pending = list(results)
+    ran = []
+
+    def next_results():
+        ran.append(len(ran))
+        return pending.pop(0)
+
+    monkeypatch.setattr(
+        verify, "run_verify_commands", scripted_verify_runner(project.repo_root, next_results)
+    )
+    return ran
+
+
+def _reuse_verify_passes(engine):
+    return sorted(
+        {
+            (e["verification_stage"], e["verification_sequence"])
+            for e in _kinds(engine.journal, "verify-command-result")
+        },
+        key=lambda p: p[1],
+    )
+
+
+class _ReviewVerifyCaptureBus:
+    """Hook-bus double that binds only `post_review_verify` and keeps its contexts."""
+
+    def __init__(self):
+        self.contexts = []
+
+    def active(self, stage):
+        return stage == "post_review_verify"
+
+    def emit(self, stage, ctx):
+        self.contexts.append(ctx)
+        return ctx
+
+
+@pytest.mark.parametrize(
+    "review",
+    [ReviewPolicy(enabled=True, trigger="recommended"), ReviewPolicy(enabled=False)],
+    ids=["not-recommended", "review-disabled"],
+)
+def test_stories_verify_reuse_skip_gate_reuses_the_dev_pass(project, monkeypatch, review):
+    """The #1002 reporter's shape in stories mode: a green dev pass on an
+    unchanged tree stands in for the skip-review gate's own run. One command
+    pass, one `verify-pass-reused` row joining back to `("dev", 1)`, no decline,
+    `post_review_verify` republishes the dev pass, and the story commits.
+
+    Ablation: drop `reuse=self._review_reuse_request(task)` from
+    `StoriesEngine._verify_review` and the gate runs its commands — a second
+    pass, and `pending.pop` on the empty script raises."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(
+        project, [stories_dev_effect()], policy=_reuse_stories_policy(review=review)
+    )
+    capture = _ReviewVerifyCaptureBus()
+    engine._bus = capture
+    ran = _script_reuse_verify_runs(monkeypatch, project, [_green("dev-out")])
+    head_before = rev_parse_head(project.project)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert len(ran) == 1
+    assert _reuse_verify_passes(engine) == [("dev", 1)]
+    (row,) = _kinds(engine.journal, "verify-pass-reused")
+    assert (row["story_key"], row["reused_stage"], row["reused_sequence"]) == ("1", "dev", 1)
+    assert row["command_count"] == 1 and row["attempt"] == 1
+    assert row["head"] == head_before and row["tree"]
+    assert not _kinds(engine.journal, "verify-reuse-declined")
+    (ctx,) = capture.contexts
+    assert ctx.verification_reused is True
+    assert (ctx.verification_stage, ctx.verification_sequence) == ("dev", 1)
+    assert [r.stdout for r in ctx.command_results] == ["dev-out"]
+    assert status_of(read_frontmatter(story_spec(project, "1"))) == "done"
+    assert rev_parse_head(project.project) != head_before  # the story commit landed
+
+
+def test_stories_verify_reuse_plan_halt_leg_mints_nothing(project, monkeypatch):
+    """A spec_checkpoint plan-halt leg runs no verify pass, so it reads no
+    fingerprint and mints no token; the resumed implement leg then runs the one
+    dev pass and its skip-review gate reuses THAT pass.
+
+    Ablation: make `StoriesEngine._run_verify_commands_after_dev` return True
+    on a plan-halt leg and leg 1 runs a command pass and fingerprints the tree
+    (`ran`/`reads` non-empty before the pause)."""
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    policy = _reuse_stories_policy()
+    engine, _ = make_engine(project, [stories_checkpoint_effect()], policy=policy)
+    ran = _script_reuse_verify_runs(monkeypatch, project, [_green("impl")])
+    real_fp = verify.worktree_fingerprint
+    reads = []
+
+    def fp(repo):
+        reads.append(len(ran))
+        return real_fp(repo)
+
+    monkeypatch.setattr(verify, "worktree_fingerprint", fp)
+
+    summary = engine.run()
+
+    assert summary.paused and summary.done == 0
+    assert load_state(engine.run_dir).paused_stage == PAUSE_PLAN_CHECKPOINT
+    assert ran == [] and reads == []
+    assert engine._verify_reuse is None
+    assert not _kinds(engine.journal, "verify-command-result")
+    assert not _kinds(engine.journal, "verify-pass-reused")
+    assert not _kinds(engine.journal, "verify-reuse-declined")
+
+    resumed, _ = resume_engine(project, engine, [stories_checkpoint_effect()])
+    rsummary = resumed.run()
+
+    assert rsummary.done == 1
+    assert len(ran) == 1
+    assert reads and set(reads) <= {0, 1}  # only the implement leg's dev pass + gate
+    passes = _reuse_verify_passes(resumed)
+    assert [stage for stage, _ in passes] == ["dev"]
+    (row,) = _kinds(resumed.journal, "verify-pass-reused")
+    assert (row["reused_stage"], row["reused_sequence"]) == ("dev", passes[0][1])
+    assert not _kinds(resumed.journal, "verify-reuse-declined")
+
+
+def test_stories_verify_reuse_off_never_fingerprints(project, monkeypatch):
+    """Default off is byte-identical in stories mode: no fingerprint is ever
+    read, both the dev pass and the skip-review gate run their commands, and
+    neither reuse journal kind appears.
+
+    Ablation: drop `self.policy.verify.reuse_unchanged` from
+    `Engine._verify_reuse_mintable` and the raising fingerprint crashes the run;
+    drop it from `Engine._review_reuse_request` and the gate journals a
+    `no-token` decline."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(
+        project, [stories_dev_effect()], policy=_reuse_stories_policy(reuse=False)
+    )
+    ran = _script_reuse_verify_runs(monkeypatch, project, [_green("dev"), _green("gate")])
+
+    def refuse(_repo):
+        raise AssertionError("fingerprinted with [verify] reuse_unchanged off")
+
+    monkeypatch.setattr(verify, "worktree_fingerprint", refuse)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert len(ran) == 2
+    assert _reuse_verify_passes(engine) == [("dev", 1), ("review", 2)]
+    assert not _kinds(engine.journal, "verify-pass-reused")
+    assert not _kinds(engine.journal, "verify-reuse-declined")

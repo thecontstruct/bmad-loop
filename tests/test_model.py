@@ -9,15 +9,25 @@ import pytest
 from conftest import refuse_to_resolve
 
 from bmad_loop.model import (
+    ENV_FAULT_SITE_DISPATCH_PREFIX,
+    ENV_FAULT_SITES,
+    PAUSE_ENVIRONMENT,
+    PAUSE_TICKET_HITL,
+    PAUSE_TICKET_REFINE,
+    PAUSE_TICKET_TREE,
     SWEEP_REFUSED_DIRTY,
     SWEEP_REFUSED_NOT_STARTED,
+    UNATTRIBUTED_MODEL,
     Phase,
     RunState,
     SessionRecord,
     StoryTask,
+    TicketBinding,
     TokenUsage,
     VerifyOutcome,
+    env_fault_site_reverifiable,
     result_mapping,
+    settle_by_model,
 )
 
 
@@ -69,6 +79,59 @@ def test_run_state_code_root_restamp_pending_round_trips_and_defaults_false():
     assert RunState.from_dict(d).code_root_restamp_pending is False
 
 
+def test_run_state_replay_of_round_trips_and_defaults_empty():
+    """DW-525: the finished run a replay run replays survives the state round trip,
+    and a state.json from before the field existed reads back "" — an ordinary run."""
+    state = _state(repo_root="/code")
+    assert state.replay_of == ""
+    state.replay_of = "20260101-000000-beef"
+    assert RunState.from_dict(state.to_dict()).replay_of == "20260101-000000-beef"
+    d = state.to_dict()
+    del d["replay_of"]
+    assert RunState.from_dict(d).replay_of == ""
+
+
+def test_mint_time_root_identities_round_trip_as_two_int_lists():
+    """DW-446: `RunState.run_dir_identity` and `StoryTask.worktree_identity` persist
+    as a two-int JSON list (or null) and read back as the same tuple.
+
+    Ablation: drop either key from `to_dict` and its round trip reads None."""
+    task = StoryTask(story_key="1-1-a", epic=1, worktree_path="/p/wt", worktree_identity=(7, 42))
+    state = _state(run_dir_identity=(3, 9), tasks={"1-1-a": task})
+
+    d = json.loads(json.dumps(state.to_dict()))
+    assert d["run_dir_identity"] == [3, 9]
+    assert d["tasks"]["1-1-a"]["worktree_identity"] == [7, 42]
+    back = RunState.from_dict(d)
+    assert back.run_dir_identity == (3, 9)
+    assert back.tasks["1-1-a"].worktree_identity == (7, 42)
+
+    unset = json.loads(json.dumps(_state(tasks={"x": StoryTask("x", 1)}).to_dict()))
+    assert unset["run_dir_identity"] is None
+    assert unset["tasks"]["x"]["worktree_identity"] is None
+
+
+def test_mint_time_root_identities_default_none_for_legacy_or_malformed_state():
+    """A state.json from before the fields existed reads back None (no record, which
+    every pin refuses), and so does anything that is not a list of exactly two ints —
+    never a raise out of `from_dict`, which would keep the run from loading."""
+    task = StoryTask(story_key="1-1-a", epic=1, worktree_identity=(7, 42))
+    legacy = _state(run_dir_identity=(3, 9), tasks={"1-1-a": task}).to_dict()
+    del legacy["run_dir_identity"]
+    del legacy["tasks"]["1-1-a"]["worktree_identity"]
+    back = RunState.from_dict(legacy)
+    assert back.run_dir_identity is None
+    assert back.tasks["1-1-a"].worktree_identity is None
+
+    for bad in ([1], [1, 2, 3], ["1", 2], [True, 2], [1.0, 2], {"dev": 1}, "1,2", 12, [None, 2]):
+        d = _state(run_dir_identity=(3, 9), tasks={"1-1-a": task}).to_dict()
+        d["run_dir_identity"] = bad
+        d["tasks"]["1-1-a"]["worktree_identity"] = bad
+        back = RunState.from_dict(d)
+        assert back.run_dir_identity is None, bad
+        assert back.tasks["1-1-a"].worktree_identity is None, bad
+
+
 def test_run_state_repo_root_round_trips_and_backs_code_root():
     """The git root a run's code work happens in, persisted because
     `runs.rearm_escalation` runs OUT OF PROCESS from the engine and had only
@@ -97,6 +160,196 @@ def test_run_state_stories_fields_default_when_absent_from_dict():
     del d["spec_folder"]
     back = RunState.from_dict(d)
     assert back.source == "sprint-status" and back.spec_folder == ""
+
+
+def test_run_state_round_trips_initiative_pin():
+    default = _state()
+    assert default.initiative == "" and default.initiative_folder == ""
+    pinned = _state(initiative="initiative-checkout", initiative_folder="/p/_bmad-output/i")
+    d = pinned.to_dict()
+    assert d["initiative"] == "initiative-checkout"
+    assert d["initiative_folder"] == "/p/_bmad-output/i"
+    back = RunState.from_dict(d)
+    assert back.initiative == "initiative-checkout"
+    assert back.initiative_folder == "/p/_bmad-output/i"
+
+
+def test_old_state_json_defaults_initiative_empty():
+    # a state.json written before the v7 pin existed reads as "no initiative pinned"
+    d = _state().to_dict()
+    del d["initiative"]
+    del d["initiative_folder"]
+    back = RunState.from_dict(d)
+    assert back.initiative == "" and back.initiative_folder == ""
+
+
+def test_run_state_round_trips_parent_initiative():
+    assert _state().parent_initiative is None
+    assert _state().to_dict()["parent_initiative"] is None
+    chained = _state(initiative="initiative-auth", parent_initiative="initiative-platform")
+    d = json.loads(json.dumps(chained.to_dict()))
+    assert d["parent_initiative"] == "initiative-platform"
+    back = RunState.from_dict(d)
+    assert back.parent_initiative == "initiative-platform"
+    assert back.initiative == "initiative-auth"
+
+
+def test_old_state_json_without_parent_initiative_loads_unchained():
+    """A state.json written before the field existed reads as a run that builds
+    the active initiative itself. Ablation (performed): drop the `from_dict`
+    default (`d["parent_initiative"]`) and this FAILS with a KeyError."""
+    d = json.loads(json.dumps(_state(initiative="initiative-checkout").to_dict()))
+    del d["parent_initiative"]
+    back = RunState.from_dict(d)
+    assert back.parent_initiative is None
+    assert back.initiative == "initiative-checkout"
+
+
+def _binding(**kw) -> TicketBinding:
+    base = dict(
+        ref="2.1",
+        id="1",
+        epic_slug="epic-checkout",
+        epic_id="2",
+        title="Checkout form",
+        plan="/p/_bmad-output/i/epic-checkout/story-checkout-form-plan.md",
+        risk="high",
+        refined=True,
+        plan_checkpoint=True,
+        done_checkpoint=False,
+        hitl=False,
+    )
+    base.update(kw)
+    return TicketBinding(**base)
+
+
+def test_run_state_ticket_fields_default_and_round_trip():
+    default = _state()
+    assert (default.ticket_epic_filter, default.ticket_story_approvals) == ("", [])
+    assert default.ticket_epic_closures == {}
+    state = _state(
+        ticket_epic_filter="epic-cart",
+        ticket_story_approvals=["2.1"],
+        ticket_epic_closures={"epic-cart": "rejected"},
+    )
+    back = RunState.from_dict(json.loads(json.dumps(state.to_dict())))
+    assert back.ticket_epic_filter == "epic-cart"
+    assert back.ticket_story_approvals == ["2.1"]
+    assert back.ticket_epic_closures == {"epic-cart": "rejected"}
+
+
+def test_old_state_json_defaults_ticket_fields_empty():
+    d = _state().to_dict()
+    for key in ("ticket_epic_filter", "ticket_story_approvals", "ticket_epic_closures"):
+        del d[key]
+    back = RunState.from_dict(d)
+    assert (back.ticket_epic_filter, back.ticket_story_approvals) == ("", [])
+    assert back.ticket_epic_closures == {}
+
+
+def test_run_state_store_topology_round_trips_exactly():
+    topology = {
+        "layout": "T3",
+        "placement": "shared-in-project",
+        "versioning": "store-repo",
+        "store_root": "/p/_bmad-output",
+        "store_repo": "/p/_bmad-output",
+    }
+    assert _state().store_topology == {}
+    back = RunState.from_dict(json.loads(json.dumps(_state(store_topology=topology).to_dict())))
+    assert back.store_topology == topology
+    old = _state().to_dict()
+    del old["store_topology"]
+    assert RunState.from_dict(old).store_topology == {}
+
+
+@pytest.mark.parametrize("mangled", [["T1"], {"layout": 1}, "T1", {"layout": ["T1"]}])
+def test_run_state_mangled_store_topology_reads_as_unreadable(mangled):
+    """A hand-mangled topology never raises out of `from_dict` and never reads as
+    "nothing recorded" (which would skip resume's comparison): it becomes a
+    marker no classified topology equals. Ablation (performed): return `{}` for a
+    mangled shape and this FAILS."""
+    d = _state().to_dict()
+    d["store_topology"] = mangled
+    back = RunState.from_dict(d)
+    assert back.store_topology and "unreadable" in back.store_topology
+
+
+def test_story_task_ticket_binding_round_trips():
+    task = StoryTask(story_key="2.1", epic=0)
+    task.ticket = _binding()
+    state = _state(source="tickets", tasks={"2.1": task})
+    back = RunState.from_dict(json.loads(json.dumps(state.to_dict()))).tasks["2.1"]
+    assert back.ticket == _binding()
+    assert back.ticket is not None and back.ticket.to_dict() == _binding().to_dict()
+
+
+def test_story_task_ticket_defaults_none_and_reads_legacy_state():
+    task = StoryTask(story_key="1-1-a", epic=1)
+    assert task.ticket is None
+    d = task.to_dict()
+    assert d["ticket"] is None
+    del d["ticket"]
+    assert StoryTask.from_dict(d).ticket is None
+
+
+def test_story_task_post_landing_latches_round_trip_and_default_off():
+    """The shared-store post-landing latches survive a save, and a legacy state
+    file (no keys) reads them unset — never as a mark owed."""
+    task = StoryTask(story_key="2.1", epic=0)
+    assert (task.ticket_done_pending, task.ticket_park_pending, task.ticket_commit_pending) == (
+        False,
+        "",
+        False,
+    )
+    task.ticket_done_pending = True
+    task.ticket_park_pending = "awaiting operator: rotate the key"
+    task.ticket_commit_pending = True
+    state = _state(source="tickets", tasks={"2.1": task})
+    back = RunState.from_dict(json.loads(json.dumps(state.to_dict()))).tasks["2.1"]
+    assert back.ticket_done_pending is True
+    assert back.ticket_park_pending == "awaiting operator: rotate the key"
+    assert back.ticket_commit_pending is True
+    d = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del d["ticket_done_pending"], d["ticket_park_pending"], d["ticket_commit_pending"]
+    legacy = StoryTask.from_dict(d)
+    assert (
+        legacy.ticket_done_pending,
+        legacy.ticket_park_pending,
+        legacy.ticket_commit_pending,
+    ) == (False, "", False)
+
+
+def test_story_task_t1_premark_latch_round_trips_and_defaults_empty():
+    """The T1 pre-window plan latch (status + digest) survives a save, and a
+    legacy state file (no keys) reads it empty — never as a plan marked by an
+    earlier window."""
+    task = StoryTask(story_key="2.1", epic=0)
+    assert (task.ticket_premark_status, task.ticket_premark_digest) == ("", "")
+    task.ticket_premark_status = "built"
+    task.ticket_premark_digest = "ab" * 32
+    state = _state(source="tickets", tasks={"2.1": task})
+    back = RunState.from_dict(json.loads(json.dumps(state.to_dict()))).tasks["2.1"]
+    assert (back.ticket_premark_status, back.ticket_premark_digest) == ("built", "ab" * 32)
+    d = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del d["ticket_premark_status"], d["ticket_premark_digest"]
+    legacy = StoryTask.from_dict(d)
+    assert (legacy.ticket_premark_status, legacy.ticket_premark_digest) == ("", "")
+
+
+def test_story_task_refuses_a_corrupt_ticket_binding():
+    """A binding that is not an object is a corrupt state file: loading refuses it
+    rather than dropping the ticket a resume needs. Ablation (performed): read a
+    non-mapping as None and this FAILS."""
+    d = StoryTask(story_key="2.1", epic=0).to_dict()
+    d["ticket"] = "2.1"
+    with pytest.raises(ValueError, match="ticket binding"):
+        StoryTask.from_dict(d)
+
+
+def test_ticket_pause_stages_are_distinct():
+    stages = (PAUSE_TICKET_HITL, PAUSE_TICKET_REFINE, PAUSE_TICKET_TREE)
+    assert stages == ("ticket-hitl", "ticket-refine", "ticket-tree")
 
 
 def test_sweeps_refused_round_trips():
@@ -280,6 +533,102 @@ def test_attach_session_usage_does_not_double_count_existing_usage():
     assert task.tokens.total == 15
 
 
+def test_attach_session_usage_copies_observed_models():
+    task = _task_with_session()
+    task.attach_session_usage("1-1-a-dev-1", TokenUsage(input_tokens=1, models=("m1", "m2")))
+    assert task.sessions[0].models == ("m1", "m2")
+    assert task.sessions[0].model == ""  # the configured model is untouched
+
+
+@pytest.mark.parametrize("models", [None, ()])
+def test_attach_session_usage_leaves_models_empty_when_unobserved(models):
+    task = _task_with_session()
+    task.attach_session_usage("1-1-a-dev-1", TokenUsage(input_tokens=1, models=models))
+    assert task.sessions[0].models == ()
+
+
+def test_attach_session_usage_copies_the_per_model_split():
+    """DW-618: a non-empty `by_model` lands on the record's `tokens_by_model`
+    and never on the task total, which counts the usage once.
+
+    Ablation: drop the `by_model` copy and the record's map stays empty."""
+    task = _task_with_session()
+    split = {"m1": TokenUsage(input_tokens=3), UNATTRIBUTED_MODEL: TokenUsage(input_tokens=1)}
+    task.attach_session_usage(
+        "1-1-a-dev-1", TokenUsage(input_tokens=4, models=("m1",), by_model=split)
+    )
+    assert task.sessions[0].tokens_by_model == split
+    assert task.tokens == TokenUsage(input_tokens=4)
+
+
+@pytest.mark.parametrize("by_model", [None, {}])
+def test_attach_session_usage_leaves_the_split_empty_when_absent(by_model):
+    task = _task_with_session()
+    task.attach_session_usage("1-1-a-dev-1", TokenUsage(input_tokens=1, by_model=by_model))
+    assert task.sessions[0].tokens_by_model == {}
+
+
+def test_token_usage_by_model_is_diagnostic_only():
+    """`by_model` re-cuts a figure without changing it: equality, `add` and the
+    persisted dict ignore it, and a hand-built TokenUsage defaults to None.
+
+    Ablation: drop `compare=False` and the equality assertion fails."""
+    usage = TokenUsage(input_tokens=10, by_model={"m": TokenUsage(input_tokens=10)})
+    assert usage == TokenUsage(input_tokens=10)
+    assert TokenUsage().by_model is None
+    assert "by_model" not in usage.to_dict()
+    total = TokenUsage()
+    total.add(usage)
+    assert total.by_model is None
+    assert TokenUsage.from_dict(usage.to_dict()).by_model is None
+
+
+def test_settle_by_model_orders_by_models_and_folds_strays():
+    """Model buckets follow `models` order; a None bucket and any key outside
+    `models` fold into the sentinel, which is dropped when zero.
+
+    Ablation: keep a stray key as-is and the key invariant breaks."""
+    buckets = {
+        None: TokenUsage(input_tokens=1),
+        "b": TokenUsage(output_tokens=2),
+        "stray": TokenUsage(input_tokens=4),
+        "a": TokenUsage(input_tokens=8),
+    }
+    settled = settle_by_model(buckets, ("a", "b", "unused"))
+    assert list(settled) == ["a", "b", UNATTRIBUTED_MODEL]
+    assert settled[UNATTRIBUTED_MODEL] == TokenUsage(input_tokens=5)
+    assert settle_by_model({None: TokenUsage(), "a": TokenUsage()}, ("a",)) == {"a": TokenUsage()}
+
+
+def test_token_usage_unread_is_diagnostic_only():
+    """`unread` qualifies a figure without changing it: equality, `add` and the
+    persisted dict ignore it, so a skip never alters stored totals or `--json`.
+
+    Ablation: drop `compare=False` and the equality assertion fails."""
+    usage = TokenUsage(input_tokens=10, unread=("rollout-x.jsonl: OSError",))
+    assert usage == TokenUsage(input_tokens=10)
+    assert "unread" not in usage.to_dict()
+    total = TokenUsage()
+    total.add(usage)
+    assert total.unread == ()
+
+
+def test_token_usage_models_is_diagnostic_only():
+    """`models` describes a figure without changing it: equality, `add` and the
+    persisted dict ignore it, and a hand-built TokenUsage defaults to None (no
+    model source), never `()`.
+
+    Ablation: drop `compare=False` and the equality assertion fails."""
+    usage = TokenUsage(input_tokens=10, models=("claude-opus-5-5",))
+    assert usage == TokenUsage(input_tokens=10)
+    assert TokenUsage().models is None
+    assert "models" not in usage.to_dict()
+    total = TokenUsage()
+    total.add(usage)
+    assert total.models is None
+    assert TokenUsage.from_dict(usage.to_dict()).models is None
+
+
 def test_session_record_result_json_round_trips():
     record = SessionRecord(
         task_id="1-1-a-dev-1",
@@ -321,15 +670,119 @@ def test_session_record_adapter_identity_defaults_for_legacy_state():
     assert back.model == ""
 
 
-def test_followup_review_recommended_round_trips():
-    task = StoryTask(story_key="1-1-a", epic=1, followup_review_recommended=True)
-    assert StoryTask.from_dict(task.to_dict()).followup_review_recommended is True
+def test_session_record_label_round_trips_and_defaults_for_legacy_state():
+    record = SessionRecord(task_id="1-1-a-tea.gate-1", role="dev", status="completed")
+    record.label = "tea.gate"
+    assert SessionRecord.from_dict(record.to_dict()).label == "tea.gate"
+    doc = record.to_dict()
+    del doc["label"]  # state.json from before the field existed
+    assert SessionRecord.from_dict(doc).label == ""
 
 
-def test_followup_review_recommended_defaults_false_for_legacy_state():
-    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del doc["followup_review_recommended"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).followup_review_recommended is False
+def test_session_record_models_round_trip_and_default():
+    record = SessionRecord(task_id="1-1-a-dev-1", role="dev", status="completed")
+    doc = record.to_dict()
+    assert "models" not in doc  # empty is not written
+    assert SessionRecord.from_dict(doc).models == ()  # absent key (legacy state)
+    record.models = ("claude-opus-5-5", "claude-haiku-5-5")
+    doc = record.to_dict()
+    assert doc["models"] == ["claude-opus-5-5", "claude-haiku-5-5"]
+    assert SessionRecord.from_dict(doc).models == ("claude-opus-5-5", "claude-haiku-5-5")
+    # only a list of str is accepted from a hand-edited or foreign state file
+    for bad in ("claude-opus-5-5", ["claude-opus-5-5", 3], {"m": 1}, None):
+        doc["models"] = bad
+        assert SessionRecord.from_dict(doc).models == ()
+
+
+def test_session_record_tokens_by_model_round_trip_and_default():
+    """DW-618: written only when non-empty, so a legacy-shaped record's dict
+    is unchanged; read back tolerantly, skipping a malformed entry.
+
+    Ablation: write the key unconditionally and the legacy doc gains it."""
+    record = SessionRecord(task_id="1-1-a-dev-1", role="dev", status="completed")
+    legacy = record.to_dict()
+    assert "tokens_by_model" not in legacy  # empty is not written
+    assert SessionRecord.from_dict(legacy).tokens_by_model == {}  # absent key
+    assert SessionRecord.from_dict(legacy).to_dict() == legacy  # byte-stable
+    record.tokens_by_model = {
+        "claude-opus-5-5": TokenUsage(input_tokens=3, cache_read_tokens=9),
+        UNATTRIBUTED_MODEL: TokenUsage(output_tokens=1),
+    }
+    doc = record.to_dict()
+    assert doc["tokens_by_model"] == {
+        "claude-opus-5-5": TokenUsage(input_tokens=3, cache_read_tokens=9).to_dict(),
+        UNATTRIBUTED_MODEL: TokenUsage(output_tokens=1).to_dict(),
+    }
+    back = SessionRecord.from_dict(json.loads(json.dumps(doc)))
+    assert back.tokens_by_model == record.tokens_by_model
+    assert back.to_dict() == doc
+    for bad in ("x", ["m"], None, 3):
+        doc["tokens_by_model"] = bad
+        assert SessionRecord.from_dict(doc).tokens_by_model == {}
+    doc["tokens_by_model"] = {
+        "ok": {"input_tokens": 2},
+        "not-a-dict": 5,
+        "bad-count": {"input_tokens": "lots"},
+    }
+    assert SessionRecord.from_dict(doc).tokens_by_model == {"ok": TokenUsage(input_tokens=2)}
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "legacy_default"),
+    [
+        ("followup_review_recommended", True, False),
+        # DW-405/407: the escalated-from-COMMITTING fact
+        ("migration_commit_escalated", True, False),
+        # DW-429: the refused-a-rival latch
+        ("migration_ledger_rival", True, False),
+        # DW-436: the validation-retry rejection latch
+        ("migration_rewrite_rejected", True, False),
+        # DW-646: the uncharged-pause rewrite digest
+        ("migration_uncharged_rewrite", "sha256:" + "a" * 64, None),
+        ("followup_reviews_spent", 2, 0),
+        ("resolved_redrive", True, False),
+        ("plan_checkpoint_pending", True, False),
+        ("sentinel_kind", "unresolved", ""),
+        ("restore_patch", "artifacts/attempt.patch", None),
+        ("token_budget_warned", True, False),
+        (
+            "dispatched_spec_file",
+            "_bmad-output/implementation-artifacts/spec-1-1-a.md",
+            None,
+        ),
+        # a pre-#860 state.json loads fail-closed: no absence was ever observed
+        ("dispatched_spec_absent", True, False),
+    ],
+    ids=[
+        "followup_review_recommended",
+        "migration_commit_escalated",
+        "migration_ledger_rival",
+        "migration_rewrite_rejected",
+        "migration_uncharged_rewrite",
+        "followup_reviews_spent",
+        "resolved_redrive",
+        "plan_checkpoint_pending",
+        "sentinel_kind",
+        "restore_patch",
+        "token_budget_warned",
+        "dispatched_spec_file",
+        "dispatched_spec_absent",
+    ],
+)
+def test_story_task_scalar_field_round_trips_and_defaults_for_legacy_state(
+    field, value, legacy_default
+):
+    """Each scalar StoryTask field survives a JSON round trip of state.json, and a
+    state.json written before the field existed loads its legacy default. The legacy
+    doc is built from a task holding the non-default value, so a load that ignored
+    the missing key and kept a stale value would fail rather than pass by accident."""
+    task = StoryTask(story_key="1-1-a", epic=1, **{field: value})
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert getattr(restored, field) == value
+
+    doc = task.to_dict()
+    del doc[field]  # state.json from before the field existed
+    assert getattr(StoryTask.from_dict(doc), field) == legacy_default
 
 
 @pytest.mark.parametrize("pending", [False, True])
@@ -342,6 +795,36 @@ def test_salvage_refile_pending_defaults_false_for_legacy_state():
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
     del doc["salvage_refile_pending"]
     assert StoryTask.from_dict(doc).salvage_refile_pending is False
+
+
+def test_migration_delivery_fields_round_trip():
+    """DW-317: the completion identity, latch and replay counts survive state.json."""
+    counts = {"converted": 2, "entries_now": 3, "open_now": 1}
+    task = StoryTask(
+        story_key="sweep-migrate",
+        epic=0,
+        migration_delivery_id="abc123",
+        migration_delivery_pending=True,
+        migration_delivery_counts=counts,
+    )
+    back = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert back.migration_delivery_id == "abc123"
+    assert back.migration_delivery_pending is True
+    assert back.migration_delivery_counts == counts
+
+
+def test_migration_delivery_fields_default_for_pre_upgrade_state():
+    doc = StoryTask(story_key="sweep-migrate", epic=0).to_dict()
+    for key in (
+        "migration_delivery_id",
+        "migration_delivery_pending",
+        "migration_delivery_counts",
+    ):
+        del doc[key]
+    back = StoryTask.from_dict(doc)
+    assert back.migration_delivery_id is None
+    assert back.migration_delivery_pending is False
+    assert back.migration_delivery_counts is None
 
 
 def test_legacy_park_eligible_state_loads_but_is_not_persisted():
@@ -380,15 +863,33 @@ def test_verify_outcome_park_fields_are_absent_by_default():
     assert unknown.park_proof_skipped is True and unknown.park_zero_diff is None
 
 
-def test_followup_reviews_spent_round_trips():
-    task = StoryTask(story_key="1-1-a", epic=1, followup_reviews_spent=2)
-    assert StoryTask.from_dict(task.to_dict()).followup_reviews_spent == 2
-
-
-def test_followup_reviews_spent_defaults_zero_for_legacy_state():
-    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del doc["followup_reviews_spent"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).followup_reviews_spent == 0
+def test_usage_relaunch_counters_round_trip_and_default_on_old_state():
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        attempt=3,
+        review_cycle=4,
+        dev_usage_relaunches=2,
+        review_usage_relaunches=1,
+    )
+    back = StoryTask.from_dict(task.to_dict())
+    assert back.dev_usage_relaunches == 2
+    assert back.review_usage_relaunches == 1
+    # the refunds are subtracted only in the charged views; the raw counters stand
+    assert back.attempt == 3 and back.review_cycle == 4
+    assert back.charged_attempts == 1
+    assert back.charged_review_cycles == 3
+    assert back.usage_relaunches == 3
+    # state.json from before the fields existed reads as no refunds
+    doc = task.to_dict()
+    del doc["dev_usage_relaunches"]
+    del doc["review_usage_relaunches"]
+    old = StoryTask.from_dict(doc)
+    assert old.dev_usage_relaunches == 0
+    assert old.review_usage_relaunches == 0
+    assert old.charged_attempts == 3
+    assert old.charged_review_cycles == 4
+    assert old.usage_relaunches == 0
 
 
 def test_generation_round_trips():
@@ -421,31 +922,121 @@ def test_escalations_resolved_upto_defaults_zero_for_legacy_state():
     assert StoryTask.from_dict(doc).escalations_resolved_upto == 0
 
 
-def test_resolved_redrive_round_trips():
-    task = StoryTask(story_key="1-1-a", epic=1, resolved_redrive=True)
-    assert StoryTask.from_dict(task.to_dict()).resolved_redrive is True
-
-
-def test_resolved_redrive_defaults_false_for_legacy_state():
-    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del doc["resolved_redrive"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).resolved_redrive is False
-
-
-def test_dispatched_spec_file_round_trips():
-    task = StoryTask(
-        story_key="1-1-a",
-        epic=1,
-        dispatched_spec_file="_bmad-output/implementation-artifacts/spec-1-1-a.md",
-    )
+def test_env_fault_site_round_trips_and_defaults_none():
+    task = StoryTask(story_key="1-1-a", epic=1, env_fault_site="probe:decision:dev")
     restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
-    assert restored.dispatched_spec_file == task.dispatched_spec_file
-
-
-def test_dispatched_spec_file_defaults_none_for_legacy_state():
+    assert restored.env_fault_site == "probe:decision:dev"
+    assert StoryTask(story_key="1-1-a", epic=1).env_fault_site is None
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del doc["dispatched_spec_file"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).dispatched_spec_file is None
+    del doc["env_fault_site"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).env_fault_site is None
+
+
+def test_env_fault_sites_vocabulary():
+    assert ENV_FAULT_SITES == {
+        "verify:dev",
+        "verify:fix",
+        "verify:review",
+        "probe:decision:dev",
+        "probe:decision:fix",
+        "probe:decision:review",
+        "probe:decision:workflow",
+        "probe:claim:dev",
+        "probe:claim:fix",
+        "probe:claim:review",
+        "probe:claim:workflow",
+        "probe:dispatch:dev",
+        "probe:dispatch:review",
+    }
+    dispatch = {s for s in ENV_FAULT_SITES if s.startswith(ENV_FAULT_SITE_DISPATCH_PREFIX)}
+    assert dispatch == {"probe:dispatch:dev", "probe:dispatch:review"}
+    assert PAUSE_ENVIRONMENT == "environment"
+
+
+def test_reverify_from_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, reverify_from="deferred")
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert restored.reverify_from == "deferred"
+
+
+def test_reverify_from_defaults_empty_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["reverify_from"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).reverify_from == ""
+    doc["reverify_from"] = None  # a null is not a pending replay either
+    assert StoryTask.from_dict(doc).reverify_from == ""
+
+
+def test_reverify_from_unknown_value_is_kept_not_dropped():
+    """Any non-empty latch means a replay is pending, so a value this version does
+    not know (a newer writer's) must survive the read rather than silently turning
+    the replay into a dev re-drive."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    doc["reverify_from"] = "from-the-future"
+    assert StoryTask.from_dict(doc).reverify_from == "from-the-future"
+
+
+def test_reverify_replayed_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, reverify_replayed="escalated")
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert restored.reverify_replayed == "escalated"
+
+
+def test_reverify_replayed_defaults_empty_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["reverify_replayed"]  # state.json from before the field existed (DW-527)
+    assert StoryTask.from_dict(doc).reverify_replayed == ""
+    doc["reverify_replayed"] = None  # a null is not a replay continuation either
+    assert StoryTask.from_dict(doc).reverify_replayed == ""
+
+
+def _dev_record(status: str) -> SessionRecord:
+    return SessionRecord(task_id="1-1-a-dev-1", role="dev", status=status)
+
+
+@pytest.mark.parametrize(
+    ("site", "latest_dev_status", "expected"),
+    [
+        (None, "completed", False),
+        ("not-a-site", "completed", False),
+        ("verify:dev", None, True),
+        ("verify:fix", None, True),
+        ("verify:review", None, True),
+        ("probe:decision:review", None, True),
+        ("probe:decision:workflow", None, True),
+        ("probe:claim:review", None, True),
+        ("probe:claim:workflow", None, True),
+        ("probe:dispatch:dev", "completed", False),
+        ("probe:dispatch:review", "completed", False),
+        ("probe:decision:dev", "completed", True),
+        ("probe:decision:dev", "crashed", False),
+        ("probe:decision:dev", None, False),
+        ("probe:decision:fix", "completed", True),
+        ("probe:decision:fix", "timeout", False),
+        ("probe:claim:dev", "completed", True),
+        ("probe:claim:dev", "crashed", False),
+        ("probe:claim:dev", None, False),
+        ("probe:claim:fix", "completed", True),
+        ("probe:claim:fix", "timeout", False),
+    ],
+)
+def test_env_fault_site_reverifiable_matrix(site, latest_dev_status, expected):
+    """Dispatch sites fired before any session ran, and a decision- or claim-site
+    fault after a crashed/timed-out dev (or fix — recorded under the dev role)
+    session left no product: neither is reverifiable. Every other site in the closed vocabulary is.
+
+    Ablation, performed: drop the latest-record status check and the `crashed` /
+    `timeout` / no-record rows redden; drop the dispatch-prefix check and both
+    dispatch rows redden."""
+    task = StoryTask(story_key="1-1-a", epic=1, env_fault_site=site)
+    if latest_dev_status is not None:
+        # an older completed record must not vouch for the latest attempt
+        task.sessions.append(_dev_record("completed"))
+        task.sessions.append(
+            SessionRecord(task_id="1-1-a-review-1", role="review", status="crashed")
+        )
+        task.sessions.append(_dev_record(latest_dev_status))
+    assert env_fault_site_reverifiable(task) is expected
 
 
 def test_rebase_spec_paths_on_reanchors_both_ownership_fields(tmp_path):
@@ -693,28 +1284,6 @@ def test_dispatched_spec_snapshot_decode_error_names_story_and_field(encoded, ca
     assert isinstance(caught.value.__cause__, cause_type)
 
 
-def test_plan_checkpoint_pending_round_trips():
-    task = StoryTask(story_key="1", epic=0, plan_checkpoint_pending=True)
-    assert StoryTask.from_dict(task.to_dict()).plan_checkpoint_pending is True
-
-
-def test_plan_checkpoint_pending_defaults_false_for_legacy_state():
-    doc = StoryTask(story_key="1", epic=0).to_dict()
-    del doc["plan_checkpoint_pending"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).plan_checkpoint_pending is False
-
-
-def test_sentinel_kind_round_trips():
-    task = StoryTask(story_key="1", epic=0, sentinel_kind="unresolved")
-    assert StoryTask.from_dict(task.to_dict()).sentinel_kind == "unresolved"
-
-
-def test_sentinel_kind_defaults_empty_for_legacy_state():
-    doc = StoryTask(story_key="1", epic=0).to_dict()
-    del doc["sentinel_kind"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).sentinel_kind == ""
-
-
 def test_board_advance_intended_round_trips_through_json():
     """#350's carry payload. The JSON leg is the point: this crosses state.json to
     reach the post-merge carry, and `_replay_unlatched_ledger_carries` reads it from
@@ -752,11 +1321,13 @@ _DEFERRED_STATE_KEYS = (
     "accepted_dev_session_index",
     "harvest_carry_commit_pending",
     "isolated_ledger_carried",
+    "ledger_seed_text",
+    "pinned_config_rewrites",
 )
 
 
 def test_deferred_work_state_fields_round_trip_through_json():
-    """All eleven fields are hand-enumerated in both serializers. Non-default
+    """All thirteen fields are hand-enumerated in both serializers. Non-default
     values make a missing line on either side observable, while the JSON leg pins
     the on-disk container shape rather than only an in-memory dataclass copy."""
     task = StoryTask(
@@ -773,6 +1344,10 @@ def test_deferred_work_state_fields_round_trip_through_json():
         accepted_dev_session_index=3,
         harvest_carry_commit_pending=True,
         isolated_ledger_carried=True,
+        ledger_seed_text="# Deferred Work\n",
+        pinned_config_rewrites={
+            ".claude/settings.json": {"dialect": "claude-settings-json", "text": "{}\n"}
+        },
     )
     restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
 
@@ -788,10 +1363,14 @@ def test_deferred_work_state_fields_round_trip_through_json():
     assert restored.accepted_dev_session_index == 3
     assert restored.harvest_carry_commit_pending is True
     assert restored.isolated_ledger_carried is True
+    assert restored.ledger_seed_text == "# Deferred Work\n"
+    assert restored.pinned_config_rewrites == {
+        ".claude/settings.json": {"dialect": "claude-settings-json", "text": "{}\n"}
+    }
 
 
 def test_deferred_work_state_fields_default_for_one_old_state_dict():
-    """A state.json written before this package has none of the eleven keys.
+    """A state.json written before this package has none of the thirteen keys.
     Every load must use ``d.get`` so resume reaches the old behavior instead of
     raising KeyError; one shared old document prevents testing only a subset."""
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
@@ -810,6 +1389,20 @@ def test_deferred_work_state_fields_default_for_one_old_state_dict():
     assert restored.accepted_dev_session_index is None
     assert restored.harvest_carry_commit_pending is False
     assert restored.isolated_ledger_carried is False
+    assert restored.ledger_seed_text is None
+    assert restored.pinned_config_rewrites == {}
+
+
+def test_rejected_dev_task_id_round_trips_and_defaults_for_old_state():
+    """The DW-617 dev RETRY latch survives the JSON state file, and a state.json
+    written before the field existed loads with it unarmed."""
+    task = StoryTask(story_key="1-1-a", epic=1, rejected_dev_task_id="1-1-a-dev-2-g1")
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert restored.rejected_dev_task_id == "1-1-a-dev-2-g1"
+
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["rejected_dev_task_id"]
+    assert StoryTask.from_dict(doc).rejected_dev_task_id == ""
 
 
 def test_pre_harvest_ledger_preserves_absent_empty_and_text_states():
@@ -849,17 +1442,6 @@ def test_deferred_work_state_container_defaults_are_not_shared():
     one.bundle_closes_intended.append("DW-1")
     assert other.harvested_deferrals == []
     assert other.bundle_closes_intended == []
-
-
-def test_restore_patch_round_trips():
-    task = StoryTask(story_key="1-1-a", epic=1, restore_patch="artifacts/attempt.patch")
-    assert StoryTask.from_dict(task.to_dict()).restore_patch == "artifacts/attempt.patch"
-
-
-def test_restore_patch_defaults_none_for_legacy_state():
-    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del doc["restore_patch"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).restore_patch is None
 
 
 def test_preserve_ref_round_trips():
@@ -912,17 +1494,6 @@ def test_operator_actions_are_not_shared_between_tasks():
     other = StoryTask(story_key="1-2-b", epic=1)
     one.operator_actions.append("buy the domain")
     assert other.operator_actions == []
-
-
-def test_token_budget_warned_round_trips():
-    task = StoryTask(story_key="1-1-a", epic=1, token_budget_warned=True)
-    assert StoryTask.from_dict(task.to_dict()).token_budget_warned is True
-
-
-def test_token_budget_warned_defaults_false_for_legacy_state():
-    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del doc["token_budget_warned"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).token_budget_warned is False
 
 
 def test_stopped_round_trips():
@@ -979,6 +1550,71 @@ def test_clear_pause_also_clears_crashed():
     assert state.crashed is False
     assert state.crash_error is None
     assert state.paused is False
+
+
+def test_usage_limit_pause_fields_round_trip_and_default_legacy():
+    """DW-591: a usage-limit pause's reset and limit class persist; a state.json
+    written before the fields existed loads both as None."""
+    state = _state(
+        paused_reason="usage limit: dev session stalled (x)",
+        paused_reset_at="2026-10-25T19:20:00+07:00",
+        paused_limit_class="wait",
+    )
+    loaded = RunState.from_dict(state.to_dict())
+    assert loaded.paused_reset_at == "2026-10-25T19:20:00+07:00"
+    assert loaded.paused_limit_class == "wait"
+    legacy = state.to_dict()
+    del legacy["paused_reset_at"]
+    del legacy["paused_limit_class"]
+    loaded = RunState.from_dict(legacy)
+    assert loaded.paused_reset_at is None
+    assert loaded.paused_limit_class is None
+
+
+def test_clear_pause_also_clears_usage_limit_fields():
+    state = _state(
+        paused_reason="usage limit",
+        paused_reset_at="2026-10-25T19:20:00+07:00",
+        paused_limit_class="blocked",
+    )
+    state.clear_pause()
+    assert state.paused_reset_at is None
+    assert state.paused_limit_class is None
+
+
+def test_record_pause_never_inherits_usage_limit_fields():
+    """A pause that is not a usage limit stores None for both facts, even over
+    values a previous pause left on the state (DW-591)."""
+    state = _state()
+    state.record_pause("usage limit", "escalation", "s1", reset_at="r", limit_class="wait")
+    assert (state.paused_reset_at, state.paused_limit_class) == ("r", "wait")
+    state.record_pause("CRITICAL escalation", "escalation", "s2")
+    assert state.paused_reason == "CRITICAL escalation"
+    assert state.paused_story_key == "s2"
+    assert state.paused_reset_at is None
+    assert state.paused_limit_class is None
+
+
+def test_restore_pause_undoes_clear_pause():
+    """`pause_snapshot` captures exactly the fields `clear_pause` clears, so a resume
+    that fails before its engine starts can put the pause back. Every field is set
+    to a non-default value: a field the snapshot missed would come back cleared."""
+    state = _state(
+        paused_reason="CRITICAL escalation",
+        paused_stage="escalation",
+        paused_story_key="s1",
+        paused_reset_at="2026-10-25T19:20:00+07:00",
+        paused_limit_class="wait",
+        stopped=True,
+        crashed=True,
+        crash_error="RuntimeError: boom",
+    )
+    before = state.to_dict()
+    snapshot = state.pause_snapshot()
+    state.clear_pause()
+    assert state.to_dict() != before
+    state.restore_pause(snapshot)
+    assert state.to_dict() == before
 
 
 def test_cache_read_weight_from_snapshot():
@@ -1243,3 +1879,168 @@ def test_story_task_baseline_artifacts_mangled_shape_reads_as_no_snapshot(mangle
     d["baseline_artifacts"] = mangled
 
     assert StoryTask.from_dict(d).baseline_artifacts is None
+
+
+# ------------------------------------ the engine's ledger bookkeeping commits (#772)
+
+
+def test_story_task_bookkeeping_ledger_round_trips_and_defaults_none():
+    """`bookkeeping_ledger` — the baseline it was minted on, whether the ledger was
+    absent from that baseline's tree, and the engine's commit shas — survives a
+    JSON `to_dict`/`from_dict` trip, and a pre-upgrade record with no key reads as
+    `None` (no record), the conservative pre-bookkeeping path."""
+    task = StoryTask(story_key="1-1-a", epic=1, baseline_commit="b" * 40)
+    assert task.bookkeeping_ledger is None
+    task.bookkeeping_ledger = {"baseline": "b" * 40, "added": True, "shas": ["c" * 40, "d" * 40]}
+
+    rehydrated = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+
+    assert rehydrated.bookkeeping_ledger == task.bookkeeping_ledger
+    assert rehydrated.bookkeeping_ledger is not task.bookkeeping_ledger
+    empty = StoryTask(story_key="1-1-a", epic=1)
+    empty.bookkeeping_ledger = {"baseline": "b" * 40, "added": False, "shas": []}
+    assert StoryTask.from_dict(empty.to_dict()).bookkeeping_ledger == empty.bookkeeping_ledger
+    legacy = task.to_dict()
+    del legacy["bookkeeping_ledger"]
+    assert StoryTask.from_dict(legacy).bookkeeping_ledger is None
+
+
+@pytest.mark.parametrize(
+    "mangled",
+    [
+        None,
+        "not a mapping",
+        ["b" * 40],
+        {"added": True, "shas": []},
+        {"baseline": "", "added": True, "shas": []},
+        {"baseline": 7, "added": True, "shas": []},
+        {"baseline": "b" * 40, "shas": []},
+        {"baseline": "b" * 40, "added": "true", "shas": []},
+        {"baseline": "b" * 40, "added": 1, "shas": []},
+        {"baseline": "b" * 40, "added": None, "shas": []},
+        {"baseline": "b" * 40, "added": True},
+        {"baseline": "b" * 40, "added": True, "shas": "c" * 40},
+        {"baseline": "b" * 40, "added": True, "shas": {"c" * 40: 1}},
+        {"baseline": "b" * 40, "added": True, "shas": ["c" * 40, 7]},
+        {"baseline": "b" * 40, "added": True, "shas": ["c" * 40, None]},
+        {"baseline": "b" * 40, "added": True, "shas": [""]},
+    ],
+)
+def test_story_task_bookkeeping_ledger_mangled_shape_reads_as_no_record(mangled):
+    """A hand-edited record that is not exactly `{baseline: str, added: bool,
+    shas: [str]}` is not partially trusted: the whole field reads as `None`, which
+    only re-enables the conservative paths (a preserve that parks the commits, a
+    gate that counts the ledger). A truthy `"true"` or `1` is not `added`, and a
+    non-string sha is never coerced into one — nor does it RAISE out of
+    `from_dict`, which would keep the whole run state from loading.
+
+    Ablation: return `raw` from `_bookkeeping_ledger_from` whenever it is a dict
+    and every mapping row fails."""
+    d = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    d["bookkeeping_ledger"] = mangled
+
+    assert StoryTask.from_dict(d).bookkeeping_ledger is None
+
+
+def test_story_task_bookkeeping_for_baseline_drops_a_record_once_baseline_moves():
+    """The record is SELF-INVALIDATING: `bookkeeping_for_baseline()` hands it back
+    only while `baseline_commit` is the baseline it names. A new attempt's
+    baseline, or a cleared one, reads as no record without any reset site having
+    to clear the field — which stays stored untouched either way.
+
+    Ablation: return `self.bookkeeping_ledger` unconditionally and the two `is
+    None` assertions after the baseline moves fail."""
+    record = {"baseline": "b" * 40, "added": False, "shas": ["c" * 40]}
+    task = StoryTask(story_key="1-1-a", epic=1, baseline_commit="b" * 40)
+    assert task.bookkeeping_for_baseline() is None
+    task.bookkeeping_ledger = record
+
+    assert task.bookkeeping_for_baseline() == record
+
+    task.baseline_commit = "e" * 40
+    assert task.bookkeeping_for_baseline() is None
+    task.baseline_commit = None
+    assert task.bookkeeping_for_baseline() is None
+    assert task.bookkeeping_ledger == record
+
+
+# ------------------------------------------- nested mount project (DW-379)
+
+
+def _nested_state() -> RunState:
+    """A run whose project `/r/app` is nested in its code root `/r`."""
+    return RunState(run_id="r1", project="/r/app", repo_root="/r", started_at="now")
+
+
+def test_mount_project_keeps_a_nested_projects_offset():
+    """`RunState.mount_project` is `ProjectPaths.rebased(<mount>).project` from what
+    state records: the mount itself by default, `<mount>/<offset>` when the project is
+    nested in the code root, None without a mount."""
+    task = StoryTask("1-1-a", 1)
+    assert _nested_state().mount_project(task) is None
+    task.worktree_path = "/r/app/.bmad-loop/runs/r1/worktrees/1"
+    assert _nested_state().mount_project(task) == Path(task.worktree_path) / "app"
+    assert _state().mount_project(task) == Path(task.worktree_path)
+
+
+def test_nested_spec_paths_round_trip_through_the_mount_project():
+    """DW-379: a relative spec spelling is always PROJECT-relative. In a nested mount
+    `to_dict` persists the spec relative to `<mount>/app`, reopening re-anchors it
+    there, and releasing the mount keeps the same project-relative spelling — the
+    one a replacement mount (or the main checkout) re-resolves against its own
+    project.
+
+    Ablation: drop the mount project from `RunState.to_dict`'s task call and the
+    persisted spelling reddens as `app/_bmad-output/...`, which the reopen then joins
+    onto `<mount>/app` a second time."""
+    state = _nested_state()
+    wt = "/r/app/.bmad-loop/runs/r1/worktrees/1"
+    task = StoryTask("1-1-a", 1)
+    task.worktree_path = wt
+    task.spec_file = f"{wt}/app/_bmad-output/impl/s.md"
+    task.dispatched_spec_file = f"{wt}/app/_bmad-output/impl/s.md"
+    state.tasks[task.story_key] = task
+
+    persisted = state.to_dict()["tasks"]["1-1-a"]
+    assert persisted["spec_file"] == "_bmad-output/impl/s.md"
+    assert persisted["dispatched_spec_file"] == "_bmad-output/impl/s.md"
+
+    reopened = RunState.from_dict(json.loads(json.dumps(state.to_dict())))
+    back = reopened.tasks["1-1-a"]
+    mount_project = reopened.mount_project(back)
+    assert mount_project is not None
+    back.rebase_spec_paths_on(mount_project)
+    assert back.spec_file == str(Path(wt) / "app" / "_bmad-output" / "impl" / "s.md")
+    assert back.dispatched_spec_file == back.spec_file
+
+    back.release_mount_owned_state(mount_project)
+    assert back.spec_file == "_bmad-output/impl/s.md"
+    assert back.dispatched_spec_file is None
+
+
+def test_default_config_spec_paths_keep_the_mount_relative_spelling():
+    """Byte-identical when `project == repo_root`: the mount project IS the mount, so
+    the persisted spelling is exactly today's mount-relative one, and a bare
+    `to_dict()` (no anchor) agrees with the state-level call."""
+    state = _state()
+    wt = "/p/.bmad-loop/runs/r1/worktrees/1"
+    task = StoryTask("1-1-a", 1)
+    task.worktree_path = wt
+    task.spec_file = f"{wt}/_bmad-output/impl/s.md"
+    state.tasks[task.story_key] = task
+
+    assert state.to_dict()["tasks"]["1-1-a"]["spec_file"] == "_bmad-output/impl/s.md"
+    assert task.to_dict()["spec_file"] == "_bmad-output/impl/s.md"
+
+
+def test_nested_spec_outside_the_mount_project_stays_verbatim():
+    """A spec inside the mount but OUTSIDE its project (the checkout's other tree) is
+    not project-relative, so it is persisted absolute — never spelled `../...`."""
+    state = _nested_state()
+    wt = "/r/app/.bmad-loop/runs/r1/worktrees/1"
+    task = StoryTask("1-1-a", 1)
+    task.worktree_path = wt
+    task.spec_file = f"{wt}/other/s.md"
+    state.tasks[task.story_key] = task
+
+    assert state.to_dict()["tasks"]["1-1-a"]["spec_file"] == f"{wt}/other/s.md"

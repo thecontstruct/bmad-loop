@@ -1,11 +1,11 @@
 """Detached launching of bmad-loop commands for the TUI.
 
 The TUI never runs engines in-process: run/sweep/resume are launched in new
-windows of a dedicated control session (bmad-loop-ctl on tmux, a per-registry
-name on psmux — see the CTL_SESSION comment below) so they survive TUI exit,
-and the dashboard observes them through run-dir artifacts exactly like runs
-started from a plain shell. Fast read-only commands (validate,
---dry-run) are captured instead, for display in a modal.
+windows of a dedicated control session (bmad-loop-ctl — see the CTL_SESSION
+comment below) so they survive TUI exit, and the dashboard observes them
+through run-dir artifacts exactly like runs started from a plain shell. Fast
+read-only commands (validate, --dry-run) are captured instead, for display in
+a modal.
 
 No textual imports here — everything drives the multiplexer seam (or a plain
 subprocess for the captured read-only commands) and is unit-testable.
@@ -18,16 +18,22 @@ import re
 import stat
 import subprocess
 import sys
+from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 
+from .. import policy as policy_mod
 from .. import runs
 from ..adapters.multiplexer import (
     MultiplexerError,
+    TerminalMultiplexer,
+    Unset,
     get_multiplexer,
     mux_usable,
+    parked_screen,
 )
 from ..journal import Journal
+from ..parked import open_session_start_indexed
 from ..platform_util import (
     DIR_FD_ANCHORED_WRITES,
     atomic_write_text,
@@ -36,19 +42,21 @@ from ..platform_util import (
 )
 
 CTL_SESSION = runs.CTL_SESSION
-# The control-session NAME is the transport's business, resolved per call
-# through `runs.ctl_session_for(project)`: the fixed name on tmux, where one
-# server serves the machine and the session really is machine-wide (scoped by
-# the per-window PROJECT_OPTION tag below), and a per-registry name on psmux,
-# whose duplicate-server mutex is keyed on the session name alone, across
-# every registry in the login session (`Local\` is a per-login-session object
-# namespace) — so a fixed name would let only ONE registry there hold a control
-# session and every other project's launch would fail as a duplicate.
-# The constant survives as the fixed base name (display fallbacks, tmux argv
-# pins); anything that addresses a live session resolves the name instead.
+# Anything that addresses a live control session resolves its name through
+# `runs.ctl_session_for(project)` rather than this constant: on tmux the one
+# session is machine-wide (scoped by the per-window PROJECT_OPTION tag below),
+# on psmux each project's registry holds its own session of this name. The
+# constant serves display fallbacks and tmux argv pins.
 
 # control-session windows are named <kind>-<run_id> (see start_detached)
 _CTL_WINDOW_RE = re.compile(r"^(?:run|sweep|resume|resolve)-(.+)$")
+
+
+def _ctl_window_name(kind: str, run_id: str) -> str:
+    """The name a control-session window hosting `run_id` carries: the one
+    start_detached mints and claim_renamed_ctl_window renames to, and the one
+    _CTL_WINDOW_RE parses back."""
+    return f"{kind}-{run_id}"
 
 
 class LaunchError(Exception):
@@ -64,6 +72,23 @@ def mux_available() -> bool:
 
 def session_exists(session: str) -> bool:
     return get_multiplexer().has_session(session)
+
+
+def agent_session_exists(session: str) -> bool:
+    """:func:`session_exists` for a run's AGENT session, the one an attach lands
+    on: in a registry shared with other projects (#729) a same-named session
+    may be another project's, and it does not exist as far as this project is
+    concerned. Saying why is the difference between that and "no session".
+
+    Kept off :func:`session_exists` itself, which also answers for the control
+    session, which carries no project tag at all (its windows do)."""
+    if not session_exists(session):
+        return False
+    refusal = runs.foreign_session_refusal(session, get_multiplexer())
+    if refusal is not None:
+        print(f"warning: treating {session} as absent — {refusal}", file=sys.stderr)
+        return False
+    return True
 
 
 # Run-dir sidecar naming the ctl-session window start_detached minted last for
@@ -252,11 +277,11 @@ def _run_dir_is_confined(project: Path, run_dir: Path) -> bool:
 
 
 def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
-    """Record the window a launch just minted, so ctl_window_id can prefer it
-    over an older window sharing the run id.
+    """Record the window that accepted the run, so ctl_window_id can prefer it
+    over an older window sharing the run id. Its one writer is claim_ctl_window.
 
     Best-effort on purpose. The window is already running by the time this
-    writes, so a failed write must not fail the launch — the lookup degrades to
+    writes, so a failed write must not fail the run — the lookup degrades to
     the name scan, i.e. to the behaviour before this record existed. A failure
     forgets the previous record rather than leaving it: degrading to the scan is
     the intended fallback, answering a superseded window is not.
@@ -351,6 +376,179 @@ def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
         _forget_ctl_window(project, run_id)
 
 
+def claim_ctl_window(project: Path, run_id: str, *, launched: bool = False) -> str | None:
+    """Publish the control-session window this process runs in as the run's
+    control window. Returns operator wording when the record did not land, None
+    when it did or when this process is not in a control session at all (a
+    resume typed in the operator's own shell owns no window to record).
+
+    `launched` is the process's own word that start_detached minted its window
+    (the hidden `--ctl-launch`). It is what tells an unanswered session probe
+    apart from an operator's shell: `current_session()` answers None for both,
+    so a launched child whose probe failed would otherwise keep the previous
+    launch's record and say nothing (#925). Launched but not provably in a
+    control session drops the record and warns, as a window that cannot name
+    itself does.
+
+    Called by the child a launch started (start_detached), at the moment it
+    accepts the run: under the run's state lock, after its liveness re-check
+    answered not alive. A rival that drives the run publishes its engine pid
+    under that same lock before releasing it, so publication follows acceptance
+    in lock order. A refused child never gets here, and a child that accepts
+    after an earlier claim overwrites it — it is now the one driving. Recording
+    from the launcher instead fails both ways (#920): it writes before the child
+    has decided, and it can write after a rival child accepted.
+
+    Ceiling: from launch until the child accepts (seconds, the child's
+    start-up) the record still names the previous launch's window, so `a` and
+    `x` in that gap answer it. Before #920 they answered the minted window at
+    once, including a window about to refuse.
+
+    ctl_window_id re-proves the record against this run's tagged
+    `<kind>-<run_id>` rows, so a record naming a window called anything else is
+    ignored there. A landed record is therefore checked by name as well, and a
+    window the lookup cannot reach is reported rather than passed off as
+    recorded (_unnamed_ctl_window, #937)."""
+    try:
+        in_ctl = in_ctl_session()
+        if not in_ctl and not launched:
+            return None
+        win_id = get_multiplexer().current_window_id() if in_ctl else None
+    except MultiplexerError:
+        if not launched:
+            raise
+        win_id = None  # a launched child's probe that raised went unanswered too
+    if win_id:
+        _record_ctl_window(project, run_id, win_id)
+        if _read_ctl_window(project, run_id) == win_id:
+            return _unnamed_ctl_window(project, run_id, win_id)
+    else:
+        # In a control window that cannot name itself, or a launched one whose
+        # session probe went unanswered: the previous record names a window this
+        # run no longer drives from, so drop it.
+        _forget_ctl_window(project, run_id)
+    return (
+        f"this window could not be recorded as run {run_id}'s control window — "
+        "attach and stop from the TUI may target an older window for this run"
+    )
+
+
+def claim_renamed_ctl_window(project: Path, run_id: str, *, launched: bool = False) -> str | None:
+    """claim_ctl_window for a run this process starts in a window it already
+    drives under another run's name: a parent-initiative chain builds each next
+    child as a new run, in the process and so the window of the run before it
+    (cli `_drive_initiative_chain`). The lookup reaches a run's window by name,
+    so the window is renamed first, to the `run` name start_detached would have
+    given `run_id`, and then claimed. Afterwards ctl_window_id answers the
+    window for `run_id` and no longer for the run before: that run's record
+    still names it, but the lookup re-proves a record by name and drops it.
+
+    Nothing is re-stamped. The project tag is a window option, which a rename
+    keeps, and a chain stays in its project, so start_detached's tag still
+    proves the window ours.
+
+    Same contract as claim_ctl_window: operator wording when the claim did not
+    land, None when it did or when this process is in no control session (an
+    operator's shell owns no window to rename). A rename that raises is worded
+    and claims nothing: the window keeps the previous run's name and record,
+    so `a` and `x` on that run still reach the window driving this one.
+
+    `launched` is the chain process's own `--ctl-launch`, whichever command
+    started the chain (a TUI `run` included): with it, a session probe that
+    goes unanswered is worded, not taken for an operator's shell."""
+    try:
+        win_id = get_multiplexer().current_window_id() if in_ctl_session() else None
+    except MultiplexerError:
+        if not launched:
+            raise
+        win_id = None
+    if not win_id:
+        # No window to rename: an operator's shell answers None from the claim,
+        # a launched window that cannot name itself the claim's wording.
+        return claim_ctl_window(project, run_id, launched=launched)
+    try:
+        get_multiplexer().rename_window(win_id, _ctl_window_name("run", run_id))
+    except MultiplexerError as e:
+        return (
+            f"this window could not be renamed for run {run_id} ({e}), so attach and stop "
+            f"from the TUI cannot find it as the run's control window — stop it with: "
+            f"bmad-loop stop {run_id}"
+        )
+    return claim_ctl_window(project, run_id, launched=launched)
+
+
+def recorded_ctl_window(project: Path, run_id: str) -> str | None:
+    """The window id the run's record names, or None (see _read_ctl_window)."""
+    return _read_ctl_window(project, run_id)
+
+
+def restore_ctl_window(
+    project: Path, run_id: str, previous: str | None, claimed: str
+) -> str | None:
+    """Hand the record back from `claimed`, a window that claimed the run and
+    then never drove it (an interactive resolve whose session could not start,
+    #937), to `previous`, the record before that claim. The caller holds the
+    run's state lock, the lock every claim is made under.
+
+    Only while the record still names `claimed`: a claim accepted since then
+    drives the run, and keeps its own. No predecessor means the record goes,
+    which is exactly the state before the claim.
+
+    Returns operator wording when the record could not be handed back (both
+    writers swallow their faults), None otherwise."""
+    if _read_ctl_window(project, run_id) != claimed:
+        return None
+    if previous:
+        _record_ctl_window(project, run_id, previous)
+        if _read_ctl_window(project, run_id) == previous:
+            return None
+    else:
+        _forget_ctl_window(project, run_id)
+        # Absence proven, not read: _read_ctl_window answers None for a record
+        # it cannot read as well, which here would pass off a kept one as gone.
+        try:
+            os.lstat(runs.run_dir_for(project, run_id) / _CTL_WINDOW_FILE)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            pass
+    return (
+        f"run {run_id}'s control-window record could not be handed back from this "
+        "exiting window — attach and stop from the TUI may target it"
+    )
+
+
+def _unnamed_ctl_window(project: Path, run_id: str, win_id: str) -> str | None:
+    """Operator wording when the claimed window is not named for the run, so
+    the lookup's name scan never reaches it; None when it is.
+
+    A window named for another run is a real shape: `resolve <finished-run>
+    --reverify` runs in `resolve-<finished-run>` and resumes a new replay run
+    there (#937), so the record lands while `a` and `x` cannot find it.
+
+    The name only, not the tag ctl_window_reachable also checks: start_detached
+    stamps the tag after the child is already running, so a tag check here
+    races the launcher, which reports a failed tag write itself."""
+    try:
+        rows = _list_ctl_windows(
+            get_multiplexer(), ctl_session(project), ["window_id", "window_name"]
+        )
+    except MultiplexerError as e:
+        return (
+            f"could not confirm this window is reachable as run {run_id}'s control "
+            f"window ({e}) — attach and stop from the TUI may not find it"
+        )
+    for row_id, name, *_ in rows:
+        if row_id == win_id:
+            m = _CTL_WINDOW_RE.match(name)
+            if m is not None and m.group(1) == run_id:
+                return None
+    return (
+        f"this window is not named for run {run_id}, so attach and stop from the TUI "
+        f"cannot find it as the run's control window — stop it with: bmad-loop stop {run_id}"
+    )
+
+
 def ctl_window_id(project: Path, run_id: str) -> str | None:
     """Stable window id (bare `@N` on tmux, session-qualified on psmux) of the
     control-session window hosting this run's orchestrator process
@@ -373,87 +571,133 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     replayed: a target that no longer resolves is the dangerous kind of stale —
     on psmux an unresolvable `-t` lands on the *active* window (psmux/psmux#545;
     tmux merely errors, which the best-effort consumers turn into a silent
-    no-op). With no record at all the answer is the first match among the rows
-    that got in — which, since #531, means the first *tagged* match: a row with
-    no tag needs the record to be a candidate at all (below), so the recordless
-    case never has an untagged one to fall back to.
+    no-op). With no record at all the answer is the first tagged match.
 
-    Scoped to `project` by the PROJECT_OPTION tag: the control session is shared
-    across projects, and a run id is only unique within one (`--run-id` is
-    caller-supplied), so a same-id window belonging to another project would
-    otherwise be a legal match here — for `x` that means killing a *live*
-    orchestrator next door. _ctl_window_candidates reads tags by the same rule,
-    but only that half is still shared: its untagged windows are admitted by the
-    run dir this one stopped trusting, because the pruning consumer of that
-    shape is #419's and the fix is partitioned there.
+    Scoped to `project` by the PROJECT_OPTION tag, and by nothing else: only a
+    row carrying one of this project's accepted tags is a candidate. The control
+    session is shared across projects, and a run id is only unique within one
+    (`--run-id` is caller-supplied), so a same-id window belonging to another
+    project would otherwise be a legal match here — for `x` that means killing a
+    *live* orchestrator next door. _ctl_window_candidates reads tags by the same
+    rule, but only that half is shared: its untagged windows are still admitted
+    by the run dir, because the pruning consumer of that shape is #419's.
 
-    An untagged row is admitted only when the record names that exact window.
-    Holding the run dir was the earlier gate, and a run dir is a coincidence
-    rather than a claim: `--run-id` is caller-supplied and deterministic, so two
-    projects scripting the same id both hold one, and each then admitted the
-    *other's* untagged window — machine-wide on tmux, where the control session
-    carries a fixed name (#531). The record is the opposite kind of fact: this
-    project wrote it, about the window its own launch minted. It survives the
-    failure this fallback exists for because start_detached records *before* it
-    tags, so a window whose (best-effort) set_window_option never landed still
-    has one.
+    An untagged row is never a candidate, however it is vouched for (#750).
+    Every proof tried for one was a fact the workspace can forge. The run dir is
+    a coincidence of a caller-supplied id (#531). The record lives under the
+    project root every coding session can write, and the window id it names is
+    a reusable handle — tmux 3.4 and psmux 3.3.8 both restart at `@0`/`@1` after
+    a server restart. A pane pid recorded beside it is observable rather than
+    secret: any same-UID process reads it from the process table, along with the
+    `TMUX` socket path in the pane's environment, and anything minted into the
+    window at creation passes through the multiplexer client's argv, which the
+    process table also shows. The tag is the one claim that needs a write
+    through the multiplexer to forge, so it is the whole proof.
 
-    What the proof costs is reach for a window minted before any record exists —
-    a fresh `run`/`sweep`, where _record_ctl_window deliberately skips because
-    the run dir is not minted yet, and anything that lost its record since. Those
-    answer None until a relaunch records one, and the two consumers wear that
-    differently: `a` falls through to the live agent session, or says "nothing to
-    attach" when there is none, while `x` kills nothing — kill_ctl_window no-ops
-    on None — and still reports the run stopped, so the orchestrator window is
-    left running with no notice. That is the honest price of the gate, and it is
-    the cheaper half: fail closed is right here because the alternative is not
-    "reach my window" but "reach *a* window": with nothing proving ownership the
-    untagged bucket is filled by listing order, and `x` would kill whatever
-    sorted first — possibly a neighbour's live orchestrator.
+    The honest bar, then: forging ownership here requires a mux write, exactly
+    as forging the tag does — no more, and no less. On a host where the coding
+    session runs unsandboxed as the same user, that is any process that can
+    find the socket, which the pane environment hands out; the gate is only as
+    strong as the session's isolation from the multiplexer.
 
-    Untagged stays a *fallback*, not a peer: merged into one listing-ordered
-    list a recorded untagged row would compete on index with a correctly tagged
-    one, and the tag is the stronger proof of the two, so untagged is consulted
-    only when nothing carries this project's tag.
+    What it costs is reach for a window whose tag cannot be read as ours: one
+    whose best-effort tag write failed at launch (start_detached records before
+    it tags, but the record admits nothing on its own), and — every window at
+    once — a listing whose option column could not be read at all, which psmux
+    folds to "" rather than failing (PsmuxMultiplexer.list_windows). The seam
+    hands both back as the same empty tag, so neither this function nor its
+    callers can tell them apart. Fail closed is still right — the alternative
+    is not "reach my window" but "reach *a* window", possibly a neighbour's live
+    orchestrator — but it must not be silent: a None here reads as "no window",
+    and `x` would then report the run stopped while its window keeps running.
+    So ctl_window_lookup also counts the same-run rows it refused for want of a
+    readable tag, and `x` and `a` say so (see kill_ctl_window and the TUI's
+    attach) instead of passing the refusal off as an absence.
 
-    One residual survives, and it is a conjunction rather than a case: a backend
-    that reuses a freed window id (a supported divergence — see the id-reuse row
-    in the tests) hands the neighbour the id this project recorded, while both
-    projects script the same run id AND the neighbour's own tag write failed AND
-    the window this record named is already gone. Name and id then both match and
-    the neighbour is admitted. Closing it needs a channel that says *this window
-    is mine* rather than *an id I once minted*, and the only one available is the
-    tag — which this function must read, never write: re-tagging on read is
-    claiming, not proving, and would hand a neighbour's window this project's
-    tag. So it is left open, deliberately and visibly. Wherever `runs.is_run` still
-    holds, every condition in that conjunction was already satisfied by the gate
-    this replaces — which admitted the neighbour on the run-id collision alone,
-    with no id reuse and no dead window required — so over those states this is a
-    strict narrowing. It is not a narrowing everywhere, and the exception is the
-    residual reached from the other side: _read_ctl_window asks nothing about the
-    run dir, so an untagged row named by a readable record whose run `runs.is_run`
-    now rejects (a partial prune is one route there, not the only one) is admitted
-    here and would have been refused by the old gate — and if that recorded id has
-    since been reused by an untagged neighbour under this run's name, the row
-    admitted is the neighbour's. That is the whole of what this gate trades away.
-    Narrowing it is a mechanism question
-    — an identity channel written at mint time and read here — and this function
-    is the wrong place to decide it."""
+    Read-only throughout: this never writes the record and never touches the
+    tag — re-tagging on read is claiming, not proving, and would hand a
+    neighbour's window this project's tag."""
+    return ctl_window_lookup(project, run_id)[0]
+
+
+def _list_ctl_windows(
+    mux: TerminalMultiplexer, session: str, fields: list[str]
+) -> list[tuple[str, ...]]:
+    """`mux.list_windows`, made to fail loud. The seam's list_windows answers
+    [] both for a session with no windows and for a query that failed — it
+    only warns, on a stderr the TUI captures — so an empty answer here would
+    read as a clean absence: `x` reporting a run stopped over a live window,
+    a prune reporting nothing to close. An empty answer is therefore confirmed
+    with list_window_ids, whose [] is a positive claim (the session listed
+    empty, or is proven gone) and which raises MultiplexerError itself when
+    its listing cannot be taken. Empty here but windows there is the failed
+    read, and raises the same type.
+
+    One extra query, and only when the listing came back empty. Ceiling: a
+    window minted between the two reads also lands in the raise — loud, never
+    silent, and the next look answers it."""
+    rows = mux.list_windows(session, fields)
+    if not rows and mux.list_window_ids(session):
+        raise MultiplexerError(
+            f"could not list the windows of {session}: the listing answered none "
+            "while the session has some"
+        )
+    return rows
+
+
+def ctl_window_lookup(project: Path, run_id: str) -> tuple[str | None, int]:
+    """ctl_window_id's answer, plus how many windows carrying this run's name
+    it refused because their tag read empty — unset, or unreadable (see
+    ctl_window_id).
+
+    A nonzero count is a degraded answer a caller must surface, with or
+    without a window: no window is not "no window", and a window beside a
+    refused row may be the parked predecessor of a relaunch whose own tag
+    write failed — so the live orchestrator is the one refused, and a stop
+    that closes the predecessor has still left it running. A refused row may
+    equally be a neighbour's untagged window under the same caller-supplied
+    run id, so the count is a notice, never a target.
+
+    Raises MultiplexerError when the listing itself could not be read (see
+    _list_ctl_windows), and when the backend is unavailable at all: neither is
+    "no window", and every caller surfaces it — the TUI's attach warns and
+    carries on to the agent session, the stop worker warns the window may still
+    be running, the CLI attach warns on stderr, ctl_window_reachable says it
+    could not confirm. Availability is re-read here, not trusted from a
+    caller's gate: it can change while a confirm modal is open."""
+    tagged, unproven, recorded = _scan_ctl_windows(project, run_id)
+    if not tagged:
+        return None, unproven
+    # Membership in `tagged`, not mere presence in the listing: it re-checks the
+    # name and the project-scoping predicates, so a record whose id is absent from
+    # the scoped matches — killed, pruned, renamed onto another run, or naming a
+    # row this project cannot claim — is not replayed. A tie-break among rows the
+    # tag already proved, never a proof on its own: it is what turns a stale id
+    # from a replayed target into a fallthrough.
+    return (recorded if recorded in tagged else tagged[0]), unproven
+
+
+def _scan_ctl_windows(project: Path, run_id: str) -> tuple[list[str], int, str | None]:
+    """ctl_window_lookup's listing pass: the ids of this run's windows proven
+    this project's by tag, in listing order; how many it refused for an empty
+    tag; and the record, read after the listing. Raises as ctl_window_lookup
+    does."""
     if not mux_available():
-        return None
+        raise MultiplexerError(
+            "multiplexer backend unavailable: the run's control window could not be looked up"
+        )
     mine = runs.accepted_tags(project)
     tagged: list[str] = []
-    untagged: list[str] = []
-    rows = get_multiplexer().list_windows(
-        ctl_session(project), ["window_id", "window_name", runs.PROJECT_OPTION]
+    unproven = 0
+    rows = _list_ctl_windows(
+        get_multiplexer(), ctl_session(project), ["window_id", "window_name", runs.PROJECT_OPTION]
     )
-    # Below the listing, above the loop. The loop needs it — it is what admits an
-    # untagged row — but listing and record are two reads of a state a concurrent
+    # Below the listing. Listing and record are two reads of a state a concurrent
     # relaunch can move between them, never one snapshot, so the ordering is the
     # only thing to get right and this keeps the one the record has always had.
     # Read FIRST, a relaunch landing in the gap leaves a record older than the
     # listing: it names the window that relaunch superseded, the listing shows it,
-    # and `recorded in matches` replays the corpse. Read here, the same relaunch
+    # and `recorded in tagged` replays the corpse. Read here, the same relaunch
     # leaves a record newer than the listing, naming a window the listing does not
     # carry yet — so it fails the re-prove and the answer falls back to a match
     # that was at least live when the listing was taken. `rows` is materialized
@@ -463,8 +707,8 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
         # win_id can be "": psmux's qualifier passes a falsy id through. An
         # empty id must never become a target — an empty `-t` resolves against
         # the *current* window. (The base's short-row padding CAN produce an
-        # empty *tag* — it fills trailing fields — which is exactly the untagged
-        # case below; window_id stays field 0 of 3.)
+        # empty *tag* — it fills trailing fields — which the tag test below
+        # refuses; window_id stays field 0 of 3.)
         if not win_id:
             continue
         # The whole run id, not a suffix of the name: RUN_ID_RE admits `-`, so
@@ -486,51 +730,61 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
         # digest alone would strand this project's own orchestrator — prunable
         # by _ctl_window_candidates, which accepts the legacy tag, yet
         # unreachable by `a` and `x`, which resolve through here.
+        # An empty tag is refused the same way (#750), but counted: it is unset
+        # or unreadable, and the caller must be able to say so (see docstrings).
         if tag in mine:
             tagged.append(win_id)
-        elif not tag and win_id == recorded:
-            # untagged, but this project's own launch recorded this window —
-            # proof of the mint, not of the tag, so it only counts if nothing
-            # is tagged
-            untagged.append(win_id)
-    matches = tagged or untagged
-    if not matches:
-        return None
-    # Membership in `matches`, not mere presence in the listing: it re-checks the
-    # name and the project-scoping predicates, so a record whose id is absent from
-    # the scoped matches — killed, pruned, renamed onto another run, or naming a
-    # row this project cannot claim — is not replayed. Not a proof of identity: a
-    # reused id under this run's name still passes, which is the residual the
-    # docstring names. But it is what turns a stale id from a replayed target
-    # into a fallthrough.
-    return recorded if recorded in matches else matches[0]
+        elif not tag:
+            unproven += 1
+    return tagged, unproven, recorded
 
 
-def ctl_window_recorded(project: Path, run_id: str, win_id: str) -> bool:
-    """Whether `ctl_window_id` now answers `win_id` for this run — i.e. whether
-    the launch's disambiguation actually took.
+def unproven_ctl_window_notice(project: Path, run_id: str, count: int) -> str:
+    """Operator wording for a nonzero ctl_window_lookup count: what was refused,
+    the two causes the seam cannot tell apart, and what to do about it. Worded
+    by count, so one window and several each read as a sentence."""
+    where = f"in {ctl_session(project)} named for run {run_id}"
+    if count == 1:
+        return (
+            f"a window {where} has no readable project tag, so it cannot be proven "
+            "this project's: its tag could not be read or was never written. Left "
+            "untouched — check it in the multiplexer and close it by hand if it is "
+            "this run's"
+        )
+    return (
+        f"{count} windows {where} have no readable project tag, so none can be "
+        "proven this project's: their tags could not be read or were never written. "
+        "Left untouched — check them in the multiplexer and close by hand any that "
+        "are this run's"
+    )
 
-    False means the launch itself succeeded but the lookup is back on the
-    ambiguous first-match scan, which is exactly #482's symptom and so is
-    operator-visible: every launcher that mints a second window under a run id
-    should report it rather than let an unqualified success toast imply the
-    targeting is sound. Split out of resume_detached's return so the resolve
-    path can warn while still keeping the captured id it attaches with.
 
-    Asks `ctl_window_id` rather than comparing the record to `win_id`, because
-    a round-tripped record is not the same claim. A backend whose
+def ctl_window_reachable(project: Path, run_id: str, win_id: str) -> bool:
+    """Whether the lookup can reach `win_id` for this run: listed under this
+    run's name and proven this project's by its tag — the launch-time check
+    every launcher's caller turns into a warning.
+
+    False means the launch itself succeeded but `a`/`x` cannot reach the window
+    it minted: since #750 an untagged window is refused outright, and
+    start_detached stamps the tag best-effort. Every launcher should report it
+    rather than let an unqualified success toast imply the targeting is sound.
+
+    Reachable, not preferred: a resume or resolve window is preferred over an
+    older one only once its child accepts the run and records it
+    (claim_ctl_window), which a check at launch cannot wait for. A child whose
+    record does not land says so in its own window.
+
+    Membership in the lookup's own listing rather than a comparison with the
+    minted id alone, because the seam tolerates a backend whose
     `new_parked_window` id is shaped differently from its `list_windows`
-    `window_id` column — a divergence the seam explicitly tolerates — writes and
-    reads the record back intact while `ctl_window_id` rejects it against the
-    listing and falls through to the first match. File equality would report
-    that as sound; it is the precise case the warning exists for.
+    `window_id` column, and such an id is no target the lookup can answer.
 
-    An unanswerable listing counts as not recorded. The probe is observation, so
+    An unanswerable listing counts as unreachable. The probe is observation, so
     it degrades rather than raising into the launchers (neither has a handler
     for it), and "could not confirm" is closer to the warning's own hedge —
-    attach/stop *may* target an older window — than silence would be."""
+    attach/stop *may* miss the window — than silence would be."""
     try:
-        return ctl_window_id(project, run_id) == win_id
+        return win_id in _scan_ctl_windows(project, run_id)[0]
     except MultiplexerError:
         return False
 
@@ -547,6 +801,40 @@ def select_ctl_window_id(window_id: str) -> None:
     control session's current window, so a plain attach to the session lands
     on it (attach-session itself takes no window)."""
     get_multiplexer().select_window(window_id)
+
+
+def select_agent_window(project: Path, run_id: str) -> None:
+    """Make the run's task window its agent session's current window, so a
+    plain attach to the session lands on the agent rather than on the ``shell``
+    window 0. Task windows open detached (DW-635: window 0 stays current to
+    catch server-start config output), so without this an attach would land
+    on the shell.
+
+    The task window is the one named for the journal's open session
+    (runs.task_window_name), so a window an operator opened in the session is
+    never picked over it. With no open session in the journal, an unreadable
+    journal, or no window under that name (a config with ``allow-rename``
+    lets the CLI retitle it), the session's highest-index window is selected:
+    list-windows is index-ordered and window 0 is the shell. Best-effort, like
+    both seam calls it makes: an unanswerable listing (``[]``, which the
+    backend already reports on stderr) selects nothing and the attach goes to
+    the session as before. The id is replayed verbatim, so a backend that
+    qualifies it (psmux's ``session:@N``) is handed back its own form."""
+    entries = runs.journal_entries_or_none(runs.run_dir_for(project, run_id))
+    start, _ = open_session_start_indexed(entries or [])
+    task_id = start.get("task_id") if start is not None else None
+    want = runs.task_window_name(str(task_id)) if task_id is not None else None
+    mux = get_multiplexer()
+    # window_name last: list_windows' bounded split keeps a free-text field whole.
+    rows = [
+        row
+        for row in mux.list_windows(runs.session_name(run_id), ["window_id", "window_name"])
+        if row and row[0]
+    ]
+    named = [row for row in rows if want is not None and row[1:2] == (want,)]
+    pick = named or rows
+    if pick:
+        mux.select_window(pick[-1][0])
 
 
 # Per-window tmux user option recording what an interactive attach should do
@@ -596,8 +884,9 @@ def in_ctl_session() -> bool:
     current_session() is None whenever this process is not inside the selected
     multiplexer, so no direct TMUX/HERDR_* env sniffing happens here. The
     shape predicate rather than one project's resolved name: the question its
-    callers ask is "am I in A control session", and on a namespacing transport
-    the name carries a registry suffix (runs.ctl_session_for)."""
+    callers ask is "am I in A control session", and a control session started
+    by an earlier release on psmux carries a registry suffix
+    (runs.is_ctl_session_name)."""
     session = current_session()
     return session is not None and runs.is_ctl_session_name(session)
 
@@ -708,56 +997,174 @@ def decision_pending(run_dir: Path) -> bool:
     return bool(entries) and entries[-1].get("kind") == "decision-pending"
 
 
-def attach_plan(project: Path, run_id: str) -> tuple[list[str], str | None] | None:
+def attach_plan(
+    project: Path, run_id: str, *, on_fault: Callable[[str], None] | None = None
+) -> tuple[tuple[list[str], str | None] | None, int]:
     """Pick where an interactive attach should land for this run and which window
     (if any) to record a return target on. Shared by the CLI `attach` command and
     mirroring the TUI's action_attach logic: prefer the orchestrator's ctl window
     when a sweep is blocked on a decision or no agent session is live, else the
-    live agent session. Returns (tmux argv, return_window) or None when there is
-    nothing to attach to."""
+    live agent session. Returns ((tmux argv, return_window) or None when there
+    is nothing to attach to, unproven) — `unproven` is ctl_window_lookup's count
+    of same-run windows refused for an empty tag, carried out with the plan
+    because a None plan is not "no window" when it is nonzero, and an agent
+    plan may have bypassed the very window a pending decision is waiting in
+    (#750). The caller must say so; see unproven_ctl_window_notice.
+
+    A ctl lookup that raises (its listing could not be read) is handed to
+    `on_fault` and the plan carries on as if there were no ctl window: the
+    agent session may still be reachable, and an attach must not be refused
+    for a window it could not check. A raising select of the agent's task window
+    (select_agent_window) does not block the attach either: with `on_fault`
+    given it is warned on stderr under its own name — `on_fault` carries ctl
+    lookup faults only, which a caller reports as such — and the attach lands on
+    the session's current window. With no `on_fault` either raise propagates."""
     session = runs.session_name(run_id)
-    win_id = ctl_window_id(project, run_id)
-    agent_live = session_exists(session)
+    try:
+        win_id, unproven = ctl_window_lookup(project, run_id)
+    except MultiplexerError as e:
+        if on_fault is None:
+            raise
+        on_fault(str(e))
+        win_id, unproven = None, 0
+    agent_live = agent_session_exists(session)
     if win_id is not None and (
         decision_pending(runs.run_dir_for(project, run_id)) or not agent_live
     ):
         select_ctl_window_id(win_id)
-        return runs.attach_target_argv(ctl_target(project)), win_id
+        return (runs.attach_target_argv(ctl_target(project)), win_id), unproven
     if agent_live:
-        return runs.attach_target_argv(runs.session_target(run_id)), None
-    return None
+        # A select that raises must not block the attach: the client lands on
+        # the current window. Warned under its own name, not via on_fault,
+        # which callers report as a control-window fault.
+        try:
+            select_agent_window(project, run_id)
+        except MultiplexerError as e:
+            if on_fault is None:
+                raise
+            print(
+                f"warning: could not select the run's task window, attaching to {session} "
+                f"as is: {e}",
+                file=sys.stderr,
+            )
+        return (runs.attach_target_argv(runs.session_target(run_id)), None), unproven
+    return None, unproven
 
 
-def kill_ctl_window(project: Path, run_id: str) -> None:
+def kill_ctl_window(project: Path, run_id: str) -> int:
     """Kill the control-session window hosting this run's orchestrator process,
-    if any. A no-op when the run was not launched from the TUI or tmux is gone."""
-    win_id = ctl_window_id(project, run_id)
+    if any. A no-op when the run was not launched from the TUI or tmux is gone.
+
+    Returns how many same-run windows were left alive because none could be
+    proven this project's (ctl_window_lookup's count): 0 means the kill went
+    through or there was nothing to kill, and anything else is a window the
+    caller must report as possibly still running rather than as stopped.
+
+    Raises MultiplexerError when the ctl listing could not be read at all
+    (ctl_window_lookup), and when the window it killed is still listed
+    afterwards: kill_window is best-effort by contract — a transport failure
+    is a silent no-op — so the kill is confirmed against list_window_ids, the
+    same membership verdict prune_ctl_windows takes. Neither may be reported
+    as a clean stop (#750)."""
+    win_id, unproven = ctl_window_lookup(project, run_id)
     if win_id is not None:
-        get_multiplexer().kill_window(win_id)
+        mux = get_multiplexer()
+        mux.kill_window(win_id)
+        if win_id in mux.list_window_ids(ctl_session(project)):
+            raise MultiplexerError(f"control window {win_id} survived the kill")
+    return unproven
 
 
-def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
+def _ctl_window_evidence(project: Path) -> str | None:
+    """What says a control window of this project could still exist, or None:
+    a run dir with a recorded ctl window, else runs.live_run_evidence. The gate for
+    raising on an unavailable backend in _ctl_window_candidates.
+
+    A record is sticky: nothing drops it when its window goes, by a prune, a
+    stop or otherwise. So a project that launched from the dashboard reports
+    an unavailable backend on every cleanup until its run dirs are removed.
+    That is the intended direction: a false "nothing to prune" is the defect,
+    a report that the scan could not run is not. Dropping the record with the
+    window was tried and given up — a verified kill does not prove the run's
+    other windows (the current one, untagged ones) gone, and the record was
+    then the only evidence left for them."""
+    # Ungated, like live_run_evidence: a record outlives a lost state.json.
+    # An unlistable runs dir yields nothing here and is named there instead.
+    # Presence, not a read: a record that cannot be read still says a window
+    # was minted, and lstat neither follows a link nor opens a FIFO. Only a
+    # proved absence is absence; a stat that fails otherwise counts.
+    for run_dir in runs.all_run_dirs(project) or []:
+        try:
+            os.lstat(run_dir / _CTL_WINDOW_FILE)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            pass
+        return f"a control window recorded for run {run_dir.name}"
+    return runs.live_run_evidence(project)
+
+
+# (window_name, reason) for a window a scan kept because it could not read
+# whether the window's command still runs.
+Undetermined = tuple[str, str]
+
+
+def _ctl_window_candidates(
+    project: Path,
+) -> tuple[list[tuple[str, str]], list[Undetermined]]:
     """(window_id, window_name) for parked control-session run windows whose run
-    is no longer live — the kill candidates for a prune.
+    is no longer live — the kill candidates for a prune — and the windows this
+    scan kept undetermined.
 
     A `<kind>-<run_id>` window parks on a `read` prompt that never closes on its
     own; it is a candidate once its run has finished/stopped/crashed (or its run
-    dir is gone). The current window is excluded so a prune triggered from inside
-    the ctl session never targets itself; live runs and the session's own shell
-    window are excluded too.
+    dir is gone) AND its screen shows the park banner (`parked_screen`): a dead
+    engine alone does not stop the window's own command, such as an interactive
+    resolve, from still running (#876). A window whose screen cannot be read is
+    kept and returned in the second list, per scan: two scans running at once
+    (two TUI cleanup workers) must each report their own. The current window is
+    excluded so a prune triggered from inside the ctl session never targets
+    itself; live runs and the session's own shell window are excluded too.
 
     The control session is shared across projects, so its per-window PROJECT_OPTION
     accepts current and legacy project tags; untagged windows still require a run
     directory under this project (mirrors runs.prunable_sessions).
+
+    Residual, left visible rather than fixed: when psmux's option probe fails,
+    PsmuxMultiplexer.list_windows reads every tag as empty, so an untagged row
+    of ours whose run dir is gone is skipped here without a report. Telling an
+    unreadable tag from an unset one needs an `on_fault` on list_windows, which
+    is a seam change.
+
+    An unavailable backend is not folded into "no candidates" when this project
+    has evidence a control window could exist (_ctl_window_evidence): it raises,
+    so both prune callers report it (#864). Without that evidence it still
+    answers `[]` — a host with no multiplexer and nothing of ours to reach is a
+    clean scan, not a failure on every run.
     """
     mux = get_multiplexer()
     ctl = runs.ctl_session_for(project, mux)
-    if not mux_usable(mux) or not session_exists(ctl):
-        return []
+    if not mux_usable(mux):
+        evidence = _ctl_window_evidence(project)
+        if evidence is None:
+            return [], []
+        raise MultiplexerError(
+            f"multiplexer backend {type(mux).__name__} is unavailable, but this "
+            f"project still has {evidence}; its control windows cannot be listed"
+        )
+    # A False has-session is weaker than it looks (its seam note): a refused
+    # connect reads the same as a missing session. So it only short-circuits
+    # when list_window_ids agrees there is nothing — whose [] is a positive
+    # claim, and which raises when its own listing cannot be taken (#750).
+    if not session_exists(ctl) and not mux.list_window_ids(ctl):
+        return [], []
     current = mux.current_window_id()
-    rows = mux.list_windows(ctl, ["window_id", "window_name", runs.PROJECT_OPTION])
+    # Fail loud on a listing that failed: both prune callers already report a
+    # raise from this scan, and an empty answer would read as nothing to prune.
+    rows = _list_ctl_windows(mux, ctl, ["window_id", "window_name", runs.PROJECT_OPTION])
     mine = runs.accepted_tags(project)
     candidates: list[tuple[str, str]] = []
+    undetermined: list[Undetermined] = []
     for win_id, name, tag in rows:
         if not win_id or win_id == current:
             continue
@@ -781,19 +1188,36 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
         # unknown warning from prunable_sessions covers the operator surface.
         if runs.engine_alive(run_dir):
             continue
-        candidates.append((win_id, name))
-    return candidates
+        # A dead engine does not make the window parked: its own command may
+        # still be running (an interactive resolve, a run before its engine
+        # wrote engine.pid). The park banner is the evidence it exited (#876;
+        # parked_screen has the ceiling); a screen that cannot be read keeps the
+        # window and says so.
+        try:
+            parked = parked_screen(mux.capture_pane(win_id))
+        except (MultiplexerError, UnicodeError) as e:
+            undetermined.append((name, str(e)))
+            continue
+        if parked:
+            candidates.append((win_id, name))
+    return candidates, undetermined
 
 
-def prunable_ctl_windows(project: Path) -> list[str]:
-    """Names of the control-session windows a prune would close (dry-run view)."""
-    return [name for _, name in _ctl_window_candidates(project)]
+def prunable_ctl_windows(project: Path) -> tuple[list[str], list[Undetermined]]:
+    """Names of the control-session windows a prune would close (dry-run view),
+    and the windows the scan kept undetermined (see _ctl_window_candidates)."""
+    candidates, undetermined = _ctl_window_candidates(project)
+    return [name for _, name in candidates], undetermined
 
 
-def prune_ctl_windows(project: Path) -> tuple[list[str], list[str], list[str]]:
+def prune_ctl_windows(
+    project: Path,
+) -> tuple[list[str], list[str], list[str], list[Undetermined]]:
     """Close parked control-session windows whose run is no longer live; returns
-    (removed, survived, unverifiable) window names (see _ctl_window_candidates).
-    A three-list tuple like runs.prune_sessions, but do NOT read the arms across:
+    (removed, survived, unverifiable) window names (see _ctl_window_candidates)
+    and, fourth and outside that partition, the windows the scan kept open
+    undetermined — never killed, so they belong to no kill outcome.
+    The three lists are like runs.prune_sessions, but do NOT read the arms across:
     that one partitions BEFORE its kills, so its `killed` is still an attempted
     kill, its `live` is "deliberately not touched" rather than "survived", and its
     `unknown` is a pid question and a SUBSET of `killed`. These three are disjoint
@@ -826,9 +1250,9 @@ def prune_ctl_windows(project: Path) -> tuple[list[str], list[str], list[str]]:
     phantom survivor for every future sweep to re-report.
     """
     mux = get_multiplexer()
-    candidates = _ctl_window_candidates(project)
+    candidates, undetermined = _ctl_window_candidates(project)
     if not candidates:
-        return [], [], []
+        return [], [], [], undetermined
     for win_id, _name in candidates:
         # kill_window is best-effort and reports nothing; a strict-POSIX decode
         # fault of the kill's own capture escapes its swallow tuple (#380) but
@@ -846,10 +1270,10 @@ def prune_ctl_windows(project: Path) -> tuple[list[str], list[str], list[str]]:
     except MultiplexerError:
         # The kills may well have landed; nothing here can say so. Claiming the
         # optimistic half is exactly the bug — the next cleanup pass retries.
-        return [], [], [name for _win_id, name in candidates]
+        return [], [], [name for _win_id, name in candidates], undetermined
     removed = [name for win_id, name in candidates if win_id not in live]
     survived = [name for win_id, name in candidates if win_id in live]
-    return removed, survived, []
+    return removed, survived, [], undetermined
 
 
 def ctl_session(project: Path) -> str:
@@ -868,16 +1292,211 @@ def _ensure_ctl_session(project: Path) -> str:
     # catch — otherwise the raw MultiplexerError slips past them and crashes the app.
     try:
         if not mux.has_session(name):
-            mux.new_session(name, project)
+            try:
+                mux.new_session(name, project)
+            except MultiplexerError:
+                # Two launches that both saw no session race on the create, and
+                # the loser is refused ("duplicate session" on tmux, "failed to
+                # create session" on psmux) by a session that now exists (#952).
+                if not mux.has_session(name):
+                    raise
+            # A setup step the backend could not finish is printed, not raised,
+            # and Textual swallows stderr, so it goes through the sink too.
+            take = getattr(mux, "take_setup_notes", None)
+            for note in take() if take is not None else []:
+                _warn_once(f"ctl-session-setup:{name}:{note}", note)
     except MultiplexerError as e:
         raise LaunchError(f"multiplexer ctl-session setup failed: {e}") from e
+    # After both arms: a session created just now on a stale server inherits
+    # that server's env as surely as a reused one does.
+    _warn_if_stale_state_root(mux, name)
     return name
+
+
+# Where launch-time warnings go: a callable taking the operator-facing line, or
+# None for stderr. `run_tui` installs a toast here for the app's run, because
+# Textual captures stderr for that whole run and a print would reach nobody.
+warn_sink: Callable[[str], None] | None = None
+
+# Keys of the warnings already given: each is said once per process, since the
+# condition it names outlives any one launch.
+_WARNED: set[str] = set()
+_STALE_ROOT = "stale-state-root"
+
+
+def _warn_once(key: str, message: str, *, label: str = "warning") -> None:
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    if warn_sink is None:
+        print(f"{label}: {message}", file=sys.stderr)
+    else:
+        warn_sink(message)
+
+
+def _warn_if_stale_state_root(mux: TerminalMultiplexer, session: str) -> None:
+    """Note once when a new pane in ``session`` would resolve a different state
+    root than this process (#731): a multiplexer server hands its panes the env
+    it started with, so a shell opened there resolves the server's root. A run
+    launched from here is not exposed (``start_detached`` hands each parked
+    engine its root), so this is a note about shells, and it names no remedy:
+    on tmux ``session`` is shared by every project on the server, so no value
+    set there is right for all of them.
+
+    Compares resolved roots, not raw values: each input the platform's cascade
+    reads is asked of the transport (``inherited_env``), the pane's root is
+    resolved from the answers with this process's passwd home (a server this
+    process can reach runs as the same user), and only a different root — or
+    none at all — warns. Any unknown answer makes the comparison unknown and
+    silent, while a query fault is reported in its own words. Never raises and
+    never blocks the launch."""
+    if _STALE_ROOT in _WARNED:
+        return
+    try:
+        own = runs.state_root()
+    except runs.StateRootError as exc:
+        _warn_once(
+            f"own-root:{exc}",
+            f"cannot check which state root {session} windows resolve: {exc}",
+        )
+        return
+
+    def fault(detail: str) -> None:
+        _warn_once(
+            f"fault:{detail}",
+            f"cannot check which state root {session} windows resolve: {detail}",
+        )
+
+    pane_env: dict[str, str] = {}
+    for name in runs.state_root_inputs():
+        try:
+            value = mux.inherited_env(session, name, on_fault=fault)
+        except Exception as exc:  # the seam says must-not-raise; a backend may still
+            fault(f"{type(mux).__name__}.inherited_env raised {exc!r}")
+            return
+        if value is None:
+            return
+        if not isinstance(value, Unset):
+            pane_env[name] = value
+    try:
+        passwd = runs.passwd_home() if runs.needs_passwd_home(pane_env) else None
+        pane: Path | None = runs.resolve_state_root(pane_env, passwd)
+    except runs.StateRootError:
+        pane = None
+    if pane == own:
+        return
+    resolved = str(pane) if pane is not None else "no usable state root"
+    _warn_once(
+        _STALE_ROOT,
+        f"new shells in {session} resolve {resolved}, not this TUI's state root {own}, "
+        "so a bmad-loop command typed into one would use that root. Runs launched from "
+        "this TUI are unaffected: each is handed its root (#731). A shell already open "
+        "there can differ either way; no query can see it.",
+        label="note",
+    )
 
 
 def cli_argv(*tail: str) -> list[str]:
     """`sys.executable -m bmad_loop.cli ...` — immune to PATH/venv drift
     inside tmux windows."""
     return [sys.executable, "-m", "bmad_loop.cli", *tail]
+
+
+def _registry_drift(project: Path, mux: TerminalMultiplexer) -> str | None:
+    """Why a run launched from this process would land in a registry this
+    process does not watch, or ``None`` when it would not.
+
+    The registry is settled once per process (`cli._configure_mux`), but the
+    detached child re-reads ``[mux] honor_ambient_psmux_data_dir`` from
+    policy.toml, which the settings editor can rewrite under a running TUI. A
+    TUI that started honouring the operator's root and then had the switch
+    turned off would launch children into the derived root while it goes on
+    querying the old one: it could not see, attach to or stop what it started.
+    So the child's answer is predicted here with the same pure rule it will
+    apply (`runs.resolve_psmux_registry_root`), from the root it inherits —
+    this process's root in force — and a disagreement refuses the launch.
+    The child receives that root in its argv (`--registry-root`, see
+    `start_detached`), so the prediction holds under `PSMUX_BARE_ENV` too,
+    where a pane inherits no `PSMUX_DATA_DIR`.
+
+    Asked only of a process that configured its registry for this project
+    (`runs.settled_project`), which every CLI entry does: there is nothing to
+    disagree with otherwise. The other direction (switch turned ON) leaves the
+    child where this process is — it inherits the derived root, which the rule
+    never honours as a pin — but no longer where the operator is: a TUI that
+    overrode the operator's root R recorded it as displaced, and with the
+    switch now on, every shell carrying R would honour it while this TUI and
+    its children stay in the derived registry. That is refused too. A TUI
+    started without R in its environment (from the Start menu, say) displaced
+    nothing, cannot know R, and so has nothing to refuse."""
+    if runs.settled_project() != project:
+        return None
+    try:
+        if not mux.has_registry_namespace():
+            return None
+        root = mux.registry_root()
+    except MultiplexerError:
+        return None  # selection already proved usable; the launch reports its own faults
+    if root is None:
+        return None
+    try:
+        derived = str(runs.mux_registry_root(project))
+    except (runs.StateRootError, OSError, RuntimeError):
+        return None  # the child cannot derive either, and keeps the root it inherits
+    fault: Exception | None = None
+    try:
+        honor = policy_mod.load(project / policy_mod.POLICY_FILE).mux.honor_ambient_psmux_data_dir
+    except (policy_mod.PolicyError, OSError) as exc:
+        honor = False  # what the child's `_configure_mux` falls back to as well
+        fault = exc
+    child = runs.resolve_psmux_registry_root(derived, root, honor_ambient=honor)
+    if child == root:
+        if honor and root == derived:
+            displaced = runs.displaced_psmux_registry_root()
+            if (
+                displaced
+                and runs.resolve_psmux_registry_root(derived, displaced, honor_ambient=True)
+                == displaced
+            ):
+                return (
+                    "[mux] honor_ambient_psmux_data_dir was turned on since this TUI "
+                    f"started: a new run would stay in the derived registry {root}, while "
+                    f"shells carrying your PSMUX_DATA_DIR now use {displaced} — restart "
+                    "the TUI (bmad-loop tui), then launch"
+                )
+        return None
+    if fault is not None:
+        # The switch may not have changed at all: the child cannot read the
+        # policy either, so it falls back to off. Name the real cause.
+        return (
+            f"policy.toml could not be read ({fault}); a new run would use the registry "
+            f"{child}, but this TUI watches {root} — fix the policy, then launch"
+        )
+    return (
+        f"[mux] honor_ambient_psmux_data_dir changed since this TUI started: a new run "
+        f"would use the registry {child}, but this TUI watches {root} and could not "
+        "see, attach to or stop it — restart the TUI (bmad-loop tui), then launch"
+    )
+
+
+def _forwardable_displaced_root(displaced: str | None, in_force: str | None) -> str | None:
+    """The spelling of this process's displaced registry root to hand a detached
+    child (see :func:`start_detached`), or ``None`` when there is nothing to
+    forward, or nothing that would survive the trip.
+
+    ``str(Path(...))`` drops a trailing separator everywhere but on a root. A
+    value that still ends in one *and* contains whitespace — a share root such
+    as ``\\\\srv\\my share\\`` — is the shape Windows PowerShell older than 7.3
+    corrupts on the way into a parked window's argv (ADR 0001 §6, "Argv fidelity
+    on psmux"), so it is not forwarded: a sweep that misses that root is the
+    outcome before this forwarding existed, while a corrupted value would name
+    a registry nobody used."""
+    if not displaced or not os.path.isabs(displaced) or displaced == in_force:
+        return None
+    normalized = str(Path(displaced))
+    if normalized.endswith(("/", "\\")) and any(c.isspace() for c in normalized):
+        return None
+    return normalized
 
 
 def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) -> str | None:
@@ -890,17 +1509,41 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
 
     Returns the new window's stable backend id (bare `@N` on tmux,
     session-qualified on psmux) so callers can target it unambiguously (window
-    names collide when several kinds share a run_id). The same id is recorded in
-    the run dir so ctl_window_id answers this window rather than an older one
-    under the same run id — see _record_ctl_window.
+    names collide when several kinds share a run_id).
+
+    Does not record the id in the run dir: the window's child does that, and
+    only once it has accepted the run (claim_ctl_window). This launch cannot
+    know whether its child will drive or refuse as "still live", and a refused
+    child's window recorded here would take the record from the window whose
+    engine keeps running (#920).
 
     Refuses a run id that aliases a control session, FIRST — this is the one
-    place every drive path converges on the mutation (the window mint and the
-    ctl-window record overwrite): run/sweep launches with freshly validated
+    place every drive path converges on the mutation (the window mint): run/sweep launches with freshly validated
     ids, and resume/resolve replaying ids an older release persisted. Gating
     each button separately kept finding the path nobody gated (resolve was
     the fourth); gating the mutation cannot. Ahead of the mux probes so the
     refusal needs no transport to be phrased.
+
+    Hands the window this process's state root, as the hidden top-level
+    ``--state-root`` ahead of the subcommand, and on a transport that
+    namespaces registries the registry root in force as ``--registry-root``.
+    The window would otherwise inherit both from the multiplexer server, which
+    may have started under another root (#731) or clear its panes' env
+    (``PSMUX_BARE_ENV``, #730), and the engine would write where this process
+    never looks. No state root, no launch: omitting the option would let the
+    engine inherit whatever the server holds, and a launcher that cannot name
+    a root could not watch the run anyway. The registry root restores only
+    what inheritance would have delivered; the child's ``_configure_mux``
+    still decides whether it is honoured. On psmux the argv reaches the child
+    intact because a window launch refuses PowerShell older than 7.3 (#862).
+
+    Also forwards this process's displaced psmux registry root, as the hidden
+    top-level ``--displaced-registry-root`` ahead of the subcommand. The child
+    inherits the derived root and so displaces nothing itself; without the
+    option a TUI-launched resume or cleanup would never sweep the operator's
+    pre-#537 registry, which only this process recorded. A root of the shape
+    older PowerShell corrupts in transit is not forwarded
+    (:func:`_forwardable_displaced_root`).
     """
     if runs.run_id_aliases_control_session(run_id):
         raise LaunchError(
@@ -913,14 +1556,39 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
             "multiplexer backend unavailable (binary missing, version unsupported, "
             "or a required helper absent)"
         )
+    try:
+        state_root = runs.state_root()
+    except runs.StateRootError as e:
+        raise LaunchError(
+            f"cannot launch {kind}: no state root to hand the window, so this TUI could "
+            f"not watch the run it starts: {e}"
+        ) from e
+    drift = _registry_drift(project, mux)
+    if drift is not None:
+        raise LaunchError(drift)
+    # `--ctl-launch` tells the child its window was minted here, which its own
+    # session probe cannot be trusted to answer (claim_ctl_window, #925).
+    hidden = ["--ctl-launch", f"--state-root={state_root}"]
+    try:
+        namespaced = mux.has_registry_namespace()
+        in_force = mux.registry_root() if namespaced else None
+    except MultiplexerError as e:
+        raise LaunchError(f"multiplexer registry query failed: {e}") from e
+    if in_force is not None:
+        hidden.append(f"--registry-root={in_force}")
+    if namespaced:
+        forwarded = _forwardable_displaced_root(runs.displaced_psmux_registry_root(), in_force)
+        if forwarded is not None:
+            hidden.append(f"--displaced-registry-root={forwarded}")
+    argv = cli_argv(*hidden, *argv_tail)
     ctl = _ensure_ctl_session(project)
     try:
         win_id = (
             mux.new_parked_window(
                 ctl,
-                f"{kind}-{run_id}",
+                _ctl_window_name(kind, run_id),
                 project,
-                cli_argv(*argv_tail),
+                argv,
                 RETURN_OPTION,
             )
             or None
@@ -928,19 +1596,18 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
     except MultiplexerError as e:
         raise LaunchError(f"multiplexer new-window failed: {e}") from e
     if win_id:
-        # Record before tagging: a window minted but unrecorded puts the lookup
-        # back on the ambiguous scan, while an *untagged* window already has a
-        # documented fallback in _ctl_window_candidates — so even a
-        # non-conforming backend raising from the (contractually best-effort)
-        # set_window_option must not cost the record.
-        _record_ctl_window(project, run_id, win_id)
         # Tag the window with its project so a cleanup in another project never
-        # closes it (the ctl session is shared across projects).
+        # closes it (the ctl session is shared across projects). No record here:
+        # the child publishes it once it accepts the run (claim_ctl_window, #920).
         mux.set_window_option(win_id, runs.PROJECT_OPTION, runs.project_tag(project))
-    else:
-        # No id to record: the backend did not capture one. Whatever the previous
-        # launch recorded now names a superseded window, so drop it.
-        _forget_ctl_window(project, run_id)
+    return win_id
+
+
+def _reachable_window(project: Path, run_id: str, win_id: str | None) -> str | None:
+    """`win_id` when the lookup can reach it for this run, else None — see
+    ctl_window_reachable. An uncaptured id is None already."""
+    if win_id and not ctl_window_reachable(project, run_id, win_id):
+        return None
     return win_id
 
 
@@ -949,10 +1616,12 @@ def start_run_detached(
     run_id: str,
     *,
     spec: str | None = None,
-    epic: int | None = None,
+    epic: int | str | None = None,  # str: a tickets-mode epic id or slug
     story: str | None = None,
     max_stories: int | None = None,
-) -> None:
+) -> str | None:
+    """Launch a run in a ctl-session window; returns the window id, or None
+    when the lookup cannot reach it afterwards — see _reachable_window."""
     tail = ["run", "--project", str(project), "--run-id", run_id]
     if spec:
         tail += ["--spec", spec]  # forces stories mode (folder+id dispatch)
@@ -962,7 +1631,7 @@ def start_run_detached(
         tail += ["--story", story]
     if max_stories is not None:
         tail += ["--max-stories", str(max_stories)]
-    start_detached(project, tail, run_id, "run")
+    return _reachable_window(project, run_id, start_detached(project, tail, run_id, "run"))
 
 
 def start_sweep_detached(
@@ -972,7 +1641,9 @@ def start_sweep_detached(
     no_prompt: bool = False,
     decisions_only: bool = False,
     max_bundles: int | None = None,
-) -> None:
+) -> str | None:
+    """Launch a sweep in a ctl-session window; returns the window id, or None
+    when the lookup cannot reach it afterwards — see _reachable_window."""
     tail = ["sweep", "--project", str(project), "--run-id", run_id]
     if no_prompt:
         tail.append("--no-prompt")
@@ -980,45 +1651,43 @@ def start_sweep_detached(
         tail.append("--decisions-only")
     if max_bundles is not None:
         tail += ["--max-bundles", str(max_bundles)]
-    start_detached(project, tail, run_id, "sweep")
+    return _reachable_window(project, run_id, start_detached(project, tail, run_id, "sweep"))
 
 
 def resume_detached(project: Path, run_id: str) -> str | None:
     """Resume in a ctl-session window; returns the window id, or None when the
-    lookup cannot name that window afterwards — the caller should warn, because
-    resume is the launch that mints a *second* window under the run id, so this
-    is exactly when the ambiguous scan starts answering the superseded one while
-    the launch itself succeeded.
+    lookup cannot reach it afterwards (see _reachable_window) — the caller
+    should warn, because resume mints a *second* window under the run id.
 
-    Two ways to land there, one signal: the backend captured no id, or it did but
-    the record did not survive (refused, unwritable, run dir pruned mid-launch).
-    Both leave `ctl_window_id` on the scan, so reporting only the first would let
-    the rest degrade behind an unqualified success toast.
-
-    Verified by re-reading rather than by threading the write's outcome up: it
-    asks the question the consumers actually ask — will `ctl_window_id` prefer
-    this window — of the same file they will read, instead of a proxy for it.
-
-    Folded into the return here, rather than reported alongside the id as the
-    resolve path does, because resume has no immediate use for a window it
-    cannot record: it launches and leaves, where resolve attaches to the window
-    it just minted and still needs that id to do so."""
+    The window becomes the run's recorded control window only once its child
+    accepts the run (claim_ctl_window), so a resume refused as "still live"
+    leaves the record with the window that drives (#920)."""
     win_id = start_detached(
         project, ["resume", "--project", str(project), run_id], run_id, "resume"
     )
-    if win_id and not ctl_window_recorded(project, run_id, win_id):
-        return None
-    return win_id
+    return _reachable_window(project, run_id, win_id)
 
 
-def start_resolve_detached(project: Path, run_id: str) -> str | None:
+def start_resolve_detached(
+    project: Path, run_id: str, *, reverify: bool = False, story: str | None = None
+) -> str | None:
     """Run `bmad-loop resolve <run_id>` in a ctl-session window. The caller
     attaches to it: the resolve agent is interactive, and the post-session
     confirm + resume happen in that same window. Returns the window id so the
-    caller attaches to exactly this window, not a stale same-run_id window."""
-    return start_detached(
-        project, ["resolve", "--project", str(project), run_id], run_id, "resolve"
-    )
+    caller attaches to exactly this window, not a stale same-run_id window.
+
+    `reverify` appends `--reverify` (DW-524): the CLI's statement of what the
+    replay will claim (HEAD/baseline, the squash-in warning), its confirm, the
+    liveness re-check under the run lock and the resume all run in that same
+    window — the TUI decides nothing about the target beyond naming it.
+    `story` appends `--story <key>`; omitted, the CLI defaults to the paused
+    story."""
+    tail = ["resolve", "--project", str(project), run_id]
+    if reverify:
+        tail.append("--reverify")
+    if story is not None:
+        tail += ["--story", story]
+    return start_detached(project, tail, run_id, "resolve")
 
 
 def run_captured_streams(argv_tail: list[str]) -> tuple[int, str, str]:

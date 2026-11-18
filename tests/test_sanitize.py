@@ -216,6 +216,130 @@ def test_scrub_text_without_max_chars_is_byte_identical():
     assert sanitize.scrub_text(text) == text  # no normalization, no lost newline
 
 
+# The single regex the anchored email scan replaced (DW-636). Kept here as the
+# oracle that the scan's spans equal what it found, so a change in what counts as
+# an email shows up as a test failure.
+_UNANCHORED_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "no at sign here",
+        "contact me@example.com",
+        "a@b.co c@d.org",  # two emails
+        "a@b.com.x@c.org",  # second local part starts inside the first domain
+        "a@b.co@c.org",  # first match ends exactly at the next `@`
+        "me@example.com123",  # trailing digits stop the TLD
+        "me@example.c",  # one-letter TLD: no match
+        "me@@example.com",  # empty local part before the second `@`
+        "me@.example.com",  # dot right after the `@`
+        "@example.com",  # no local part
+        "a..b%c+d-e_f@sub-1.Example.ORG.",  # every local and domain char class
+        "x@y.zz.q@w.ee",
+        "café@exämple.com",  # non-ASCII letters are outside both classes
+        "user@host",  # no dot
+        "a@b.c.de-f",
+        "line1 a@b.cc\nline2 c@d.ee",
+    ],
+)
+def test_email_spans_match_the_regex_they_replace(text):
+    expected = [m.span() for m in _UNANCHORED_EMAIL_RE.finditer(text)]
+    assert list(sanitize._email_spans(text)) == expected
+    assert sanitize.scrub_text(text) == _UNANCHORED_EMAIL_RE.sub("<redacted:email>", text)
+    assert ("email" in sanitize.assert_no_leak(text)) == bool(expected)
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("mail me@example.com now", "mail <redacted:email> now"),
+        ("a@b.com.x@c.org", "<redacted:email><redacted:email>"),
+        ("me@example.com123", "<redacted:email>123"),
+        ("a+tag@sub.example.io, b@c.de", "<redacted:email>, <redacted:email>"),
+        ("user@host and me@example.c", "user@host and me@example.c"),
+    ],
+)
+def test_scrub_text_email_redaction_characterization(text, expected):
+    assert sanitize.scrub_text(text) == expected
+
+
+class _CountingMatcher:
+    """Stands in for ``_EMAIL_DOMAIN_RE``, counting each domain attempt."""
+
+    def __init__(self, pattern):
+        self.pattern = pattern
+        self.calls = 0
+
+    def match(self, text, pos):
+        self.calls += 1
+        return self.pattern.match(text, pos)
+
+
+def test_email_scan_is_anchored_on_at_signs(monkeypatch):
+    """Email detection does one domain match per ``@`` and nothing else. That
+    keeps scrub_text and assert_no_leak linear on a long alphanumeric line. The
+    unanchored regex restarted a scan at every position of such a run, which is
+    quadratic (DW-636).
+
+    Ablation: restoring the unanchored regex in ``assert_no_leak`` leaves the
+    count at 0 where 1 is required. Restoring it in ``scrub_text`` leaves the
+    count at 1 where 2 is required.
+    """
+    counter = _CountingMatcher(sanitize._EMAIL_DOMAIN_RE)
+    monkeypatch.setattr(sanitize, "_EMAIL_DOMAIN_RE", counter)
+    run = "a" * 80_000
+
+    assert "email" not in sanitize.assert_no_leak(run)
+    assert sanitize.scrub_text(run) == run
+    assert counter.calls == 0
+
+    assert "email" in sanitize.assert_no_leak(run + " me@example.com")
+    assert counter.calls == 1
+    assert sanitize.scrub_text(run + "@example.com") == "<redacted:email>"
+    assert counter.calls == 2
+
+    # Many `@`s: one attempt each.
+    counter.calls = 0
+    assert sanitize.scrub_text("a@" * 1000) == "a@" * 1000
+    assert counter.calls == 1000
+
+
+class _MeteredStr(str):
+    """A ``str`` that tallies how many characters its slices copy out."""
+
+    sliced = 0
+
+    def __getitem__(self, key):
+        out = super().__getitem__(key)
+        if isinstance(key, slice):
+            type(self).sliced += len(out)
+        return out
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["a" * 80_000, "a@" * 5_000, ("x" * 50 + "@") * 1_000 + "me@example.com"],
+    ids=["no-at-run", "many-at-signs", "long-locals-then-email"],
+)
+def test_email_spans_never_rescan_earlier_text(monkeypatch, text):
+    """The left-hand scan for each ``@`` reads only the text since the previous
+    ``@`` or match, so all the slices together copy at most ``len(text)``
+    characters. Slicing from the start of the text at every ``@`` gives the
+    same spans but is quadratic in the number of ``@``s.
+
+    Ablation: slicing ``text[:at]`` (clamped with ``max(lo, ...)``) instead of
+    ``text[lo:at]`` copies about 25M characters on ``"a@" * 5000``, against a
+    bound of 10k.
+    """
+    monkeypatch.setattr(_MeteredStr, "sliced", 0)
+    metered = _MeteredStr(text)
+    spans = list(sanitize._email_spans(metered))
+    assert spans == [m.span() for m in _UNANCHORED_EMAIL_RE.finditer(text)]
+    assert _MeteredStr.sliced <= len(text)
+
+
 def test_scrub_event_payload_is_scrub_json(home):
     payload = {"session_id": "s-1", "cwd": f"{home}/proj", "n": 5}
     out = sanitize.scrub_event_payload(payload)
@@ -236,6 +360,15 @@ def test_scrub_event_payload_is_scrub_json(home):
         "glpat-xxxxxxxxxxxxxxxxxxxx",  # gitlab pat
         "AIzaSyA0000000000000000000000000000000",  # google api key
         "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",  # 40-char high-entropy hex secret
+        # Shapes whose every alnum run is shorter than _SECRET_RUN_MIN, so only a
+        # prefix arm can catch them. Low-entropy canaries in the vendors' formats,
+        # not live keys.
+        "sk_live_CANARYxxxxxxxxxxxxxxxx",  # stripe secret, legacy 24-char tail
+        "sk_test_CANARYxxxxxxxxxxxxxxxx",  # stripe test secret
+        "rk_live_CANARYxxxxxxxxxxxxxxxx",  # stripe restricted key
+        "xapp-1-A0CANARY01-0000000000-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",  # slack app-level
+        "SG.CANARYxxxxxxxxxxxxxxx.CANARYxxxx-xxxxxxxxxxxxxxx_xxxxxxxxxxxxxxxx",  # sendgrid
+        "pypi-AgEIcHlwaS5vcmcCANARY",  # pypi upload token
     ],
 )
 def test_looks_like_secret_catches_credentials(value):
@@ -252,6 +385,12 @@ def test_looks_like_secret_catches_credentials(value):
         "01234567-89ab-cdef-0123-456789abcdef",  # UUID: short runs at hyphens
         "DW-1",
         "1.2-add-logging",
+        # Near-misses for the vendor arms: each shares a prefix's first letters
+        # but not the format the arm is anchored on.
+        "sk_util",
+        "pypi-mirror",
+        "SG.1",
+        "xapp-name",
     ],
 )
 def test_looks_like_secret_passes_safe_slugs(value):
@@ -311,6 +450,12 @@ def test_assert_no_leak_clean_text():
     [
         ("contact me@example.com", "email"),
         ("see https://user:pass@host/x", "url-credentials"),
+        # Not only http(s): connection strings carry userinfo the same way.
+        ("dsn postgres://app:hunter2@localhost:5432/db", "url-credentials"),
+        ("REDIS_URL=redis://default:hunter2@cache:6379", "url-credentials"),
+        ("uri mongodb+srv://bob:hunter2@cluster0.example.net/x", "url-credentials"),
+        ("broker amqp://guest:guest@rabbit/vhost", "url-credentials"),
+        ("ssh://deploy:hunter2@host/repo.git", "url-credentials"),
         ("path /home/alice/x", "absolute-home-path"),
         # Every arm of _ABS_HOME_RE, not just the Linux one. The macOS and root
         # arms were correct but unpinned; so was the drive-letter-plus-FORWARD-
@@ -350,6 +495,84 @@ def test_assert_no_leak_clean_text():
 )
 def test_assert_no_leak_fires(text, rule):
     assert rule in sanitize.assert_no_leak(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ssh://git@github.com:22/org/repo.git",  # user, no password
+        "git@github.com:org/repo.git",  # scp-style, no scheme
+        "see https://host:8443/path",  # a port is not a password
+        "redis://cache:6379?client=user@cluster",  # `@` past the authority
+        "redis://cache:6379#user@cluster",
+    ],
+)
+def test_assert_no_leak_url_rule_needs_a_password(text):
+    assert "url-credentials" not in sanitize.assert_no_leak(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Each key follows a `/`. The prefix arms are `^`-anchored, so they see
+        # the key only when `/` ends the token before it. Low-entropy canaries in
+        # the vendors' formats, not live keys.
+        "https://host.test/sk_live_123456789012345678901234",  # stripe secret in a URL path
+        "path/rk_live_abcdefABCDEF0123456789",  # stripe restricted key
+        "./SG.CANARYxxxxxxxxxxxxxxx.CANARYxxxx-xxxx",  # sendgrid
+        "a/sk-ant-xxxxxxxxxxxxxxxxxxxxx",  # anthropic
+    ],
+)
+def test_assert_no_leak_finds_prefixed_keys_in_url_paths(text):
+    """Ablation: restoring `/` in ``_LEAK_TOKEN_RE`` fails every row."""
+    assert "secret" in sanitize.assert_no_leak(text)
+
+
+def test_url_cred_scheme_is_bounded():
+    """The scheme is capped at 32 characters, one of the two properties that keep
+    the unanchored URL-credential scan linear on a long alphanumeric run. A longer
+    scheme still matches, starting later.
+
+    Ablation: restoring the unbounded ``*`` scheme makes the match start at 0.
+    """
+    text = "a" * 40 + "://u:p@h"
+    m = sanitize._URL_CRED_RE.search(text)
+    assert m is not None
+    assert m.start() == 8
+    assert "url-credentials" in sanitize.assert_no_leak(text)
+
+
+def test_url_cred_user_half_stops_at_first_colon():
+    """The user half stops at the first ``:`` (RFC 3986's user/password split),
+    the other property that keeps the scan linear. The whole userinfo is still
+    redacted.
+
+    Ablation: restoring ``[^/?#\\s]*`` for the user half yields ``"a:b"``.
+    """
+    m = sanitize._URL_CRED_RE.search("redis://a:b:c@h")
+    assert m is not None
+    assert m.group("user") == "a"
+    assert sanitize.scrub_text("redis://a:b:c@h") == "redis://<redacted:userinfo>h"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Email-shaped tail: the email rule alone would leave `hunter2!` behind.
+        "redis://bob:hunter2!x@example.com",
+        "dsn postgres://app:hunter2@db.example.com:5432/db",
+        # `@` inside the password: redaction must run to the last `@`.
+        "redis://bob:p@ss@localhost:6379",
+        "amqp://bob:a@b@mq.example.com",
+    ],
+)
+def test_scrub_text_redacts_url_credentials_whole(text):
+    out = sanitize.scrub_text(text)
+    for fragment in ("hunter2", "p@ss", "a@b", "bob:", "app:"):
+        assert fragment not in out
+    assert "<redacted:userinfo>" in out
+    # The redacted output must not re-trip the guard on its own marker.
+    assert sanitize.assert_no_leak(out) == []
 
 
 def test_assert_no_leak_sees_wsl_unc_through_the_json_render():

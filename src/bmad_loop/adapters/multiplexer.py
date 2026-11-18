@@ -33,11 +33,13 @@ from __future__ import annotations
 
 import functools
 import importlib.metadata
+import re
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Final, final
 
 from .. import envvars
 from .entrypoints import record_load_error
@@ -47,6 +49,49 @@ class MultiplexerError(Exception):
     """A transport-backend operation failed. Backends raise a subclass (e.g.
     :class:`~.tmux_backend.TmuxError`) so call sites can catch the seam-level type
     without importing a backend."""
+
+
+# The line a :meth:`TerminalMultiplexer.new_parked_window` window prints once its
+# command has exited, right before it parks; ``{ec}`` is the exit status. The
+# ctl-window prune reads it back (:func:`parked_screen`) to tell a parked window
+# from one whose command is still running, which neither the pane's pid nor its
+# current command can: both name the parking shell either way (#876).
+PARKED_BANNER = "[bmad-loop exited {ec} — press enter]"
+# The named keys :meth:`TerminalMultiplexer.send_keys` may press. Closed on
+# purpose: an operator answering a parked prompt from the dashboard (#855) needs
+# only confirm (Enter) and decline (Escape), and a backend refuses anything else
+# rather than typing a key it was never asked to vouch for.
+ALLOWED_KEYS: Final = frozenset({"Enter", "Escape"})
+# Matched against the screen with all whitespace removed (see parked_screen).
+# The dash, and only these spellings of it: the real em dash; its UTF-8 bytes
+# read as cp1252 (`â€”`); the escapes of the capture's backslashreplace decode,
+# UTF-8 under an ASCII locale (`\xe2\x80\x94`) or a cp1252 dash under UTF-8
+# (`\x97`). No wildcard: any other token between the exit status and "press
+# enter" is not our banner, and reading it as one would kill a live window.
+_PARKED_DASHES = ("—", "â€”", r"\xe2\x80\x94", r"\x97")
+_PARKED_BANNER_TAIL_RE = re.compile(
+    r"\[bmad-loopexited-?\d+(?:"
+    + "|".join(re.escape(dash) for dash in _PARKED_DASHES)
+    + r")pressenter\]\Z"
+)
+
+
+def parked_screen(screen: str) -> bool:
+    """True when a :meth:`TerminalMultiplexer.capture_pane` screen shows a parked
+    window: the visible text ENDS with :data:`PARKED_BANNER`. Anything else — a
+    running command, one not yet started, a banner followed by later output —
+    reads as not parked.
+
+    Whitespace, row breaks included, is dropped before matching, so the banner
+    still matches when a pane narrower than it wraps it across rows (capture
+    reports physical rows, trailing spaces trimmed) or when the command's last
+    output had no newline and the banner was printed onto the same row.
+
+    The ceiling, kept on purpose: a command that is still running and whose
+    visible screen ends with that exact text reads as parked. A flag the
+    wrapper sets after its command exits would close that, but psmux has no
+    per-window option to carry it (#310)."""
+    return _PARKED_BANNER_TAIL_RE.search("".join(screen.split())) is not None
 
 
 def parse_target(target: str) -> tuple[str, str | None] | None:
@@ -65,6 +110,24 @@ def parse_target(target: str) -> tuple[str, str | None] | None:
         return None
     session, _, window = target[1:].partition(":")
     return (session, window or None)
+
+
+@final
+class Unset:
+    """The type of :data:`UNSET`: a variable confirmed absent for new panes, as
+    answered by :meth:`TerminalMultiplexer.inherited_env`. Its own type rather
+    than ``""`` because absent and set-to-empty are different inputs to the
+    state-root cascade (an absent ``HOME`` takes the passwd fallback, an empty
+    one names ``/``). Compare with ``is UNSET``."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+#: The one :class:`Unset` instance.
+UNSET: Final = Unset()
 
 
 class TerminalMultiplexer(ABC):
@@ -144,6 +207,34 @@ class TerminalMultiplexer(ABC):
     def list_sessions(self) -> list[str]:
         """Names of all live sessions."""
 
+    def list_sessions_reporting(
+        self, *, on_fault: Callable[[str], None] | None = None
+    ) -> list[str]:
+        """:meth:`list_sessions`, with a fault the listing folds into ``[]``
+        handed to ``on_fault`` instead of the backend's own channel.
+
+        A backend that answers a failed listing with ``[]`` — the bundled
+        tmux family does, warning on stderr (DW-458) — makes that fault look
+        like "no live session" to a caller that cannot read stderr: the TUI,
+        where Textual captures it for the app's whole run, and whose removal
+        guard reads the listing (DW-466). Given a sink, such a backend calls it
+        with a one-line description of the fault (no ``warning:`` prefix, no
+        consequence clause — the caller states its own) and does NOT also warn
+        on its own channel: one route per frontend. ``None`` keeps the
+        backend's own channel, so ``list_sessions()`` and
+        ``list_sessions_reporting()`` answer and warn alike. An answer —
+        a missing multiplexer, no server running — is not a fault and reaches
+        neither.
+
+        Non-abstract, and a method of its own rather than a keyword on
+        :meth:`list_sessions`, so released out-of-tree backends keep working
+        unchanged: an override declared ``list_sessions(self)`` cannot take a
+        keyword core would pass it, and this default never passes one. It
+        reports nothing, which is right for a backend that raises
+        :class:`MultiplexerError` on a failed listing (the caller hears it as
+        the raise). A backend that folds a fault into ``[]`` overrides this."""
+        return self.list_sessions()
+
     @abstractmethod
     def session_options(self, option: str) -> dict[str, str]:
         """Map of session name -> value of ``option`` across all sessions."""
@@ -192,6 +283,12 @@ class TerminalMultiplexer(ABC):
         the process exits — and finally returns an attached client to its origin
         (keyed by the per-window ``return_opt``). Returns the native window id.
 
+        On reaching the park the window prints :data:`PARKED_BANNER` as its last
+        line, readable through :meth:`capture_pane`; that is what lets the
+        ctl-window prune close a parked window and leave a running one alone. A
+        backend that parks without it, or cannot capture, gets its windows kept
+        and reported, never closed.
+
         That id is **opaque to core** exactly as :meth:`new_window`'s is, so a
         backend MAY return an already-qualified target rather than a bare id
         (psmux returns ``session:@N``) — and an obligation follows from that
@@ -203,7 +300,7 @@ class TerminalMultiplexer(ABC):
         """Native ids of every window in ``session`` (empty if it is gone).
 
         SYMMETRY RULE: these must be the *same id form* :meth:`new_window`
-        returns, because :meth:`window_alive` is a membership test over this
+        returns, because :meth:`window_alive` starts from membership in this
         list. A backend that qualifies one side and not the other reads every
         live window as instantly dead. The form itself is the backend's own —
         psmux emits ``session:@N`` because its ids are minted per server (one
@@ -252,11 +349,15 @@ class TerminalMultiplexer(ABC):
 
     @abstractmethod
     def window_alive(self, session: str, window_id: str) -> bool:
-        """True iff ``window_id`` is still a window of ``session``.
+        """True iff ``window_id`` is still a window of ``session`` whose pane is
+        alive. A window the multiplexer keeps listed after its pane exited (a
+        user's ``remain-on-exit on``) is NOT alive: the CLI is gone (#950). That
+        is the one place this differs from membership in :meth:`list_window_ids`,
+        which still lists such a window.
 
         May raise :class:`MultiplexerError` when liveness is unknowable — a
         transport timeout / missing binary, or any other failure to take the
-        listing this membership test reads (see :meth:`list_window_ids`).
+        listing this liveness test reads (see :meth:`list_window_ids`).
         Callers must treat that as "don't know", not "dead", and must not tear
         down a possibly-working session on it. Reachable in ordinary operation,
         not only under a hung binary: a live server that refuses or drops the
@@ -273,6 +374,23 @@ class TerminalMultiplexer(ABC):
         """Make ``target`` the current window of its session (best-effort: a no-op
         on a transport failure). ``target`` is a :meth:`target` token or a
         backend-native window id."""
+
+    def rename_window(self, target: str, name: str) -> None:
+        """Rename the targeted window to ``name``, so a later by-name lookup
+        (the TUI's ``<kind>-<run_id>`` control-window scan) finds it under the
+        new one. ``target`` is a :meth:`target` token or a backend-native
+        window id. The name must stick: a multiplexer that auto-renames
+        windows must not rename this one back.
+
+        CHECKED, unlike :meth:`select_window`: a rename that did not land
+        raises :class:`MultiplexerError`, so the caller can say the window is
+        still under its old name.
+
+        NON-abstract so released out-of-tree backends keep working unchanged:
+        the default raises :class:`MultiplexerError` ("cannot rename"), which
+        the caller reads as a rename that did not land. A backend that can
+        rename a window overrides this."""
+        raise MultiplexerError(f"{type(self).__name__} cannot rename a window")
 
     @abstractmethod
     def set_window_option(self, target: str, option: str, value: str) -> None:
@@ -302,11 +420,61 @@ class TerminalMultiplexer(ABC):
     @abstractmethod
     def pipe_pane(self, window_id: str, log_file: Path) -> None:
         """Tee the window's pane output to ``log_file`` (tolerant of the window
-        having already died)."""
+        having already died). ``window_id`` may also be a :meth:`pane_target`."""
 
     @abstractmethod
     def send_text(self, window_id: str, text: str) -> None:
-        """Send ``text`` literally to the window, then submit it (Enter)."""
+        """Send ``text`` literally to the window, then submit it (Enter).
+
+        ``window_id`` may also be a :meth:`pane_target`. Raises
+        :class:`MultiplexerError` instead of typing when the target pane is in a
+        mode (copy, clock, ...) that would swallow the keys (#949): an
+        undelivered nudge must not read as a delivered one."""
+
+    def pane_target(self, window_id: str) -> str:
+        """A ``-t`` target that keeps naming the pane ``window_id`` was launched
+        in, even after an operator splits the window and another pane becomes
+        active (#948). Resolve it right after :meth:`new_window`, while the
+        launched pane is the only one. Opaque like the window id; accepted by
+        :meth:`pipe_pane`, :meth:`send_text` and :meth:`capture_pane`.
+
+        NON-abstract so released out-of-tree backends keep working unchanged:
+        the default answers the window id itself, i.e. the window's active pane
+        as before. Raises :class:`MultiplexerError` when the pane cannot be
+        resolved."""
+        return window_id
+
+    def capture_pane(self, window_id: str) -> str:
+        """The window's VISIBLE screen as plain text, one line per row — what an
+        operator attached to it would see right now, not its scrollback.
+
+        Read by the generic adapter only at the instant a stall wake nudge is
+        about to be typed (DW-350): a screen showing a prompt only a human should
+        answer withholds the nudge, whose trailing Enter could confirm it. Pure
+        observation — any failure there degrades to "no match" and the nudge
+        goes out as it always did.
+
+        NON-abstract so released out-of-tree backends keep working unchanged:
+        the default raises :class:`MultiplexerError` ("cannot capture"), which
+        the caller treats exactly like a clean screen. A backend that can read
+        its pane overrides this."""
+        raise MultiplexerError(f"{type(self).__name__} cannot capture a pane's visible screen")
+
+    def send_keys(self, target: str, *keys: str) -> None:
+        """Press each named key of ``keys`` in order in the pane ``target`` names
+        (a window id or a :meth:`pane_target`).
+
+        Named keys only, each one of :data:`ALLOWED_KEYS`, never literal text,
+        and no implicit Enter: what is sent is exactly ``keys``. Raises
+        :class:`MultiplexerError` instead of pressing anything when a key is not
+        allowed or the target pane is in a mode (copy, clock, ...) that would
+        swallow the keys, as :meth:`send_text` does (#949).
+
+        NON-abstract so released out-of-tree backends keep working unchanged:
+        the default raises :class:`MultiplexerError` ("cannot send keys"), and
+        the caller reads that as a refusal. A backend that can press keys
+        overrides this."""
+        raise MultiplexerError(f"{type(self).__name__} cannot send named keys to a pane")
 
     # ----------------------------------------------------- client / attach
 
@@ -501,6 +669,31 @@ class TerminalMultiplexer(ABC):
         the run or the shell) and the sweep here — see
         ``docs/porting-to-a-new-os.md``."""
         return []
+
+    def inherited_env(
+        self,
+        session: str,
+        name: str,
+        *,
+        on_fault: Callable[[str], None] | None = None,
+    ) -> str | Unset | None:
+        """What a new pane in ``session`` will inherit for the environment
+        variable ``name``: its value (``""`` included), :data:`UNSET` when it is
+        confirmed absent, or ``None`` when this transport cannot tell.
+
+        A multiplexer server is long-lived, and its panes inherit the
+        environment the server started with rather than the one of the client
+        asking for the pane, so a launcher cannot read the answer off its own
+        environment (#731). Must not raise. A query the backend supports but
+        could not complete (timeout, missing binary, an unexpected reply)
+        answers ``None`` **and** hands ``on_fault`` a one-line description, so a
+        caller can tell "tried and failed" from "cannot tell"; with no sink the
+        backend says nothing.
+
+        Non-abstract, defaulting to ``None`` with nothing reported, so released
+        out-of-tree backends keep working unchanged. tmux and psmux answer it
+        through ``show-environment``."""
+        return None
 
     def window_pane_pids(self, target: str) -> list[int]:
         """Best-effort OS pids of ``target``'s pane root processes, for the kill
@@ -716,13 +909,40 @@ def _factory_by_name(name: str) -> Callable[[], TerminalMultiplexer] | None:
     return None
 
 
+def _raised(what: str, exc: BaseException) -> str:
+    # One wording for every probe fault this module folds, stderr and row alike.
+    return f"{what} raised {type(exc).__name__}: {exc}"
+
+
+def _probe_available(backend: TerminalMultiplexer) -> tuple[bool, str | None]:
+    """``available()`` read through a guard, keeping the fault it folds: the
+    verdict, and ``None`` or the raise that forced it to False."""
+    try:
+        return bool(backend.available()), None
+    except Exception as exc:
+        return False, _raised("available()", exc)
+
+
+_PROBE_FAULTS_WARNED: set[tuple[str, str]] = set()
+
+
 def _usable(backend: TerminalMultiplexer) -> bool:
     """``available()`` read through a guard: selection must never crash on a
-    backend's host probe, so a missing or raising probe reads as unavailable."""
-    try:
-        return bool(backend.available())
-    except Exception:
-        return False
+    backend's host probe, so a missing or raising probe reads as unavailable.
+
+    That False is a fold, not an answer, so it says so on stderr (DW-464) —
+    once per process per distinct fault, like :func:`mux_usable`'s warning:
+    the TUI's observers re-probe through here on every poll."""
+    usable, fault = _probe_available(backend)
+    if fault is not None:
+        key = (type(backend).__name__, fault)
+        if key not in _PROBE_FAULTS_WARNED:
+            _PROBE_FAULTS_WARNED.add(key)
+            print(
+                f"warning: multiplexer backend {key[0]} {fault}; reading it as unavailable",
+                file=sys.stderr,
+            )
+    return usable
 
 
 def backend_forced() -> bool:
@@ -865,15 +1085,27 @@ class MuxBackendInfo:
     # present (TerminalMultiplexer.version_error). Defaulted so it is additive
     # for anyone constructing this row positionally.
     version_error: str | None = None
+    # Why ``matches_platform`` or ``available`` reads False when it is a fold,
+    # not an answer: the platform predicate, the factory or ``available()``
+    # raised (DW-464). ``"; "``-joined when more than one did. Appended with a
+    # default for the same reason as version_error.
+    probe_error: str | None = None
 
 
 def detect_multiplexers() -> list[MuxBackendInfo]:
     """Probe every registered backend: availability, version, platform match,
     and which one :func:`_select` would pick (with its reason).
 
-    Never raises — this feeds diagnostics, which must work on a misconfigured
-    host: a forced unknown name yields rows with no selected mark, and a
-    backend whose factory or probes blow up reads as unavailable. Constructs
+    Every per-backend probe in the row loop is guarded — this feeds diagnostics,
+    which must work on a misconfigured host: a forced unknown name yields rows
+    with no selected mark, and a backend whose factory or probes blow up there
+    reads as unavailable, naming the raise in ``probe_error`` (or, for
+    ``version()``, ``version_error``). Two steps ahead of that loop are NOT fully guarded, so
+    this function can raise: the registry loads (a broken third-party entry point
+    is recorded, not raised — :func:`_load_external_backends` — but a failed
+    import of a bundled backend, i.e. a broken install, propagates), and the
+    :func:`_select` call, which catches only :class:`MultiplexerError` — a factory
+    or platform predicate that raises while selection runs it propagates. Constructs
     every registered backend, so factories must stay cheap, side-effect-free
     constructors (true of the tmux family)."""
     _load_builtin_backends()
@@ -888,29 +1120,41 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
         if name in seen:  # duplicate registrations: only the selectable (first) one is shown
             continue
         seen.add(name)
+        # A raising probe still reads False/None as before, but the row keeps
+        # its identity (DW-464) — the #428 blindness version_error fixed for
+        # version(), here for the probes that decide the other two columns.
+        faults: list[str] = []
         try:
             matches_platform = bool(matches(sys.platform))
-        except Exception:
+        except Exception as exc:
             matches_platform = False
+            faults.append(_raised("platform predicate", exc))
         version: str | None = None
         version_error: str | None = None
         try:
             backend = factory()
-            available = _usable(backend)
-        except Exception:
+        except Exception as exc:
             available = False
+            faults.append(_raised("factory", exc))
         else:
+            # The row carries this fault, so it takes the quiet probe, not
+            # _usable's stderr warning.
+            available, fault = _probe_available(backend)
+            if fault is not None:
+                faults.append(fault)
             # version() is cosmetic: its failure must not overwrite the
             # already-computed availability (a selected backend would
-            # otherwise show a contradictory available=False row).
+            # otherwise show a contradictory available=False row). It is
+            # named in version_error, whose question — why is there no
+            # version — a raise answers too.
             try:
                 version = fold_version(backend.version())
-            except Exception:
-                version = None
-            if version is None:
+            except Exception as exc:
+                version, version_error = None, _raised("version()", exc)
+            if version is None and version_error is None:
                 # Read only after version(), which is what it describes, and
                 # only when there is a None to explain. Guarded like every other
-                # probe here — this function never raises.
+                # probe in this loop — none of them may raise out of it.
                 try:
                     version_error = backend.version_error()
                 except Exception:
@@ -925,6 +1169,7 @@ def detect_multiplexers() -> list[MuxBackendInfo]:
                 selected=selected,
                 reason=reason if selected else "",
                 version_error=version_error,
+                probe_error="; ".join(faults) or None,
             )
         )
     return rows

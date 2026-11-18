@@ -13,11 +13,21 @@ Two strategies, one report shape:
 - SCAN (default, zero process launch beyond ``--version``/``--help``): locate the
   newest already-existing transcript by convention, read the declared hook config,
   infer the token schema. Works whenever the user has used the CLI before.
-- PROBE (``--probe``, opt-in): in an ephemeral ``mkdtemp`` workspace, register the
-  full-payload capture hook for every native event, launch one trivial content-free
-  turn in a tmux window, capture each event's complete payload, then tear down. The
-  raw capture exists only transiently inside the temp dir, which is ``rmtree``'d in a
-  ``finally`` (even on exception / Ctrl-C).
+- PROBE (``--probe``, opt-in): register the full-payload capture hook for every
+  native event, launch one trivial content-free turn in a tmux window, capture each
+  event's complete payload, then tear down. The raw capture and the launch log live
+  only in an ephemeral ``mkdtemp`` dir, which is ``rmtree``'d in a ``finally`` (even
+  on exception / Ctrl-C). The hook script and its config sit in that same dir for
+  every dialect but ``codex-hooks-json``: Codex keys hook trust by config path and
+  hash, so a fresh temp dir always reads untrusted. Codex therefore gets a stable
+  per-user workspace (:func:`probe_workspace`, under the state root) that is reset
+  on every run and rewritten with the same bytes, so a one-time trust grant there
+  keeps holding. It holds only the hook script and the config — never captures or
+  logs — and is deliberately left in place for the operator to open Codex in.
+
+A third, separate probe, :func:`launch_screen_probe`, launches the CLI with no
+prompt and only watches its first screen for a parked startup dialog — zero
+tokens; it shares the tmux launcher and the availability checks, not the report.
 
 One finding, two render targets: :func:`render_markdown` for the human report
 (the CLI default) and :func:`render_json` for the machine-readable document that
@@ -42,7 +52,9 @@ to shape instead of trying to enumerate what might be sensitive.
 
 from __future__ import annotations
 
+import errno
 import glob
+import hashlib
 import os
 import re
 import shlex
@@ -50,22 +62,28 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
+from typing import Literal
 
-from . import runs, sanitize
-from .adapters.multiplexer import MultiplexerError, get_multiplexer
+import regex
+
+from . import childrun, platform_util, runs, sanitize
+from .adapters.generic import PARKED_PROMPT_MATCH_TIMEOUT_S
+from .adapters.multiplexer import MultiplexerError, TerminalMultiplexer, get_multiplexer
+from .adapters.panematch import Hit, MatchTimeout, match_rows, screen_rows
 from .adapters.profile import CLIProfile
-from .install import merge_hooks, relay_registered
-from .process_host import get_process_host
+from .install import gated_hook_events, merge_hooks, read_relay_registration
+from .process_host import ProcessHostError, get_process_host
 
 # cmd_probe catches `probe.LeakDetected` around the renderers, mirroring
 # diagnostics — the noqa keeps ruff's F401 autofix from deleting the re-export.
 from .sanitize import LeakDetected  # noqa: F401 — re-export
 from .signals import SignalWatcher
-from .tokens import _jsonl_entries, read_usage
+from .tokens import _jsonl_entries, codex_home, read_usage
 
 # Version of the `--json` document (machine.py contract). Distinct from the
 # document's `version` key, which holds the *probed CLI's* `--version` output.
@@ -80,9 +98,13 @@ TRANSCRIPT_GLOBS = {
     "codex-rollout": "~/.codex/sessions/*/*/*/rollout-*.jsonl",
     "gemini-chat": "~/.gemini/tmp/*/chats/session-*.jsonl",
     "copilot-events": "~/.copilot/session-state/*/events.jsonl",
+    "antigravity-transcript": (
+        "~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl"
+    ),
 }
 # Fallback family glob keyed by the `cli` name, so a CLI whose usage_parser is
-# still "none" (e.g. antigravity, freshly added) still gets transcript discovery.
+# "none" (a freshly added profile, or an override that turns the parser off)
+# still gets transcript discovery.
 FAMILY_GLOBS = {
     "claude": "~/.claude/projects/*/*.jsonl",
     "codex": "~/.codex/sessions/*/*/*/rollout-*.jsonl",
@@ -98,12 +120,19 @@ FAMILY_GLOBS = {
         "~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl"
     ),
 }
+# Codex relocates its whole state root with CODEX_HOME. The live tally resolves
+# that root through `tokens.codex_home`, so the convention globs above that are
+# rooted here follow it too (see `_convention_glob`).
+_CODEX_ROOT_PREFIX = "~/.codex/"
 
 _TOKEN_KEY_RE = re.compile(
     r"(token|tokens|cached|input|output|prompt|completion|thoughts|usage)", re.I
 )
 
 PROBE_HOOK_NAME = "bmad_loop_probe_hook.py"
+# Under the state root: one stable live-probe workspace per Codex profile.
+PROBE_WORKSPACES_DIR = "probe-workspaces"
+_UNSAFE_NAME_CHAR_RE = re.compile(r"[^A-Za-z0-9._-]")
 PROBE_PROMPT = "Reply with exactly: OK"
 PROBE_TASK_ID = "probe"
 PROBE_GRACE_S = 3.0
@@ -163,6 +192,8 @@ class ProfileFinding:
     declared_events: dict = field(default_factory=dict)  # native -> canonical
     registered: bool | None = None  # scan: hooks present in the CLI's config?
     hook_trust: str | None = None  # trusted | untrusted | unverifiable (Codex only)
+    # trusted | untrusted | unverifiable — only when --workspace was requested
+    workspace_trust: str | None = None
     captured_events: list[EventCapture] = field(default_factory=list)  # probe
     transcript: TranscriptFinding | None = None
     tokens: TokenSchema | None = None
@@ -207,34 +238,56 @@ def binary_runs(binary: str, timeout_s: float = 10) -> int | None:
     Never raises, and that is load-bearing rather than defensive style: machine.py
     records that every gate in ``cmd_validate`` runs inside a ``try`` so "the
     command has no error path of its own — its rc is purely the verdict". A probe
-    that raised would give it one. The guard is ``_run_capture``'s exactly, and
-    the return is deliberately left as bytes (no ``text=True``): nothing here reads
-    the output, so the locale decode that forced ``errors="replace"`` on that
-    function never happens and cannot raise the ``UnicodeDecodeError`` the guard
-    does not name.
+    that raised would give it one. The guard names ``_run_capture``'s families
+    plus ``ProcessHostError``, the one fault the tree kill adds (a bogus
+    ``BMAD_LOOP_PROCESS_HOST`` override surfaces there). The output is never read;
+    :func:`childrun.run_argv` decodes it with ``errors="replace"``, so no
+    ``UnicodeDecodeError`` can escape either.
 
-    None (could not launch, or timed out) and a nonzero code are separate answers
-    to the caller, not one sentinel: the first has no return code to report.
+    None (could not launch, timed out, or interrupted before spawning) and a
+    nonzero code are separate answers to the caller, not one sentinel: the first
+    has no return code to report.
 
-    ``stdin=DEVNULL`` is required, not cosmetic. With the caller's tty inherited, a
-    shim that prompts blocks on the read for the whole timeout — measured 4.00s
-    against 0.00s — inside an interactive command.
+    Bounded by :func:`childrun.run_argv`, not ``subprocess.run``: on timeout the
+    latter killed only the root and then waited on the pipes with no bound, so a
+    Windows ``.cmd`` shim — rooted at ``cmd.exe``, the real program its child —
+    returned only when that child exited by itself (a 0.5 s timeout measured at
+    120 s). ``run_argv`` kills the whole tree and bounds the drain. It is also
+    stop-aware, but no hard-stop probe is installed here: ``cmd_validate`` never
+    runs inside ``Engine.run``, and the probe only reads the stop channel.
+
+    ``stdin=DEVNULL`` (``run_argv``'s spawn) is required, not cosmetic. With the
+    caller's tty inherited, a shim that prompts blocks on the read for the whole
+    timeout — measured 4.00s against 0.00s — inside an interactive command.
 
     Not folded into :func:`run_version_help`, which discards the return code by
     design and spawns TWO children (``--version`` then ``--help``) at ``timeout_s``
     each: reusing it would cost up to 20s per profile here.
     """
     try:
-        proc = subprocess.run(
-            [binary, "--version"],
-            capture_output=True,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            timeout=timeout_s,
-        )
-    except (OSError, subprocess.SubprocessError):
+        run = childrun.run_argv([binary, "--version"], cwd=None, timeout=timeout_s)
+    except (OSError, subprocess.SubprocessError, ProcessHostError):
         return None
-    return proc.returncode
+    if run.timed_out or run.interrupted:
+        return None
+    return run.returncode
+
+
+def binary_version_text(binary: str, timeout_s: float = 10) -> str | None:
+    """The first line of ``binary --version`` output (stdout, then stderr), or
+    None when it could not run, timed out, exited nonzero, or printed nothing.
+
+    Never raises, for :func:`binary_runs`'s reason (cmd_validate has no error
+    path of its own), and bounded by the same :func:`childrun.run_argv`. A
+    failed run is None rather than a reason; the caller reports it."""
+    try:
+        run = childrun.run_argv([binary, "--version"], cwd=None, timeout=timeout_s)
+    except (OSError, subprocess.SubprocessError, ProcessHostError):
+        return None
+    if run.timed_out or run.interrupted or run.returncode != 0:
+        return None
+    output = ((run.stdout or "") + (run.stderr or "")).strip()
+    return output.splitlines()[0] if output else None
 
 
 def run_version_help(binary: str, timeout_s: float = 10) -> FlagFinding:
@@ -332,14 +385,35 @@ def _newest(paths: list[Path]) -> Path:
     return max(paths, key=lambda p: p.stat().st_mtime if p.exists() else 0)
 
 
+def _convention_glob(pattern: str, env: Mapping[str, str]) -> tuple[str | None, str]:
+    """The ``(search, display)`` forms of a convention glob.
+
+    A ``~/.codex/``-rooted pattern searches under ``tokens.codex_home(env)``, the
+    root live sessions tally from; the root is escaped, so it matches literally
+    as live resolution does. Its display names ``$CODEX_HOME`` rather than the
+    configured path: the glob renders verbatim, without `_redact_location`.
+    ``search`` is None when no codex root can be determined."""
+    if not pattern.startswith(_CODEX_ROOT_PREFIX):
+        return os.path.expanduser(pattern), pattern
+    rest = pattern[len(_CODEX_ROOT_PREFIX) :]
+    root = codex_home(env)
+    search = None if root is None else os.path.join(glob.escape(str(root)), rest)
+    display = f"$CODEX_HOME/{rest}" if env.get("CODEX_HOME") else pattern
+    return search, display
+
+
 def discover_transcript(
     parser: str,
     *,
     cli: str,
     hints: Hints,
     aliases: dict[str, str] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> TranscriptFinding | None:
-    """Locate the newest existing transcript via override or convention glob."""
+    """Locate the newest existing transcript via override or convention glob.
+
+    ``env`` is the environment the CLI runs under (default: this process's);
+    the codex globs resolve CODEX_HOME from it."""
     if hints.transcript:
         path = Path(hints.transcript).expanduser()
         if not path.is_file():
@@ -361,16 +435,17 @@ def discover_transcript(
             note="no transcript-location convention for this CLI; "
             "pass --transcript PATH or --session-dir DIR"
         )
-    matches = [Path(p) for p in glob.glob(os.path.expanduser(pattern))]
+    search, display = _convention_glob(pattern, os.environ if env is None else env)
+    matches = [Path(p) for p in glob.glob(search)] if search is not None else []
     matches = [p for p in matches if p.is_file()]
     if not matches:
         return TranscriptFinding(
-            glob=pattern,
+            glob=display,
             note="no existing transcript matched the convention glob; "
             "use --transcript / --session-dir, or run --probe",
         )
     return _describe_transcript(
-        _newest(matches), glob_pat=pattern, multiple=len(matches) > 1, aliases=aliases
+        _newest(matches), glob_pat=display, multiple=len(matches) > 1, aliases=aliases
     )
 
 
@@ -459,24 +534,44 @@ def infer_token_schema(
 # --------------------------------------------------------------- hook config
 
 
-def _hooks_registered(project: Path, profile: CLIProfile) -> bool:
-    config_path = project / profile.hooks.config_path
-    if not config_path.is_file():
-        return False
-    import json
+def _hooks_registered(project: Path, profile: CLIProfile) -> tuple[bool, str | None]:
+    """``(registered, fault)`` for the bmad-loop relay over the profile's events.
 
+    It goes through :func:`install.read_relay_registration`, the same reader
+    ``validate``'s ``hooks.*`` checks and the launch relay warning use, so it reads
+    only ``project / profile.hooks.config_path``: project-only is the contract. A
+    relay registered in a user- or local-scope settings file (or a CLI's
+    managed-policy/plugin hooks) is not seen here, though the CLI may still merge
+    it; ``bmad-loop init --cli <profile>`` registers the relay in the project
+    config.
+
+    ``fault`` names a broken config — invalid JSON, a non-object top level,
+    malformed handlers for a declared event, or an unreadable file (named only by
+    exception type) — behind the project-relative config path, never an absolute
+    one (the report's egress check refuses home-rooted paths). A fault reads as
+    unregistered. A missing file is unregistered with no fault."""
+    rel_path = profile.hooks.config_path
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return False
-    if not isinstance(config, dict):
-        return False
-    return relay_registered(config, profile.hooks.dialect, profile.hooks.events)
+        registration = read_relay_registration(project, profile)
+    except (OSError, ValueError) as error:
+        return False, f"{rel_path} could not be read ({type(error).__name__})"
+    if registration.fault_detail is not None:
+        return False, f"{rel_path} {registration.fault_detail}"
+    return registration.registered, None
 
 
 def _check_hook_trust(
-    finding: ProfileFinding, project: Path, profile: CLIProfile, binary: str, *, live: bool = False
+    finding: ProfileFinding,
+    project: Path,
+    profile: CLIProfile,
+    binary: str,
+    *,
+    live: bool = False,
+    workspace_label: str | None = None,
 ) -> None:
+    """Codex only: query hook trust at ``project`` and record a non-trusted verdict.
+    ``live`` is the ``--probe`` path, where ``project`` is the stable probe
+    workspace and ``workspace_label`` its paste-safe spelling for the next step."""
     if profile.hooks.dialect != "codex-hooks-json":
         return
     from .codex_trust import project_hook_trust
@@ -485,14 +580,23 @@ def _check_hook_trust(
     trust = project_hook_trust(project, profile, binary=binary, marker=marker)
     finding.hook_trust = trust.status
     if trust.status != "trusted":
-        scope = "temporary probe workspace" if live else "project checkout"
+        scope = "stable probe workspace" if live else "project checkout"
         finding.warnings.append(
             f"Codex hook trust for {scope} using {finding.binary}: {trust.reason}"
         )
-        if live:
+        if live and trust.status == "untrusted":
             finding.next_steps.append(
-                "Codex has no trust grant for this fresh temporary workspace; "
-                "live capture cannot proceed until that workspace is trusted"
+                f"Open Codex once in the stable probe workspace `{workspace_label}` "
+                f"(cd there and run `{finding.binary}` under the profile's `[env]`, if "
+                "it sets any), accept its folder trust and "
+                "hooks trust prompts, then re-run "
+                f"`bmad-loop probe-adapter {finding.cli} --probe` from your project checkout"
+            )
+        elif live:
+            # unverifiable: a trust grant cannot fix a failed or unreadable query
+            finding.next_steps.append(
+                "Resolve the Codex hook trust diagnostic and re-run "
+                f"`bmad-loop probe-adapter {finding.cli} --probe`"
             )
         elif "stale" in trust.reason:
             finding.next_steps.append(
@@ -504,6 +608,34 @@ def _check_hook_trust(
             )
         else:
             finding.next_steps.append("Resolve the Codex hook trust diagnostic and re-run the scan")
+
+
+def check_workspace_trust(finding: ProfileFinding, profile: CLIProfile, workspace: Path) -> None:
+    """Read-only: is ``workspace`` in the profile's declared workspace-trust list
+    (DW-390)? Sets ``finding.workspace_trust``; a non-trusted verdict adds a
+    warning and a next step. The workspace path itself is never rendered — the
+    reasons from :func:`workspace_trust.trust_status` are path-free, and the
+    settings file is named by its ``~/`` spelling only."""
+    from . import workspace_trust
+
+    spec = profile.workspace_trust
+    if spec is None:
+        return
+    status, reason = workspace_trust.trust_status(spec, workspace)
+    finding.workspace_trust = status
+    if status == "trusted":
+        return
+    finding.warnings.append(f"workspace trust {status} for the requested workspace: {reason}")
+    if status == "unverifiable":
+        finding.next_steps.append(
+            f"Repair {spec.settings_path}: it must be a JSON object whose "
+            f"{spec.key!r} is a list of path strings"
+        )
+    else:
+        finding.next_steps.append(
+            f"Run `{profile.binary}` in the project root and trust it; bmad-loop seeds "
+            "each worktree from that grant (or trust this workspace directly)"
+        )
 
 
 # ----------------------------------------------------------------- SCAN mode
@@ -545,16 +677,30 @@ def scan(
         )
 
     if profile is not None:
-        finding.registered = _hooks_registered(project, profile)
+        finding.registered, hook_fault = _hooks_registered(project, profile)
         _check_hook_trust(finding, project, profile, binary)
-        if not finding.registered:
+        if hook_fault is not None:
+            finding.warnings.append(f"project hook config {hook_fault}")
             finding.next_steps.append(
-                f"hooks not registered in {profile.hooks.config_path}; "
-                f"`bmad-loop init --cli {cli}` to validate the dialect end-to-end, "
+                f"fix the project hook config: {hook_fault}; then `bmad-loop init --cli "
+                f"{cli}` against this project registers the relay there, or re-run "
+                "with --probe"
+            )
+        elif not finding.registered:
+            finding.next_steps.append(
+                "hooks not registered in the project hook config "
+                f"{profile.hooks.config_path} (only this file is read: a relay in "
+                "user- or local-scope settings, managed policy or plugin hooks reads "
+                f"as unregistered); `bmad-loop init --cli {cli}` against this project "
+                "registers the relay there so a run validates the dialect end-to-end, "
                 "or re-run with --probe"
             )
 
-    finding.transcript = discover_transcript(parser, cli=cli, hints=hints, aliases=aliases)
+    # The profile's env overlays this process's, as it does for live sessions.
+    cli_env = {**os.environ, **profile.env} if profile is not None else None
+    finding.transcript = discover_transcript(
+        parser, cli=cli, hints=hints, aliases=aliases, env=cli_env
+    )
     if finding.transcript and finding.transcript.note:
         finding.warnings.append(finding.transcript.note)
     if finding.transcript and finding.transcript.real_path is not None:
@@ -578,6 +724,8 @@ class _ProbeLauncher:
     def __init__(self, session_name: str):
         self.session_name = session_name
         self.mux = get_multiplexer()
+        # The fault behind the last `start` that returned None, as `Type: message`.
+        self.error: str | None = None
 
     def start(self, argv: list[str], env: dict[str, str], cwd: Path, log_file: Path) -> str | None:
         try:
@@ -594,7 +742,8 @@ class _ProbeLauncher:
             window_id = self.mux.new_window(
                 self.session_name, PROBE_TASK_ID, cwd, window_env, command
             )
-        except MultiplexerError:
+        except MultiplexerError as e:
+            self.error = f"{type(e).__name__}: {e}"
             return None
         # pipe-pane may race a window that dies instantly; tolerate failure.
         self.mux.pipe_pane(window_id, log_file)
@@ -607,11 +756,35 @@ class _ProbeLauncher:
         self.mux.kill_session(self.session_name)
 
 
-def _probe_argv(profile: CLIProfile, binary: str, hints: Hints) -> list[str]:
+def _resolved_binary(profile: CLIProfile, binary: str) -> str:
     if profile.hooks.dialect == "codex-hooks-json":
         from .codex_trust import resolved_codex_binary
 
-        binary = resolved_codex_binary(binary, profile.env) or binary
+        return resolved_codex_binary(binary, profile.env) or binary
+    return binary
+
+
+def _mux_ready(mux: TerminalMultiplexer) -> bool:
+    # Gate on the SELECTED backend's availability rather than a hardcoded
+    # `which("tmux")` — a Windows host running herdr (or a future psmux) must
+    # still probe. Guarded so a backend whose host probe raises reads as
+    # unavailable, exactly like selection's _usable().
+    try:
+        return bool(mux.available())
+    except Exception:  # a raising host probe means "cannot probe", not a crash
+        return False
+
+
+def _binary_found(profile: CLIProfile, binary: str) -> bool:
+    if profile.hooks.dialect == "codex-hooks-json":
+        from .codex_trust import resolved_codex_binary
+
+        return resolved_codex_binary(binary, profile.env) is not None
+    return shutil.which(binary) is not None
+
+
+def _probe_argv(profile: CLIProfile, binary: str, hints: Hints) -> list[str]:
+    binary = _resolved_binary(profile, binary)
     argv = [
         binary,
         *profile.launch_args,
@@ -680,6 +853,65 @@ def _collect_captures(capture_dir: Path, events_map: dict[str, str]) -> list[Eve
     return captures
 
 
+def probe_workspace(profile: CLIProfile) -> Path:
+    """The stable live-probe workspace for a ``codex-hooks-json`` profile:
+    ``<state root>/probe-workspaces/<profile name>``. Codex keys hook trust by
+    the config's path and hash, so only a path that survives between runs can
+    hold a trust grant. The name is made path-safe: anything outside
+    ``[A-Za-z0-9._-]`` becomes ``_``, leading and trailing dots go (an empty
+    result becomes ``profile``), and a Windows device name (``nul``, ``CON``)
+    gets a ``_`` prefix. A changed name also gets ``-<hex8>`` of the raw name,
+    so two profiles that coerce alike (``my codex`` and ``my_codex``) never
+    share — and keep resetting — one workspace and its trust grant. Raises
+    :class:`runs.StateRootError` when no state root exists."""
+    name = _UNSAFE_NAME_CHAR_RE.sub("_", profile.name).strip(".") or "profile"
+    if platform_util.names_win32_alias(name):
+        name = "_" + name
+    if name != profile.name:
+        raw = profile.name.encode("utf-8", "surrogatepass")
+        name += "-" + hashlib.sha256(raw).hexdigest()[:8]
+    return runs.state_root() / PROBE_WORKSPACES_DIR / name
+
+
+def _workspace_label(path: Path) -> str:
+    """Paste-safe spelling of the stable probe workspace: home -> ``~``, and the
+    per-component :func:`_redact_location` form when that still names the user
+    (a state root under ``/tmp/pytest-of-<user>``, say) or trips any other
+    egress-guard rule (an email-shaped component of ``BMAD_LOOP_STATE_DIR``) —
+    the guard would otherwise refuse the whole report."""
+    label = sanitize.redact_home(str(path))
+    if sanitize.embeds_current_username(label) or sanitize.assert_no_leak(label):
+        label = _redact_location(path)
+    return label
+
+
+def _reset_probe_workspace(workspace: Path) -> None:
+    """Empty ``workspace`` so its contents are exactly what this run writes.
+
+    The directory itself is kept: the untrusted next step sends the operator to
+    ``cd`` into it, and removing a shell's cwd strands that shell (``Path.cwd()``
+    raises) even after the same path is recreated. It and its
+    ``probe-workspaces`` parent are made owner-only (``0o700``; a no-op beyond
+    the read-only bit on Windows): Codex trusts the hook config's hash, not the
+    script it runs, so a script others can rewrite would run in every later
+    trusted session. A link (or junction) or a plain file at either of those two
+    paths fails loud as :class:`OSError` rather than being followed; links at
+    the state root or above are the operator's layout and are followed. A link
+    inside the workspace is removed, never followed."""
+    parent = workspace.parent
+    parent.parent.mkdir(parents=True, exist_ok=True)
+    for directory in (parent, workspace):
+        if platform_util.is_link_like(directory):
+            raise OSError(errno.ELOOP, "a symlink or junction, not a directory", str(directory))
+        directory.mkdir(mode=0o700, exist_ok=True)  # a plain file: FileExistsError
+        os.chmod(directory, 0o700)  # tighten one made by an older run or a looser umask
+    for child in workspace.iterdir():
+        if child.is_dir() and not platform_util.is_link_like(child):
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
 def probe(
     *,
     cli: str,
@@ -707,21 +939,10 @@ def probe(
     finding.flags = run_version_help(binary)
 
     # The live probe launches through the selected multiplexer backend (see
-    # _ProbeLauncher), so gate on THAT backend's availability rather than a
-    # hardcoded `which("tmux")` — a Windows host running herdr (or a future psmux)
-    # must still probe. `available()` is guarded so a backend whose host probe
-    # raises reads as unavailable, exactly like selection's _usable().
+    # _ProbeLauncher), so gate on THAT backend's availability (_mux_ready).
     mux = get_multiplexer()
-    try:
-        mux_ready = bool(mux.available())
-    except Exception:  # a raising host probe means "cannot probe", not a crash
-        mux_ready = False
-    if profile.hooks.dialect == "codex-hooks-json":
-        from .codex_trust import resolved_codex_binary
-
-        binary_found = resolved_codex_binary(binary, profile.env) is not None
-    else:
-        binary_found = shutil.which(binary) is not None
+    mux_ready = _mux_ready(mux)
+    binary_found = _binary_found(profile, binary)
     if not mux_ready or not binary_found:
         # finding.binary, not the raw local — see the identical note in scan()
         missing = f"multiplexer backend {type(mux).__name__}" if not mux_ready else finding.binary
@@ -730,31 +951,74 @@ def probe(
         scanned.mode = "probe"
         return scanned
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="bmad-loop-probe-"))
-    launcher = _ProbeLauncher(session_name=f"bmad-loop-probe-{tmpdir.name}")
+    # `raw` holds everything a run produces (captures, the launch log) and is
+    # rmtree'd in the finally. `workspace` holds the hook script + config and is
+    # the launch cwd: `raw` itself, except for Codex (see probe_workspace).
+    raw = Path(tempfile.mkdtemp(prefix="bmad-loop-probe-"))
+    launcher = _ProbeLauncher(session_name=f"bmad-loop-probe-{raw.name}")
     try:
-        capture_dir = tmpdir / "capture"
+        capture_dir = raw / "capture"
         capture_dir.mkdir(parents=True, exist_ok=True)
+
+        workspace = raw
+        workspace_label: str | None = None
+        if profile.hooks.dialect == "codex-hooks-json":
+            try:
+                workspace = probe_workspace(profile)
+                workspace_label = _workspace_label(workspace)
+                _reset_probe_workspace(workspace)
+            except (runs.StateRootError, OSError) as exc:
+                if isinstance(exc, runs.StateRootError):
+                    why = sanitize.scrub_text(str(exc))
+                else:
+                    why = f"{type(exc).__name__}: {exc.strerror or 'unknown error'}"
+                where = f" at `{workspace_label}`" if workspace_label else ""
+                finding.hook_trust = "unverifiable"
+                finding.warnings.append(
+                    f"Codex hook trust unverifiable: could not prepare the stable probe "
+                    f"workspace{where} ({why})"
+                )
+                if isinstance(exc, runs.StateRootError):
+                    finding.next_steps.append(
+                        "Make the bmad-loop state directory resolvable (point "
+                        "BMAD_LOOP_STATE_DIR at an absolute, writable directory), then "
+                        f"re-run `bmad-loop probe-adapter {cli} --probe`"
+                    )
+                else:
+                    finding.next_steps.append(
+                        "Close any Codex session running in the probe workspace and "
+                        f"make sure `{workspace_label}` is a directory you own that can be "
+                        "emptied (remove a file or symlink at that path or its parent; check "
+                        "its parent directory is writable), then re-run "
+                        f"`bmad-loop probe-adapter {cli} --probe`"
+                    )
+                return finding
 
         # 1. lay down the capture hook + a hook config registered through the very
         #    same merge_hooks `bmad-loop init` uses — so a bad dialect surfaces live.
         hook_src = resources.files("bmad_loop.data").joinpath(PROBE_HOOK_NAME)
-        hook_path = tmpdir / PROBE_HOOK_NAME
+        hook_path = workspace / PROBE_HOOK_NAME
         hook_path.write_text(hook_src.read_text(encoding="utf-8"), encoding="utf-8")
         host = get_process_host()
         interp = host.hook_interpreter()
+        # `init`'s version gate (#865): an event the probed CLI is too old for
+        # would make it skip this whole config, so it stays out — and says so.
+        events, gate_notes = gated_hook_events(replace(profile, binary=binary))
+        finding.warnings.extend(gate_notes)
         registrations = {
             native: f"{interp} {host.shell_quote(str(hook_path))} {canonical}"
-            for native, canonical in profile.hooks.events.items()
+            for native, canonical in events.items()
         }
         config, _ = merge_hooks({}, registrations, profile.hooks.dialect)
-        config_path = tmpdir / profile.hooks.config_path
+        config_path = workspace / profile.hooks.config_path
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
-        # The source checkout's trust says nothing about this new directory.
+        # The source checkout's trust says nothing about the probe workspace.
         # Query after writing its config and before launching a model turn.
-        _check_hook_trust(finding, tmpdir, profile, binary, live=True)
+        _check_hook_trust(
+            finding, workspace, profile, binary, live=True, workspace_label=workspace_label
+        )
         if finding.hook_trust is not None and finding.hook_trust != "trusted":
             return finding
 
@@ -762,14 +1026,14 @@ def probe(
         argv = _probe_argv(profile, binary, hints)
         env = {
             **profile.env,
-            "BMAD_LOOP_RUN_DIR": str(tmpdir),
+            "BMAD_LOOP_RUN_DIR": str(raw),
             "BMAD_LOOP_TASK_ID": PROBE_TASK_ID,
             "BMAD_LOOP_PROBE_CAPTURE_DIR": str(capture_dir),
         }
-        log_file = tmpdir / "probe.log"
+        log_file = raw / "probe.log"
         watcher = SignalWatcher(capture_dir)
         launched_ns = time.time_ns()
-        window_id = launcher.start(argv, env, tmpdir, log_file)
+        window_id = launcher.start(argv, env, workspace, log_file)
         if window_id is None:
             finding.warnings.append("could not launch the CLI in tmux; no events captured")
             return finding
@@ -832,7 +1096,11 @@ def probe(
             )
         else:
             finding.transcript = discover_transcript(
-                profile.usage_parser, cli=cli, hints=hints, aliases=aliases
+                profile.usage_parser,
+                cli=cli,
+                hints=hints,
+                aliases=aliases,
+                env={**os.environ, **profile.env},
             )
         if finding.transcript and finding.transcript.note:
             finding.warnings.append(finding.transcript.note)
@@ -845,11 +1113,11 @@ def probe(
             # ~-relative so a $TMPDIR under $HOME can't trip the egress guard;
             # the shell expands ~ so the printed path stays inspectable.
             finding.warnings.append(
-                f"--keep-temp: RAW probe data retained at {sanitize.redact_home(str(tmpdir))} "
+                f"--keep-temp: RAW probe data retained at {sanitize.redact_home(str(raw))} "
                 "— DO NOT SHARE; delete it after inspection"
             )
         else:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            shutil.rmtree(raw, ignore_errors=True)
 
 
 def _log_tail(log_file: Path, max_lines: int = 20) -> str | None:
@@ -863,6 +1131,185 @@ def _log_tail(log_file: Path, max_lines: int = 20) -> str | None:
     return sanitize.scrub_text(
         "\n".join(lines), max_lines=max_lines, max_chars=sanitize.SCRUB_TEXT_MAX_CHARS
     )
+
+
+# ------------------------------------------------------- LAUNCH-SCREEN probe
+
+LAUNCH_PROBE_TIMEOUT_S = 15.0
+LAUNCH_PROBE_POLL_S = 0.5
+LAUNCH_PROBE_TASK_ID = "launchprobe"
+
+LaunchVerdict = Literal[
+    "parked", "clean", "died", "unavailable", "launch-failed", "capture-failed", "skipped"
+]
+LAUNCH_PARKED: LaunchVerdict = "parked"
+LAUNCH_CLEAN: LaunchVerdict = "clean"
+LAUNCH_DIED: LaunchVerdict = "died"
+LAUNCH_UNAVAILABLE: LaunchVerdict = "unavailable"
+LAUNCH_FAILED: LaunchVerdict = "launch-failed"
+LAUNCH_CAPTURE_FAILED: LaunchVerdict = "capture-failed"
+LAUNCH_SKIPPED: LaunchVerdict = "skipped"
+
+
+@dataclass(frozen=True)
+class LaunchScreenResult:
+    """The one verdict of :func:`launch_screen_probe`. ``detail`` says why in
+    one line; ``evidence``/``line`` are the parked ``Hit``'s; ``log_tail`` is
+    the scrubbed pipe-pane tail of a window that died."""
+
+    verdict: LaunchVerdict
+    detail: str = ""
+    evidence: str | None = None
+    line: str | None = None
+    log_tail: str | None = None
+
+
+def _launch_argv(profile: CLIProfile, binary: str, model: str | None) -> list[str]:
+    """A real session's argv (``GenericAdapter.interactive_argv``) with no
+    prompt, and ``launch_args`` moved to the END.
+
+    The prompt positional is what a launch arg may carry: gemini, copilot and
+    agy launch with ``-i <prompt>``. Dropping the prompt in place would hand
+    ``-i`` the first bypass arg AS a prompt — a model turn, the one thing this
+    probe must never cause. A working profile can only put such a flag last in
+    ``launch_args`` (the prompt follows it in a real launch), so ending the
+    argv with ``launch_args`` leaves it nothing to consume: the CLI starts with
+    no prompt, or refuses the flag and exits."""
+    argv = [_resolved_binary(profile, binary), *profile.bypass_args]
+    if model:
+        argv += [profile.model_flag, model]
+    return [*argv, *profile.launch_args]
+
+
+def launch_screen_probe(
+    profile: CLIProfile,
+    *,
+    binary: str,
+    project: Path,
+    model: str | None = None,
+    timeout_s: float = LAUNCH_PROBE_TIMEOUT_S,
+    poll_s: float = LAUNCH_PROBE_POLL_S,
+) -> LaunchScreenResult:
+    """Launch the CLI the way a session would and watch its first screen for a
+    dialog only a human should answer (#727, DW-596).
+
+    ``profile`` must already be resolved for the role's permission mode
+    (``profile.for_permission_mode(mode)``), so its ``bypass_args`` are the
+    args a real session launches with. The CLI runs in ``project`` in a fresh
+    private multiplexer session; its env is ``profile.env`` plus the relay's
+    ``BMAD_LOOP_RUN_DIR``/``BMAD_LOOP_TASK_ID``/``BMAD_LOOP_EVENTS_DIR``, all
+    aimed into a throwaway temp dir, so a hook the CLI fires at startup writes
+    its event file there and never into a run of the project.
+
+    ZERO TOKENS, by construction: no prompt is launched (see
+    :func:`_launch_argv`), nothing is ever typed into the pane, and no dialog is
+    answered. The pane is only captured, every ``poll_s`` until ``timeout_s``,
+    and matched against ``profile.parked_prompt_patterns`` with the adapter's
+    own matcher and per-search timeout (``panematch.match_rows``).
+
+    Exactly one verdict:
+
+    - ``parked``: a pattern matched the screen (``evidence``, ``line``).
+    - ``clean``: the deadline passed with the window alive and no match.
+    - ``died``: the window exited first (``log_tail``). The screen is matched
+      before liveness is read, so a CLI that paints a dialog and then exits
+      still reads ``parked`` when its last look caught the dialog.
+    - ``unavailable``: no usable multiplexer backend, or the binary is not
+      found (the codex binary resolved as a session would).
+    - ``launch-failed``: the window could not be opened.
+    - ``capture-failed``: the pane could not be read, a search timed out, or
+      liveness was unknowable — a failed look, never folded into ``clean``.
+    - ``skipped``: the profile has no ``parked_prompt_patterns``; nothing is
+      launched.
+
+    The session is killed and the temp dir removed on every path."""
+    if not profile.parked_prompt_patterns:
+        return LaunchScreenResult(LAUNCH_SKIPPED, "profile declares no parked_prompt_patterns")
+    patterns = tuple(regex.compile(p) for p in profile.parked_prompt_patterns)
+    mux = get_multiplexer()
+    if not _mux_ready(mux):
+        return LaunchScreenResult(
+            LAUNCH_UNAVAILABLE, f"multiplexer backend {type(mux).__name__} is not available"
+        )
+    if not _binary_found(profile, binary):
+        return LaunchScreenResult(
+            LAUNCH_UNAVAILABLE, f"binary {sanitize.redact_home(binary)!r} not found"
+        )
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="bmad-loop-launchprobe-"))
+    launcher = _ProbeLauncher(session_name=f"bmad-loop-launchprobe-{tmpdir.name}")
+    try:
+        env = {
+            **profile.env,
+            "BMAD_LOOP_RUN_DIR": str(tmpdir),
+            "BMAD_LOOP_TASK_ID": LAUNCH_PROBE_TASK_ID,
+            "BMAD_LOOP_EVENTS_DIR": str(tmpdir / "events"),
+        }
+        log_file = tmpdir / "launch.log"
+        window_id = launcher.start(_launch_argv(profile, binary, model), env, project, log_file)
+        if window_id is None:
+            return LaunchScreenResult(
+                LAUNCH_FAILED, launcher.error or "could not open the probe window"
+            )
+
+        def died() -> LaunchScreenResult:
+            return LaunchScreenResult(
+                LAUNCH_DIED,
+                "the CLI window exited before the deadline",
+                log_tail=_log_tail(log_file),
+            )
+
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                screen = launcher.mux.capture_pane(window_id)
+            except MultiplexerError as capture_fault:
+                # A window that exited cannot be captured: that is death, not
+                # a failed look — but only when liveness says so.
+                try:
+                    alive = launcher.window_alive(window_id)
+                except MultiplexerError as alive_fault:
+                    return LaunchScreenResult(
+                        LAUNCH_CAPTURE_FAILED,
+                        f"{type(capture_fault).__name__}: {capture_fault}; liveness "
+                        f"unknowable: {type(alive_fault).__name__}: {alive_fault}",
+                    )
+                if not alive:
+                    return died()
+                return LaunchScreenResult(
+                    LAUNCH_CAPTURE_FAILED, f"{type(capture_fault).__name__}: {capture_fault}"
+                )
+            found = match_rows(screen_rows(screen), patterns, timeout=PARKED_PROMPT_MATCH_TIMEOUT_S)
+            if isinstance(found, MatchTimeout):
+                return LaunchScreenResult(
+                    LAUNCH_CAPTURE_FAILED, f"pattern {found.pattern!r}: {found.error}"
+                )
+            if isinstance(found, Hit):
+                return LaunchScreenResult(
+                    LAUNCH_PARKED,
+                    "a parked prompt is on the launch screen",
+                    found.evidence,
+                    found.line,
+                )
+            try:
+                alive = launcher.window_alive(window_id)
+            except MultiplexerError as e:
+                return LaunchScreenResult(
+                    LAUNCH_CAPTURE_FAILED, f"liveness unknowable: {type(e).__name__}: {e}"
+                )
+            if not alive:
+                return died()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return LaunchScreenResult(
+                    LAUNCH_CLEAN, f"no parked prompt within {timeout_s:g}s of launch"
+                )
+            time.sleep(min(poll_s, remaining))
+    finally:
+        try:
+            launcher.kill()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ------------------------------------------------------------------ rendering
@@ -895,6 +1342,8 @@ def render_markdown(
         out.append(_fmt_kv("hooks registered", "yes" if f.registered else "no"))
     if f.hook_trust is not None:
         out.append(_fmt_kv("Codex hook trust", f.hook_trust))
+    if f.workspace_trust is not None:
+        out.append(_fmt_kv("workspace trust", f.workspace_trust))
     out.append(_fmt_kv("warnings", str(len(f.warnings))))
     out.append("")
 
@@ -1046,6 +1495,7 @@ def render_json(
         "usage_parser": f.parser,
         "hooks_registered": f.registered,
         "hook_trust": f.hook_trust,
+        "workspace_trust": f.workspace_trust,
         "declared_events": f.declared_events,
         "version": f.flags.version if f.flags else None,
         "help": f.flags.help if f.flags else None,

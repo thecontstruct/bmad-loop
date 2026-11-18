@@ -9,8 +9,13 @@ Files are created privately (0600); modes and xattrs are not preserved. The
 check after staging is not a lock or atomic compare-and-swap: a noncooperating
 filesystem writer can still race the final check and replacement. On platforms
 without descriptor-relative reads, source and destination reads plus destination
-pathname-identity observations use the checked fallback and retain its check/read
-race.
+pathname-identity observations use the checked fallback: pinned to the accepted
+root identity by an ``lstat`` compare after each lookup, it still retains its
+check/read race. Destination parents, and a missing artifacts root, are created
+anchored and without following links (``_make_parents``). A root whose ``lstat``
+carries no inode (DW-444) pins those fallback reads only weakly, and ``capture``
+alone also accepts identity-less files under it; each such degrade is counted for
+the engine to journal, while ``publish`` refuses that root outright.
 """
 
 from __future__ import annotations
@@ -25,17 +30,22 @@ from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 from typing import BinaryIO, Literal, NamedTuple
 
-from . import verify
+from . import platform_util, verify
 from .bmadconfig import ProjectPaths
 from .frontmatter import parse_frontmatter
 from .model import StoryTask
 from .platform_util import (
+    AT_DIRECTORY,
+    AT_NOFOLLOW,
     DIR_FD_ANCHORED_WRITES,
+    HANDLE_ANCHORED_WRITES,
     atomic_write_bytes_confined,
     has_parent_ref,
+    link_like_stat,
     names_tree_root,
     names_win32_alias,
     open_dir_confined,
+    path_is_confined,
 )
 
 
@@ -101,21 +111,137 @@ def _relative(value: object) -> str:
     return value
 
 
-def _confined(root: Path, path: Path) -> None:
-    """Reject links at every component, including the configured root."""
+def _confined(root: Path, path: Path) -> os.stat_result | None:
+    """Reject links at every component, including the configured root, and
+    return the ``lstat`` this took for ``root`` (None when ``root`` is missing).
+
+    Two refusals with different reach. A symlink (``S_ISLNK``) is refused at
+    EVERY component, ancestors above ``root`` included. A win32 link-like reparse
+    point (:data:`platform_util._LINK_REPARSE_TAGS` — a directory junction, whose
+    ``lstat`` reports ``S_IFDIR``) is refused only at ``root`` itself and below it
+    (DW-422, decision "refuse below root only"): everything from ``root`` down is
+    session-writable, and a junction there would steer the path-based fallback
+    reads out of the repository, while ancestors above ``root`` are the
+    operator's layout — a checkout kept behind a junction must keep working.
+
+    The returned result is the identity the caller accepted: every
+    descriptor-relative open below passes it as ``open_dir_confined``'s
+    ``root_identity``, and every path-based fallback re-checks it with
+    ``_root_still_pinned`` (:func:`_still_pinned`), so a root replaced by a link
+    between this predicate and the open is refused rather than walked (DW-338).
+    A None identity is itself a refusal for an opening caller — there is no
+    accepted root to pin to.
+
+    Why this root carries no persisted mint-time record, unlike the run dir and
+    the unit mounts (DW-446): the root is operator-configured and shared across
+    runs, not minted, so a record would refuse an operator's legitimate
+    re-creation of the directory; and the ancestor residual a fresh ``lstat``
+    leaves at those roots does not arise here, because this walk ``lstat``s
+    EVERY ancestor on each call and refuses a symlink anywhere in the chain — a
+    parent swapped for a symlink to a tree holding a real artifacts directory
+    refuses before any open. The one accepted exemption is DW-422's: a win32
+    junction ABOVE ``root`` is the operator's layout and passes."""
     if has_parent_ref(path):
         raise PublicationError(f"artifact path contains parent traversal: {path}")
     if not path.is_relative_to(root):
         raise PublicationError(f"artifact is outside {root}: {path}")
+    root_identity: os.stat_result | None = None
     for part in (path, *path.parents):
         try:
-            mode = part.lstat().st_mode
+            metadata = os.lstat(part)  # not Path.lstat (via os.stat): the junction test seam
         except FileNotFoundError:
             continue
+        mode = metadata.st_mode
         if stat.S_ISLNK(mode):
             raise PublicationError(f"artifact path is a symlink: {part}")
+        if part.is_relative_to(root) and link_like_stat(metadata):
+            raise PublicationError(f"artifact path is a link-like reparse point: {part}")
         if part != path and not stat.S_ISDIR(mode):
             raise PublicationError(f"artifact parent is not a directory: {part}")
+        if part == root:
+            root_identity = metadata
+    return root_identity
+
+
+_unpinned_observations: dict[str, tuple[str, int]] = {}
+"""Per artifacts root, the zero-inode degrades granted since the last
+:func:`drain_unpinned_observations`: root -> (filesystem, count). Module state
+because the pin sits under four helpers reached from four public entry points
+(``capture``, ``bind_armed``, ``prepare``, ``publish``), and the engine runs one
+process per run (DW-444)."""
+
+
+def drain_unpinned_observations() -> list[tuple[str, str, int]]:
+    """Return and clear the counted zero-inode degrades as
+    ``(root, filesystem, count)``, one per root, in first-degrade order.
+
+    The engine's worktree flow journals each as ``artifact-observation-unpinned``;
+    a degrade from an entry point that does not drain stays counted until the
+    next drain."""
+    drained = [(root, fs, count) for root, (fs, count) in _unpinned_observations.items()]
+    _unpinned_observations.clear()
+    return drained
+
+
+def _count_unpinned(root: Path) -> None:
+    """Count one degrade against ``root``; its filesystem is named on the first."""
+    key = str(root)
+    counted = _unpinned_observations.get(key)
+    if counted is None:
+        _unpinned_observations[key] = (platform_util.filesystem_name(root), 1)
+    else:
+        _unpinned_observations[key] = (counted[0], counted[1] + 1)
+
+
+def _weak_root_pin(root: Path, root_identity: os.stat_result) -> bool:
+    """The zero-inode root's weak pin, uncounted: a fresh ``lstat`` of ``root``
+    is a non-link directory on the accepted ``st_dev`` that STILL reads zero.
+
+    CPython's win32 ``FindFirstFile`` stat fallback zeroes ``st_dev`` as well as
+    ``st_ino``, so on that path the same-device compare matches trivially; that
+    is accepted (DW-444) — the ``S_ISDIR`` and link checks carry the weight
+    there, and refusing on ``st_dev == 0`` would undo the fix on exactly that
+    path."""
+    try:
+        current = os.lstat(root)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(current.st_mode)
+        and not link_like_stat(current)
+        and current.st_dev == root_identity.st_dev
+        and current.st_ino == 0
+    )
+
+
+def _still_pinned(root: Path, root_identity: os.stat_result | None) -> bool:
+    """The path-based fallback's pin (DW-422): whether ``root`` is still the
+    directory ``_confined`` accepted. No identity never pins — a fallback that
+    found an existing entry under a root it could not identify refuses.
+
+    An ``lstat`` compare taken after the fallback's own path lookup, so a root
+    swapped for a link before that lookup is caught; a swap landing after it is
+    the check-then-read residual the module docstring names.
+
+    A root accepted with a zero inode (a filesystem that reports no identity,
+    DW-444) cannot be compared, so the pin degrades — recorded decision "Degrade
+    observation, journaled" — to :func:`_weak_root_pin` (still a non-link
+    directory on the accepted ``st_dev`` that still reads zero; a root that now
+    reports an inode refuses), and every such degrade is counted
+    (:func:`drain_unpinned_observations`), never a silent True. A symlink or
+    junction swapped in still refuses; a same-device plain-directory swap is the
+    accepted residual, which is why only these read-only observations degrade:
+    ``platform_util._root_still_pinned`` stays strict, so the confined writers and
+    :func:`_create_directories` keep refusing, and :func:`publish` refuses a
+    zero-inode root before any of them runs."""
+    if root_identity is None:
+        return False
+    if root_identity.st_ino != 0:
+        return platform_util._root_still_pinned(root, root_identity)
+    if not _weak_root_pin(root, root_identity):
+        return False
+    _count_unpinned(root)
+    return True
 
 
 def _read_bytes(stream: BinaryIO, max_bytes: int | None) -> bytes:
@@ -136,7 +262,7 @@ def _read_bytes(stream: BinaryIO, max_bytes: int | None) -> bytes:
 @contextmanager
 def _open_regular(root: Path, path: Path) -> Iterator[BinaryIO | None]:
     """Open one confined regular file without following its leaf on POSIX."""
-    _confined(root, path)
+    root_identity = _confined(root, path)
     try:
         mode = path.lstat().st_mode
     except FileNotFoundError:
@@ -145,15 +271,25 @@ def _open_regular(root: Path, path: Path) -> Iterator[BinaryIO | None]:
     if not stat.S_ISREG(mode):
         raise PublicationError(f"artifact is not a regular file: {path}")
     if not DIR_FD_ANCHORED_WRITES:
-        # checked fallback; no descriptor-relative API
+        # checked fallback; no descriptor-relative API, pinned by an lstat compare
         with path.open("rb") as stream:
+            if not _still_pinned(root, root_identity):
+                raise PublicationError(f"artifact directory was replaced: {path}")
             yield stream
         return
-    parent_fd = open_dir_confined(root, path.parent)
+    parent_fd = (
+        None
+        if root_identity is None
+        else open_dir_confined(root, path.parent, root_identity=root_identity)
+    )
     if parent_fd is None:
         raise PublicationError(f"artifact parent was redirected: {path}")
+    # These flags exist only on the dir-fd arm; the native Windows type stubs
+    # lack them, so resolve them after the gate above.
+    o_nofollow = getattr(os, "O_NOFOLLOW")
+    o_nonblock = getattr(os, "O_NONBLOCK")
     try:
-        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+        fd = os.open(path.name, os.O_RDONLY | o_nofollow | o_nonblock, dir_fd=parent_fd)
         with os.fdopen(fd, "rb") as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise PublicationError(f"artifact is not a regular file: {path}")
@@ -227,16 +363,24 @@ def _destination_path_identity(root: Path, path: Path) -> _FileIdentity | None:
     """Freshly observe one destination leaf without following a redirect."""
     if not DIR_FD_ANCHORED_WRITES:
         try:
-            _confined(root, path)
+            root_identity = _confined(root, path)
         except PublicationError:
             return None
         try:
             metadata = path.lstat()
         except FileNotFoundError:
             return None
+        if not _still_pinned(root, root_identity):
+            return None
         return _file_identity(metadata)
 
-    parent_fd = open_dir_confined(root, path.parent)
+    try:
+        root_identity = _confined(root, path)
+    except PublicationError:
+        return None
+    if root_identity is None:
+        return None
+    parent_fd = open_dir_confined(root, path.parent, root_identity=root_identity)
     if parent_fd is None:
         return None
     try:
@@ -255,8 +399,67 @@ def _destination_still_names(root: Path, path: Path, opened: os.stat_result) -> 
     return opened_identity is not None and _destination_path_identity(root, path) == opened_identity
 
 
-def _probe_destination(root: Path, path: Path, expected: bytes | None = None) -> _DestinationProbe:
-    """Bound one destination probe to its opened size plus one growth check."""
+def _degraded_leaf_still_names(
+    root: Path, path: Path, opened: os.stat_result, streamed: int
+) -> bool:
+    """``capture``'s weak leaf check under a degraded root (DW-444, resolved
+    2026-09-27): whether an opened regular file with NO inode is still the file
+    ``path`` names. A filesystem that reports no inode for its root reports none
+    for the files under it, so the strict :func:`_destination_still_names` can
+    never hold there and every non-empty artifacts dir would pause.
+
+    Holds only on the path-based fallback, only for an opened file with no
+    identity, and only when :func:`_still_pinned` takes its zero-inode degrade
+    branch for this root; then a fresh ``lstat`` of the leaf must be a regular
+    non-link file on the opened ``st_dev`` that still has no inode, whose size
+    equals both the opened size and the bytes streamed. Each accepted leaf is
+    counted like a root degrade. Unlike the root's two ``lstat``s, this compares
+    a path ``lstat`` against a handle ``fstat``: when the ``lstat`` takes
+    CPython's win32 ``FindFirstFile`` fallback it reports ``st_dev`` 0 while the
+    ``fstat`` reads the handle's real volume serial, so a leaf ``st_dev`` of 0
+    is accepted too (the spec's "do not refuse on ``st_dev == 0``"); any other
+    mismatch refuses.
+
+    Capture-only by construction: :func:`_destination_equals`, the ``publish``
+    probes and ``prepare``/``bind`` binding stay strict — this relaxes the
+    comparison baseline, never a write or its authority."""
+    if DIR_FD_ANCHORED_WRITES or _file_identity(opened) is not None:
+        return False
+    try:
+        root_identity = _confined(root, path)
+    except PublicationError:
+        return False
+    if root_identity is None or root_identity.st_ino != 0:
+        return False
+    try:
+        leaf = os.lstat(path)  # not Path.lstat (via os.stat): the test seam
+    except OSError:
+        return False
+    if not _still_pinned(root, root_identity):
+        return False
+    if not (
+        stat.S_ISREG(leaf.st_mode)
+        and not link_like_stat(leaf)
+        and leaf.st_dev in (opened.st_dev, 0)
+        and _file_identity(leaf) is None
+        and leaf.st_size == opened.st_size == streamed
+    ):
+        return False
+    _count_unpinned(root)
+    return True
+
+
+def _probe_destination(
+    root: Path,
+    path: Path,
+    expected: bytes | None = None,
+    *,
+    degraded_leaf_ok: bool = False,
+) -> _DestinationProbe:
+    """Bound one destination probe to its opened size plus one growth check.
+
+    ``degraded_leaf_ok`` is ``capture``'s alone: it also accepts an
+    identity-less leaf under a degraded root (:func:`_degraded_leaf_still_names`)."""
     with _open_regular(root, path) as stream:
         if stream is None:
             return _DestinationProbe(observation=None, matches_expected=False)
@@ -287,7 +490,10 @@ def _probe_destination(root: Path, path: Path, expected: bytes | None = None) ->
             remaining == 0
             and not extra
             and os.fstat(stream.fileno()).st_size == size
-            and _destination_still_names(root, path, opened)
+            and (
+                _destination_still_names(root, path, opened)
+                or (degraded_leaf_ok and _degraded_leaf_still_names(root, path, opened, size))
+            )
         )
         observation = _DestinationObservation(
             size=size,
@@ -328,7 +534,7 @@ def _destination_equals(root: Path, path: Path, expected: bytes) -> bool:
 
 def _file_size(root: Path, path: Path) -> int | None:
     """Measure a confined regular file without following a replaced leaf."""
-    _confined(root, path)
+    root_identity = _confined(root, path)
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -336,12 +542,23 @@ def _file_size(root: Path, path: Path) -> int | None:
     if not stat.S_ISREG(metadata.st_mode):
         raise PublicationError(f"artifact is not a regular file: {path}")
     if not DIR_FD_ANCHORED_WRITES:
-        return metadata.st_size  # checked fallback; no descriptor-relative API
-    parent_fd = open_dir_confined(root, path.parent)
+        # checked fallback; no descriptor-relative API, pinned by an lstat compare
+        if not _still_pinned(root, root_identity):
+            raise PublicationError(f"artifact directory was replaced: {path}")
+        return metadata.st_size
+    parent_fd = (
+        None
+        if root_identity is None
+        else open_dir_confined(root, path.parent, root_identity=root_identity)
+    )
     if parent_fd is None:
         raise PublicationError(f"artifact parent was redirected: {path}")
+    # These flags exist only on the dir-fd arm; the native Windows type stubs
+    # lack them, so resolve them after the gate above.
+    o_nofollow = getattr(os, "O_NOFOLLOW")
+    o_nonblock = getattr(os, "O_NONBLOCK")
     try:
-        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+        fd = os.open(path.name, os.O_RDONLY | o_nofollow | o_nonblock, dir_fd=parent_fd)
         try:
             opened = os.fstat(fd)
             if not stat.S_ISREG(opened.st_mode):
@@ -362,7 +579,11 @@ def _root(paths: ProjectPaths) -> Path:
     root = paths.implementation_artifacts
     if not _local(paths):
         raise PublicationError(f"artifact directory must be strictly inside the repository: {root}")
-    _confined(paths.repo_root, root)
+    # `root` as its own confinement root: `repo_root` and the directories
+    # between it and `root` are ancestors ABOVE the artifacts root, where a
+    # junction is the operator's layout (DW-422); the symlink refusal, the
+    # parent-traversal check and the parent-is-directory check still cover them.
+    _confined(root, root)
     return root
 
 
@@ -372,21 +593,34 @@ def capture(task: StoryTask, paths: ProjectPaths) -> None:
     inventory: dict[str, str] = {}
 
     def walk(directory: Path) -> None:
-        _confined(root, directory)
-        directory_fd = open_dir_confined(root, directory) if DIR_FD_ANCHORED_WRITES else None
+        root_identity = _confined(root, directory)
+        directory_fd = (
+            open_dir_confined(root, directory, root_identity=root_identity)
+            if DIR_FD_ANCHORED_WRITES and root_identity is not None
+            else None
+        )
         if DIR_FD_ANCHORED_WRITES and directory_fd is None:
             raise PublicationError(f"artifact inventory directory was redirected: {directory}")
         try:
             with os.scandir(directory_fd if directory_fd is not None else directory) as entries:
+                if directory_fd is None and not _still_pinned(root, root_identity):
+                    raise PublicationError(
+                        f"artifact inventory directory was replaced: {directory}"
+                    )
                 for entry in entries:
                     path = directory / entry.name
-                    mode = entry.stat(follow_symlinks=False).st_mode
+                    info = entry.stat(follow_symlinks=False)
+                    mode = info.st_mode
                     rel = path.relative_to(root).as_posix()
-                    if stat.S_ISDIR(mode):
+                    if link_like_stat(info):
+                        # a symlink or a win32 junction: recorded, never walked
+                        inventory[rel] = "nonregular"
+                    elif stat.S_ISDIR(mode):
                         inventory[rel] = "directory"
                         walk(path)
                     elif stat.S_ISREG(mode):
-                        observed = _destination_observation(root, path)
+                        # The one probe allowed the identity-less leaf degrade (DW-444).
+                        observed = _probe_destination(root, path, degraded_leaf_ok=True).observation
                         if observed is None:
                             raise PublicationError(f"artifact disappeared during inventory: {path}")
                         if not observed.complete:
@@ -880,6 +1114,10 @@ def prepare(
             "tracked artifact deliverables changed since accepted verification: "
             + ", ".join(differing)
         )
+    if selected.contents:
+        # DW-444: refuse a zero-inode target root here, before merge, not only
+        # at `publish` after the unit has already been integrated.
+        _refuse_zero_inode_root(_root(paths))
     task.artifact_payload = {
         rel: base64.b64encode(data).decode("ascii") for rel, data in selected.contents.items()
     }
@@ -887,6 +1125,120 @@ def prepare(
     # material, and a later resume must never read changed source bytes as intent.
     if task.artifact_destination is None:
         task.artifact_destination = str(paths.implementation_artifacts)
+
+
+def _create_directories(
+    anchor: Path, target: Path, *, root_identity: os.stat_result | None
+) -> None:
+    """Create the missing directories from ``anchor`` down to ``target`` without
+    following a link below ``anchor`` (DW-421).
+
+    Modeled on ``verify._make_candidate_parents`` (same three arms, copied rather
+    than shared because tests steer each module's arm flags independently).
+    POSIX: each component is ``mkdir``-ed and then opened
+    ``O_NOFOLLOW | O_DIRECTORY`` relative to the one above, so a link below
+    ``anchor`` fails the open before anything is created through it. win32 with
+    handle-relative opens: each component is created-or-opened in ONE call
+    (``O_CREAT`` without ``O_EXCL``, ``AT_DIRECTORY``, ``AT_NOFOLLOW``), so a
+    junction or symlink is opened as the reparse point itself and refused. Hosts
+    with neither: ``_root_still_pinned`` on ``anchor`` and ``path_is_confined``
+    on each component's ancestry before its ``mkdir`` — check-then-act, a link
+    planted between check and create still redirects it.
+
+    ``root_identity`` pins ``anchor`` (the ``fstat`` compare in
+    ``open_dir_confined`` on both handle arms, the ``lstat`` compare on the path
+    arm); None leaves ``anchor`` unpinned, for the operator-chosen repository
+    root only. A refused redirect surfaces as ``PublicationError`` where this
+    module decides it and as the kernel's (or ``win32_at``'s) ``OSError`` where a
+    no-follow open refuses it."""
+    relative = target.relative_to(anchor)
+    if not DIR_FD_ANCHORED_WRITES and not HANDLE_ANCHORED_WRITES:
+        if root_identity is not None and not platform_util._root_still_pinned(
+            anchor, root_identity
+        ):
+            raise PublicationError(f"artifact directory was replaced: {anchor}")
+        current = anchor
+        for part in relative.parts:
+            current = current / part
+            if not path_is_confined(anchor, current.parent):
+                raise PublicationError(f"artifact directory is redirected: {current.parent}")
+            current.mkdir(exist_ok=True)
+        return
+    fd = open_dir_confined(anchor, anchor, root_identity=root_identity)
+    if fd is None:
+        raise PublicationError(f"artifact directory could not be opened: {anchor}")
+    try:
+        for part in relative.parts:
+            if DIR_FD_ANCHORED_WRITES:
+                # These flags exist only on the dir-fd arm; the native Windows
+                # type stubs lack them, so resolve them inside the gate.
+                o_directory = getattr(os, "O_DIRECTORY")
+                o_nofollow = getattr(os, "O_NOFOLLOW")
+                try:
+                    os.mkdir(part, 0o777, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                nested = os.open(part, os.O_RDONLY | o_directory | o_nofollow, dir_fd=fd)
+            else:
+                nested = platform_util.open_at(
+                    fd, part, os.O_RDONLY | os.O_CREAT | AT_DIRECTORY | AT_NOFOLLOW
+                )
+            fd, previous = nested, fd
+            os.close(previous)
+    finally:
+        os.close(fd)
+
+
+def _make_parents(root: Path, path: Path, repo_root: Path) -> os.stat_result:
+    """Create ``path``'s missing parents below the artifacts ``root`` — and a
+    missing ``root`` itself — without following a link, and return the root
+    identity the destination writer must pin to (DW-421).
+
+    ``path.parent.mkdir(parents=True)`` followed links, so a root swapped for a
+    link after ``_confined`` got empty directories created outside the
+    repository before the pinned writer refused. Here an existing root is opened
+    pinned to the identity ``_confined`` accepted and every parent is created
+    anchored below it (:func:`_create_directories`); with no parent missing that
+    open is still the pin check.
+
+    A missing root is created by the same anchored walk from ``repo_root``,
+    which is operator-chosen and so opened unpinned (``open_dir_confined``'s pin
+    rule); ``_confined`` then runs again for the new root's identity and the
+    parents are created pinned to it. That walk refuses ANY link between
+    ``repo_root`` and the missing root — on win32 a junctioned ancestor too,
+    although ``_confined`` exempts ancestors above an EXISTING root. Fail-closed
+    on purpose: an operator who keeps that ancestry behind a junction pre-creates
+    the artifacts directory, and an existing root anchors at itself, so its
+    ancestors never matter."""
+    root_identity = _confined(root, path)
+    if root_identity is None:
+        _create_directories(repo_root, root, root_identity=None)
+        root_identity = _confined(root, path)
+        if root_identity is None:
+            raise PublicationError(f"artifact directory is missing: {root}")
+    _create_directories(root, path.parent, root_identity=root_identity)
+    return root_identity
+
+
+def _refuse_zero_inode_root(root: Path) -> None:
+    """Refuse publication into an artifacts root whose ``lstat`` carries no
+    inode (DW-444), on EVERY arm and before any probe, directory or write.
+
+    Observation degrades on such a root (:func:`_still_pinned`); writes never
+    do, because nothing can pin it. The strict writers would refuse anyway, but
+    each arm with its own message ("replaced", "could not be opened"); stating
+    it here, ahead of the arm split, names the real reason. A missing root has
+    nothing to refuse: ``_make_parents`` creates it and the strict pins refuse
+    an identity-less new one."""
+    try:
+        metadata = os.lstat(root)
+    except FileNotFoundError:
+        return
+    if metadata.st_ino == 0:
+        raise PublicationError(
+            f"artifacts root has no inode identity on {platform_util.filesystem_name(root)}, "
+            f"so it cannot be pinned; publication is refused: {root}"
+        )
 
 
 def publish(task: StoryTask, paths: ProjectPaths) -> None:
@@ -900,6 +1252,7 @@ def publish(task: StoryTask, paths: ProjectPaths) -> None:
         raise PublicationError("artifact publication intent is missing")
     if task.artifact_payload:
         _root(paths)
+        _refuse_zero_inode_root(root)
     for rel, encoded in task.artifact_payload.items():
         path = root / _relative(rel)
         intended = base64.b64decode(encoded, validate=True)
@@ -919,8 +1272,8 @@ def publish(task: StoryTask, paths: ProjectPaths) -> None:
             raise PublicationError(f"artifact destination became tracked: {path}")
         if not verify.path_ignored(paths.repo_root, path):
             raise PublicationError(f"artifact destination is no longer ignored: {path}")
-        _confined(root, path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        # The writer below pins the root it walks to this identity (DW-338).
+        root_identity = _make_parents(root, path, paths.repo_root)
         if _destination_observation(root, path) != current:
             raise PublicationError(f"artifact destination changed during publication: {path}")
 
@@ -929,7 +1282,11 @@ def publish(task: StoryTask, paths: ProjectPaths) -> None:
                 raise PublicationError(f"artifact destination changed during publication: {path}")
 
         atomic_write_bytes_confined(
-            path, intended, confine_root=root, _before_replace=validate_destination
+            path,
+            intended,
+            confine_root=root,
+            root_identity=root_identity,
+            _before_replace=validate_destination,
         )
         if not _destination_equals(root, path, intended):
             raise PublicationError(f"published artifact is not visible at destination: {path}")

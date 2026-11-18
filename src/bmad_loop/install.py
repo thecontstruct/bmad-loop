@@ -16,27 +16,47 @@ orchestrator's signal watcher is CLI-agnostic.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import os
 import re
 import shlex
 import shutil
+import stat
+import subprocess
 import sys
+import tempfile
 import tomllib
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack
+from dataclasses import dataclass
 from importlib import resources
 from importlib.resources.abc import Traversable
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
-from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
+from . import bmadconfig, childrun, skill_locate, ticketlayout, ticketmodel, ticketstore, tickettree
+from .adapters.profile import (
+    ALIASES,
+    CANONICAL_EVENTS,
+    CLIProfile,
+    ProfileError,
+    load_profiles,
+    parse_cli_version,
+)
 from .checks import Finding
 from .platform_util import atomic_write_bytes, atomic_write_text, file_lock
 from .policy import POLICY_TEMPLATE
-from .process_host import get_process_host
-from .verify import GitError, git_below_floor, git_bytes, git_floor_text, git_version_at_least
+from .process_host import ProcessHostError, get_process_host
+from .skill_locate import Located, SkillScope, as_scope
+from .verify import (
+    GitError,
+    git_below_floor,
+    git_bytes,
+    git_floor_text,
+    git_version_at_least,
+)
 
 # The probe-adapter capture hook participates in merge_hooks' dedup only (a
 # probe re-merge must stay idempotent) and never counts as a relay
@@ -49,14 +69,33 @@ ANTIGRAVITY_HOOK_TIMEOUT_SEC = 60  # agy hook timeouts are seconds (default 30)
 # wrapper); bmad-loop registers all its handlers under this single group.
 ANTIGRAVITY_HOOK_GROUP = "bmad-loop"
 
-# The bmad-loop-* skills bundled in the wheel (bmad_loop/data/skills/) that
+# The bmad-loop-* skills bundled in the wheel (bmad_loop/data/skills/, mapped from
+# the repo-root `skills/` at build time; see :func:`skills_root`) that
 # `bmad-loop init` lays down. The inner dev primitive (`bmad-build-auto`, formerly
 # `bmad-dev-auto`) is upstream (not bundled here): the orchestrator drives it as an
-# already-installed skill.
+# already-installed skill. These dirs are the only skills init writes: the
+# BMAD-installed skills and `_bmad/` are read, never modified. `bmod-bmad-loop` is
+# the module record BMAD v7 `bmad setup` discovers (its `bmod.toml`); it is never
+# invoked, so on v6 it is an inert skill folder.
 MODULE_SKILLS = (
     "bmad-loop-resolve",
     "bmad-loop-sweep",
     "bmad-loop-setup",
+    "bmod-bmad-loop",
+)
+
+# Which upstream install ships the skills the base-skill findings require, in both
+# BMAD config eras (bmadconfig.ProjectPaths.era): v6 installs them with the bmm
+# module, v7 with the method module (`_bmad/method`, the bmod-method record).
+BMAD_FLOOR_TEXT = (
+    "the bmm module (BMAD-METHOD >= 6.10.0) or, on BMAD v7, the method module (bmod-method >= 6.13)"
+)
+# Which upstream install ships the REVIEW skills a review finding names. They differ
+# from the primitive's floor on v7: the merged `bmad-review` moved out of the method
+# module into core-tools (the bmod-core-tools record lists it).
+REVIEW_FLOOR_TEXT = (
+    "the bmm module (BMAD-METHOD >= 6.10.0) or, on BMAD v7, the core-tools module "
+    "(which ships bmad-review)"
 )
 
 # The inner dev primitive, in both upstream eras. BMAD-METHOD PR #2651 (shipped in
@@ -158,7 +197,11 @@ RENDER_DIR_REL = f"{BMAD_DIR}/{RENDER_DIR_NAME}"
 #     requirement, used when the installed skill's shape can't be read: normally the
 #     reviewers are derived per tree from the dev primitive itself
 #     (resolve_review_layers), because which skills the review step invokes is a
-#     property of that skill version, not of a catalog pinned in here (#260).
+#     property of that skill version, not of a catalog pinned in here (#260). Three
+#     shapes are read: step-04 prose (v6.10.0), [[workflow.review_layers]]
+#     (v6.10-6.12) and the v7 [[workflow.quick_lenses]]/[[workflow.thorough_lenses]]
+#     sets. Neither hunter exists upstream any more, so a v7 tree must never land on
+#     this fallback just because its shape went unread.
 # bmad-review-verification-gap is not in the fallback set: no tagged BMAD-METHOD
 # release ships it standalone (on current sources it is a thin forwarder to the
 # merged bmad-review), so demanding it of every project made `validate`
@@ -180,7 +223,8 @@ DEV_BASE_SKILLS = {
 # falls back to the static catalog only when the resolution is None (an unreadable
 # shape), never because it resolved to requiring nothing. Both topologies stay
 # supported; this constant is named here for the fallback path only, and the derived
-# path sees it named in the layers themselves.
+# path sees it named in the layers themselves. The v7 lens sets are the 6.11 shape
+# again: every shipped lens says "Do not invoke any skill", so they derive nothing.
 MERGED_REVIEW_SKILL = "bmad-review"
 # The DEV_BASE_SKILLS entries MERGED_REVIEW_SKILL subsumes. bmad-dev-auto (the dev
 # primitive) is NOT here — the merged reviewer never substitutes for it.
@@ -240,7 +284,56 @@ def _customize_overrides(skill: str) -> tuple[Path, ...]:
     )
 
 
-def resolve_dev_primitive(project: Path, tree: str) -> str | None:
+# A skill question's tree argument: a plain tree string (a project-only scope over
+# that one tree, exactly as before user roots existed) or a :class:`SkillScope`
+# from :func:`skill_locate.scope_for`. Every question below resolves a skill
+# through :func:`skill_locate.locate`, so the copy a check reads is the copy the
+# session loads.
+SkillTree = str | SkillScope
+
+
+def _scope_items(trees: Iterable[SkillTree]) -> list[SkillScope]:
+    """``trees`` as scopes, deduplicated in first-seen order."""
+    return list(dict.fromkeys(as_scope(tree) for tree in trees))
+
+
+def _skill_dir(project: Path, scope: SkillScope, name: str) -> Path:
+    """Where ``name``'s files are read: the located copy's folder, else the primary
+    tree's spelling of it (absent or SKILL.md-less), which is exactly the path a
+    plain string tree has always read."""
+    found = skill_locate.locate(project, scope, name)
+    return found.path if found is not None else project / scope.tree / name
+
+
+def _root_detail(found: Located | None) -> dict[str, str]:
+    """The additive ``root`` detail entry for a copy outside the primary tree."""
+    return {} if found is None or found.primary else {"root": found.root}
+
+
+def _searched_detail(scope: SkillScope) -> dict[str, list[str]]:
+    """The additive ``searched`` detail entry: every location a missing skill was
+    looked for, when that is more than the primary tree alone."""
+    searched = list(scope.project_trees())
+    if scope.resolve_user:
+        searched += [root.spelling for root in scope.user_roots if not root.unavailable]
+    return {"searched": searched} if len(searched) > 1 else {}
+
+
+def _primitive_copy(project: Path, tree: SkillTree) -> Located | None:
+    """The located dev primitive :func:`resolve_dev_primitive` names, or None."""
+    scope = as_scope(tree)
+    new = skill_locate.locate(project, scope, DEV_PRIMITIVE_NEW)
+    if new is not None:
+        return new
+    legacy = skill_locate.locate(project, scope, DEV_PRIMITIVE_LEGACY)
+    if legacy is not None and all(
+        _is_file(legacy.path / marker) for marker in DEV_PRIMITIVE_MARKERS
+    ):
+        return legacy
+    return None
+
+
+def resolve_dev_primitive(project: Path, tree: SkillTree) -> str | None:
     """The dev-primitive skill name to drive in ``tree``, or None when none is usable.
 
     Prefers :data:`DEV_PRIMITIVE_NEW`; falls back to :data:`DEV_PRIMITIVE_LEGACY`
@@ -252,25 +345,30 @@ def resolve_dev_primitive(project: Path, tree: str) -> str | None:
     :func:`missing_base_skills` against the resolved dir. Requiring markers here
     instead would make a truncated bmad-build-auto silently resolve to a legacy
     install (or to the shim's failure message), hiding the real problem.
+
+    Each name is located through ``tree``'s scope (:func:`skill_locate.locate`), so a
+    user-root copy resolves only when the scope says the CLI would load it.
     """
-    if _is_file(project / tree / DEV_PRIMITIVE_NEW / "SKILL.md"):
-        return DEV_PRIMITIVE_NEW
-    legacy = project / tree / DEV_PRIMITIVE_LEGACY
-    if _is_file(legacy / "SKILL.md") and all(
-        _is_file(legacy / marker) for marker in DEV_PRIMITIVE_MARKERS
-    ):
-        return DEV_PRIMITIVE_LEGACY
+    found = _primitive_copy(project, tree)
+    return found.name if found is not None else None
+
+
+def _shim_copy(project: Path, tree: SkillTree) -> Located | None:
+    """The located legacy-named skill when it is only a forwarding shim (SKILL.md
+    present, at least one marker absent), else None."""
+    legacy = skill_locate.locate(project, as_scope(tree), DEV_PRIMITIVE_LEGACY)
+    if legacy is None:
+        return None
+    if any(not (legacy.path / marker).is_file() for marker in DEV_PRIMITIVE_MARKERS):
+        return legacy
     return None
 
 
-def _is_dev_primitive_shim(project: Path, tree: str) -> bool:
+def _is_dev_primitive_shim(project: Path, tree: SkillTree) -> bool:
     """True when ``tree`` holds a legacy-named skill that is only a forwarding shim
     (SKILL.md present, at least one marker absent). Selects the failure *message* in
     :func:`missing_base_skills`; it is never a resolution input."""
-    legacy = project / tree / DEV_PRIMITIVE_LEGACY
-    if not (legacy / "SKILL.md").is_file():
-        return False
-    return any(not (legacy / marker).is_file() for marker in DEV_PRIMITIVE_MARKERS)
+    return _shim_copy(project, tree) is not None
 
 
 def _is_renderer_stub(skill_dir: Path) -> bool:
@@ -344,21 +442,21 @@ def _absent_renderer_sources(skill_dir: Path) -> list[str]:
     return sorted(set(absent))
 
 
-def renderer_stub_resolved(project: Path, trees: Sequence[str]) -> bool:
+def renderer_stub_resolved(project: Path, trees: Sequence[SkillTree]) -> bool:
     """Whether any active tree resolves to a renderer-backed dev primitive.
 
     Resolution is per tree and deduplicated exactly like :func:`missing_base_skills`.
     Public because the engine's seed-escalation decision reuses this exact preflight
     discriminator rather than re-deriving one (`worktree_flow`).
     """
-    for tree in dict.fromkeys(trees):
-        resolved = resolve_dev_primitive(project, tree)
-        if resolved is not None and _is_renderer_stub(project / tree / resolved):
+    for scope in _scope_items(trees):
+        found = _primitive_copy(project, scope)
+        if found is not None and _is_renderer_stub(found.path):
             return True
     return False
 
 
-def dev_primitive_or_default(project: Path, tree: str | None) -> str:
+def dev_primitive_or_default(project: Path, tree: SkillTree | None) -> str:
     """Total form of :func:`resolve_dev_primitive` for callers that need a name.
 
     A prompt string — and a path this module has to probe *somewhere* to report on —
@@ -382,6 +480,14 @@ class ReviewResolution(NamedTuple):
     fail. ``active_layers`` names every layer with a non-empty ``instruction`` —
     all of them disabled is a run that HALTs. ``unreadable`` names override files
     that failed to parse.
+
+    ``lens_sets`` names the v7 lens sets read (``("quick", "thorough")``), and is
+    empty for every other shape; ``active_layers`` then spans both sets, and
+    ``active_sets`` names the sets holding at least one enabled lens — a ``quick`` or
+    ``thorough`` selection launches only its own set. ``selection`` is the resolved
+    ``workflow.review`` string of that shape, or None when no string value is
+    configured. All three trail with defaults so every positional construction of
+    the older shapes stays valid.
     """
 
     source: str
@@ -390,6 +496,9 @@ class ReviewResolution(NamedTuple):
     layer_driven: bool
     active_layers: tuple[str, ...]
     unreadable: tuple[str, ...]
+    lens_sets: tuple[str, ...] = ()
+    selection: str | None = None
+    active_sets: tuple[str, ...] = ()
 
     def skills(self) -> tuple[str, ...]:
         """Every skill this review step may invoke, required or advisory."""
@@ -417,8 +526,57 @@ def _layers_of(data: Any) -> list[Any]:
     return list(layers) if isinstance(layers, list) else []
 
 
+# The v7 lens sets (BMAD-METHOD #2861), keyed by the `workflow.review` value that
+# selects each: `[[workflow.quick_lenses]]` and `[[workflow.thorough_lenses]]`.
+LENS_SETS = {"quick": "quick_lenses", "thorough": "thorough_lenses"}
+# Every `workflow.review` value v7 bmad-build-auto accepts: its workflow.md HALTs
+# the run on any other ("workflow.review must be none, quick, thorough, or auto").
+REVIEW_SELECTIONS = ("none", "quick", "thorough", "auto")
+
+
+def _lens_sets_of(data: Any) -> dict[str, list[Any]]:
+    """The v7 lens arrays present in ``data``, as ``{"quick": [...], "thorough": [...]}``.
+
+    A set appears only when its key holds an array — presence is what tells the lens
+    shape apart from the others, so an absent set is left out rather than reported
+    as ``[]``. Every hop is type-guarded as in :func:`_layers_of`.
+    """
+    workflow = data.get("workflow") if isinstance(data, dict) else None
+    if not isinstance(workflow, dict):
+        return {}
+    found: dict[str, list[Any]] = {}
+    for name, key in LENS_SETS.items():
+        lenses = workflow.get(key)
+        if isinstance(lenses, list):
+            found[name] = list(lenses)
+    return found
+
+
+def _review_selection_of(data: Any) -> str | None:
+    """``workflow.review`` as text, or None only when the key is absent.
+
+    A present non-string value (``review = false``) is not dropped: v7's template
+    HALTs on it like on any unknown word, so it comes back as its TOML literal
+    (``false``, ``1``, ``["quick"]``). That text never equals a valid selection —
+    those are bare words only a string can produce — so the caller reports it.
+    """
+    workflow = data.get("workflow") if isinstance(data, dict) else None
+    if not isinstance(workflow, dict) or "review" not in workflow:
+        return None
+    selection = workflow["review"]
+    if isinstance(selection, str):
+        return selection
+    return json.dumps(selection, default=str)
+
+
 # BMAD's own merge keys for arrays of tables, in detection precedence order.
 _KEYED_MERGE_FIELDS = ("code", "id")
+
+
+class _MalformedMergeKey(ValueError):
+    """An array of tables keys on a value that cannot identify an entry (anything but
+    a non-empty string, e.g. ``id = ["quick"]`` or ``id = 1``) — BMAD v7's resolver
+    rejects the whole customization on it rather than merging."""
 
 
 def _keyed_merge_field(items: list[Any]) -> str | None:
@@ -446,10 +604,17 @@ def _merge_layer_arrays(base: list[Any], override: list[Any]) -> list[Any]:
     `src/scripts/resolve_customization.py`: keyed merge when the combined array
     opts into one (matching keys replace in place, new keys append), plain
     concatenation otherwise.
+
+    Raises :class:`_MalformedMergeKey` when the chosen key holds anything but a
+    non-empty string, as v7's ``_detect_keyed_merge_field`` raises ``ConfigError`` —
+    and an array or table key would otherwise crash the preflight with ``TypeError``.
     """
     key = _keyed_merge_field(base + override)
     if key is None:
         return base + override
+    for item in base + override:
+        if not isinstance(item[key], str) or not item[key]:
+            raise _MalformedMergeKey(f"`{key}` = {item[key]!r} is not a valid array-entry key")
     result: list[Any] = []
     index_by_key: dict[Any, int] = {}
     for item in base:
@@ -472,26 +637,57 @@ def _merge_layer_arrays(base: list[Any], override: list[Any]) -> list[Any]:
     return result
 
 
-def _merged_review_layers(
-    project: Path, tree: str, skill: str
-) -> tuple[list[Any], tuple[str, ...]] | None:
+class _MergedReview(NamedTuple):
+    """A primitive's review config with project overrides applied, in every shape.
+
+    ``layers`` is the merged ``review_layers`` array. ``lens_shape`` is True when the
+    SHIPPED config carries a lens set and no review layer — the v7 primitive, whose
+    run reads only ``lens_sets`` (each merged independently) and ``selection``.
+    """
+
+    layers: list[Any]
+    unreadable: tuple[str, ...]
+    lens_shape: bool
+    lens_sets: dict[str, list[Any]]
+    selection: str | None
+
+
+def _merged_review_layers(project: Path, tree: SkillTree, skill: str) -> _MergedReview | None:
     """The skill's shipped review layers with project overrides applied.
 
     ``skill`` is the resolved dev-primitive name — the shipped config and its
     overrides are read from the SAME era, because that is what the run does.
 
-    Returns ``(layers, unreadable_override_paths)``, or None when the skill's OWN
-    customize.toml is absent or unparseable — the one case that genuinely means
-    "shape unknown", so the caller falls back to the static catalog.
+    Returns a :class:`_MergedReview`, or None when the skill's OWN customize.toml is
+    absent or unparseable — the one case that genuinely means "shape unknown", so
+    the caller falls back to the static catalog.
 
-    An unparseable OVERRIDE is not that case: BMAD's resolver warns and treats it
-    as empty, still resolving every other layer. Matching that keeps the preflight
-    agreeing with the run; the broken file is reported separately as a warning.
+    An unparseable OVERRIDE is not that case: the layer-era resolver warns and
+    treats it as empty, still resolving every other layer, so the preflight leaves
+    it out the same way and reports it separately — a warning there, a problem on
+    a v7 tree, whose strict loader refuses to render the skill at all.
+
+    The lens sets merge exactly as the layers do, each set on its own (BMAD's
+    resolver deep-merges each array of tables by its key), and ``workflow.review``
+    is a scalar: the last value wins, string or not.
+
+    The shape is decided by the SHIPPED file, not the merge: a v7 run reads only the
+    lens sets, so a ``review_layers`` override left over from a v6 install is inert
+    there and must not pull the preflight onto the layer path — that would require
+    skills the run never invokes. A shipped file carrying a review layer keeps the
+    layer path whatever lens tables it also carries (the v6.10-6.12 contract).
+
+    The shipped ``customize.toml`` is read from the copy ``tree``'s scope locates
+    (a user-root copy when the session would load that one); the overrides are
+    always the project's own ``_bmad/custom/`` files, wherever the skill lives.
     """
-    data = _read_toml(project / tree / skill / "customize.toml")
+    data = _read_toml(_skill_dir(project, as_scope(tree), skill) / "customize.toml")
     if data is None:
         return None
     layers = _layers_of(data)
+    lens_sets = _lens_sets_of(data)
+    lens_shape = bool(lens_sets) and not layers
+    selection = _review_selection_of(data)
     unreadable: list[str] = []
     for rel in _customize_overrides(skill):
         override = project / rel
@@ -501,17 +697,67 @@ def _merged_review_layers(
         if extra is None:
             unreadable.append(rel.as_posix())
             continue
-        layers = _merge_layer_arrays(layers, _layers_of(extra))
-    return layers, tuple(unreadable)
+        try:
+            merged_layers = _merge_layer_arrays(layers, _layers_of(extra))
+            merged_sets = {
+                name: _merge_layer_arrays(lens_sets.get(name, []), lenses)
+                for name, lenses in _lens_sets_of(extra).items()
+            }
+        except _MalformedMergeKey:
+            # reported with the unparseable overrides; the file is left out whole
+            unreadable.append(rel.as_posix())
+            continue
+        layers = merged_layers
+        lens_sets.update(merged_sets)
+        override_selection = _review_selection_of(extra)
+        if override_selection is not None:
+            selection = override_selection
+    return _MergedReview(layers, tuple(unreadable), lens_shape, lens_sets, selection)
 
 
-def _layer_id(layer: dict[str, Any], index: int) -> str:
-    """A layer's id for reporting — positional when it declares none."""
+def _layer_id(layer: dict[str, Any], index: int, label: str = "") -> str:
+    """A layer's id for reporting — positional when it declares none, prefixed with
+    ``label`` (a lens set's name) so positions in two sets cannot collide."""
     lid = layer.get("id")
-    return lid if isinstance(lid, str) and lid else f"#{index + 1}"
+    return lid if isinstance(lid, str) and lid else f"{label}#{index + 1}"
 
 
-def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
+def _collect_layer_skills(
+    layers: list[Any],
+    required: dict[str, list[str]],
+    advisory: dict[str, list[str]],
+    active: list[str],
+    label: str = "",
+) -> None:
+    """Fold one array of review layers (or lenses) into the requirement buckets.
+
+    A non-gated layer's invocation phrasing is required; a ``when``-gated layer's
+    invocations, and any bmad-* token not tied to an invocation phrasing, are
+    advisory. Empty-``instruction`` layers are disabled and contribute nothing.
+    """
+    for index, layer in enumerate(layers):
+        if not isinstance(layer, dict):
+            continue
+        instruction = layer.get("instruction")
+        if not isinstance(instruction, str) or not instruction.strip():
+            continue
+        layer_id = _layer_id(layer, index, label)
+        active.append(layer_id)
+        when = layer.get("when")
+        gated = isinstance(when, str) and bool(when.strip())
+        invoked = _INVOKE_SKILL_RE.findall(instruction)
+        # A gated layer's invocations are advisory; so is any bmad-* token we
+        # can't tie to an invocation phrasing, in either kind of layer.
+        hard = [] if gated else invoked
+        soft = [s for s in _SKILL_REF_RE.findall(instruction) if gated or s not in invoked]
+        for bucket, skills in ((required, hard), (advisory, soft)):
+            for skill in skills:
+                ids = bucket.setdefault(skill, [])
+                if layer_id not in ids:
+                    ids.append(layer_id)
+
+
+def resolve_review_layers(project: Path, tree: SkillTree) -> ReviewResolution | None:
     """Read the review skills this project will really invoke, or None if unknown.
 
     The primitive's installed NAME is resolved from disk here rather than taken as
@@ -538,6 +784,16 @@ def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
     every layer whose condition does not hold, and that condition is evaluated by
     the model in run context — undecidable here, so hard-requiring its skill would
     be a false FAIL.
+
+    BMAD v7 replaced the layers with two lens sets, ``[[workflow.quick_lenses]]``
+    and ``[[workflow.thorough_lenses]]``, selected per run by ``workflow.review``.
+    Each lens is read with the same per-layer rule, over BOTH sets: the selection
+    that runs is not knowable from config (``auto`` follows the route the model
+    resolves, the invocation may ``--set workflow.review=...``, and bmad-loop's own
+    ``[tickets] thorough_review`` asks for ``thorough``), so any enabled lens may
+    run — the same rule that requires every enabled review layer. Shape precedence
+    is decided by :func:`_merged_review_layers`: a review-layer config keeps the
+    layer path, a v7 config takes the lens path, and anything else falls to step-04.
     """
     # `primitive`, not `skill`: the layer loop below binds `skill` to each INVOKED
     # review skill, and the step-04 fallback after it reads this name as a directory.
@@ -547,31 +803,20 @@ def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
     merged = _merged_review_layers(project, tree, primitive)
     if merged is None:
         return None
-    layers, unreadable = merged
-    if layers:
+    unreadable = merged.unreadable
+    if merged.lens_shape or merged.layers:
         required: dict[str, list[str]] = {}
         advisory: dict[str, list[str]] = {}
         active: list[str] = []
-        for index, layer in enumerate(layers):
-            if not isinstance(layer, dict):
-                continue
-            instruction = layer.get("instruction")
-            if not isinstance(instruction, str) or not instruction.strip():
-                continue
-            layer_id = _layer_id(layer, index)
-            active.append(layer_id)
-            when = layer.get("when")
-            gated = isinstance(when, str) and bool(when.strip())
-            invoked = _INVOKE_SKILL_RE.findall(instruction)
-            # A gated layer's invocations are advisory; so is any bmad-* token we
-            # can't tie to an invocation phrasing, in either kind of layer.
-            hard = [] if gated else invoked
-            soft = [s for s in _SKILL_REF_RE.findall(instruction) if gated or s not in invoked]
-            for bucket, skills in ((required, hard), (advisory, soft)):
-                for skill in skills:
-                    ids = bucket.setdefault(skill, [])
-                    if layer_id not in ids:
-                        ids.append(layer_id)
+        active_sets: list[str] = []
+        if merged.lens_shape:
+            for name, lenses in merged.lens_sets.items():
+                before = len(active)
+                _collect_layer_skills(lenses, required, advisory, active, name)
+                if len(active) > before:
+                    active_sets.append(name)
+        else:
+            _collect_layer_skills(merged.layers, required, advisory, active)
         return ReviewResolution(
             "customize.toml",
             {s: tuple(i) for s, i in required.items()},
@@ -580,9 +825,14 @@ def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
             True,
             tuple(active),
             unreadable,
+            tuple(merged.lens_sets) if merged.lens_shape else (),
+            merged.selection if merged.lens_shape else None,
+            tuple(active_sets),
         )
     try:
-        step04 = (project / tree / primitive / "step-04-review.md").read_text(encoding="utf-8")
+        step04 = (_skill_dir(project, as_scope(tree), primitive) / "step-04-review.md").read_text(
+            encoding="utf-8"
+        )
     except (OSError, UnicodeDecodeError):
         return None
     # step-04 is a whole prose document rather than a self-contained execution
@@ -607,7 +857,21 @@ STORIES_PROBE_FILE = "step-01-clarify-and-route.md"
 STORIES_PROBE_TEXT = "folder+id dispatch"
 
 
-def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding]:
+def _primitive_probe(
+    project: Path, scope: SkillScope, found: Located | None, name: str
+) -> tuple[str, str, str, Path]:
+    """``(tree, skill, rel, path)`` of the dev primitive's file ``name``: the located
+    copy's, or — nothing resolved — :data:`DEV_PRIMITIVE_NEW`'s under the primary
+    tree, the name to install. ``rel`` is the skill folder as messages show it."""
+    if found is None:
+        rel = f"{scope.tree}/{DEV_PRIMITIVE_NEW}"
+        return scope.tree, DEV_PRIMITIVE_NEW, rel, project / rel / name
+    return scope.tree, found.name, found.display, found.path / name
+
+
+def missing_stories_support(
+    project: Path, trees: Sequence[SkillTree], *, skip_unresolved: bool = False
+) -> list[Finding]:
     """Problems for stories mode's stricter dev-primitive requirement.
 
     Sprint mode drives any dev primitive; stories mode needs the folder+id
@@ -621,12 +885,20 @@ def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding
 
     The two failures are separate check ids because they are separate conditions
     with separate remediations: ``-missing`` is a half install (reinstall the
-    module), ``-stale`` is an install that is simply too old (update it)."""
+    module), ``-stale`` is an install that is simply too old (update it).
+
+    A tree whose primitive does not resolve is probed under
+    :data:`DEV_PRIMITIVE_NEW` — the name to install — and reported ``-missing``.
+    ``skip_unresolved`` drops such a tree instead: pass it only from a caller that
+    runs :func:`missing_base_skills` over the same trees, which already reports it
+    (``skills.base-missing``/``-shim``) and keeps the run refused."""
     problems: list[Finding] = []
-    for tree in dict.fromkeys(trees):
-        skill = dev_primitive_or_default(project, tree)
-        probe = project / tree / skill / STORIES_PROBE_FILE
-        detail = {"tree": tree, "skill": skill, "file": STORIES_PROBE_FILE}
+    for scope in _scope_items(trees):
+        found = _primitive_copy(project, scope)
+        if found is None and skip_unresolved:
+            continue
+        tree, skill, rel, probe = _primitive_probe(project, scope, found, STORIES_PROBE_FILE)
+        detail = {"tree": tree, "skill": skill, "file": STORIES_PROBE_FILE, **_root_detail(found)}
         try:
             text = probe.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -638,7 +910,7 @@ def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding
                 Finding(
                     "skills.stories-dispatch-missing",
                     "problem",
-                    f"{tree}/{skill}/{STORIES_PROBE_FILE} not found — stories "
+                    f"{rel}/{STORIES_PROBE_FILE} not found — stories "
                     f"mode needs folder+id dispatch; update the BMad Method (bmm) module",
                     detail,
                 )
@@ -649,7 +921,7 @@ def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding
                 Finding(
                     "skills.stories-dispatch-stale",
                     "problem",
-                    f"{tree}/{skill} lacks folder+id dispatch (no "
+                    f"{rel} lacks folder+id dispatch (no "
                     f"{STORIES_PROBE_TEXT!r} in {STORIES_PROBE_FILE}) — stories mode needs a "
                     f"newer {skill}; update the bmm module",
                     {**detail, "marker": STORIES_PROBE_TEXT},
@@ -658,7 +930,683 @@ def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding
     return problems
 
 
-def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
+# BMAD v7 ticket-tree mode. The project's ticket-tree script, which bmad-loop and
+# bmad-build-auto both run; it is also the v7 era marker (bmadconfig.V7_MARKER_REL).
+TICKETS_SCRIPT_REL = bmadconfig.V7_MARKER_REL.as_posix()
+# The repo-vs-tracker store choice the script reads (`[tickets] store`, default repo).
+TICKETS_STORE_CONFIG_REL = f"{CUSTOMIZE_DIR.as_posix()}/ticketing-store-config.toml"
+# The method module's install record, relative to a skill tree: `[bmod] version`
+# names the installed BMAD-METHOD release. Display only.
+BMOD_METHOD_MANIFEST = "bmod-method/bmod.toml"
+BMOD_METHOD_SKILL = "bmod-method"
+# A dev primitive that dispatches `ticket <ref>` from the tree resolves it with
+# `uv run {project-root}/_bmad/method/scripts/tickets.py ... find <ref>` in its
+# step-01; an older one has no ticket route. The marker is that script path,
+# stable across the step's prose.
+TICKETS_PROBE_FILE = STORIES_PROBE_FILE
+TICKETS_PROBE_TEXT = "method/scripts/tickets.py"
+
+
+def _bmod_version(manifest: Path) -> str | None:
+    """``[bmod] version`` of one ``bmod.toml``, or None."""
+    data = _read_toml(manifest)
+    bmod = data.get("bmod") if data is not None else None
+    version = bmod.get("version") if isinstance(bmod, dict) else None
+    return version.strip() if isinstance(version, str) and version.strip() else None
+
+
+def bmod_method_version(project: Path, trees: Sequence[SkillTree]) -> str | None:
+    """``[bmod] version`` of the first ``<tree>/bmod-method/bmod.toml`` that has
+    one, or None. Display only: nothing gates on it. Each tree's manifest is read
+    from the ``bmod-method`` copy its scope locates."""
+    for scope in _scope_items(trees):
+        version = _bmod_version(_skill_dir(project, scope, BMOD_METHOD_SKILL) / "bmod.toml")
+        if version is not None:
+            return version
+    return None
+
+
+def missing_tickets_support(
+    project: Path, trees: Sequence[SkillTree], *, skip_unresolved: bool = False
+) -> list[Finding]:
+    """Problems for tickets mode's dev-primitive requirement: the resolved
+    primitive's ``step-01-clarify-and-route.md`` must route a ticket from the tree
+    (it carries :data:`TICKETS_PROBE_TEXT`). One problem :class:`Finding` per
+    ``trees`` entry lacking it; callers gate this on tickets mode only.
+
+    ``-missing`` (the step file is absent or unreadable: a half install) and
+    ``-stale`` (an install too old to know the ticket tree) are separate ids, and an
+    unresolved primitive is named and ``skip_unresolved`` honoured, as in
+    :func:`missing_stories_support`."""
+    problems: list[Finding] = []
+    for scope in _scope_items(trees):
+        found = _primitive_copy(project, scope)
+        if found is None and skip_unresolved:
+            continue
+        tree, skill, rel, probe = _primitive_probe(project, scope, found, TICKETS_PROBE_FILE)
+        detail = {"tree": tree, "skill": skill, "file": TICKETS_PROBE_FILE, **_root_detail(found)}
+        try:
+            text = probe.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            problems.append(
+                Finding(
+                    "skills.tickets-dispatch-missing",
+                    "problem",
+                    f"{rel}/{TICKETS_PROBE_FILE} not found — tickets mode "
+                    f"needs a dev primitive that dispatches from the ticket tree; "
+                    f"update the BMad Method module",
+                    detail,
+                )
+            )
+            continue
+        if TICKETS_PROBE_TEXT not in text:
+            problems.append(
+                Finding(
+                    "skills.tickets-dispatch-stale",
+                    "problem",
+                    f"{rel} cannot dispatch from the ticket tree (no "
+                    f"{TICKETS_PROBE_TEXT!r} in {TICKETS_PROBE_FILE}) — tickets mode needs "
+                    f"a newer {skill}; update the BMad Method module",
+                    {**detail, "marker": TICKETS_PROBE_TEXT},
+                )
+            )
+    return problems
+
+
+def _ticket_store(project: Path) -> tuple[str | None, str]:
+    """The ticket store ``tickets.py`` would use — ``[tickets] store`` of
+    :data:`TICKETS_STORE_CONFIG_REL`, ``"repo"`` when the file, the table or the
+    value is absent or blank, as upstream reads it — and "" or the reason the file
+    could not be read (then the store is None)."""
+    path = project / TICKETS_STORE_CONFIG_REL
+    try:
+        # utf-8-sig: upstream's `read_text` strips a byte-order mark before parsing
+        data = tomllib.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return "repo", ""
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        return None, f"{type(e).__name__}: {e}"
+    table = data.get("tickets", {})
+    store = table.get("store", "repo") if isinstance(table, dict) else "repo"
+    return (store if isinstance(store, str) and store else "repo"), ""
+
+
+def _probe_fault(path: Path, kind: Literal["file", "dir"]) -> tuple[bool, str]:
+    """Whether ``path`` is a ``kind`` entry, and "" or the stat fault that kept the
+    probe from finding out. Absence (ENOENT/ENOTDIR and kin) is a plain false; any
+    other OSError is reported, never raised and never folded into absence:
+    ``Path.is_file``/``is_dir`` raise it on 3.11–3.13 and answer false on 3.14."""
+    try:
+        mode = path.stat().st_mode
+    except OSError as e:
+        if e.errno in _ABSENCE_ERRNOS or getattr(e, "winerror", None) in _ABSENCE_WINERRORS:
+            return False, ""
+        return False, f"{type(e).__name__}: {e}"
+    except ValueError:
+        return False, ""
+    return (stat.S_ISREG(mode) if kind == "file" else stat.S_ISDIR(mode)), ""
+
+
+def _probe_unreadable(check: str, rel: str, fault: str) -> Finding:
+    return Finding(
+        check,
+        "problem",
+        f"{rel} could not be checked ({fault}) — fix its permissions or the filesystem and re-run",
+        {"path": rel, "error": fault},
+    )
+
+
+def _initiative_children(folder: Path) -> tuple[tuple[str, ...] | None, Path, str]:
+    """Whether the initiative at ``folder`` is a parent initiative, read from its
+    ``tickets.toml`` the way the script's ``is_parent`` reads it (an
+    ``initiative`` key), without spawning the script: the child slugs (None for
+    an initiative that is no parent, or has no ``tickets.toml`` yet), the file
+    read, and "" or the fault that kept the read from answering."""
+    try:
+        path = ticketlayout.breakdown_dir(folder) / ticketlayout.BREAKDOWN
+    except OSError as e:
+        return None, folder / ticketlayout.TICKETS, f"{type(e).__name__}: {e}"
+    present, fault = _probe_fault(path, "file")
+    if fault or not present:
+        return None, path, fault
+    try:
+        # utf-8-sig, as the script reads it: a BOM would hide the first table.
+        data = tomllib.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as e:  # ValueError: UnicodeDecodeError, TOMLDecodeError
+        return None, path, f"{type(e).__name__}: {e}"
+    if "initiative" not in data:
+        return None, path, ""
+    rows: object = data["initiative"]
+    if not isinstance(rows, list):
+        return None, path, "`initiative` is not a list of `[[initiative]]` tables"
+    children: list[str] = []
+    for row in rows:  # pyright: ignore[reportUnknownVariableType]
+        slug = (
+            row.get("slug") if isinstance(row, dict) else None
+        )  # pyright: ignore[reportUnknownMemberType]
+        if not isinstance(slug, str):
+            return None, path, "an `[[initiative]]` table has no text `slug`"
+        children.append(slug)
+    return tuple(children), path, ""
+
+
+def _tickets_store_findings(
+    paths: bmadconfig.ProjectPaths,
+    isolation: str,
+    extra_args_roles: Sequence[str],
+    sandboxed_roles: Sequence[str] = (),
+    *,
+    chained: bool = False,
+) -> list[Finding]:
+    """The store-topology findings for the active initiative's folder (it exists):
+    the classified layout (``tickets.store-topology``), or the refusal under the
+    check :attr:`ticketstore.StoreRefusal.check` names, plus the
+    ``tickets.store-sandbox`` warning when sessions write a shared store outside
+    their cwd while a role's ``extra_args`` replace the profile's bypass flags or
+    a role runs ``adapter.permission_mode = "sandboxed"``, whose sandbox confines
+    writes to the working directory. ``chained``: ``paths`` are re-rooted on a
+    child initiative of the active (parent) one, classified as a chained run
+    (:func:`ticketstore.classify_store`), and every finding names the child."""
+    result = ticketstore.assess_store(paths, isolation, chained=chained)
+    if result is None:
+        return []
+    conflict = ticketstore.store_topology_conflict(result)
+    detail: dict[str, object] = {
+        "path": str(paths.initiative_folder),
+        "repo_root": str(paths.repo_root),
+        "isolation": isolation,
+    }
+    prefix = ""
+    if chained:
+        detail["initiative"] = paths.active_initiative
+        prefix = f"child initiative {paths.active_initiative!r}: "
+    if isinstance(result, ticketstore.StoreRefusal):
+        assert conflict is not None
+        return [
+            Finding(result.check, "problem", prefix + conflict, {**detail, "refusal": result.code})
+        ]
+    findings = [
+        Finding(
+            "tickets.store-topology",
+            "ok" if conflict is None else "problem",
+            prefix + (conflict or f"ticket store {ticketstore.describe_topology(result)}"),
+            {**detail, "topology": result.to_dict()},
+        )
+    ]
+    outside_cwd = result.needs_redirect(isolation) or result.placement == "shared-outside"
+    if outside_cwd and (extra_args_roles or sandboxed_roles):
+        causes: list[str] = []
+        if extra_args_roles:
+            causes.append(
+                f"`extra_args` for {', '.join(extra_args_roles)} replace the profile's "
+                "sandbox-bypass flags (keep them in `extra_args`)"
+            )
+        if sandboxed_roles:
+            causes.append(
+                f'{", ".join(sandboxed_roles)} run permission_mode = "sandboxed", whose '
+                'sandbox confines writes to the working directory (use "bypass" there)'
+            )
+        findings.append(
+            Finding(
+                "tickets.store-sandbox",
+                "warning",
+                f"{prefix}sessions write the shared ticket store {result.store_root} outside "
+                f"their working directory, and {'; '.join(causes)} — a sandboxed CLI may "
+                "refuse those writes",
+                {
+                    "store_root": str(result.store_root),
+                    "roles": list(extra_args_roles),
+                    "sandboxed_roles": list(sandboxed_roles),
+                    **({"initiative": paths.active_initiative} if chained else {}),
+                },
+            )
+        )
+    return findings
+
+
+def _tickets_parent_findings(
+    paths: bmadconfig.ProjectPaths,
+    children: Sequence[str],
+    isolation: str,
+    retrospective: str | None,
+    extra_args_roles: Sequence[str],
+    sandboxed_roles: Sequence[str],
+) -> list[Finding]:
+    """The findings for an active initiative that is a parent of ``children``.
+
+    Refused (a ``tickets.initiative-parent`` problem) unless ``[scm] isolation``
+    is ``"worktree"`` — sessions in the main checkout read the user config, which
+    names the parent; only a worktree mount can name a child — and
+    ``gates.retrospective`` is not ``"auto"``, whose session runs in the main
+    checkout and reads the parent. Accepted, it is an ok line naming the children,
+    followed by :func:`_tickets_store_findings` for each child that has a folder
+    (``paths`` re-rooted on it, classified as chained); a child declared but not
+    sliced yet has none and is skipped. A child slug that is no single folder
+    name is refused, and a child folder that cannot be statted is a
+    ``tickets.initiative-missing`` problem naming the error."""
+    listed = ", ".join(children) or "none listed"
+    detail: dict[str, object] = {
+        "initiative": paths.active_initiative,
+        "children": list(children),
+        "isolation": isolation,
+        "retrospective": retrospective,
+    }
+    causes: list[str] = []
+    if isolation != "worktree":
+        causes.append(
+            f'`[scm] isolation = "{isolation}"` runs sessions in the main checkout, which '
+            'reads the parent from the user config — set `isolation = "worktree"`'
+        )
+    if retrospective == "auto":
+        causes.append(
+            '`gates.retrospective = "auto"` runs its session in the main checkout, which '
+            'reads the parent — set it to "notify" or "never"'
+        )
+    child_paths: list[bmadconfig.ProjectPaths] = []
+    if not causes:
+        for child in children:
+            try:
+                child_paths.append(paths.with_initiative(child))
+            except ValueError:
+                causes.append(f"child initiative {child!r} is not a single folder name")
+    if causes:
+        return [
+            Finding(
+                "tickets.initiative-parent",
+                "problem",
+                f"active initiative {paths.active_initiative!r} is a parent initiative "
+                f"(children: {listed}) and {'; '.join(causes)} — or set `[core] "
+                "active_initiative` to one child (ask the `bmad` skill to switch it)",
+                detail,
+            )
+        ]
+    store_findings: list[Finding] = []
+    skipped: list[str] = []
+    for child in child_paths:
+        folder = child.initiative_folder
+        assert folder is not None and child.active_initiative is not None  # with_initiative
+        present, fault = _probe_fault(folder, "dir")
+        if fault:
+            store_findings.append(
+                _probe_unreadable("tickets.initiative-missing", str(folder), fault)
+            )
+        elif not present:
+            skipped.append(child.active_initiative)
+        else:
+            store_findings.extend(
+                _tickets_store_findings(
+                    child, isolation, extra_args_roles, sandboxed_roles, chained=True
+                )
+            )
+    message = (
+        f"active initiative {paths.active_initiative!r} is a parent initiative "
+        f"(children: {listed}), accepted under worktree isolation"
+    )
+    if skipped:
+        message += (
+            f"; {', '.join(skipped)} {'has' if len(skipped) == 1 else 'have'} no folder "
+            "yet (declared, not sliced) and the store checks skip "
+            f"{'it' if len(skipped) == 1 else 'them'}"
+        )
+    return [
+        Finding("tickets.initiative-parent", "ok", message, {**detail, "skipped": skipped}),
+        *store_findings,
+    ]
+
+
+def tickets_parent_problems(
+    paths: bmadconfig.ProjectPaths, isolation: str, retrospective: str | None
+) -> list[Finding]:
+    """The problems :func:`tickets_preflight` refuses a parent active initiative
+    with (:func:`_tickets_parent_findings`: ``tickets.initiative-parent`` and the
+    store of a child it refuses), or the fault that kept the parent read from
+    answering — for a caller that does not run the whole preflight (the dry-run
+    banner). Empty when the active initiative is no parent."""
+    folder = paths.initiative_folder
+    if paths.era != "v7" or folder is None or not paths.active_initiative:
+        return []
+    children, breakdown, fault = _initiative_children(folder)
+    if fault:
+        return [_probe_unreadable("tickets.initiative-parent", str(breakdown), fault)]
+    if children is None:
+        return []
+    findings = _tickets_parent_findings(paths, children, isolation, retrospective, (), ())
+    return [f for f in findings if f.severity == "problem"]
+
+
+def tickets_preflight(
+    paths: bmadconfig.ProjectPaths,
+    trees: Sequence[SkillTree],
+    *,
+    probe_capability: bool,
+    branch_per: str | None = None,
+    isolation: str = "none",
+    extra_args_roles: Sequence[str] = (),
+    sandboxed_roles: Sequence[str] = (),
+    retrospective: str | None = None,
+) -> list[Finding]:
+    """Tickets mode's project checks, as :class:`Finding` s (``paths`` is the
+    paths loaded for tickets mode, ``trees`` the dev skill trees, ``branch_per``
+    the policy's ``[scm] branch_per``; None skips its check; ``isolation`` the
+    policy's ``[scm] isolation``; ``extra_args_roles`` the launch roles whose
+    resolved adapter sets ``extra_args``; ``sandboxed_roles`` those whose
+    ``permission_mode`` is not bypass; ``retrospective`` the policy's
+    ``gates.retrospective``, None read as not ``"auto"``).
+
+    Static checks, in order: the script (``tickets.script-missing``), the BMad
+    config reader it imports (``tickets.config-utils-missing``), ``uv`` on PATH
+    (``tickets.uv-missing``: bmad-build-auto runs the script through uv even when
+    bmad-loop runs it directly), the active initiative (``tickets.initiative-unset``
+    / ``tickets.initiative-missing``), a parent initiative
+    (``tickets.initiative-parent``, :func:`_tickets_parent_findings`: refused
+    unless ``isolation`` is ``"worktree"`` and ``retrospective`` is not
+    ``"auto"``, else an ok line and the store topology of each child that has a
+    folder), the store topology
+    (:func:`_tickets_store_findings`: ``tickets.store-topology``,
+    ``tickets.tree-untracked``, ``tickets.own-repo-isolation``,
+    ``tickets.workspace-unsupported``, and the ``tickets.store-sandbox`` warning),
+    a repo store (``tickets.store-not-repo``: tracker stores
+    are refused), and a warning for ``branch_per = "run"``
+    (``tickets.branch-per-run``: build-auto checks that the checked-out branch
+    fits the ticket, and one branch for the whole run may not). ``tickets.era`` is
+    the ok line that names what was found once the script is present.
+
+    ``probe_capability`` runs the script's ``--help`` and checks every verb and
+    ``mark`` status bmad-loop needs (``tickets.capability``). It executes the
+    project's script, so ``validate`` passes it only under ``--probes``; without
+    it ``tickets.capability-not-run`` says so. (``validate``'s ledger gate check,
+    not this preflight, runs ``tickets.py next`` without ``--probes``, and only
+    when an unlanded ledger entry declares a gate: ``cli._validate_hard_gates``.)"""
+    project = paths.project
+    findings: list[Finding] = []
+    script_ok, script_fault = _probe_fault(project / TICKETS_SCRIPT_REL, "file")
+    if script_fault:
+        findings.append(
+            _probe_unreadable("tickets.script-missing", TICKETS_SCRIPT_REL, script_fault)
+        )
+    elif not script_ok:
+        findings.append(
+            Finding(
+                "tickets.script-missing",
+                "problem",
+                f"{TICKETS_SCRIPT_REL} not found — tickets mode drives the BMAD v7 ticket "
+                "tree through it; install or update the BMad Method module (BMAD v7) "
+                "with `bmad setup`",
+                {"path": TICKETS_SCRIPT_REL},
+            )
+        )
+    utils_ok, utils_fault = _probe_fault(project / RENDERER_CONFIG_UTILS_REL, "file")
+    if utils_fault:
+        findings.append(
+            _probe_unreadable(
+                "tickets.config-utils-missing", RENDERER_CONFIG_UTILS_REL, utils_fault
+            )
+        )
+    elif not utils_ok:
+        findings.append(
+            Finding(
+                "tickets.config-utils-missing",
+                "problem",
+                f"{RENDERER_CONFIG_UTILS_REL} not found — tickets.py reads the BMad config "
+                "through it and exits with `cannot read the BMad config`; re-run "
+                "`bmad setup`",
+                {"path": RENDERER_CONFIG_UTILS_REL},
+            )
+        )
+    if shutil.which("uv") is None:
+        findings.append(
+            Finding(
+                "tickets.uv-missing",
+                "problem",
+                "uv not found on PATH — bmad-build-auto runs tickets.py with `uv run`; "
+                "install uv (https://docs.astral.sh/uv/)",
+                None,
+            )
+        )
+    if paths.era == "v7":
+        if not paths.active_initiative:
+            findings.append(
+                Finding(
+                    "tickets.initiative-unset",
+                    "problem",
+                    "no `[core] active_initiative` is set — tickets mode runs the active "
+                    "initiative's ticket tree; set one in "
+                    f"{bmadconfig.V7_CENTRAL_LAYERS_REL[-1].as_posix()} (or ask the `bmad` "
+                    "skill to switch it)",
+                    {"output_folder": str(paths.output_folder)},
+                )
+            )
+        else:
+            folder = paths.initiative_folder
+            folder_ok, folder_fault = (
+                _probe_fault(folder, "dir") if folder is not None else (False, "")
+            )
+            if folder_fault:
+                findings.append(
+                    _probe_unreadable("tickets.initiative-missing", str(folder), folder_fault)
+                )
+            elif not folder_ok:
+                findings.append(
+                    Finding(
+                        "tickets.initiative-missing",
+                        "problem",
+                        f"active initiative {paths.active_initiative!r} has no folder at "
+                        f"{paths.initiative_folder} — create it with the `bmad-agent-po` "
+                        "skill, or switch `[core] active_initiative` (the `bmad` skill "
+                        "can switch it)",
+                        {
+                            "initiative": paths.active_initiative,
+                            "path": str(paths.initiative_folder),
+                        },
+                    )
+                )
+            else:
+                assert folder is not None  # folder_ok
+                children, breakdown, parent_fault = _initiative_children(folder)
+                if parent_fault:
+                    findings.append(
+                        _probe_unreadable("tickets.initiative-parent", str(breakdown), parent_fault)
+                    )
+                elif children is not None:
+                    findings.extend(
+                        _tickets_parent_findings(
+                            paths,
+                            children,
+                            isolation,
+                            retrospective,
+                            extra_args_roles,
+                            sandboxed_roles,
+                        )
+                    )
+                else:
+                    findings.extend(
+                        _tickets_store_findings(paths, isolation, extra_args_roles, sandboxed_roles)
+                    )
+    store, store_error = _ticket_store(project)
+    if store != "repo":
+        findings.append(
+            Finding(
+                "tickets.store-not-repo",
+                "problem",
+                (
+                    f"{TICKETS_STORE_CONFIG_REL} cannot be read ({store_error}), so the "
+                    "ticket store is unknown — bmad-loop drives only a repo store"
+                    if store is None
+                    else f"the ticket store is {store!r} ({TICKETS_STORE_CONFIG_REL}): "
+                    "tracker stores are not supported by bmad-loop — tickets mode needs "
+                    '`store = "repo"`'
+                ),
+                {"path": TICKETS_STORE_CONFIG_REL, "store": store},
+            )
+        )
+    if branch_per == "run":
+        findings.append(
+            Finding(
+                "tickets.branch-per-run",
+                "warning",
+                '`[scm] branch_per = "run"` runs every ticket on one branch — '
+                "bmad-build-auto checks that the checked-out branch fits the ticket "
+                "it builds and HALTs when it judges it does not; "
+                '`branch_per = "story"` gives each ticket its own branch',
+                {"branch_per": branch_per},
+            )
+        )
+    if not script_ok:
+        return findings
+    version = bmod_method_version(project, trees)
+    findings.insert(
+        0,
+        Finding(
+            "tickets.era",
+            "ok",
+            f"BMAD v7 ticket tree: {TICKETS_SCRIPT_REL} (method module "
+            f"{version or 'version unknown'}), initiative "
+            f"{paths.active_initiative or '(none)'}",
+            {
+                "era": paths.era,
+                "script": TICKETS_SCRIPT_REL,
+                "bmod_method_version": version,
+                "initiative": paths.active_initiative,
+            },
+        ),
+    )
+    if not probe_capability:
+        findings.append(
+            Finding(
+                "tickets.capability-not-run",
+                "ok",
+                "tickets.py capability not probed — it executes the project's script; "
+                "pass --probes to run it",
+                {"run": False},
+            )
+        )
+        return findings
+    try:
+        cap = tickettree.TicketTree(project).capability()
+    except tickettree.TicketsError as e:
+        findings.append(
+            Finding(
+                "tickets.capability",
+                "problem",
+                f"tickets.py could not be probed: {e}",
+                {"kind": e.kind},
+            )
+        )
+        return findings
+    missing = ticketmodel.capability_problems(cap)
+    if missing:
+        findings.append(
+            Finding(
+                "tickets.capability",
+                "problem",
+                f"{'; '.join(missing)} — update the BMad Method module",
+                {"problems": missing},
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                "tickets.capability",
+                "ok",
+                f"tickets.py offers every command and status tickets mode needs "
+                f"({', '.join(sorted(cap.verbs))})",
+                {"verbs": sorted(cap.verbs), "statuses": sorted(cap.statuses)},
+            )
+        )
+    return findings
+
+
+# The one bundled skill a triage session dispatches (`/bmad-loop-sweep`). Named
+# here so the triage-tree preflight (:func:`missing_sweep_skill`) and its callers
+# spell it once; it is also a MODULE_SKILLS member, which is how `init` lays it down.
+SWEEP_SKILL = "bmad-loop-sweep"
+# `init --force-skills` rmtree's and re-copies every MODULE_SKILLS dir (`_copy_skills`),
+# so the remediation says so rather than silently costing the operator local edits.
+_SWEEP_REMEDIATION = (
+    "run `bmad-loop init --force-skills` (it re-copies every bmad-loop-* skill in the "
+    "tree, overwriting local edits)"
+)
+
+
+# Source checkout layout: src/bmad_loop/install.py -> <repo>/skills.
+_CHECKOUT_SKILLS = Path(__file__).resolve().parent.parent.parent / "skills"
+
+
+def skills_root() -> Traversable:
+    """The root of the bundled ``MODULE_SKILLS`` dirs.
+
+    The canonical skills live at the repo root (``skills/``) so the Vercel
+    ``skills`` CLI discovers them; the wheel's ``force-include`` maps them to
+    ``bmad_loop/data/skills``. An editable install never applies that mapping, so
+    a source checkout falls back to its own ``skills/``. When neither exists the
+    package path is returned unchanged, so the caller's read fails loudly on it."""
+    bundled = resources.files("bmad_loop.data").joinpath("skills")
+    if not bundled.is_dir() and _CHECKOUT_SKILLS.is_dir():
+        return _CHECKOUT_SKILLS
+    return bundled
+
+
+def bundled_skill_files(skill: str) -> tuple[str, ...]:
+    """The POSIX rels of every file the wheel bundles under ``skills/<skill>/``.
+
+    Read from the installed package rather than restated as a literal, so a mode
+    file added to the bundled skill is required by the preflight the moment it
+    ships — a hand-kept list would silently stop checking it. Sorted and
+    deterministic (the walk itself sorts)."""
+    root = skills_root().joinpath(skill)
+    return tuple(rel for rel, entry in _walk_traversable_files(root) if rel and _is_file(entry))
+
+
+def missing_sweep_skill(project: Path, trees: Sequence[str]) -> list[Finding]:
+    """Problems for the triage skill tree(s) a sweep dispatches ``/bmad-loop-sweep`` into.
+
+    Triage is deliberately outside :data:`DEV_PRIMITIVE_ROLES` (see that comment):
+    its whole prompt surface is :data:`SWEEP_SKILL`, which `bmad-loop init` lays
+    down. That exclusion left the skill itself unchecked, so a deleted or partial
+    copy stalled every triage session at ``Unknown command`` until timeout. For
+    every distinct ``trees`` entry — callers pass the triage profile's tree only —
+    confirm each file the wheel bundles for the skill (:func:`bundled_skill_files`)
+    exists, via the fault-total :func:`_is_file`. Existence only: content is the
+    operator's (a local edit to a mode file is theirs to make).
+
+    Two check ids, one per condition: ``skills.sweep-missing`` (no skill directory
+    at all) and ``skills.sweep-incomplete`` (present, but some bundled file absent —
+    ``missing_files`` carries exactly the absent rels, as a list). Both share the
+    single remediation, ``bmad-loop init --force-skills``. Empty list means OK."""
+    required = bundled_skill_files(SWEEP_SKILL)
+    problems: list[Finding] = []
+    for tree in dict.fromkeys(trees):
+        skill_dir = project / tree / SWEEP_SKILL
+        missing = [rel for rel in required if not _is_file(skill_dir.joinpath(*rel.split("/")))]
+        if not missing:
+            continue
+        detail: dict[str, object] = {"tree": tree, "skill": SWEEP_SKILL}
+        if not _is_dir(skill_dir):
+            problems.append(
+                Finding(
+                    "skills.sweep-missing",
+                    "problem",
+                    f"{tree}/{SWEEP_SKILL} not found — triage sessions would stall at an "
+                    f"unknown /{SWEEP_SKILL}; {_SWEEP_REMEDIATION}",
+                    detail,
+                )
+            )
+            continue
+        problems.append(
+            Finding(
+                "skills.sweep-incomplete",
+                "problem",
+                f"{tree}/{SWEEP_SKILL} is incomplete (missing {', '.join(missing)}: "
+                f"deleted or partial, or laid down by an older bmad-loop release) — "
+                f"triage sessions would stall at an unknown or broken /{SWEEP_SKILL}; "
+                f"{_SWEEP_REMEDIATION}",
+                {**detail, "missing_files": missing},
+            )
+        )
+    return problems
+
+
+def missing_base_skills(project: Path, trees: Sequence[SkillTree]) -> list[Finding]:
     """Problems for the upstream skills the orchestrator drives but doesn't bundle.
 
     The dev primitive (bmad-build-auto, or a complete pre-rename bmad-dev-auto) and
@@ -700,6 +1648,11 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     can have a post-consolidation `.claude` tree and a pre-merge `.agents` one side
     by side — and, across the rename, a different primitive era in each.
 
+    A ``skills.base-missing`` (or ``review-layer-missing``) for a scope with
+    ``[skills] user_roots`` off notes a copy in one of that CLI's own user roots
+    (:func:`_home_hint`), with its display path in ``detail["outside"]``. That is
+    a hint, never a resolution: the run still refuses until the switch is set.
+
     ``skills.base-incomplete`` carries ``missing_markers`` as a list — the message
     joins it with ", " for the human line, which a consumer would otherwise have to
     split back apart on a separator the message is free to change.
@@ -718,19 +1671,27 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     These are independent of the ordinary marker check: a damaged primitive may
     need both remediations. All are content-gated on the installed SKILL.md, so an
     inline pre-renderer install sees byte-stable behavior.
+
+    A ``trees`` entry may be a :class:`SkillScope`: every skill is then located
+    through it (:func:`skill_locate.locate`), a copy outside the primary tree adds
+    ``detail["root"]``, a missing skill searched in more than one place adds
+    ``detail["searched"]``, and the user-root warnings of
+    :func:`_user_root_findings` join the list. A plain string is a project-only
+    scope and reports exactly what it always has.
     """
     problems: list[Finding] = []
     resolved_stub = False
-    for tree in dict.fromkeys(trees):
-        resolved = resolve_dev_primitive(project, tree)
-        if resolved is None and _is_dev_primitive_shim(project, tree):
-            legacy_dir = project / tree / DEV_PRIMITIVE_LEGACY
-            absent = [m for m in DEV_PRIMITIVE_MARKERS if not (legacy_dir / m).is_file()]
+    for scope in _scope_items(trees):
+        tree = scope.tree
+        found = _primitive_copy(project, scope)
+        shim = _shim_copy(project, scope) if found is None else None
+        if shim is not None:
+            absent = [m for m in DEV_PRIMITIVE_MARKERS if not (shim.path / m).is_file()]
             problems.append(
                 Finding(
                     "skills.base-shim",
                     "problem",
-                    f"{tree}/{DEV_PRIMITIVE_LEGACY} is unusable (missing "
+                    f"{shim.display} is unusable (missing "
                     f"{', '.join(absent)}) and {DEV_PRIMITIVE_NEW} is not installed — "
                     f"most likely the forwarding shim the BMad Method's rename left "
                     f"behind, otherwise a truncated install; update the bmm module. The "
@@ -741,32 +1702,44 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                         "skill": DEV_PRIMITIVE_LEGACY,
                         "expected": DEV_PRIMITIVE_NEW,
                         "missing_markers": absent,
+                        **_root_detail(shim),
                     },
                 )
             )
-        elif resolved is None:
+        elif found is None:
+            hint, outside = _home_hint(scope, DEV_PRIMITIVE_NEW)
             problems.append(
                 Finding(
                     "skills.base-missing",
                     "problem",
                     f"{tree}/{DEV_PRIMITIVE_NEW} not found — the orchestrator drives this "
-                    f"upstream dev primitive directly; it ships with the bmm module "
-                    f"(BMAD-METHOD >= 6.10.0); install or update bmm in this project "
-                    f"(older installs name it {DEV_PRIMITIVE_LEGACY})",
-                    {"tree": tree, "skill": DEV_PRIMITIVE_NEW},
+                    f"upstream dev primitive directly; it ships with {BMAD_FLOOR_TEXT}; "
+                    f"install or update bmm (on v7, method) in this project "
+                    f"(older installs name it {DEV_PRIMITIVE_LEGACY}){hint}",
+                    {
+                        "tree": tree,
+                        "skill": DEV_PRIMITIVE_NEW,
+                        **outside,
+                        **_searched_detail(scope),
+                    },
                 )
             )
         else:
-            skill_dir = project / tree / resolved
+            resolved, skill_dir, rel, root = (
+                found.name,
+                found.path,
+                found.display,
+                _root_detail(found),
+            )
             absent = [m for m in DEV_PRIMITIVE_MARKERS if not (skill_dir / m).is_file()]
             if absent:
                 problems.append(
                     Finding(
                         "skills.base-incomplete",
                         "problem",
-                        f"{tree}/{resolved} is incomplete (missing "
+                        f"{rel} is incomplete (missing "
                         f"{', '.join(absent)}) — reinstall it from the bmm module",
-                        {"tree": tree, "skill": resolved, "missing_markers": absent},
+                        {"tree": tree, "skill": resolved, "missing_markers": absent, **root},
                     )
                 )
             if _is_renderer_stub(skill_dir):
@@ -781,7 +1754,7 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                         Finding(
                             "skills.dev-renderer",
                             "problem",
-                            f"{tree}/{resolved}/SKILL.md renders via "
+                            f"{rel}/SKILL.md renders via "
                             f"{RENDERER_SCRIPT_MARKER} but the renderer script unit is "
                             f"incomplete (missing {', '.join(absent_scripts)}) — the "
                             "session would HALT without writing a spec; reinstall the "
@@ -790,6 +1763,7 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                                 "tree": tree,
                                 "skill": resolved,
                                 "missing_scripts": absent_scripts,
+                                **root,
                             },
                         )
                     )
@@ -799,7 +1773,7 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                     Finding(
                         "skills.dev-renderer-sources",
                         "problem",
-                        f"{tree}/{resolved} renders via {RENDERER_SCRIPT_MARKER} but its "
+                        f"{rel} renders via {RENDERER_SCRIPT_MARKER} but its "
                         f"render sources are incomplete (unresolved: "
                         f"{', '.join(absent_sources)}) — the session would HALT without "
                         "writing a spec; reinstall the BMad Method (bmm) module",
@@ -807,10 +1781,12 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                             "tree": tree,
                             "skill": resolved,
                             "missing_sources": absent_sources,
+                            **root,
                         },
                     )
                 )
-        problems.extend(_review_findings(project, tree))
+        problems.extend(_review_findings(project, scope))
+        problems.extend(_user_root_findings(project, scope, found))
     if resolved_stub and not (project / CENTRAL_CONFIG_REL).is_file():
         problems.append(
             Finding(
@@ -826,7 +1802,311 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     return problems
 
 
-def dev_primitive_warnings(project: Path, trees: Sequence[str]) -> list[Finding]:
+RENDER_PROBE_CHECK = "skills.dev-render-probe"
+# Wall-clock budget for one render. The stub's launcher is typically
+# `uv run --no-cache`, which fetches the renderer's inline-script deps on every
+# probe (so the probe needs network access) before rendering.
+RENDER_PROBE_TIMEOUT_S = 120.0
+# The two placeholders a renderer stub's command names; the session substitutes
+# the absolute project root and skill dir for them before running it.
+RENDER_PROJECT_ROOT_PLACEHOLDER = "{project-root}"
+RENDER_SKILL_ROOT_PLACEHOLDER = "{skill-root}"
+# render_skill.py's stdout contract (`main()`): success prints the entry to follow
+# at rc 0; every handled failure prints one HALT line at rc 1.
+_RENDER_OK_PREFIX = "read and follow "
+_RENDER_HALT_PREFIX = "HALT: "
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+def dev_renderer_probe(project: Path, trees: Sequence[SkillTree]) -> list[Finding]:
+    """Execute each renderer stub's own render command in a throwaway copy.
+
+    The ``skills.dev-renderer*`` checks in :func:`missing_base_skills` prove the
+    renderer's files exist; they cannot see a render that HALTs on a missing or
+    ambiguous config value, a bad ``customize.toml``, an import error or a launcher
+    that fails. Those surface in a run only as a result-less dev session. This probe
+    answers the session's first question — does the stub's render command succeed —
+    before a session is spent on it. One ``skills.dev-render-probe`` finding per
+    deduplicated tree whose dev primitive resolves to a renderer stub (``detail``
+    carries ``tree`` and ``skill``); when none does, a single ``ok`` saying there is
+    nothing to render (``detail["trees"]``).
+
+    Contract:
+
+    - The command is the first line inside a fenced code block of the stub's
+      SKILL.md that names ``render_skill.py``, split with :func:`shlex.split`
+      (posix). ``{project-root}`` / ``{skill-root}`` are replaced per argv element
+      with the temp project root / temp skill dir. No such line, a line that does
+      not split, or one missing either placeholder is a problem — never a
+      hand-built fallback argv, which would test a command no session runs. No
+      ``--set`` is appended: the engine's dev prompt names no route or review.
+    - The render runs in a :class:`tempfile.TemporaryDirectory` holding a copy of
+      ``<project>/_bmad/`` (minus its top-level ``render/``, per
+      :data:`BMAD_SEED_EXCLUDES`) and of ``<project>/<tree>/<skill>``, with that
+      temp dir as cwd. Render failures are path-independent, so the copy answers
+      the session's question while ``validate`` stays a non-writer: the project,
+      including ``_bmad/render/``, is never touched, and the temp dir is removed.
+    - rc 0 plus a stdout line starting ``read and follow `` is ``ok``; a stdout
+      ``HALT: `` line is a problem carrying the halt text (``detail["halt"]``);
+      anything else (e.g. a bare traceback) is a problem naming the rc and the last
+      stderr/stdout line. A launcher (argv[0]) absent from PATH, a spawn
+      ``OSError``, a timeout (:data:`RENDER_PROBE_TIMEOUT_S`) and a staging
+      ``OSError`` are each a problem.
+    - Every message and detail maps the temp root back to the project path.
+
+    Never raises: ``validate`` has no error path of its own, its rc is purely the
+    verdict (see :func:`bmad_loop.probe.binary_runs`).
+
+    Opt-in (``validate --render-probe``) because it executes project-controlled
+    content — the stub's argv and ``render_skill.py``, the same content a run
+    executes. Plain ``validate`` must stay non-executing for a fresh clone, as the
+    provenance note on the ``adapter.binary`` probe in ``cmd_validate`` records.
+    No coding CLI is launched and no prompt is sent.
+
+    The stub is the copy each tree's scope locates; a user-root copy is staged from
+    its own folder into the temp root's primary-tree position (``detail["root"]``
+    names where it came from).
+    """
+    scopes = list(_scope_items(trees))
+    unique = list(dict.fromkeys(scope.tree for scope in scopes))
+    findings: list[Finding] = []
+    for scope in scopes:
+        found = _primitive_copy(project, scope)
+        if found is None or not _is_renderer_stub(found.path):
+            continue
+        findings.append(_probe_render(project, scope.tree, found.name, source=found))
+    if not findings:
+        findings.append(
+            Finding(
+                RENDER_PROBE_CHECK,
+                "ok",
+                "no dev tree resolves a renderer stub — nothing to render",
+                {"trees": unique},
+            )
+        )
+    return findings
+
+
+def _render_command_line(skill_md: str) -> str | None:
+    """The first line inside a fenced code block that names the renderer script."""
+    fence: str | None = None
+    for line in skill_md.splitlines():
+        if fence is None:
+            opened = _FENCE_OPEN_RE.match(line)
+            if opened is not None:
+                fence = opened.group(1)
+            continue
+        stripped = line.strip()
+        if len(stripped) >= len(fence) and set(stripped) == {fence[0]}:
+            fence = None
+            continue
+        if RENDERER_SCRIPT_MARKER in line:
+            return stripped
+    return None
+
+
+def _render_path_unmapper(tmp_root: Path, project: Path) -> Callable[[str], str]:
+    """A ``str -> str`` that rewrites the temp root (every spelling) to the project."""
+    forms = {tmp_root}
+    try:
+        forms.add(tmp_root.resolve())
+    except (OSError, RuntimeError):
+        pass
+    pairs: dict[str, str] = {}
+    for form in forms:
+        pairs[str(form)] = str(project)
+        pairs[form.as_posix()] = project.as_posix()
+    ordered = sorted(pairs.items(), key=lambda pair: len(pair[0]), reverse=True)
+
+    def unmap(text: str) -> str:
+        for src, dst in ordered:
+            text = text.replace(src, dst)
+        return text
+
+    return unmap
+
+
+def _stage_render_copy(project: Path, skill_dir: Path, root: Path, tmp_skill: Path) -> None:
+    """Copy ``_bmad/`` (minus top-level ``render/``) and the skill dir under ``root``.
+
+    An absent ``_bmad/`` is not staged: the render then fails exactly as the
+    session's would, and the presence checks already name the missing files.
+    """
+    bmad_src = project / BMAD_DIR
+    if bmad_src.is_dir():
+        top = os.fspath(bmad_src)
+
+        def ignore(directory: str, names: list[str]) -> list[str]:
+            if directory != top:
+                return []
+            return [name for name in names if name in BMAD_SEED_EXCLUDES]
+
+        shutil.copytree(bmad_src, root / BMAD_DIR, symlinks=True, ignore=ignore)
+    tmp_skill.parent.mkdir(parents=True, exist_ok=True)
+    # dirs_exist_ok: a skill tree under `_bmad/` was already copied with it.
+    shutil.copytree(skill_dir, tmp_skill, symlinks=True, dirs_exist_ok=True)
+
+
+def _last_line(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def _probe_render(
+    project: Path, tree: str, skill: str, *, source: Located | None = None
+) -> Finding:
+    """One tree's render verdict; see :func:`dev_renderer_probe` for the contract.
+    ``source`` is the located copy to probe (default: ``<tree>/<skill>``)."""
+    rel = source.display if source is not None else f"{tree}/{skill}"
+    detail: dict[str, Any] = {"tree": tree, "skill": skill, **_root_detail(source)}
+
+    def problem(message: str) -> Finding:
+        return _render_problem(detail, message)
+
+    skill_dir = source.path if source is not None else project / tree / skill
+    unparsed = f"{rel}/SKILL.md: the render command could not be parsed"
+    try:
+        skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return problem(f"{unparsed} ({exc}); nothing was executed")
+    line = _render_command_line(skill_md)
+    if line is None:
+        return problem(
+            f"{unparsed} (no fenced code line names {RENDERER_SCRIPT_MARKER}); nothing was executed"
+        )
+    detail["command"] = line
+    try:
+        template = shlex.split(line, posix=True)
+    except ValueError as exc:
+        return problem(f"{unparsed} ({exc}): {line}; nothing was executed")
+    absent = [
+        token
+        for token in (RENDER_PROJECT_ROOT_PLACEHOLDER, RENDER_SKILL_ROOT_PLACEHOLDER)
+        if not any(token in arg for arg in template)
+    ]
+    if absent:
+        return problem(
+            f"{unparsed} (it does not name {' or '.join(absent)}): {line}; nothing was executed"
+        )
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="bmad-loop-render-probe-", ignore_cleanup_errors=True
+        ) as tmp:
+            return _render_in(project, Path(tmp), template, detail, source=skill_dir, rel=rel)
+    except OSError as exc:
+        return problem(f"{rel}: could not create a throwaway render directory ({exc})")
+
+
+def _render_problem(detail: Mapping[str, Any], message: str, **extra: Any) -> Finding:
+    return Finding(RENDER_PROBE_CHECK, "problem", message, {**detail, **extra})
+
+
+def _render_in(
+    project: Path,
+    root: Path,
+    template: Sequence[str],
+    detail: Mapping[str, Any],
+    *,
+    source: Path | None = None,
+    rel: str | None = None,
+) -> Finding:
+    """Stage the copy under ``root``, run the substituted command there, classify it.
+
+    ``source`` is the skill folder staged (default ``<project>/<tree>/<skill>``); it
+    always lands at ``<root>/<tree>/<skill>``, and ``rel`` is how messages name it."""
+    tree, skill = str(detail["tree"]), str(detail["skill"])
+    rel = rel if rel is not None else f"{tree}/{skill}"
+
+    def problem(message: str, **extra: Any) -> Finding:
+        return _render_problem(detail, message, **extra)
+
+    unmap = _render_path_unmapper(root, project)
+    tmp_skill = root / tree / skill
+    try:
+        _stage_render_copy(
+            project, source if source is not None else project / tree / skill, root, tmp_skill
+        )
+    except OSError as exc:
+        return problem(f"{rel}: could not stage the throwaway render copy ({unmap(str(exc))})")
+    argv = [
+        arg.replace(RENDER_PROJECT_ROOT_PLACEHOLDER, str(root)).replace(
+            RENDER_SKILL_ROOT_PLACEHOLDER, str(tmp_skill)
+        )
+        for arg in template
+    ]
+    try:
+        launcher = shutil.which(argv[0])
+    except ValueError as exc:  # e.g. a NUL byte read from SKILL.md
+        return problem(f"{rel}: render launcher {unmap(argv[0])!r} is unusable ({exc})")
+    if launcher is None:
+        searched = os.environ.get("PATH", "")
+        shown = unmap(argv[0])
+        return problem(
+            f"{rel}: render launcher {shown!r} not found on PATH ({searched}) — a dev "
+            "session could not run the render command either",
+            launcher=shown,
+            path=searched,
+        )
+    try:
+        # Popen + tree kill, not subprocess.run(timeout=): run kills only the direct
+        # child, orphaning `uv run`'s renderer grandchild (POSIX) or blocking its
+        # post-kill drain on the pipes that grandchild still holds (Windows).
+        proc = subprocess.Popen(
+            [launcher, *argv[1:]],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return problem(f"{rel}: render command could not be launched ({unmap(str(exc))})")
+    try:
+        raw_out, raw_err = proc.communicate(timeout=RENDER_PROBE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessHostError, OSError):
+            childrun.kill_tree(proc)
+        # Bounded drain: a straggler the tree kill could not reach may hold the pipes.
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError, ValueError):
+            proc.communicate(timeout=childrun.DRAIN_S)
+        return problem(
+            f"{rel}: render command did not finish within {RENDER_PROBE_TIMEOUT_S:g}s",
+            timeout_s=RENDER_PROBE_TIMEOUT_S,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        with contextlib.suppress(ProcessHostError, OSError):
+            childrun.kill_tree(proc)
+        return problem(f"{rel}: render command output could not be read ({unmap(str(exc))})")
+    stdout = unmap(raw_out or "")
+    stderr = unmap(raw_err or "")
+    out_lines = stdout.splitlines()
+    halt = next((ln for ln in out_lines if ln.startswith(_RENDER_HALT_PREFIX)), None)
+    if halt is not None:
+        text = halt[len(_RENDER_HALT_PREFIX) :].strip()
+        return problem(
+            f"{rel}: render HALTs: {text} — a dev session would stop here without writing a spec",
+            rc=proc.returncode,
+            halt=text,
+        )
+    entry = next((ln for ln in out_lines if ln.startswith(_RENDER_OK_PREFIX)), None)
+    if proc.returncode == 0 and entry is not None:
+        return Finding(
+            RENDER_PROBE_CHECK,
+            "ok",
+            f"{rel} renders cleanly (render command run in a throwaway copy; project untouched)",
+            {**detail, "rc": proc.returncode},
+        )
+    last = _last_line(stderr) or _last_line(stdout) or "(no output)"
+    return problem(
+        f"{rel}: render failed with rc {proc.returncode} and no HALT line (last output: "
+        f"{last}) — a dev session would stop without writing a spec",
+        rc=proc.returncode,
+        last_line=last,
+    )
+
+
+def dev_primitive_warnings(project: Path, trees: Sequence[SkillTree]) -> list[Finding]:
     """Advisory findings about a resolved dev primitive — validate-only, never a gate.
 
     One condition, and it is genuinely survivable — which is what keeps it out of
@@ -858,9 +2138,15 @@ def dev_primitive_warnings(project: Path, trees: Sequence[str]) -> list[Finding]
     Returns [] when nothing resolves — :func:`missing_base_skills` owns that story.
     """
     findings: list[Finding] = []
-    resolved = {tree: resolve_dev_primitive(project, tree) for tree in dict.fromkeys(trees)}
-    new_trees = [tree for tree, name in resolved.items() if name == DEV_PRIMITIVE_NEW]
-    legacy_trees = [tree for tree, name in resolved.items() if name == DEV_PRIMITIVE_LEGACY]
+    resolved = {scope: resolve_dev_primitive(project, scope) for scope in _scope_items(trees)}
+    new_trees = list(
+        dict.fromkeys(scope.tree for scope, name in resolved.items() if name == DEV_PRIMITIVE_NEW)
+    )
+    legacy_trees = list(
+        dict.fromkeys(
+            scope.tree for scope, name in resolved.items() if name == DEV_PRIMITIVE_LEGACY
+        )
+    )
     if new_trees:
         orphaned = [
             (CUSTOMIZE_DIR / f"{DEV_PRIMITIVE_LEGACY}{suffix}").as_posix()
@@ -901,6 +2187,25 @@ def dev_primitive_warnings(project: Path, trees: Sequence[str]) -> list[Finding]
     return findings
 
 
+def _home_hint(scope: SkillScope, name: str) -> tuple[str, dict[str, str]]:
+    """The message suffix and ``outside`` detail entry for a skill the project lacks
+    but one of the scope's own user roots holds while ``[skills] user_roots`` is
+    off (:func:`skill_locate.home_copy`), or ``("", {})``. Only the roots the CLI
+    itself loads are probed, and with the switch on there is nothing to hint: a
+    user copy would have resolved."""
+    if scope.resolve_user:
+        return "", {}
+    found = skill_locate.home_copy(scope, name)
+    if found is None:
+        return "", {}
+    return (
+        f"; a copy exists at {found.display}, which this CLI loads — set "
+        f"`[skills] user_roots = true` in .bmad-loop/policy.toml to use it, or install "
+        f"it per project (`npx skills add` without -g)",
+        {"outside": found.display},
+    )
+
+
 def _where_clause(layer_ids: Sequence[str]) -> str:
     """How a finding's message names the layers that reach for a skill."""
     if len(layer_ids) > 1:
@@ -910,7 +2215,7 @@ def _where_clause(layer_ids: Sequence[str]) -> str:
     return "review step invokes"
 
 
-def _review_findings(project: Path, tree: str) -> list[Finding]:
+def _review_findings(project: Path, tree: SkillTree) -> list[Finding]:
     """Findings for the review skills this tree's dev primitive invokes.
 
     Problems block; warnings never do. A skill is only a problem when the
@@ -924,83 +2229,153 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
     send them to a path that does not exist on a renamed project. The static-catalog
     fallback below has no :class:`ReviewResolution` to carry the name, so this
     resolves independently rather than widening that tuple.
+
+    A tree whose primitive does not resolve gets NO review finding: the reviewers
+    derive from the primitive, :func:`missing_base_skills` already reports that root
+    cause, and the static fallback would otherwise demand the long-deleted hunters on
+    top of it.
+
+    Every skill is located through ``tree``'s scope, as in :func:`missing_base_skills`.
     """
-    primitive = dev_primitive_or_default(project, tree)
-    resolved = resolve_review_layers(project, tree)
+    scope = as_scope(tree)
+    found = _primitive_copy(project, scope)
+    if found is None:
+        return []
+    primitive, primitive_rel, root = found.name, found.display, _root_detail(found)
+    tree_name = scope.tree
+
+    def present(skill: str) -> bool:
+        return skill_locate.locate(project, scope, skill) is not None
+
+    resolved = resolve_review_layers(project, scope)
     if resolved is None:
         # Unknown shape: keep the long-standing static requirement, which both real
         # topologies satisfy — the two hunters, or the merged reviewer instead.
-        if (project / tree / MERGED_REVIEW_SKILL / "SKILL.md").is_file():
+        if present(MERGED_REVIEW_SKILL):
             return []
-        return [
-            Finding(
-                "skills.base-missing",
-                "problem",
-                f"{tree}/{skill} not found — this review layer ships with the bmm module "
-                f"(BMAD-METHOD >= 6.10.0), as does the consolidated {MERGED_REVIEW_SKILL} "
-                f"skill that supersedes it in newer releases; install or update bmm in "
-                f"this project",
-                {"tree": tree, "skill": skill},
+        fallback: list[Finding] = []
+        for skill in sorted(_REVIEW_LAYER_SKILLS):
+            if present(skill):
+                continue
+            hint, outside = _home_hint(scope, skill)
+            fallback.append(
+                Finding(
+                    "skills.base-missing",
+                    "problem",
+                    f"{tree_name}/{skill} not found — this review layer ships with "
+                    f"{BMAD_FLOOR_TEXT}, as does the consolidated {MERGED_REVIEW_SKILL} "
+                    f"skill that supersedes it in newer releases; install "
+                    f"{REVIEW_FLOOR_TEXT} in this project{hint}",
+                    {"tree": tree_name, "skill": skill, **outside, **_searched_detail(scope)},
+                )
             )
-            for skill in sorted(_REVIEW_LAYER_SKILLS)
-            if not (project / tree / skill / "SKILL.md").is_file()
-        ]
+        return fallback
     findings: list[Finding] = []
     for rel in resolved.unreadable:
+        # v7 renders the primitive through `render_skill.py`, whose strict loader
+        # raises on this file, so no dev run starts; the layer-era resolver skipped it.
+        v7 = bool(resolved.lens_sets)
+        consequence = (
+            "BMAD v7 refuses to render the dev skill with it, so every dev run fails to start"
+            if v7
+            else "this project's review layers resolve without it"
+        )
         findings.append(
             Finding(
                 "skills.customize-unreadable",
-                "warning",
-                f"{rel} could not be parsed as TOML — the run's resolver skips a broken "
-                f"override layer, so this project's review layers resolve without it; "
-                f"fix the file or remove it",
-                {"tree": tree, "file": rel},
+                "problem" if v7 else "warning",
+                f"{rel} could not be read as a customize override (invalid TOML, or an "
+                f"array entry whose `id`/`code` is not a non-empty string) — "
+                f"{consequence}; fix the file or remove it",
+                {"tree": tree_name, "file": rel},
             )
         )
-    if resolved.layer_driven and not resolved.active_layers:
+    override_rel = _customize_overrides(primitive)[0].as_posix()
+    selection = resolved.selection
+    if resolved.lens_sets and selection is not None and selection not in REVIEW_SELECTIONS:
+        findings.append(
+            Finding(
+                "skills.review-selection-invalid",
+                "problem",
+                f"{primitive_rel} resolves workflow.review = {selection!r} — its "
+                f"workflow HALTs every dev run on any value but "
+                f"{', '.join(REVIEW_SELECTIONS)}; fix `review` in {override_rel} or in "
+                f"the skill's customize.toml",
+                {"tree": tree_name, "source": resolved.source, "selection": selection, **root},
+            )
+        )
+    if resolved.lens_sets:
+        # `quick`/`thorough` launch only their own set, so an enabled lens in the other
+        # one cannot serve the run; `auto` may route to either, so it needs just one.
+        # An unset selection is left to the run: whether it HALTs is undecidable here.
+        if selection in LENS_SETS:
+            checked: tuple[str, ...] = (selection,)
+        else:
+            checked = resolved.lens_sets
+        if (
+            selection is not None
+            and selection != "none"
+            and not any(name in resolved.active_sets for name in checked)
+        ):
+            tables = " / ".join(f"[[workflow.{LENS_SETS[n]}]]" for n in checked)
+            findings.append(
+                Finding(
+                    "skills.review-layers-empty",
+                    "problem",
+                    f"{primitive_rel} has no enabled review lens (every `instruction` "
+                    f"in {tables} is empty or absent) while workflow.review is "
+                    f"{selection!r} — every dev run would HALT with no lens to launch; "
+                    f're-enable a lens in {override_rel}, or set review = "none" there',
+                    {"tree": tree_name, "source": resolved.source, **root},
+                )
+            )
+    elif resolved.layer_driven and not resolved.active_layers:
         findings.append(
             Finding(
                 "skills.review-layers-empty",
                 "problem",
-                f"{tree}/{primitive} has no enabled review layer (every "
+                f"{primitive_rel} has no enabled review layer (every "
                 f"`instruction` is empty) — every dev run would HALT blocked with "
                 f"'no active review layers'; re-enable a layer in "
-                f"{_customize_overrides(primitive)[0].as_posix()}",
-                {"tree": tree, "source": resolved.source},
+                f"{override_rel}",
+                {"tree": tree_name, "source": resolved.source, **root},
             )
         )
     for skill, layer_ids in sorted(resolved.required.items()):
-        if (project / tree / skill / "SKILL.md").is_file():
+        if present(skill):
             continue
+        hint, outside = _home_hint(scope, skill)
         findings.append(
             Finding(
                 "skills.review-layer-missing",
                 "problem",
-                f"{tree}/{skill} not found — {tree}/{primitive}'s "
+                f"{tree_name}/{skill} not found — {primitive_rel}'s "
                 f"{_where_clause(layer_ids)} it ({resolved.source}), so every dev run's "
-                f"review would fail; install or update the bmm module so this project's "
-                f"review layers resolve",
+                f"review would fail; install {REVIEW_FLOOR_TEXT} so this project's "
+                f"review layers resolve{hint}",
                 {
-                    "tree": tree,
+                    "tree": tree_name,
                     "skill": skill,
                     "layers": list(layer_ids),
                     "source": resolved.source,
+                    **outside,
+                    **_searched_detail(scope),
                 },
             )
         )
     for skill, layer_ids in sorted(resolved.advisory.items()):
-        if (project / tree / skill / "SKILL.md").is_file():
+        if present(skill):
             continue
         findings.append(
             Finding(
                 "skills.review-layer-unresolved",
                 "warning",
-                f"{tree}/{skill} not found — {tree}/{primitive}'s "
+                f"{tree_name}/{skill} not found — {primitive_rel}'s "
                 f"{_where_clause(layer_ids)} it conditionally, or names it in prose this "
                 f"check cannot confirm is a handoff ({resolved.source}); install it if "
                 f"that layer is meant to run",
                 {
-                    "tree": tree,
+                    "tree": tree_name,
                     "skill": skill,
                     "layers": list(layer_ids),
                     "source": resolved.source,
@@ -1010,15 +2385,309 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
     return findings
 
 
-def _hook_command(project: Path, profile: CLIProfile, canonical_event: str) -> str:
-    """Command for this installation's console entry point, independent of PATH."""
-    del project, profile
+def _review_skill_names(project: Path, scope: SkillScope) -> tuple[str, ...]:
+    """Every review skill ``scope``'s dev primitive may invoke: the read review
+    shape's skills, else the static merged-or-standalone fallback the preflight and
+    the worktree gate apply to a shape that cannot be read."""
+    review = resolve_review_layers(project, scope)
+    if review is not None:
+        return review.skills()
+    return _fallback_review_skill_names(project, scope)
+
+
+def _fallback_review_skill_names(project: Path, scope: SkillScope) -> tuple[str, ...]:
+    """The static review requirement for a review shape that cannot be read: the
+    merged reviewer when it resolves, else the standalone hunters."""
+    if skill_locate.locate(project, scope, MERGED_REVIEW_SKILL) is not None:
+        return (MERGED_REVIEW_SKILL,)
+    return tuple(sorted(_REVIEW_LAYER_SKILLS))
+
+
+def required_review_skill_names(project: Path, tree: SkillTree) -> tuple[str, ...]:
+    """The review skills ``tree``'s dev primitive WILL invoke: the ones whose
+    absence fails the run preflight (the problem-severity rows of
+    :func:`_review_findings`). That is the read shape's ``required`` skills, else
+    the static fallback for a shape that cannot be read. ``advisory`` skills are
+    left out, because a gated layer may never run and preflight only warns about
+    them."""
+    scope = as_scope(tree)
+    review = resolve_review_layers(project, scope)
+    if review is not None:
+        return tuple(review.required)
+    return _fallback_review_skill_names(project, scope)
+
+
+USER_SHADOW_CHECK = "skills.user-shadow"
+USER_ROOT_UNAVAILABLE_CHECK = "skills.user-root-unavailable"
+USER_ROOT_VERSION_SKEW_CHECK = "skills.user-root-version-skew"
+SKILL_ROOT_CHECK = "skills.root"
+
+_UNAVAILABLE_REASONS = {
+    "no-home": "the home directory cannot be determined",
+    "unreadable": "it cannot be read",
+}
+
+
+def _unavailable_text(reason: str) -> str:
+    if reason.startswith("env:"):
+        return f"{reason[4:]} is set, so the CLI does not read it"
+    return _UNAVAILABLE_REASONS.get(reason, reason)
+
+
+def _user_root_findings(project: Path, scope: SkillScope, found: Located | None) -> list[Finding]:
+    """The user-root warnings for one scope; empty for a scope without user roots
+    (every plain tree string).
+
+    - ``skills.user-shadow``: a skill the run drives sits in both a project tree
+      and a user root and the CLI may run the user copy instead of the one the
+      checks read (:func:`skill_locate.shadow`) — ``user`` precedence with the
+      switch off, ``unordered`` precedence whatever the switch.
+    - ``skills.user-root-unavailable`` (switch on only): a declared root that can
+      never resolve — a disabler variable is set, the home is unknown, or the
+      folder cannot be read.
+    - ``skills.user-root-version-skew``: a user root's and a project tree's
+      ``bmod-method/bmod.toml`` name different BMAD-METHOD versions, so skills
+      from two installs may mix in one session.
+    """
+    if not scope.user_roots:
+        return []
+    tree = scope.tree
+    findings: list[Finding] = []
+    names = (found.name, *_review_skill_names(project, scope)) if found is not None else ()
+    for name in dict.fromkeys(names):
+        clash = skill_locate.shadow(project, scope, name)
+        if clash is None:
+            continue
+        checked, other = clash.checked.display, clash.other.display
+        if clash.kind == "overrides":
+            message = (
+                f"{other} overrides {checked}: this CLI loads the personal copy over the "
+                f"project's, but the checks read the project copy — remove {other}, or set "
+                f"`[skills] user_roots = true` in .bmad-loop/policy.toml so the checks read "
+                f"the copy that runs"
+            )
+        else:
+            message = (
+                f"{checked} and {other} both load, in no order this CLI states — the checks "
+                f"read the project copy; remove one of them so a session cannot run the other"
+            )
+        findings.append(
+            Finding(
+                USER_SHADOW_CHECK,
+                "warning",
+                message,
+                {
+                    "tree": tree,
+                    "skill": name,
+                    "checked": checked,
+                    "other": other,
+                    "precedence": scope.precedence,
+                    "kind": clash.kind,
+                },
+            )
+        )
+    if scope.resolve_user:
+        for root in scope.user_roots:
+            if not root.unavailable:
+                continue
+            findings.append(
+                Finding(
+                    USER_ROOT_UNAVAILABLE_CHECK,
+                    "warning",
+                    f"user skill root {root.spelling} is unavailable "
+                    f"({_unavailable_text(root.unavailable)}) — skills installed there are "
+                    f"not used for {tree}",
+                    {"tree": tree, "root": root.spelling, "reason": root.unavailable},
+                )
+            )
+    project_version = next(
+        (
+            v
+            for t in scope.project_trees()
+            if (v := _bmod_version(project / t / BMOD_METHOD_MANIFEST)) is not None
+        ),
+        None,
+    )
+    user_found = next(
+        (
+            (root.spelling, v)
+            for root in scope.user_roots
+            if not root.unavailable
+            and root.path is not None
+            and (v := _bmod_version(root.path / BMOD_METHOD_MANIFEST)) is not None
+        ),
+        None,
+    )
+    if project_version is not None and user_found is not None and user_found[1] != project_version:
+        user_root, user_version = user_found
+        findings.append(
+            Finding(
+                USER_ROOT_VERSION_SKEW_CHECK,
+                "warning",
+                f"{user_root}/{BMOD_METHOD_SKILL} is BMAD-METHOD {user_version} but "
+                f"{tree}/{BMOD_METHOD_SKILL} is {project_version} — a session may mix skills "
+                f"from the two installs; update the older one",
+                {
+                    "tree": tree,
+                    "root": user_root,
+                    "user_version": user_version,
+                    "project_version": project_version,
+                },
+            )
+        )
+    return findings
+
+
+def session_skill_candidates(
+    project: Path, scope: SkillTree, prompt_skill: str = ""
+) -> tuple[str, ...]:
+    """Every skill a session of ``scope``'s CLI may load: ``prompt_skill`` (the
+    skill its prompt names, when it names one), the :data:`BASE_SKILLS` catalog and
+    the review skills the installed primitive invokes."""
+    review = resolve_review_layers(project, scope)
+    return tuple(
+        dict.fromkeys(
+            (
+                *((prompt_skill,) if prompt_skill else ()),
+                *BASE_SKILLS,
+                *(review.skills() if review is not None else ()),
+            )
+        )
+    )
+
+
+# A skill id read from a user root's module record names a folder under that root;
+# anything but a plain name (a separator, `..`, a glob) is not one.
+_SKILL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _module_skill_ids(root: Path) -> list[str]:
+    """Every id listed by ``[bmod] skills`` in ``root``'s ``bmod-*/bmod.toml``
+    module records, in folder order. An unreadable root or record lists nothing."""
+    try:
+        manifests = sorted(root.glob("bmod-*/bmod.toml"))
+    except OSError:
+        return []
+    ids: list[str] = []
+    for manifest in manifests:
+        data = _read_toml(manifest)
+        bmod = data.get("bmod") if data is not None else None
+        listed = bmod.get("skills") if isinstance(bmod, dict) else None
+        if isinstance(listed, list):
+            ids += [
+                skill
+                for skill in listed
+                if isinstance(skill, str) and _SKILL_ID_RE.fullmatch(skill) and ".." not in skill
+            ]
+    return ids
+
+
+def user_root_skill_ids(project: Path, scope: SkillTree, prompt_skill: str = "") -> tuple[str, ...]:
+    """The BMAD module skill ids a session of ``scope``'s CLI loads from a user root.
+
+    Candidates are :func:`session_skill_candidates` plus every id a user root's
+    ``bmod-*/bmod.toml`` lists under ``[bmod] skills``; one is kept only where
+    :func:`skill_locate.locate` returns a user-root copy — so nothing with the
+    switch off, and never a personal skill no BMAD module record names. Feeds the
+    opencode allow-list and the run's user-root journal."""
+    resolved = as_scope(scope)
+    ids = list(session_skill_candidates(project, resolved, prompt_skill))
+    for root in resolved.user_roots:
+        if not root.unavailable and root.path is not None:
+            ids += _module_skill_ids(root.path)
+    kept: list[str] = []
+    for skill in dict.fromkeys(ids):
+        found = skill_locate.locate(project, resolved, skill)
+        if found is not None and found.origin == "user":
+            kept.append(skill)
+    return tuple(kept)
+
+
+def module_record_version(root: Path, skill: str) -> str | None:
+    """``[bmod] version`` of the first ``bmod-*/bmod.toml`` in ``root`` whose
+    ``[bmod] skills`` lists ``skill``, or None (no record names it, or it carries
+    no version). Display only: the run journals it beside each user-root skill."""
+    try:
+        manifests = sorted(root.glob("bmod-*/bmod.toml"))
+    except OSError:
+        return None
+    for manifest in manifests:
+        data = _read_toml(manifest)
+        bmod = data.get("bmod") if data is not None else None
+        listed = bmod.get("skills") if isinstance(bmod, dict) else None
+        if isinstance(listed, list) and skill in listed:
+            return _bmod_version(manifest)
+    return None
+
+
+def skill_root_findings(project: Path, scopes: Iterable[SkillTree]) -> list[Finding]:
+    """``skills.root`` ok lines: where each skill the run drives (the dev primitive
+    and its review skills) resolved, per scope. Validate-only — never part of
+    :func:`missing_base_skills`, whose caller in the run preflight prints every
+    non-problem finding as a warning."""
+    findings: list[Finding] = []
+    for scope in _scope_items(scopes):
+        found = _primitive_copy(project, scope)
+        if found is None:
+            continue
+        located = [found]
+        for skill in _review_skill_names(project, scope):
+            copy = skill_locate.locate(project, scope, skill)
+            if copy is not None:
+                located.append(copy)
+        for copy in located:
+            where = "user root" if copy.origin == "user" else "project tree"
+            findings.append(
+                Finding(
+                    SKILL_ROOT_CHECK,
+                    "ok",
+                    f"{copy.name} resolves from {copy.display} ({where})",
+                    {
+                        "tree": scope.tree,
+                        "skill": copy.name,
+                        "root": copy.root,
+                        "origin": copy.origin,
+                    },
+                )
+            )
+    return findings
+
+
+def _relay_executable() -> Path:
+    """This installation's console entry point, independent of PATH: the invoked
+    launcher when it is the ``bmad-loop`` script itself, else the sibling of the
+    running interpreter. Raises ``ProfileError`` when it is not a readable,
+    executable file."""
     name = "bmad-loop.exe" if os.name == "nt" else "bmad-loop"
     invoked = Path(sys.argv[0]).absolute()
     executable = invoked if invoked.name == name else Path(sys.executable).absolute().parent / name
     if not executable.is_file() or not os.access(executable, os.R_OK | os.X_OK):
         raise ProfileError(f"installed bmad-loop command is unavailable: {executable}")
-    return f"{get_process_host().shell_quote(str(executable))} relay {canonical_event}"
+    return executable
+
+
+def _hook_command(project: Path, profile: CLIProfile, canonical_event: str) -> str:
+    """Command for this installation's console entry point, independent of PATH."""
+    del project, profile
+    return f"{get_process_host().shell_quote(str(_relay_executable()))} relay {canonical_event}"
+
+
+def _warn_unsafe_relay_path() -> None:
+    """DW-346: print one advisory line when the relay executable ``init`` just
+    registered carries shell metacharacters this host's hook quoting leaves
+    exposed. Warn only — the registered command is unchanged and ``init`` still
+    succeeds; ``validate`` repeats the check as ``hooks.relay-path-unsafe``."""
+    try:
+        executable = str(_relay_executable())
+    except ProfileError:
+        return  # registration would already have failed on this; nothing to add
+    chars = get_process_host().unsafe_shell_chars(executable)
+    if chars:
+        print(
+            f"  warning: installed relay path {executable} contains shell "
+            f"metacharacter(s) {' '.join(chars)} this host's hook quoting leaves "
+            f"unsafe — hook runs may fail; reinstall bmad-loop under a path without them"
+        )
 
 
 def relay_executable(command: str) -> Path | None:
@@ -1037,27 +2706,47 @@ def relay_executable_text(command: str) -> str | None:
     `Path` normalizes the spelling (on Windows it treats `\\` and `/` alike), so
     callers asking "would init write something different" compare this text.
     """
+    parts = _installed_relay_parts(command)
+    return parts[0] if parts is not None else None
+
+
+# Canonical events an installed `bmad-loop relay <kind>` command may report — a
+# command naming one of these is managed (deduped, stripped, replaced by init).
+# Every canonical event, so the parked kinds (DW-348) a profile may map a native
+# event straight to stay managed too; claude reaches them through `Notification`.
+_RELAY_CANONICAL_EVENTS = frozenset(CANONICAL_EVENTS)
+
+
+def _installed_relay_parts(command: str) -> tuple[str, str] | None:
+    """`(executable text, canonical event)` of an installed console relay command."""
     for posix in (os.name != "nt", os.name == "nt"):
         try:
             parts = shlex.split(command, posix=posix)
         except ValueError:
             continue
-        if (
-            len(parts) != 3
-            or parts[1] != "relay"
-            or parts[2] not in {"SessionStart", "Stop", "SessionEnd", "Notification", "PreCompact"}
-        ):
+        if len(parts) != 3 or parts[1] != "relay" or parts[2] not in _RELAY_CANONICAL_EVENTS:
             continue
         raw = parts[0].strip('"')
         for flavor in (PurePosixPath, PureWindowsPath):
             executable = flavor(raw)
             if executable.name in {"bmad-loop", "bmad-loop.exe"} and executable.is_absolute():
-                return raw
+                return raw, parts[2]
     return None
 
 
 def _legacy_relay_script(command: str) -> str | None:
     """Recognize only the Python command that old init actually registered."""
+    parts = _legacy_relay_parts(command)
+    return parts[0] if parts is not None else None
+
+
+def _legacy_relay_parts(command: str) -> tuple[str, str, str] | None:
+    """`(script, canonical event, interpreter token)` of an old copied-script relay.
+
+    The interpreter is the command's FIRST token only (`python3`, `uv`, or an
+    absolute path to either): `uv run --no-project python` resolves its `python`
+    itself, so the word after it is not a PATH lookup this command makes.
+    """
     for posix in (True, False):
         try:
             parts = shlex.split(command, posix=posix)
@@ -1076,12 +2765,22 @@ def _legacy_relay_script(command: str) -> str | None:
         normalized = script.replace("\\", "/")
         if PurePosixPath(normalized).parts[-2:] != (".bmad-loop", "bmad_loop_hook.py"):
             continue
-        interpreter = PurePosixPath(prefix[0].strip('"').replace("\\", "/")).name.lower()
+        token = prefix[0].strip('"')
+        interpreter = PurePosixPath(token.replace("\\", "/")).name.lower()
         if interpreter.startswith("python") and len(prefix) == 1:
-            return script
+            return script, parts[-1], token
         if interpreter in {"uv", "uv.exe"} and prefix[1:] == ["run", "--no-project", "python"]:
-            return script
+            return script, parts[-1], token
     return None
+
+
+def _relay_canonical_event(command: str) -> str | None:
+    """The canonical event a managed relay command reports, or None if unmanaged."""
+    installed = _installed_relay_parts(command)
+    if installed is not None:
+        return installed[1]
+    legacy = _legacy_relay_parts(command)
+    return legacy[1] if legacy is not None else None
 
 
 def _relay_command(command: object) -> bool:
@@ -1099,6 +2798,31 @@ def _commands_in_handler(handler: object) -> Iterator[str]:
             if isinstance(item, dict) and isinstance(item.get("command"), str):
                 yield item["command"]
     elif isinstance(handler.get("command"), str):
+        yield handler["command"]
+
+
+def _executed_commands_in_handler(handler: object) -> Iterator[str]:
+    """Like `_commands_in_handler`, but only commands a CLI actually runs.
+
+    A `type: prompt` (or any non-`command`) handler carrying a relay `command`
+    never executes it, so it must not count as a registration. Nested
+    (claude/codex/gemini) and flat (copilot/agy/cursor) shapes alike. A flat handler
+    with no `type` counts as a command: Cursor's bare `{"command": …}` entries carry
+    none and run as commands. Stripping keeps the any-shape `_commands_in_handler`: a
+    managed command is removed wherever it sits.
+    """
+    if not isinstance(handler, dict):
+        return
+    nested = handler.get("hooks")
+    if isinstance(nested, list):
+        for item in nested:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "command"
+                and isinstance(item.get("command"), str)
+            ):
+                yield item["command"]
+    elif handler.get("type", "command") == "command" and isinstance(handler.get("command"), str):
         yield handler["command"]
 
 
@@ -1142,9 +2866,11 @@ def hook_event_container(config: dict, dialect: str) -> dict:
 
 
 def _relay_in_handlers(handlers) -> bool:
-    """True if any handler in a native-event list carries the relay command."""
+    """True if any handler in a native-event list executes the relay command."""
     return isinstance(handlers, list) and any(
-        _relay_command(command) for handler in handlers for command in _commands_in_handler(handler)
+        _relay_command(command)
+        for handler in handlers
+        for command in _executed_commands_in_handler(handler)
     )
 
 
@@ -1167,15 +2893,30 @@ def strip_relay_hooks(config: dict, dialect: str) -> bool:
     Empty event lists are dropped; an empty container is left in place for
     `merge_hooks` to refill.
     """
-    container = hook_event_container(config, dialect)
+    return _strip_commands(hook_event_container(config, dialect), _relay_command)
+
+
+def _strip_commands(
+    container: dict,
+    predicate: Callable[[object], bool],
+    native_events: Iterable[str] | None = None,
+) -> bool:
+    """Drop every command `predicate` selects from a `native event -> handlers` map.
+
+    `native_events` limits the visit (default: every event in `container`). A
+    non-list event value is not ours and is skipped. Removal is at command
+    granularity for nested entries and whole-entry for flat ones; empty event lists
+    are dropped. True if anything went. The predicate alone decides what is
+    stripped, in both shapes.
+    """
     removed = False
-    for native_event in list(container):
+    for native_event in list(container if native_events is None else native_events):
         handlers = container.get(native_event)
         if not isinstance(handlers, list):
             continue
         kept = []
         for handler in handlers:
-            if not any(_relay_command(c) for c in _commands_in_handler(handler)):
+            if not any(predicate(c) for c in _commands_in_handler(handler)):
                 kept.append(handler)
                 continue
             # claude/codex/gemini wrap commands in a nested "hooks" list, and a
@@ -1186,9 +2927,7 @@ def strip_relay_hooks(config: dict, dialect: str) -> bool:
             nested = handler.get("hooks") if isinstance(handler, dict) else None
             if isinstance(nested, list):
                 surviving = [
-                    c
-                    for c in nested
-                    if not (isinstance(c, dict) and _relay_command(c.get("command")))
+                    c for c in nested if not (isinstance(c, dict) and predicate(c.get("command")))
                 ]
                 if surviving:
                     if len(surviving) != len(nested):
@@ -1205,10 +2944,212 @@ def strip_relay_hooks(config: dict, dialect: str) -> bool:
     return removed
 
 
-def relay_registered(config: dict, dialect: str, events: Iterable[str]) -> bool:
-    """True if the bmad-loop relay is registered for any of `events`."""
+def _strip_hazardous_unmapped_relays(container: dict, registrations: Mapping[str, str]) -> bool:
+    """Strip managed relays under natives outside `registrations` that would lie.
+
+    A relay under an unregistered native event is hazardous when the canonical
+    event it reports is `Stop` (it would complete sessions early) or one the
+    registrations report from a different native event (the two disagree). For
+    every profile that maps Stop (all that can complete) this is the same set
+    `relay_registered` refuses. Any other relay there is left alone: it
+    may belong to an alias profile sharing this config file (DW-409).
+
+    `Stop` joins the set only through a registration reporting it, which every
+    profile that can complete has. A Stop-less registration set (an alias mapping
+    only `Notification`, or probe-capture commands, which parse to None) must not
+    strip another alias's `Stop` relay from the native it legitimately sits under.
+    `relay_registered` needs no such guard: it refuses a Stop-less map outright.
+    """
+    hazardous = {
+        canonical
+        for command in registrations.values()
+        if (canonical := _relay_canonical_event(command)) is not None
+    }
+
+    def hazardous_relay(command: object) -> bool:
+        return isinstance(command, str) and _relay_canonical_event(command) in hazardous
+
+    unmapped = [native for native in container if native not in registrations]
+    return _strip_commands(container, hazardous_relay, unmapped)
+
+
+def relay_registered(config: dict, dialect: str, events: Mapping[str, str]) -> bool:
+    """True if the relay is truthfully registered for a profile's `events`.
+
+    `events` maps each native event to the canonical event it reports. Only
+    executed (`type: command`) handlers count. Registered means every native event
+    mapped to Stop — the completion signal — runs a relay reporting `Stop`, and no
+    mapped native event runs a relay reporting a DIFFERENT canonical event: a
+    SessionStart firing `relay Stop` would complete every session at launch, and a
+    Stop firing `relay SessionEnd` never completes one. Other events need not be
+    present.
+
+    The same hazard reaches native events OUTSIDE `events` (DW-409): a claude
+    `SubagentStop` firing `relay Stop` completes a session when a subagent ends. So
+    a relay under an unmapped native that reports `Stop`, or a canonical event the
+    map reports from a different native, is refused too. A relay there reporting a
+    canonical event the map never names is accepted: profiles can share a config
+    file, and it may be an alias profile's registration. For agy the same refusal
+    covers every other top-level group, since agy runs them all (DW-490,
+    `foreign_group_relay_hazards`).
+    """
     container = hook_event_container(config, dialect)
-    return any(_relay_in_handlers(container.get(event, [])) for event in events)
+    stop_natives = [native for native, canonical in events.items() if canonical == "Stop"]
+    if not stop_natives:
+        return False
+    satisfied: set[str] = set()
+    for native, canonical in events.items():
+        handlers = container.get(native)
+        if not isinstance(handlers, list):
+            continue
+        for handler in handlers:
+            for command in _executed_commands_in_handler(handler):
+                reported = _relay_canonical_event(command)
+                if reported is None:
+                    continue
+                if reported != canonical:
+                    return False
+                satisfied.add(native)
+    hazardous = {"Stop", *events.values()}
+    for native, handlers in container.items():
+        if native in events or not isinstance(handlers, list):
+            continue
+        for handler in handlers:
+            for command in _executed_commands_in_handler(handler):
+                if _relay_canonical_event(command) in hazardous:
+                    return False
+    if foreign_group_relay_hazards(config, dialect, events):
+        return False
+    return all(native in satisfied for native in stop_natives)
+
+
+@dataclass(frozen=True)
+class RelayRegistration:
+    """One hooked profile's project hook config, as :func:`read_relay_registration`
+    reads it.
+
+    ``parsed`` is the loaded JSON (``{}`` when the file is missing or not JSON).
+    ``registered`` is :func:`relay_registered` over it, False for a non-object top
+    level and forced False by a malformed handler list. ``fault_detail`` is the
+    config fault without the path ("is not valid JSON", "is not a JSON object",
+    "has malformed handlers for A, B"), or None when the file is absent or parsed
+    cleanly; a caller that must render a relative path joins it to
+    ``profile.hooks.config_path`` itself."""
+
+    config_path: Path
+    parsed: object
+    registered: bool
+    fault_detail: str | None
+
+    @property
+    def fault(self) -> str | None:
+        """``fault_detail`` behind the absolute ``config_path`` (validate's
+        ``hooks.config-parse`` message), or None when there is no fault."""
+        if self.fault_detail is None:
+            return None
+        return f"{self.config_path} {self.fault_detail}"
+
+
+def read_relay_registration(project: Path, profile: CLIProfile) -> RelayRegistration:
+    """The registration core shared by ``validate``'s ``hooks.*`` checks, the
+    launch relay warning and ``probe-adapter``'s scan.
+
+    It reads only ``project / profile.hooks.config_path``. Project-only is the
+    contract (DW-645): a relay registered in a user- or local-scope settings file
+    (or a CLI's managed/plugin hooks) is not seen here, though the CLI may still
+    merge it; ``bmad-loop init`` registers the relay in the project config.
+
+    A missing file is unregistered with no fault. Invalid JSON, a non-object top
+    level, and a non-list handler value under a declared native event are faults
+    (``fault_detail``) and read unregistered. Any other read error (``OSError``,
+    ``UnicodeDecodeError``) propagates, as it always has for validate; a caller
+    that must not raise catches ``(OSError, ValueError)``."""
+    hook_config = project / profile.hooks.config_path
+    if not hook_config.is_file():
+        return RelayRegistration(hook_config, {}, False, None)
+    try:
+        parsed: object = json.loads(hook_config.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return RelayRegistration(hook_config, {}, False, "is not valid JSON")
+    if not isinstance(parsed, dict):
+        return RelayRegistration(hook_config, parsed, False, "is not a JSON object")
+    registered = relay_registered(parsed, profile.hooks.dialect, profile.hooks.events)
+    container = hook_event_container(parsed, profile.hooks.dialect)
+    malformed = [
+        event
+        for event in profile.hooks.events
+        if event in container and not isinstance(container[event], list)
+    ]
+    if malformed:
+        return RelayRegistration(
+            hook_config, parsed, False, f"has malformed handlers for {', '.join(malformed)}"
+        )
+    return RelayRegistration(hook_config, parsed, registered, None)
+
+
+def missing_relay_events(config: dict, dialect: str, events: Mapping[str, str]) -> list[str]:
+    """Native events in ``events`` with no executed relay reporting their canonical
+    event, in map order.
+
+    `relay_registered` answers only for the completion signal: a config written
+    before a profile mapped a newer event (claude's ``StopFailure``) still passes
+    it while that event never reaches the loop. This names what such a config
+    lacks; ``bmad-loop init`` registers it in place. A relay that reports a
+    different canonical event does not count — `relay_registered` refuses that
+    config outright.
+    """
+    container = hook_event_container(config, dialect)
+    missing: list[str] = []
+    for native, canonical in events.items():
+        handlers = container.get(native)
+        present = isinstance(handlers, list) and any(
+            _relay_canonical_event(command) == canonical
+            for handler in handlers
+            for command in _executed_commands_in_handler(handler)
+        )
+        if not present:
+            missing.append(native)
+    return missing
+
+
+def foreign_group_relay_hazards(
+    config: dict, dialect: str, events: Mapping[str, str]
+) -> list[tuple[str, str]]:
+    """`(group, native)` for each agy top-level group other than ours that lies.
+
+    agy runs the hooks of EVERY top-level group, not only ANTIGRAVITY_HOOK_GROUP,
+    so a relay hand-added to a user group fires as surely as ours (DW-490). A
+    group's native event lies under the same rules `relay_registered` applies to
+    the managed group: a mapped native whose executed relay reports a different
+    canonical event, or an unmapped one whose relay reports `Stop` or a canonical
+    event the map reports elsewhere. A truthful relay there is accepted but never
+    satisfies registration. Other dialects have one container: always [].
+
+    These groups are the operator's, so this only reports: `merge_hooks` never
+    writes outside the managed group, and `init` warns instead of repairing.
+    """
+    if dialect != "antigravity-hooks-json":
+        return []
+    unmapped_hazardous = {"Stop", *events.values()}
+    found: list[tuple[str, str]] = []
+    for group, container in config.items():
+        if group == ANTIGRAVITY_HOOK_GROUP or not isinstance(container, dict):
+            continue
+        for native, handlers in container.items():
+            if not isinstance(handlers, list):
+                continue
+            expected = events.get(native)
+            for command in (c for h in handlers for c in _executed_commands_in_handler(h)):
+                reported = _relay_canonical_event(command)
+                if reported is None:
+                    continue
+                lies = (
+                    (reported != expected) if native in events else (reported in unmapped_hazardous)
+                )
+                if lies:
+                    found.append((group, native))
+                    break
+    return found
 
 
 def registered_relay_paths(
@@ -1220,6 +3161,7 @@ def registered_relay_paths(
     executable text as written in the command, or the legacy script path with
     the project directory substituted. The `Path` answers presence questions;
     the spelling answers whether init would now write something different.
+    Only executed (`type: command`) handlers are read — nothing else runs.
     """
     container = hook_event_container(config, dialect)
     paths: list[tuple[Path, str]] = []
@@ -1228,7 +3170,7 @@ def registered_relay_paths(
         if not isinstance(handlers, list):
             continue
         for handler in handlers:
-            for command in _commands_in_handler(handler):
+            for command in _executed_commands_in_handler(handler):
                 executable = relay_executable_text(command)
                 if executable is not None:
                     paths.append((Path(executable), executable))
@@ -1238,6 +3180,26 @@ def registered_relay_paths(
                         path = Path(script.replace("$CLAUDE_PROJECT_DIR", str(project)))
                         paths.append((path, str(path)))
     return paths
+
+
+def registered_relay_interpreters(config: dict, dialect: str, events: Iterable[str]) -> list[str]:
+    """Interpreter tokens (`python3`, `uv`, ...) that legacy relay commands name.
+
+    Only the command's first token, as registered, from executed handlers: an old
+    copied-script relay whose interpreter cannot be found fails every hook run.
+    """
+    container = hook_event_container(config, dialect)
+    interpreters: list[str] = []
+    for event in events:
+        handlers = container.get(event)
+        if not isinstance(handlers, list):
+            continue
+        for handler in handlers:
+            for command in _executed_commands_in_handler(handler):
+                legacy = _legacy_relay_parts(command)
+                if legacy is not None:
+                    interpreters.append(legacy[2])
+    return interpreters
 
 
 def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tuple[dict, bool]:
@@ -1275,6 +3237,7 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
             if not _managed_hook_in_handlers(handlers):
                 handlers.append(_hook_entry(dialect, command))
                 changed = True
+        changed |= _strip_hazardous_unmapped_relays(group, registrations)
         return config, changed
     if dialect in ("copilot-settings-json", "cursor-hooks-json"):
         # Both are versioned. For cursor this is REQUIRED, not cosmetic: Cursor 3.x
@@ -1291,7 +3254,13 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
             for existing in _commands_in_handler(h)
         ):
             # Scope the strip to this event. Profiles may share a config file;
-            # their disjoint events must survive later registrations.
+            # their disjoint events must survive later registrations. (The
+            # unmapped-event strip below is scoped the same way: it removes only
+            # relays reporting Stop or a canonical event registered here from
+            # another native. A Stop relay under an unmapped native completes
+            # this profile's sessions early. Aliases whose maps put one canonical
+            # event on different natives are contradictory for one CLI, so the
+            # last merge wins: an accepted tradeoff — DW-409.)
             scoped = {"hooks": {native_event: matchers}}
             changed |= strip_relay_hooks(scoped, dialect)
             if native_event in scoped["hooks"]:
@@ -1305,6 +3274,7 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
         if not _managed_hook_in_handlers(matchers):
             matchers.append(_hook_entry(dialect, command))
             changed = True
+    changed |= _strip_hazardous_unmapped_relays(hooks, registrations)
     return config, changed
 
 
@@ -1334,6 +3304,203 @@ def _confined_to(target: Path, root: Path) -> bool:
         return False
 
 
+TREE_OUTSIDE_CHECK = "skills.tree-outside"
+
+
+def _resolved_text(path: Path) -> str:
+    """``path`` resolved for a finding's ``target``; the raw spelling if resolving fails."""
+    try:
+        return str(path.resolve())
+    except (OSError, RuntimeError):
+        return str(path)
+
+
+def skill_trees_outside(
+    project: Path, repo_root: Path, trees: Iterable[SkillTree], *, isolation: str
+) -> list[Finding]:
+    """``skills.tree-outside``: a skill tree, or a skill the run needs from one,
+    that a link carries out of where bmad-loop can follow it.
+
+    Two shapes, judged by different roots because two different consumers refuse
+    them:
+
+    - The **tree itself** resolving outside ``project`` (a junction from
+      ``.agents/skills`` to a global folder). ``init`` refuses to write through it
+      (:func:`_confined_to`), so it is a ``warning`` — unless worktree isolation is
+      on and it also leaves ``repo_root``, where seeding cannot copy a single skill
+      out of it and the finding is a ``problem``. Its skill-level links are then
+      not reported again.
+    - A **required skill directory** — the resolved dev primitive plus the review
+      skills it will invoke (:func:`required_review_skill_names`: the shape's
+      ``required`` skills, or for a shape that cannot be read the
+      merged-or-standalone fallback the worktree gate uses) — resolving outside
+      ``repo_root``. An advisory (``when``-gated) reviewer is left out, as in
+      :func:`base_skills_seed_incomplete`: it may never run, so its absence from a
+      worktree cannot stall the session. Only worktree isolation reads skills through a copy,
+      and its seeding skips a source outside the repo and then escalates the unit
+      mid-run, so it is a ``problem`` there and no finding at all otherwise: in
+      place, the session reads the link directly.
+
+    A link that stays inside the repo (``.claude/skills -> .agents/skills``, the
+    ``skills`` CLI's own layout) is fine on both counts. A skill that is absent or
+    unresolved is :func:`missing_base_skills`' to report, not this check's.
+    ``detail``: ``tree``, ``skill`` (skill-level only), ``target`` (the resolved
+    path) and ``isolation``.
+
+    For a :class:`SkillScope` the tree-level check covers its primary tree and the
+    skill-level check the copies its scope locates in a project tree. A skill
+    resolved from a user root is excluded: it is outside the repo by design, the
+    session loads it natively, and worktree seeding never copies it."""
+    worktree = isolation == "worktree"
+    findings: list[Finding] = []
+    for scope in _scope_items(trees):
+        tree = scope.tree
+        tree_dir = project / tree
+        if not _confined_to(tree_dir, project):
+            leaves_repo = not _confined_to(tree_dir, repo_root)
+            target = _resolved_text(tree_dir)
+            fatal = worktree and leaves_repo
+            consequence = (
+                "; worktree isolation cannot seed skills from outside the repo, so every "
+                "isolated session would stall — install them per project or set "
+                '[scm] isolation = "none"'
+                if fatal
+                else ""
+            )
+            findings.append(
+                Finding(
+                    TREE_OUTSIDE_CHECK,
+                    "problem" if fatal else "warning",
+                    f"{tree} resolves outside the project ({target}) — `bmad-loop init` "
+                    f"refuses to install into it; install the skills into the project "
+                    f"(`npx skills add` without -g) rather than linking the tree"
+                    f"{consequence}",
+                    {"tree": tree, "target": target, "isolation": isolation},
+                )
+            )
+            if fatal:
+                continue
+        if not worktree:
+            continue
+        primitive = resolve_dev_primitive(project, scope)
+        # only the reviewers the primitive will invoke, as the worktree's
+        # required-skill gate; an unreadable review shape takes its same
+        # merged-or-standalone fallback
+        review_skills = required_review_skill_names(project, scope)
+        required = (*((primitive,) if primitive is not None else ()), *review_skills)
+        for skill in dict.fromkeys(required):
+            found = skill_locate.locate(project, scope, skill)
+            if found is not None and found.origin == "user":
+                continue
+            skill_dir = found.path if found is not None else tree_dir / skill
+            if not skill_dir.is_dir() or _confined_to(skill_dir, repo_root):
+                continue
+            target = _resolved_text(skill_dir)
+            rel = found.display if found is not None else f"{tree}/{skill}"
+            findings.append(
+                Finding(
+                    TREE_OUTSIDE_CHECK,
+                    "problem",
+                    f"{rel} resolves outside the repo ({target}) — worktree "
+                    f"isolation cannot seed a skill from outside the repo, so the isolated "
+                    f"session would stall on it; install it into the project (`npx skills "
+                    f'add` without -g) or set [scm] isolation = "none"',
+                    {
+                        "tree": tree,
+                        "skill": skill,
+                        "target": target,
+                        "isolation": isolation,
+                        **_root_detail(found),
+                    },
+                )
+            )
+    return findings
+
+
+# Bound on one `<binary> --version` probe for the hook-event version gate.
+CLI_VERSION_TIMEOUT_S = 10.0
+# Successful probes by resolved binary path and profile env: one launch per
+# binary per process, so worktree provisioning does not respawn the CLI for every
+# story. The env is part of the key because a launcher's answer can depend on it
+# (a version-manager shim, an `env node` launcher). A failed probe is not cached
+# — the next registration tries again.
+_cli_versions: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[int, int, int]] = {}
+
+
+def cli_version(profile: CLIProfile) -> tuple[int, int, int] | None:
+    """The installed CLI's version from ``<binary> --version``, or None when the
+    binary is not on PATH, the run fails (spawn error, timeout, stop, nonzero exit)
+    or prints no ``X.Y.Z``. Never raises: every None is an answer the caller turns
+    into a visible "version unknown" note. The environment is the session's own
+    (the profile's ``env`` over this process's), both to resolve the binary, as
+    `codex_trust` does, and to run it: a launcher that finds its interpreter on
+    the profile's PATH must find it here too."""
+    session_env = {**os.environ, **profile.env}
+    resolved = shutil.which(profile.binary, path=session_env.get("PATH"))
+    if resolved is None:
+        return None
+    key = (resolved, tuple(sorted(profile.env.items())))
+    cached = _cli_versions.get(key)
+    if cached is not None:
+        return cached
+    try:
+        run = childrun.run_argv(
+            [resolved, "--version"],
+            cwd=None,
+            timeout=CLI_VERSION_TIMEOUT_S,
+            env=session_env if profile.env else None,
+        )
+    except (OSError, subprocess.SubprocessError, ProcessHostError):
+        return None
+    if run.timed_out or run.interrupted or run.returncode != 0:
+        return None
+    version = parse_cli_version((run.stdout or "") + "\n" + (run.stderr or ""))
+    if version is not None:
+        _cli_versions[key] = version
+    return version
+
+
+def gated_hook_events(profile: CLIProfile) -> tuple[dict[str, str], list[str]]:
+    """The profile's ``native -> canonical`` events this CLI install can carry, and
+    one note per event left out (#865).
+
+    A native event in ``hooks.event_min_versions`` is registered only when
+    :func:`cli_version` reads a version at or above its floor: an older CLI may
+    reject the whole hook config over one unknown key (Claude Code before 2.1.78
+    skips the entire settings file, Stop relay included), so an unreadable
+    version leaves the event out too. A profile with no floors never spawns the
+    probe, and the validator refuses a floor on a Stop carrier, so the
+    completion signal is never gated. Every caller surfaces the notes."""
+    events = dict(profile.hooks.events)
+    floors = profile.hooks.event_min_versions
+    if not floors:
+        return events, []
+    version = cli_version(profile)
+    notes: list[str] = []
+    for native, floor in floors.items():
+        need = parse_cli_version(floor)
+        if native not in events or (version is not None and need is not None and version >= need):
+            continue
+        del events[native]
+        found = "an unreadable version" if version is None else ".".join(map(str, version))
+        notes.append(
+            f"{native} hook not registered ({profile.name}): it needs {profile.binary} "
+            f">= {floor}, found {found} — upgrade it and re-run "
+            f"`bmad-loop init --cli {profile.name}`"
+        )
+    return events, notes
+
+
+def strip_event_relays(config: dict, dialect: str, natives: Iterable[str]) -> bool:
+    """Drop managed relay commands registered under ``natives``. True if any went.
+
+    The other half of the version gate: a config written while the CLI was new
+    enough keeps its gated relay after a downgrade, and that one entry can make
+    the older CLI skip the whole file — so registration strips what it gated out.
+    User handlers under the same native event stay."""
+    return _strip_commands(hook_event_container(config, dialect), _relay_command, natives)
+
+
 def _register_hooks(project: Path, profile: CLIProfile) -> int:
     if profile.hookless:
         print(f"  no hooks needed ({profile.name}): HTTP/SSE transport")
@@ -1350,15 +3517,21 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
         except json.JSONDecodeError:
             print(f"FAIL: {config_path} is not valid JSON; fix it and re-run init")
             return 1
+    events, gate_notes = gated_hook_events(profile)
     try:
         registrations = {
             native: _hook_command(project, profile, canonical)
-            for native, canonical in profile.hooks.events.items()
+            for native, canonical in events.items()
         }
     except ProfileError as e:
         print(f"FAIL: {e}")
         return 1
+    gated_out = [native for native in profile.hooks.events if native not in events]
+    stripped = strip_event_relays(config, profile.hooks.dialect, gated_out)
     config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    changed |= stripped
+    for note in gate_notes:
+        print(f"  warning: {note}")
     if changed:
         # atomic_write_text, never write_text (#379), the same rule
         # `_worktree_local_exclude` states for its bytes sibling. This is a
@@ -1391,6 +3564,15 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
         print(f"  hooks registered ({profile.name}): {config_path}")
     else:
         print(f"  hooks already registered ({profile.name})")
+    # DW-490: a lying relay in a group init does not own stays; say where it is.
+    for group, native in foreign_group_relay_hazards(
+        config, profile.hooks.dialect, profile.hooks.events
+    ):
+        print(
+            f"  warning: {config_path} group {group!r} runs a bmad-loop relay under "
+            f"{native!r} that reports the wrong event — init leaves groups it does not "
+            f"own alone; remove that relay by hand"
+        )
     return 0
 
 
@@ -1677,7 +3859,7 @@ _SHIELD_LOCK_NAME = "bmad-loop-shield.lock"
 # <paths>` after the `add -A` at `verify.py:1891` and `:1932`. No shadow, so no
 # seed, no `_shield_inherited_excludes`, no permanent `extensions.worktreeConfig`,
 # no version floor. It is MECHANICALLY REACHABLE: those adds are the orchestrator's
-# own, not an LLM's (no skill in `data/skills/` runs git).
+# own, not an LLM's (no skill in `skills/` runs git).
 #
 # Rejected on the merits, for two reasons that are about correctness rather than
 # scope:
@@ -2806,7 +4988,7 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
             #
             # The rollback exists because the enable one line above is a PERMANENT
             # repo-format change, and the guarantee this code owes (docstring,
-            # CHANGELOG, docs/FEATURES.md) is that the flag outlives a failed shield
+            # CHANGELOG) is that the flag outlives a failed shield
             # only where a rollback was DECLINED or could not be made, and the reason
             # says which. `needs_enable` gates it — a safety property, not a
             # micro-optimization, and see `_shield_undo_extension` for the second gate
@@ -2869,7 +5051,7 @@ def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
     BMAD installer's copy or local edits are never clobbered silently). Returns
     True if any skill was skipped because it already existed.
     """
-    skills_root = resources.files("bmad_loop.data").joinpath("skills")
+    root = skills_root()
     skipped_any = False
     for tree in trees:
         tree_dir = project / tree
@@ -2896,7 +5078,7 @@ def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
                 continue
             if dst.exists():
                 shutil.rmtree(dst)
-            _copy_traversable(skills_root.joinpath(skill), dst)
+            _copy_traversable(root.joinpath(skill), dst)
             installed.append(skill)
         parts: list[str] = []
         if installed:
@@ -2980,6 +5162,8 @@ def install_into(
     for profile in profiles:
         if _register_hooks(project, profile) != 0:
             return 1
+    if any(not profile.hookless for profile in profiles):
+        _warn_unsafe_relay_path()
 
     # 3. bundled skills into each CLI's skill tree (deduped: codex+gemini share
     #    .agents/skills)

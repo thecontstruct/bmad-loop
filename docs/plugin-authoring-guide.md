@@ -10,12 +10,15 @@ Unity game-engine layer. A plugin can:
 
 Plugins are **folder-drop**: a directory with a `plugin.toml` manifest (plus any
 helper scripts) dropped under `.bmad-loop/plugins/<name>/`. No registration, no
-install step. A plugin that ships **in-process Python** is loaded only when you
-**trust** it by name — dropping a folder in never runs code.
+install step. Dropping a folder in **never runs code**: a project plugin with
+anything executable — shell hooks, workflows, seeds, or in-process Python — runs
+only after you **grant** it with `bmad-loop plugins enable <name>`, which records
+a sha256 of the whole plugin directory outside the repo. See
+[Trust & safety](#trust--safety).
 
-> Already wrote a [CLI adapter profile](../README.md#other-coding-clis) or the old
-> `[engine]` block? Same idea — declarative TOML + optional scripts, discovered and
-> overlaid. The plugin system generalizes both.
+> Already wrote a [CLI adapter profile](../README.md#other-coding-clis)? Same idea —
+> declarative TOML + optional scripts, discovered and overlaid. The plugin system
+> generalizes it.
 
 ---
 
@@ -37,21 +40,37 @@ key = "greeting"
 type = "str"
 default = "hi"
 label = "Greeting"
-help = "Shown in the settings UI once this plugin is enabled."
+help = "Shown in the settings UI."
 ```
 
 That's a complete, loadable plugin. It has no `[hooks]` and no `[python]`, so it
 runs no code and is byte-identical to "no plugin" at run time — it exists only to
 contribute a setting. This is the shape the bundled
 [`example`](../src/bmad_loop/data/plugins/example/plugin.toml) plugin ships in.
+A settings-only plugin needs no grant: it loads as soon as it is discovered, and
+its section always shows in the settings TUI.
 
-A setting-only section appears in the TUI only once the plugin is **enabled**:
+Now give it behavior. Append a hook:
 
 ```toml
-# .bmad-loop/policy.toml
-[plugins]
-enabled = ["hello"]
+[hooks.pre_story]
+cmd = 'python3 "{scripts}/hello.py"'
 ```
+
+and add `.bmad-loop/plugins/hello/hello.py` beside the manifest. The plugin now
+has an executable surface, so it is **inert until you grant it**. The next
+`bmad-loop run` prints a `note:` that `hello` is not granted, and runs without
+it. Review the folder, then grant it:
+
+```console
+$ bmad-loop plugins enable hello
+plugin "hello" granted: sha256:3f9a1c0b7d2e (2 files) in ~/.local/state/bmad-loop/<project-tag>/plugin-grants.json
+```
+
+The grant pins the bytes of every file in the folder. Edit any of them and the
+next launch stops with `plugin "hello" changed since it was granted`. Review the
+change, then re-pin it with `bmad-loop plugins accept hello`. `bmad-loop plugins`
+lists every discovered plugin with its grant status.
 
 ---
 
@@ -69,6 +88,13 @@ same-name plugin **overrides** an earlier one; a new name **extends** the set):
 Each plugin lives in its **own directory** — that directory is the plugin's
 `{scripts}` root (see [`{scripts}` substitution](#scripts-substitution)), so its
 manifest and helper scripts sit together.
+
+**Origin decides trust.** Builtin plugins (and, once they exist, entry-point
+plugins) are trusted by provenance: they ship with the installed package. A
+project-local plugin lives in the agent-writable repo, so it runs only under an
+operator grant (see [Trust & safety](#trust--safety)). A project plugin that
+overrides a builtin name gets no trust from the builtin: the override needs its
+own grant, and a refused override does **not** fall back to the builtin.
 
 **Entry points are a documented future seam.** `discover()` already yields an
 `entry_point` source between builtin and project, but `_discover_entry_points()`
@@ -98,10 +124,15 @@ needs. The manifest parses into the immutable `PluginManifest`
 | `priority`    | int    | `0`     | Cross-plugin ordering at a shared stage; **lower runs first**, then load order. |
 | `seed_files`  | list   | `[]`    | Project-relative gitignored files to copy into each isolated worktree.          |
 | `seed_globs`  | list   | `[]`    | Project-relative glob patterns to expand + copy into each worktree.             |
+| `read_only`   | bool   | `false` | The plugin's hooks write nothing a verify pass reads; see below.                |
 
 `seed_files` / `seed_globs` must be **project-relative** (an absolute path is
 rejected at load). They let a plugin prime an isolated checkout with gitignored
 paths it needs — e.g. the Unity plugin seeds an MCP-generated skill tree.
+
+`read_only` must be a TOML boolean (any other type is refused at load). It covers
+every hook the plugin has, declarative and `[python]`, and matters only under
+`[verify] reuse_unchanged` — see [Reused skip-review gates](#reused-skip-review-gates).
 
 ### `[[settings]]` — settings schema
 
@@ -143,8 +174,10 @@ module = "hooks.py"        # plugin-relative file
 class = "MyPlugin"         # subclass of bmad_loop.plugins.Plugin (default "Plugin")
 ```
 
-Declaring `[python]` makes the **whole plugin trust-gated**: the module is never
-imported unless the plugin is in `[plugins] enabled`. See [Trust](#trust--safety).
+The module is never imported until the plugin is trusted: a **builtin** by naming
+it in `[plugins] enabled`, a **project** plugin by granting it with
+`bmad-loop plugins enable <name>`. An un-enabled builtin `[python]` plugin is
+wholly inert (its hooks, workflows and seeds too). See [Trust](#trust--safety).
 
 ### `[workflows.<name>]` — provided workflows
 
@@ -172,27 +205,108 @@ that breaks across machines or between a builtin and a project-local copy.
 
 ## Trust & safety
 
-There are **two trust tiers**, by design:
+Trust is decided by **origin** and pinned by **content**. A name is
+not trusted on its own: a folder can be swapped under a name that was approved
+before.
 
-1. **Declarative tier (always runs).** A data-only or declarative plugin —
-   settings + `[hooks.<stage>]` shell commands — loads and runs as soon as it is
-   discovered. This is the same risk surface as the old `engine.toml *_cmd` hooks
-   or a project's verify commands: operator-authored shell, trusted by virtue of
-   living in the repo.
-
-2. **In-process tier (trust-gated).** A plugin that declares a `[python]` module
-   is **never imported or executed** unless its `name` is in:
+1. **Builtin and entry-point plugins — trusted by provenance.** They ship inside
+   the installed package. Their manifests, settings and declarative hooks load
+   when discovered. A builtin that declares an in-process `[python]` module runs
+   only when its name is in:
 
    ```toml
    [plugins]
-   enabled = ["my-plugin"]
+   enabled = ["unity"]
    ```
 
-   **Dropping a `[python]` plugin folder in never runs its code.** The module
-   (and anything it provides that depends on the module — its `on_<stage>`
-   handlers, its `validate`, and its provided **workflows**) stays inert until you
-   list it. An un-enabled `[python]` plugin is recorded `plugin-untrusted` in the
-   run journal.
+   An un-enabled builtin `[python]` plugin is **wholly inert**: its module, its
+   `[hooks.*]`, its workflows and its seeds all stay off, and the run's
+   `plugins-active` journal line leaves it out.
+
+2. **Project plugins (`.bmad-loop/plugins/<name>/`) — trusted by content grant.**
+   A project plugin with an **executable surface** runs only after the operator
+   grants it. An executable surface is any of: `[hooks.*]`, `[workflows.*]`,
+   `[python]`, `seed_files` or `seed_globs`. A settings-only project plugin needs
+   no grant.
+
+   ```console
+   $ bmad-loop plugins                   # list plugins, origin, surface, grant status
+   $ bmad-loop plugins enable <name>     # first grant
+   $ bmad-loop plugins accept <name>     # re-pin after reviewing a change
+   $ bmad-loop plugins revoke <name>     # drop the grant
+   ```
+
+   Toggling a project plugin on in the [settings TUI](tui-guide.md) grants it too.
+
+   **What a grant is.** A sha256 over **every file in the plugin directory** (the
+   manifest, scripts, modules and dotfiles; `__pycache__` excluded), plus the
+   directory's path relative to the repo. It is stored **outside the repo**, at
+   `<state root>/<project-tag>/plugin-grants.json`, because the repo and its
+   `policy.toml` are agent-writable and a grant kept there could be forged. For a
+   project plugin the grant replaces `[plugins] enabled`: `bmad-loop plugins`
+   never writes `policy.toml`. Grants are per machine and keyed by the project
+   path.
+
+   **What a launch does.** `bmad-loop run`, `sweep` and `resume` each read the
+   grants **once**, judge every plugin before their first side effect,
+   and hand the same frozen grants to the engine and to any auto-sweep child.
+   Nothing later re-reads the store. The outcome depends on what the operator
+   intended:
+
+   | Plugin state                                                     | Outcome                                                                                            |
+   | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+   | never granted, not in `[plugins] enabled`                        | **inert**: a `note:` at launch, a `plugin-refused` journal row, the run goes on without it         |
+   | named in `[plugins] enabled` but never granted                   | **startup fails**; the error points to `bmad-loop plugins enable <name>`                           |
+   | granted, then a file added, removed or changed, or the dir moved | **startup fails** (`changed since it was granted`); review, then `bmad-loop plugins accept <name>` |
+   | granted dir unreadable (a link inside it, over a cap)            | **startup fails**; fix the dir, then `bmad-loop plugins accept <name>`                             |
+   | granted, then stripped of every hook, workflow, module and seed  | **startup fails**; restore them, or `bmad-loop plugins revoke <name>`                              |
+   | granted dir deleted, or moved out of `.bmad-loop/plugins/`       | **startup fails** (`no longer discovered`); restore it, or `bmad-loop plugins revoke <name>`       |
+   | granted and unchanged                                            | runs from a verified snapshot                                                                      |
+
+   A fatal refusal is raised before **any** plugin code runs, builtins included.
+   In an auto-sweep child it lands as `sweep-auto-not-started` plus a
+   notification. Nothing on a run, sweep or child path ever prompts: a refusal
+   never turns into a stall waiting for an answer.
+
+   **Snapshot execution.** A granted plugin does not run from its live folder. At
+   launch its verified files are copied to a content-addressed snapshot under
+   `<state root>/<project-tag>/_plugin-snapshots/<digest>/`, and that copy
+   becomes its `{scripts}` root. A `[python]` module is compiled from the exact
+   bytes the grant hashed; no `.pyc` is read or written. A session that edits
+   the live plugin folder mid-run therefore changes nothing until the next launch,
+   which refuses the edit. Hooks run with `PYTHONDONTWRITEBYTECODE=1`.
+
+   **Limits.** The plugin directory itself may be a symlink, but links (and
+   Windows junctions) inside it are refused. Caps: 2048 files, 16 MiB per file,
+   64 MiB total.
+
+   `bmad-loop validate` reports every refusal under the `plugins.trust` check.
+
+**What a grant does not cover.** These residuals are known and deliberate:
+
+- **Same-user tampering outside the repo.** The store and the snapshots live in
+  the user's state directory. A process running as the same user that sets out to
+  rewrite them can. Out-of-tree moves the trust record out of reach of a session
+  editing the repo; it is not a sandbox (the same boundary as the run's config
+  digest).
+- **Moving the project loses its grants**. They are keyed by the project
+  path, so a moved or re-cloned project starts ungranted. This fails closed:
+  re-grant after a move.
+- **Files a hook names outside `{scripts}`.** A hook `cmd` that runs a script
+  elsewhere in the repo runs that script unpinned. Keep everything a hook
+  executes inside the plugin folder.
+- **Settings steer a granted plugin.** `[plugins.<name>]` settings live in
+  `policy.toml` and are not part of the grant; a granted plugin reads whatever
+  values are there at launch.
+- **Builtin provenance follows the install.** In an editable install (a source
+  checkout set up with `uv sync`), the builtin plugins are files in a working
+  tree, and they are still trusted as builtins.
+- **Snapshot leftovers.** An interrupted snapshot build can leave
+  `<digest>.tmp-*` or `<digest>.stale-*` directories under `_plugin-snapshots/`.
+  They are never executed unverified; deleting them is safe when no run is live.
+- **A merged story that edits a tracked plugin folder** makes the next launch
+  fail with a mismatch. That is the gate working: review the change, then
+  `bmad-loop plugins accept <name>`.
 
 **Failure isolation.** Every hook — subprocess or Python — is wrapped. A Python
 handler that raises is caught (`except Exception` only — `RunStopped`/SIGTERM as
@@ -202,6 +316,31 @@ declarative hook fails **open** by default (an error lets the run continue; only
 clean non-zero exit vetoes); set `fail_closed = true` to make any failure defer
 the unit. An in-process handler can opt into the same by setting `fail_closed =
 True` on its class.
+
+**Hard stops.** Declarative hooks (and the verify commands) run through a
+stop-aware runner. A hard `bmad-loop stop` that lands while a hook is running
+kills the hook's process tree, and the run stops: the bus journals
+`plugin-hook-interrupted` (`plugin`, `stage`) instead of `plugin-hook-error`, and
+`fail_closed` never turns that into a veto, because an interrupted hook has not
+failed. If the interrupted hook is on `post_run`, the run still finishes. A hook
+timeout kills the tree the same way. Hooks that run as part of the stop's own
+unwind — `pre_worktree_teardown`/`post_worktree_teardown`,
+`pre_rollback`/`post_rollback` — are not interrupted and still run to completion.
+
+What the kill reaches:
+
+- The runner re-scans the tree under the hook's root once a second while that root
+  runs, and every 50 ms while the root winds down after its signal. At kill time it
+  also takes in each surviving known process's current children.
+- Only processes still alive with a matching recorded identity are signalled.
+- A background job whose parent shell exited is killed if its parent chain was still
+  under the live root at one of those scans. A process forked in the root's TERM
+  handler is killed if the root lived one 50 ms re-scan after forking.
+- Out of reach: a process that starts and is reparented away within one scan
+  interval, a TERM handler that forks and exits at once, a descendant reparented
+  away from a surviving job after the root exited, and a process that starts while
+  the survivors are being reaped.
+- On macOS without `psutil`, only the root is killed.
 
 **Versioning.** Every manifest declares `api_version`. The framework supports a
 set of versions (`SUPPORTED_API`). A **builtin** with an unsupported version is a
@@ -225,15 +364,12 @@ matches the core settings fields exactly:
 | `options`   | `select`      | Non-empty list of allowed string values.         |
 | `min`/`max` | `int`/`float` | Numeric bounds (widget hints).                   |
 
-**Rendering.** Once a plugin is enabled, its settings appear as their own section
-in the settings TUI (generated from the schema — see
-`src/bmad_loop/settings_schema.py`). They persist to a `[plugins.<name>]` table in
-`policy.toml`:
+**Rendering.** A plugin's settings appear as their own section in the settings
+TUI (generated from the schema — see `src/bmad_loop/settings_schema.py`): always
+for a settings-only plugin, and once it is enabled or granted for one with
+executable surface. They persist to a `[plugins.<name>]` table in `policy.toml`:
 
 ```toml
-[plugins]
-enabled = ["my-plugin"]
-
 [plugins.my-plugin]
 strict = true
 mode = "b"
@@ -248,8 +384,10 @@ mode = "b"
 - Anywhere with a `Policy`: `policy.plugin_setting("my-plugin", "strict", default)`.
 
 Settings are **data**, not code — a plugin can carry `[plugins.<name>]` settings
-without being in `enabled` (the settings UI just won't surface a disabled plugin's
-section). Only the in-process `[python]` module is trust-gated.
+without being enabled or granted (the settings UI just won't surface an inactive
+plugin's section). The trust gate is on code, so settings are not part of a
+grant: a granted plugin reads whatever `[plugins.<name>]` values are present at
+launch.
 
 ---
 
@@ -268,15 +406,17 @@ A `[hooks.<stage>]` shell command. The bus runs it with:
 - **cwd** = the unit's worktree (or repo root);
 - a `BMAD_LOOP_*` environment describing the run:
 
-  | Var                                                                               | Meaning                                       |
-  | --------------------------------------------------------------------------------- | --------------------------------------------- |
-  | `BMAD_LOOP_STAGE`                                                                 | the stage firing                              |
-  | `BMAD_LOOP_RUN_ID` / `BMAD_LOOP_RUN_DIR`                                          | run identity                                  |
-  | `BMAD_LOOP_REPO_ROOT` / `BMAD_LOOP_WORKTREE`                                      | git roots                                     |
-  | `BMAD_LOOP_STORY_KEY` / `BMAD_LOOP_ROLE` / `BMAD_LOOP_PHASE` / `BMAD_LOOP_BRANCH` | unit context                                  |
-  | `BMAD_LOOP_AGENTS`                                                                | comma-separated CLI agent ids in the worktree |
-  | `BMAD_LOOP_PLUGIN`                                                                | your plugin's name                            |
-  | `BMAD_LOOP_SETTING_<KEY>`                                                         | each resolved setting                         |
+  | Var                                                                               | Meaning                                                 |
+  | --------------------------------------------------------------------------------- | ------------------------------------------------------- |
+  | `BMAD_LOOP_STAGE`                                                                 | the stage firing                                        |
+  | `BMAD_LOOP_RUN_ID` / `BMAD_LOOP_RUN_DIR`                                          | run identity                                            |
+  | `BMAD_LOOP_REPO_ROOT` / `BMAD_LOOP_WORKTREE`                                      | git roots                                               |
+  | `BMAD_LOOP_STORY_KEY` / `BMAD_LOOP_ROLE` / `BMAD_LOOP_PHASE` / `BMAD_LOOP_BRANCH` | unit context                                            |
+  | `BMAD_LOOP_AGENTS`                                                                | comma-separated CLI agent ids in the worktree           |
+  | `BMAD_LOOP_DELIVERY_ID`                                                           | dedup key of an at-least-once stage                     |
+  | `BMAD_LOOP_ROLLBACK_OUTCOME`                                                      | `post_rollback` only: `completed` / `paused` / `failed` |
+  | `BMAD_LOOP_PLUGIN`                                                                | your plugin's name                                      |
+  | `BMAD_LOOP_SETTING_<KEY>`                                                         | each resolved setting                                   |
 
 A **blocking** hook's non-zero exit **vetoes** (defers) the unit. A non-blocking
 hook is advisory (logged `plugin-hook`).
@@ -332,7 +472,8 @@ stage. It carries:
 - **Read-only facts** (properties, no setter): `run_id`, `story_key`, `epic`,
   `phase`, `attempt`, `role`, `worktree`, `branch`, `repo_root`, `run_dir`,
   `agents`, `result_json` (a copy), `session_status`, `verify_reason`,
-  `decision_action`, `settings`. Observe these; you can never rewrite history.
+  `decision_action`, `delivery_id`, `rollback_outcome`, `settings`. Observe
+  these; you can never rewrite history.
 - **A mutable whitelist** — assign only these, and only where the stage allows:
   `proposed_prompt`, `proposed_env`, `proposed_feedback`,
   `proposed_commit_message`, `proposed_decision`.
@@ -372,22 +513,44 @@ there.
 | `pre_pick_next` / `post_pick_next`         | around selecting the next story |
 | `pre_epic_boundary` / `post_epic_boundary` | at an epic transition           |
 
+Under `[gates] retrospective = "auto"`, the epic transition also runs one headless
+retrospective session between those two stages. That session fires
+`pre_retro_session`, then the generic `pre_session` / `post_session`, with
+`role = "retro"` and the story key `epic-<N>-retrospective`. That key is not a
+story in the run's state. A veto on either pre-stage fails the retrospective
+(journaled `retro-auto-failed`); it does not pause the run.
+
 ### Story / unit
 
-| Stage                                              | When                                                                              | Mutable surface                                       |
-| -------------------------------------------------- | --------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| `pre_story` / `post_story`                         | around one story                                                                  | veto (`pre_`)                                         |
-| `pre_worktree_setup` / `post_worktree_setup`       | around isolated-worktree provisioning                                             | —                                                     |
-| `pre_ready_gate` / `post_ready_gate`               | around the engine-ready gate                                                      | veto (`pre_`)                                         |
-| `pre_worktree_teardown` / `post_worktree_teardown` | around teardown (in a `finally`)                                                  | **observe-only** — a veto here cannot un-tear-down    |
-| `pre_rollback` / `post_rollback`                   | around a failed attempt's `git reset --hard` (only when a rollback actually runs) | **observe-only** — a veto here cannot block the reset |
-| `pre_integrate`                                    | before integrating a finished unit                                                | —                                                     |
-| `pre_merge` / `post_merge`                         | around the local branch merge                                                     | —                                                     |
+| Stage                                              | When                                                                                                                                         | Mutable surface                                       |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `pre_story` / `post_story`                         | around one story                                                                                                                             | veto (`pre_`)                                         |
+| `pre_worktree_setup` / `post_worktree_setup`       | around isolated-worktree provisioning                                                                                                        | —                                                     |
+| `pre_ready_gate` / `post_ready_gate`               | around the engine-ready gate                                                                                                                 | veto (`pre_`)                                         |
+| `pre_worktree_teardown` / `post_worktree_teardown` | around teardown (in a `finally`)                                                                                                             | **observe-only** — a veto here cannot un-tear-down    |
+| `pre_rollback` / `post_rollback`                   | around a failed attempt's `git reset --hard` (only when a rollback actually runs); `post_` pairs every `pre_`, even a paused/failed rollback | **observe-only** — a veto here cannot block the reset |
+| `pre_integrate`                                    | before integrating a finished unit                                                                                                           | —                                                     |
+| `pre_merge` / `post_merge`                         | around the local branch merge                                                                                                                | —                                                     |
 
 `post_story` fires after an isolated unit's worktree teardown. If the worktree was
 removed, a declarative `post_story` hook runs from the repo root and
 `BMAD_LOOP_WORKTREE` still names the removed worktree; if it was kept (a deferred
 unit under `keep_failed`), the hook runs from that worktree.
+
+`post_rollback` fires exactly once for every emitted `pre_rollback`, including when
+the rollback stops part-way — it pauses the run for manual recovery (an
+attempt-owned spec it cannot safely restore, work it could not park, a refused
+reset) or an unexpected error escapes it. `ctx.rollback_outcome`
+(`BMAD_LOOP_ROLLBACK_OUTCOME` for a declarative hook) says which: `completed`,
+`paused`, or `failed`; after the latter two the tree may be only partially reset.
+It is `None` on every other stage, `pre_rollback` included. A plugin that
+quiesces in `pre_rollback` can therefore always rely on the matching release;
+one that does post-reset work (re-installing dependencies, re-applying state)
+should gate it on `completed`, since `post_rollback` does not imply the reset
+finished.
+Rollback paths that never emit `pre_rollback` (a clean tree, a policy pause with
+`[scm] rollback_on_failure` off, an owned-spec pause raised before the rollback
+starts) emit neither stage.
 
 ### Dev
 
@@ -397,134 +560,104 @@ unit under `keep_failed`), the hook runs from that worktree.
 | `pre_dev_session`                  | before each dev session          | `proposed_prompt`, `proposed_env`, veto                                              |
 | `post_dev_verify`                  | after dev or repair verification | —                                                                                    |
 
-`post_dev_verify` fires on **both** legs of the dev phase — once after the dev
-session's verification, and again after each repair session's — so a handler sees
-it **more than once per story**, not once. The two legs share one `attempt`
-counter bounded by `[limits] max_dev_attempts`, which is also the bound on how
-many times the stage can fire for one story. Write handlers to be idempotent and
-to key on the correlation fields below rather than on the story alone. It also
-fires on the way to a pause: an attempt whose session reported a CRITICAL
-escalation emits before the run stops, on either leg.
+`post_dev_verify` fires more than once per story. Write handlers to be idempotent and
+to key on the correlation fields below, not on the story alone:
 
-`post_dev_verify` exposes `ctx.command_results`: an immutable tuple of the
-per-command `CommandResult` records core just executed. Each has `command`,
-`returncode`, the existing merged bounded `output_tail`, separate `stdout`
-and `stderr` strings, and `spawn_error` — normally `None`, and set when the child
-could not be started at all. The typical cause is the directory it was to run in
-(missing, not a directory, or unsearchable), which the message names, but any
-spawn-time `OSError` lands here — a missing shell, EMFILE, ENOMEM — so read the
-wrapped exception rather than assuming the directory. Such a result carries no
-real exit status (`verify.SPAWN_FAULT_RC`, deliberately outside the range a
-signal-killed child reports and distinct from the timeout leg's `-1`) and
-classifies as an environment fault, which pauses the run. The two stream strings
-are intended to be the streams essentially whole
-— they are not cut to `[verify] stream_capture_kb`, which bounds only what is
-written to disk — but they are not unbounded either: a hard 32 MiB per-stream
-ceiling applies, so a pathologically chatty command cannot grow the orchestrator's
-peak memory with the number of configured verify commands. When that ceiling cuts
-a stream the **tail** is what a plugin receives, and the matching journal record's
-`stdout_bytes` / `stderr_bytes` still report what the command emitted, so the cut
-is always detectable rather than silent. Ordinary suites never reach it. This is
-observation data only: a plugin cannot change the verifier's outcome or the commit
-decision. The run's `journal.jsonl` also records
-one `verify-command-result` entry per command with run/story/attempt/stage and
-verification-sequence correlation — note that `attempt` is the dev/repair counter, so every review
-cycle of one attempt shares a single value and only `verification_sequence` tells successive review
-passes apart — `output_tail`, `spawn_error`, byte counts, and run-relative `stdout_path` /
-`stderr_path` pointers under the run's `verify/` directory; full streams are not
-embedded in the journal. `spawn_error` rides the record because the record's
-readers are out-of-process and `returncode` alone cannot separate a child that
-never started from one that ran. That store is deliberately separate from `logs/`, which
-holds coding-CLI pane captures named after session task ids and is read as such
-by the TUI.
+- It fires after the dev session's verification and again after each repair session's. Both
+  legs share one `attempt` counter bounded by `[limits] max_dev_attempts`.
+- It also fires on the way to a pause: after a session that reported a CRITICAL escalation,
+  and after a dev or repair leg whose `[environment]` probe preflight failed (no command
+  results).
+- A `bmad-loop resolve --reverify` replay fires it once more with **no session**:
+  `ctx.session_status` is `None`, `ctx.result_json` is the latest completed dev session's
+  result, and `attempt` does not advance. Check `session_status` before assuming a session.
 
-Two more context fields say **which** verification the results came from, because
-nothing else on the context can: both the dev leg and the repair leg emit
-`post_dev_verify` from `Phase.DEV_VERIFY`, and `ctx.attempt` is one per-story
-counter the repair leg continues rather than restarts, so its value orders the
-two but names neither.
+`ctx.command_results` is an immutable tuple of the `CommandResult` records core just ran,
+one per `[verify] commands` entry:
+
+| Field         | Value                                                                                                                                                                                   |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `command`     | the command line                                                                                                                                                                        |
+| `returncode`  | exit status; `verify.SPAWN_FAULT_RC` when the child never started, −1 on timeout                                                                                                        |
+| `output_tail` | merged, bounded tail of both streams                                                                                                                                                    |
+| `stdout`      | the stream essentially whole: not cut to `[verify] stream_capture_kb`, but capped at 32 MiB (the tail is kept; the journal's byte counts show the cut)                                  |
+| `stderr`      | as `stdout`                                                                                                                                                                             |
+| `spawn_error` | `None`, or why the child could not start (any spawn-time `OSError`, typically a missing or unsearchable directory). Such a result classifies as an environment fault and pauses the run |
+
+The results are observation only: a plugin cannot change the verifier's outcome or the
+commit decision. Treat verifier output as potentially sensitive.
+
+Two fields say which verification produced the results, since `attempt` orders the dev and
+repair legs but names neither:
 
 | Field                       | Value                                                                                  |
 | --------------------------- | -------------------------------------------------------------------------------------- |
 | `ctx.verification_stage`    | `"dev"` for the initial dev verification, `"fix"` for a repair one, `None` if none ran |
 | `ctx.verification_sequence` | the story's 1-based ordinal for that pass, or `None` if it recorded nothing            |
 
-Together they are the join key: the `verify-command-result` entries carrying this
-`story_key` + `verification_stage` + `verification_sequence` are exactly this
-context's results, one per record, ordered by `command_index`. The sequence is
-monotonic per story **across a pause/resume** — unlike `attempt`, which a human
-re-arm reuses — so it is safe to persist as a correlation id.
+The review gate publishes the same pair on [`post_review_verify`](#review), as
+`"review"` (or `None`), except on a [reused skip-review gate](#reused-skip-review-gates). The sequence is monotonic per story across pause/resume (unlike
+`attempt`, which a human re-arm reuses), so it is safe to persist as a correlation id.
 
-Read `ctx.command_results == ()` together with `verification_stage`; on its own it
-is ambiguous:
+Read `ctx.command_results == ()` together with `verification_stage`:
 
-- **`verification_stage is None`** — no verify pass ran. Several causes land here
-  and the empty tuple names none of them: the session did not complete
-  (`ctx.session_status`), an earlier gate already failed the attempt — the
-  dev-artifact check or the deferral harvest (`ctx.verify_reason`) — or the engine
-  variant suppressed the pass for this leg (stories mode skips it on a plan-halt
-  leg, which has no implementation to build).
-- **stage set, `verification_sequence is None`** — the pass ran and executed
-  nothing, because `[verify] commands` is empty. No journal record exists either.
-- **stage set, sequence an int** — those commands ran, and each has a matching
-  journal record.
+- **`verification_stage is None`**: no verify pass ran. The session did not complete
+  (`ctx.session_status`), an earlier gate failed the attempt (`ctx.verify_reason`), an
+  `[environment]` probe failed the preflight (`ctx.verify_reason` names it), or stories mode
+  skipped the pass on a plan-halt leg.
+- **Stage set, `verification_sequence is None`**: the pass ran with `[verify] commands` empty.
+  No journal record exists.
+- **Stage set, sequence an int**: those commands ran, and each has a journal record.
 
-What lands on disk is bounded by `[verify] stream_capture_kb` (default 256 KiB per
-stream): the **tail** is retained, and the record stays explicit about the cut —
-`stdout_bytes` / `stderr_bytes` are what the command emitted, `stdout_captured_bytes` /
-`stderr_captured_bytes` how much of that reached disk, and `stdout_truncated` /
-`stderr_truncated` their inequality. Both counts are UTF-8 lengths of the decoded
-stream, **not** file sizes: the files are written in text mode, so Windows newline
-translation makes the file larger there. Set the knob to `0` to retain nothing at
-all — no files are written and the pointers are null, but the record still lands
-with the full byte counts, because "nothing was retained" and "the command was
-silent" are different facts. Retaining is observation and never fails a run: if the
-write raises (ENOSPC, a read-only run dir, or a `verify/` directory whose
-confinement cannot be established — the store refuses rather than write through
-a symlink a session planted), the pointer is null and `capture_error`
-carries the reason. A plugin reading these pointers must therefore treat both
-`None` and a missing file as normal, and consult `*_truncated` before assuming a
-file holds a command's whole output. Treat verifier output as potentially sensitive and store, upload, sign,
-or act on it only from an explicitly configured plugin.
+#### `verify-command-result` journal records
 
-**The dev phase is the whole of this HOOK, not of the journal.** `[verify]
-commands` also run at the _review_ gate — `verify_review` /
-`verify_review_stories` / `verify_review_bundle` end on the same core classifier
-— and those runs **are journalled** (`verification_stage: "review"`, sharing the
-story's one `verification_sequence` counter with the dev and fix passes) but are
-**not published to any hook.** They run in `repo_root`, the same root
-the dev phase uses (#695); only the gates' own artifact reads — the spec, the
-sprint board, the deferred-work ledger — stay project-rooted. Five engine gates reach them: the
-converged review pass, the review-budget-exhaustion rescue, the review-timeout
-salvage, and both passes inside the skip-review commit path (which runs the gate
-again after a repair). The records do not name which of the five ran — the
-neighbouring `review-result` / `review-skipped*` / `review-timeout-salvage*`
-entries and the sequence ordering say that. `bmad-loop confirm --reverify` runs
-the commands too, out of band by construction — the run that parked the story is
-finished, so there is no journal to write to and no hook bus to emit on.
+The run's `journal.jsonl` records one `verify-command-result` per command. The records with
+this context's `story_key` + `verification_stage` + `verification_sequence` are exactly its
+results, ordered by `command_index`. Each carries run/story/attempt/stage correlation,
+`output_tail`, `spawn_error`, byte counts, and run-relative `stdout_path` / `stderr_path`
+pointers under the run's `verify/` directory (not `logs/`, which holds session pane captures).
 
-Two consequences a handler has to be written for:
+- `attempt` is the dev/repair counter, so every review pass of one attempt shares it; only
+  `verification_sequence` tells review passes apart.
+- **Hard stop.** A pass cut short by a hard `bmad-loop stop` records `interrupted: true` with
+  `returncode` −1001 (`INTERRUPTED_RC`). The killed command's `output_tail` is
+  `interrupted by a hard stop request`; every later command still gets a record with
+  `not started: an earlier command was interrupted by a hard stop request`. No hook observes
+  that pass. The field is absent from passes that ran through.
+- **On-disk capture** is bounded by `[verify] stream_capture_kb` (default 256 KiB per stream;
+  the tail is kept). `stdout_bytes` / `stderr_bytes` are what the command emitted,
+  `*_captured_bytes` what reached disk, and `*_truncated` their inequality. Counts are UTF-8
+  lengths of the decoded stream, not file sizes. `0` retains nothing: no files, null
+  pointers, full byte counts.
+- **Capture never fails a run.** If the write raises (ENOSPC, read-only run dir, a `verify/`
+  directory whose confinement cannot be established), the pointer is null and
+  `capture_error` says why. Treat both `None` and a missing file as normal, and check
+  `*_truncated` before assuming a file holds the whole output.
 
-- **`verify-command-result` entries are a complete census of a RUN's verifier
-  command invocations, but not of every gate visit or of a project's.** Every
-  command executed by an in-run dev, fix or review pass lands a record. A pass
-  with no `[verify] commands` configured executes nothing and therefore records
-  nothing; `bmad-loop confirm --reverify` stays outside because it runs after the
-  run that parked the story is over. Count distinct `verification_sequence`
-  values to derive recorded passes, while preserving that zero-command caveat.
-- **One command record is not a pass verdict**, and an earlier red pass is not
-  evidence the commit was blocked: a failed pass can be followed by a green
-  review-gate pass and a commit. Group records by `verification_sequence`, then
-  correlate that group with its surrounding decision event instead of inferring
-  the decision from one command or from an older pass. The dev and fix legs use
-  `dev-decision` / `fix-decision`; review passes use the applicable neighbouring
-  `review-result`, `review-skipped*`, `review-timeout-salvage*`,
-  `review-budget-committed`, or `review-followup-damped` event described above.
+#### Review-gate verification
 
-The hook boundary is deliberate, not an oversight — the review leg would need its
-own stage rather than a second meaning for one named `post_dev_verify` — and is
-tracked as a follow-up in [#656](https://github.com/bmad-code-org/bmad-loop/issues/656),
-which now narrows to that stage: the journalling half of it has landed.
+**`post_dev_verify` covers the dev phase only.** `[verify] commands` also run at the review
+gate, in the same `repo_root` as the dev phase, and are journalled with
+`verification_stage: "review"` (sharing the story's `verification_sequence` counter) and
+published on [`post_review_verify`](#review). Five engine gates reach them: the converged
+review pass, the review-budget-exhaustion rescue, the review-timeout salvage, and both passes
+of the skip-review commit path. The records do not name which gate ran; the neighbouring
+`review-result` / `review-skipped*` / `review-timeout-salvage*` entries do.
+`bmad-loop confirm --reverify` runs the commands out of band, with no journal and no hook bus.
+
+Two consequences for handlers:
+
+- **The records are a complete census of a run's in-run verifier invocations**, not of every
+  gate visit or of the project's. A hard-stopped pass records its full configured command
+  count; a pass with no commands records nothing; `confirm --reverify` records nothing.
+  Count distinct `verification_sequence` values to derive recorded passes.
+  The `verify-pass-reused` and `verify-reuse-declined` entries allocate no sequence: a
+  reuse entry is not a pass, and it adds no `verify-command-result` records.
+- **One command record is not a pass verdict**, and an earlier red pass does not mean the
+  commit was blocked. Group records by `verification_sequence`, then read the surrounding
+  decision event: `dev-decision` / `fix-decision` for the dev and fix legs; `review-result`,
+  `review-skipped*`, `review-timeout-salvage*`, `review-budget-committed` or
+  `review-followup-damped` for review passes.
 
 ### Review
 
@@ -534,11 +667,74 @@ which now narrows to that stage: the journalling half of it has landed.
 | `pre_review_session`  | before each review session     | `proposed_prompt`, `proposed_env`, veto           |
 | `post_review_session` | after each review session      | —                                                 |
 | `post_review_result`  | after a review verdict         | a [workflow injection point](#workflows-provides) |
+| `post_review_verify`  | after each review verify gate  | —                                                 |
 | `pre_fix_session`     | before a verify-repair session | `proposed_prompt`, `proposed_env`, veto           |
 
-None of these carries the review gate's `[verify] commands` results — that gate
-journals every command it runs, stream captures included, but publishes nothing to
-a hook context. See the boundary note above `### Review`.
+`post_review_verify` is the review leg's counterpart of `post_dev_verify`, as its
+own stage. It fires once per review verify gate visit, in every run mode (sprint,
+stories, sweep):
+
+- The gate visits are the converged review pass, the review-budget-exhaustion
+  rescue, the review-timeout salvage, and each of the (up to two) passes inside the
+  skip-review commit path. A visit ended by an exception (a hard stop, a repair
+  pause, an engine error) is never published.
+- A story can see it **several times** (once per review cycle that reached the gate,
+  plus a re-check after a verify-repair). Write handlers to be idempotent and key on
+  `verification_sequence` when it is set (`None` when no commands ran).
+- It fires after the gate has finished, including its acceptance bookkeeping
+  (binding the review artifact source, a sweep's ledger reclose), and before the
+  engine routes on the outcome (journals `review-verify-failed`, escalates, repairs,
+  or commits).
+- It is observation only: a handler cannot change the gate's outcome, the routing,
+  or the journal.
+
+The context carries the same payload as `post_dev_verify`:
+
+| Field                       | Value                                                                                                                                                                                                                                                                                                                                                           |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ctx.session_status`        | the status of the review session whose product was gated — the timeout-class status on the review-timeout salvage visit; `None` on the skip-review path, where no review session ran                                                                                                                                                                            |
+| `ctx.result_json`           | that review session's result (a copy) — often `None` on the timeout-salvage visit; `None` on the skip-review path                                                                                                                                                                                                                                               |
+| `ctx.verify_reason`         | the gate's outcome reason (the failure reason on a red gate)                                                                                                                                                                                                                                                                                                    |
+| `ctx.command_results`       | the `CommandResult` records the gate's command pass ran, in order                                                                                                                                                                                                                                                                                               |
+| `ctx.verification_stage`    | `"review"` whenever the gate reached its command pass (including zero commands); `None` when one of the gate's artifact checks refused first — the spec, the operator-action list, the sprint board, or a sweep's ledger (stories mode checks the spec only) — or a failed `[environment]` probe stopped the gate before its commands; `verify_reason` names it |
+| `ctx.verification_sequence` | the story's ordinal for that pass (joins the `verify-command-result` entries), or `None` if it recorded nothing (no `[verify] commands`, or no pass)                                                                                                                                                                                                            |
+| `ctx.verification_reused`   | `True` when the gate reused an earlier pass instead of running its commands (below); `False` on every other gate visit and on every other stage                                                                                                                                                                                                                 |
+
+Read `command_results == ()` with `verification_stage` exactly as for
+`post_dev_verify`. A review pass cut short by a hard `bmad-loop stop` stops the run
+before the gate is classified, so it is never published.
+
+#### Reused skip-review gates
+
+With `[verify] reuse_unchanged` on, the two skip-review commit gates can reuse the
+story's green dev or fix pass when nothing git-visible changed since it. On such a
+gate, `post_review_verify` carries the reused pass's `command_results`, its stage
+(`"dev"` or `"fix"`, not `"review"`) and its sequence, with `ctx.verification_reused`
+`True`. The `story_key` + stage + sequence join still resolves to the
+`verify-command-result` records of the pass that ran, so a handler keyed on the
+sequence sees it a second time. The journal holds one `verify-pass-reused` entry for
+the gate (`reused_stage`, `reused_sequence`, `command_count`, `head`, `tree`), and a
+gate that could not reuse journals `verify-reuse-declined` with a `decline` reason and
+runs its commands as usual. `verification_reused` is a Python-plugin context property;
+declarative hooks get no environment variable for it.
+
+Any hook dispatched between the pass and the gate by a plugin whose `[plugin]` table
+does not set `read_only = true` voids the reusable pass: the gate declines with
+`plugin-hook` and a `detail` of `<plugin>:<stage>`. Declare `read_only` only when no
+hook of the plugin writes files (ignored ones included) or other state a verify
+command reads.
+
+Checked-out submodules and nested repositories are fingerprinted recursively, by their
+own HEAD and working tree; an unpopulated submodule directory counts as empty. One the
+fingerprint cannot read (a symlink, a directory holding files but no repository of its
+own, more than 8 levels deep) declines with `gitlinks` and a `detail` of
+`<cause>: <path>`, such as `not-a-checkout: vendor/lib`. Ignored files inside a
+submodule are blind spots, as in the parent.
+
+A sweep's bundle gate reuses too. Its fingerprint leaves the deferred-work ledger out,
+and the gate instead declines with `ledger-mismatch` when the ledger is neither the one
+the pass ran against nor that ledger after the bundle's own close, or with `ledger-fault`
+(plus a `detail`) when it cannot read it.
 
 ### Commit
 
@@ -555,6 +751,64 @@ a hook context. See the boundary note above `### Review`.
 | `pre_session`  | before **every** session (after the role-specific `pre_*_session`, so it sees its mutations) | `proposed_prompt`, `proposed_env`, veto |
 | `post_session` | after every session                                                                          | —                                       |
 
+#### Account rotation
+
+bmad-loop does not switch coding-CLI accounts. With `[limits] usage_limit_action =
+"relaunch"` it relaunches a story whose session ended on a usage limit without charging
+an attempt (see [Usage-limit pauses](escalations-guide.md#usage-limit-pauses)), and the
+relaunched session's environment carries `BMAD_LOOP_USAGE_RELAUNCH=<n>`, the story's
+relaunch count so far. It is unset until the story's first relaunch, and stays set on
+every later dev, fix and review session of that story. Switching accounts is left to you.
+Claude Code keeps one account per config directory, so point `CLAUDE_CONFIG_DIR` at a
+different one:
+
+- **A wrapper `binary`.** A project profile overlay
+  (`.bmad-loop/profiles/claude.toml`, a copy of the shipped profile) names your script as
+  `binary`. The script picks the config directory and `exec`s `claude`.
+- **A `pre_session` plugin.** The hook sees the session environment in
+  `ctx.proposed_env`, `BMAD_LOOP_USAGE_RELAUNCH` included, and sets `CLAUDE_CONFIG_DIR`
+  there.
+
+Rotate once per relaunch, not on every session that carries the variable: remember the
+highest count you rotated on for each run and story (`BMAD_LOOP_RUN_DIR`,
+`BMAD_LOOP_STORY_KEY`), and switch only when the count goes past it. A wrapper sketch:
+
+```bash
+#!/usr/bin/env bash
+accounts=("$HOME/.claude-a" "$HOME/.claude-b")   # each logged in once by hand
+state="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rotate"; mkdir -p "$state"
+idx=$(cat "$state/index" 2>/dev/null || echo 0)
+seen="$state/seen-$(basename "${BMAD_LOOP_RUN_DIR:-none}")-${BMAD_LOOP_STORY_KEY:-none}"
+n="${BMAD_LOOP_USAGE_RELAUNCH:-0}"
+if [ "$n" -gt "$(cat "$seen" 2>/dev/null || echo 0)" ]; then
+    idx=$(( (idx + 1) % ${#accounts[@]} ))
+    printf '%s' "$idx" > "$state/index"; printf '%s' "$n" > "$seen"
+fi
+CLAUDE_CONFIG_DIR="${accounts[$idx]}" exec claude "$@"
+```
+
+Before relying on it:
+
+- Each config directory needs its own one-time setup: log in, trust the project
+  workspace, and accept the bypass-permissions prompt. A directory that skipped a step
+  parks the session on that dialog.
+- Hooks you added to your own user settings (a `StopFailure` hook, for example) live in
+  one config directory; copy them to every directory you rotate through. bmad-loop's own
+  relay hooks are in the project's `.claude/settings.json` and work with any directory.
+- Never commit, ship or log credentials. Keep the config directories outside the project
+  tree, and never echo their contents from a hook or wrapper.
+- Setting `CLAUDE_CONFIG_DIR` makes Claude Code skip `~/.claude/skills`, so install the
+  skills your sessions use in the project tree. Under `[skills] user_roots`, what bmad-loop
+  catches depends on where the variable is set:
+  - **A `pre_session` hook:** a session whose skill came from `~/.claude/skills` stops
+    before launch, with an error naming the skill and the variable, unless the project
+    tree holds a byte-identical copy. So does a dev session whose primitive needs a
+    review skill that came from there.
+  - **The parent environment or the profile `[env]`:** preflight reports
+    `~/.claude/skills` as `skills.user-root-unavailable`.
+  - **A wrapper `binary`:** the script sets the variable after bmad-loop has checked the
+    session, so nothing catches it, and the session launches without that skill.
+
 ### Sweep (deferred-work cycle — bundles inherit all per-story stages)
 
 | Stage                                                  | When                             |
@@ -566,6 +820,17 @@ a hook context. See the boundary note above `### Review`.
 | `pre_decision` / `post_decision`                       | around a human-decision item     |
 | `pre_bundle` / `post_bundle`                           | around a deferred-work bundle    |
 | `pre_materialize_bundles` / `post_materialize_bundles` | around materializing bundles     |
+
+`post_migrate` gets **at least one delivery attempt**. The engine records the
+completed migration before firing it and, if the process or host dies before the emit
+returns, fires it again on resume. A returned emit counts as delivered even when a
+handler failed: a Python raise, a declarative error, timeout or non-zero exit is not
+retried, and a veto on `post_migrate` is ignored. Every delivery of one completion
+carries the same `ctx.delivery_id` (`BMAD_LOOP_DELIVERY_ID` for a declarative hook),
+and a later re-migration gets a new one. A handler with non-idempotent side effects
+should deduplicate on that id. Stages without an id leave `ctx.delivery_id` as `None`
+and do not set the variable. A migration whose ledger holds no legacy entries completes
+without a session and fires neither `pre_migrate_session` nor `post_migrate`.
 
 ---
 
@@ -595,13 +860,16 @@ blocking = false           # true: a non-completed session defers the unit
   about to commit). `pre_commit_gate` is **defer-safe**: it fires before the unit
   enters COMMITTING, so a _blocking_ workflow whose session doesn't complete
   still defers cleanly. Other stages lack a worktree or run after teardown.
+- **`role = "review"` keeps the review CLI in the skills preflight** when
+  `[review] enabled = false`, which otherwise skips it. A workflow switched off with
+  `<workflow-name>_enabled = false` does not count.
 - **`prompt`** expands `{story_key}`, `{run_id}`, and `{scripts}`.
 - **The orchestrator appends two sections to what you write**, and appends them
   _after_ the session gates fire, so a `pre_workflow_session` / `pre_session`
   prompt rewrite cannot strip them: a **`## Sprint board`** prohibition — the
   same one dev and review prompts carry, because a workflow session runs while
   the orchestrator's own `sprint-status.yaml` advance is still uncommitted and
-  must not be "fixed" or reverted (#437) — and the **`## Completion signal`**
+  must not be "fixed" or reverted — and the **`## Completion signal`**
   contract naming the marker file the session must write before ending its turn.
   Write `prompt` as a self-contained instruction; do not restate either. (Stories
   mode has no board, so the first section is absent there.)
@@ -610,9 +878,10 @@ blocking = false           # true: a non-completed session defers the unit
   token budget. Its journal entries are `workflow-start` / `workflow-end`.
 - **`blocking`**: a blocking workflow whose session doesn't complete **defers the
   unit** (through the existing defer primitive). A non-blocking one is advisory.
-- A workflow from a `[python]` plugin is **trust-gated** along with the module: it
-  fires only when the plugin is enabled. A workflow from a pure-declarative plugin
-  fires whenever the plugin is discovered.
+- A workflow is **trust-gated** with the rest of its plugin. A project plugin's
+  workflow fires only once the plugin is granted, and its `{scripts}` resolves to
+  the verified snapshot. A builtin `[python]` plugin's workflow fires only when the
+  plugin is in `[plugins] enabled`. See [Trust & safety](#trust--safety).
 
 `registry.provided_workflows()` lists declared workflow names for introspection.
 
@@ -729,18 +998,28 @@ class GuardrailsPlugin(Plugin):
             ctx.proposed_commit_message = f"{base}\n\n{trailer}" if base else trailer
 ```
 
-**4. Enable + configure** in `.bmad-loop/policy.toml`:
+**4. Configure** in `.bmad-loop/policy.toml`:
 
 ```toml
-[plugins]
-enabled = ["guardrails"]
-
 [plugins.guardrails]
 trailer = "Automated-by: bmad-loop"
 forbid_epic = 0           # set to an epic number to park it
 ```
 
-**5. Run.** On the next `bmad-loop run`:
+**5. Grant it.** Review the folder, then record its content grant:
+
+```console
+$ bmad-loop plugins enable guardrails
+plugin "guardrails" granted: sha256:<12 hex> (2 files) in <state root>/<project-tag>/plugin-grants.json
+```
+
+Do **not** add `guardrails` to `[plugins] enabled`: that list trusts builtins, and
+a project plugin named there without a grant fails startup. The settings live in
+`policy.toml`, outside the plugin folder, so changing them never invalidates the
+grant. Editing `plugin.toml` or `guardrails.py` does: the next launch stops until
+you run `bmad-loop plugins accept guardrails`.
+
+**6. Run.** On the next `bmad-loop run`:
 
 - the settings TUI shows a **guardrails** section with `trailer` + `forbid_epic`;
 - each story increments `stories_seen` in the run's `plugin_shared`;
@@ -748,8 +1027,9 @@ forbid_epic = 0           # set to an epic number to park it
 - after dev lands, the **doc-sync** workflow runs an extra review-role session;
 - each commit message gets the **trailer** appended.
 
-Drop `[python]` from the manifest and `guardrails` from `enabled`, and the plugin
-goes completely inert — proof of the trust gate.
+Run `bmad-loop plugins revoke guardrails`, and the plugin goes completely inert:
+the next launch prints a `note:` and journals `plugin-refused` — proof of the
+trust gate.
 
 ---
 
@@ -757,10 +1037,11 @@ goes completely inert — proof of the trust gate.
 
 bmad-loop's core is portable Python, and the OS-specific work is quarantined behind
 seams (the tmux transport, the `ProcessHost` lifecycle, the hook interpreter — see
-[Porting bmad-loop to a new OS](porting-to-a-new-os.md)). Plugin **helper scripts**
-are spawned under the orchestrator's own interpreter (`sys.executable`), **not** a
-PATH-resolved `python3` — so a bundled script may `import bmad_loop` and reach those
-seams instead of re-implementing OS primitives. Follow this discipline:
+[Porting bmad-loop to a new OS](porting-to-a-new-os.md)). A helper script that an
+in-process plugin spawns with `sys.executable` (as the Unity plugin does) runs under the
+orchestrator's interpreter, so it may `import bmad_loop` and reach those seams instead of
+re-implementing OS primitives. A declarative hook `cmd` runs through the host shell, so a
+`python3` there is whatever is on `PATH` and may not see `bmad_loop`. Follow this discipline:
 
 - **Use the `ProcessHost` seam for pid lifecycle.** For terminate / force-kill /
   liveness, call `get_process_host()` rather than guarding `os.kill` /
@@ -807,7 +1088,11 @@ scan. See it alongside `unity_setup.py` / `unity_cleanup.py` (and the
 - Model + base class: `src/bmad_loop/plugins/model.py`
 - Manifest parser: `src/bmad_loop/plugins/manifest.py`
 - Discovery + overlay + api-check: `src/bmad_loop/plugins/loader.py`
-- Trust gate: `src/bmad_loop/plugins/trust.py`
+- Trust gate: `src/bmad_loop/plugins/trust.py` (refusals),
+  `src/bmad_loop/plugins/grants.py` (the verdict),
+  `src/bmad_loop/plugins/digest.py` (directory hashing),
+  `src/bmad_loop/plugins/store.py` (the out-of-tree grant store),
+  `src/bmad_loop/plugins/snapshot.py` (verified snapshots)
 - Registry (the inter-pillar contract): `src/bmad_loop/plugins/registry.py`
 - Hook bus + dispatch: `src/bmad_loop/plugins/bus.py`
 - Hook context + veto: `src/bmad_loop/plugins/context.py`

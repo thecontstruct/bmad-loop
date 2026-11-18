@@ -3,8 +3,8 @@
 These operator/test override knobs used to be read inline at scattered call
 sites (`engine`, `adapters.multiplexer`, `cli`, `process_host`), which left them
 undiscoverable and undocumented. This module is the one place each is named,
-typed, and given a reader; the operator-facing table lives in the README under
-"Environment variables".
+typed, and given a reader; the operator-facing table lives in
+`docs/reference/configuration.md` under "Environment variables".
 
 Each reader preserves its call site's exact semantics — same parse, same
 fallback — so routing a site through here changes nothing observable. Only the
@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Mapping
 
 #: Overrides the per-session wall-clock budget, in seconds (test / E2E hook).
 SESSION_TIMEOUT_S = "BMAD_LOOP_SESSION_TIMEOUT_S"
@@ -85,8 +86,10 @@ def process_host() -> str | None:
     return os.environ.get(PROCESS_HOST)
 
 
-def state_dir() -> str | None:
-    """The overriding bmad-loop state root, or ``None`` when unset.
+def state_dir(env: Mapping[str, str] | None = None) -> str | None:
+    """The overriding bmad-loop state root, or ``None`` when unset. Read from
+    ``env`` when given (:func:`runs.resolve_state_root` asks on behalf of another
+    process's environment), else from this process's.
 
     Verbatim like the two name readers above — :func:`runs.state_root` uses the
     value as the state root itself, so an operator who names a directory gets that
@@ -108,4 +111,4 @@ def state_dir() -> str | None:
     *current directory*, so honouring it would silently root the control plane at
     whatever cwd the loop happened to be launched from.
     """
-    return os.environ.get(STATE_DIR) or None
+    return (os.environ if env is None else env).get(STATE_DIR) or None

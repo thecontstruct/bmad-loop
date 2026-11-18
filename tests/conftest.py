@@ -4,28 +4,62 @@ that simulate the side effects skill sessions would have on disk."""
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import importlib
+import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import stat
 import subprocess
 import sys
+import time
 import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+import perf_report
 import pytest
 import yaml
 
-from bmad_loop import cli, documents, envvars, platform_util, runs, win32_at
+from bmad_loop import (
+    cli,
+    documents,
+    envvars,
+    install,
+    platform_util,
+    runs,
+    skill_locate,
+    ticketlayout,
+    ticketmodel,
+    win32_at,
+)
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.bmadconfig import ProjectPaths, load_paths
 from bmad_loop.checks import ValidationReport
-from bmad_loop.journal import STATE_FILE, save_state
+from bmad_loop.journal import STATE_FILE, Journal, save_state
 from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, SessionRecord, StoryTask
+from bmad_loop.plugins.grants import GrantSet
+from bmad_loop.statemachine import PlanTransitionRefused, check_plan_transition
+from bmad_loop.ticketmodel import (
+    Capability,
+    EpicRow,
+    FindResult,
+    NextView,
+    StatusView,
+    TicketRow,
+)
+from bmad_loop.tickettree import (
+    PlanMark,
+    TicketsNoMatch,
+    TicketsPinMismatch,
+    TicketsPlanMismatch,
+    TicketsTransitionRefused,
+)
 from bmad_loop.verify import finalize_commit, rev_parse_head
 
 # The suite reads/writes UTF-8 files (specs, journals, JSON, reports). Windows'
@@ -40,6 +74,36 @@ if sys.platform == "win32" and not sys.flags.utf8_mode:
         "(e.g. `set PYTHONUTF8=1 && uv run pytest`). The suite assumes UTF-8 to "
         "match the files under test; CI's windows job sets this automatically."
     )
+
+# Modules that bind `get_multiplexer` by name at import. Tests swap a stand-in in
+# by patching `multiplexer.get_multiplexer`, and monkeypatch restores only that
+# module: one of these first imported while a patch stood (cli imports
+# `tui.launch` lazily) keeps the stand-in for every later test on the worker.
+# Importing them here binds the real function before any test runs (DW-566).
+# `tests/test_conftest.py` holds this list to the module-level binders in src.
+_MUX_BINDING_MODULES = (
+    "bmad_loop.adapters.generic",
+    "bmad_loop.probe",
+    "bmad_loop.runs",
+    "bmad_loop.tui.app",
+    "bmad_loop.tui.launch",
+)
+for _mod in _MUX_BINDING_MODULES:
+    # tui.app needs the `tui` extra; without textual it cannot be imported at all,
+    # so it cannot capture a stand-in either.
+    if _mod != "bmad_loop.tui.app" or importlib.util.find_spec("textual") is not None:
+        importlib.import_module(_mod)
+
+
+# Opt-in runtime metrics (`--test-metrics-dir=PATH`, tests/perf_report.py). Both
+# hooks only register the options and, when the directory option is given, the
+# recorder; without it nothing else of that module runs.
+def pytest_addoption(parser: pytest.Parser) -> None:
+    perf_report.add_options(parser)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    perf_report.configure(config)
 
 
 def _codec_rejects_bad_byte() -> bool:
@@ -125,6 +189,55 @@ real_mux_e2e = pytest.mark.xdist_group(REAL_MUX_XDIST_GROUP)
 REAL_MUX_HANG_CEILING_S = 90.0
 
 
+# ------------------------------------------------- private tmux server (DW-561)
+# A real-tmux test must never reach the developer's DEFAULT tmux server. A server the
+# first test starts keeps that test's cwd, so once pytest deletes the sandbox every
+# later pane fails shell init (`getcwd: cannot access parent directories`), and leaked
+# `bmad-loop-*` sessions pile up across runs. The default server may also host the
+# session running the suite, so a kill that reaches it ends that session too.
+#
+# `TMUX_TMPDIR` is the only lever: the product builds its own tmux argv, so `-L`/`-S`
+# cannot be injected, but every client it spawns (and every pane, through `$TMUX`)
+# inherits the redirect. Teardown and probes name the socket with `-S` instead of
+# trusting the inherited env, so a lost redirect leaks onto the default server
+# without anything being killed there.
+
+
+def private_tmux_socket_path(base: Path) -> Path:
+    """The socket a tmux client with ``TMUX_TMPDIR=base`` and no ``TMUX`` talks to."""
+    return base / f"tmux-{os.getuid()}" / "default"
+
+
+@contextlib.contextmanager
+def private_tmux_socket(base: Path) -> Iterator[Path]:
+    """Point every tmux client in this process tree at a private server under
+    ``base`` and yield its socket path; kill that server, by explicit socket, on
+    exit. Fails loudly if the server still answers afterwards."""
+    socket = private_tmux_socket_path(base)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("TMUX_TMPDIR", str(base))
+        mp.delenv("TMUX", raising=False)
+        mp.delenv("TMUX_PANE", raising=False)
+        try:
+            yield socket
+        finally:
+            probe = {"capture_output": True, "text": True, "timeout": REAL_MUX_HANG_CEILING_S}
+            subprocess.run(["tmux", "-S", str(socket), "kill-server"], **probe)
+            alive = subprocess.run(["tmux", "-S", str(socket), "list-sessions"], **probe)
+            if alive.returncode == 0:
+                raise AssertionError(
+                    f"private tmux server {socket} survived teardown: {alive.stdout!r}"
+                )
+
+
+@pytest.fixture
+def private_tmux_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """One private tmux server per test; yields its socket path for ``-S`` probes.
+    A short `mktemp` dir keeps the socket far below the 108-byte sun_path limit."""
+    with private_tmux_socket(tmp_path_factory.mktemp("tmux")) as socket:
+        yield socket
+
+
 # --------------------------------------------------- reap-identity helpers (Linux)
 # The identity model DW-126/DW-127 put behind every signal a test sends to a process
 # it did not spawn itself: never trust a bare pid, which the kernel is free to recycle
@@ -137,6 +250,17 @@ REAL_MUX_HANG_CEILING_S = 90.0
 #
 # Every function below is Linux-only AT CALL TIME (/proc, os.pidfd_open). Nothing here
 # touches either at import time, because this file also loads on Windows.
+
+# A pidfd-capable kernel does not imply a pidfd-capable interpreter: uv's standalone
+# CPython builds (3.13.2 measured on WSL2) ship without `os.pidfd_open` and
+# `signal.pidfd_send_signal`. So gate on the attributes, never on the platform. A KERNEL
+# refusal (ENOSYS/EPERM) on a build that has them still fails loudly in
+# `preflight_pidfd_support`.
+HAVE_PIDFD = hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
+needs_pidfd = pytest.mark.skipif(
+    not HAVE_PIDFD,
+    reason="this Python build has no os.pidfd_open / signal.pidfd_send_signal",
+)
 
 
 def positive_ascii_decimal(token: str) -> bool:
@@ -319,9 +443,7 @@ def opencode_runs() -> bool:
 
     ``stdin=subprocess.DEVNULL`` because a shim that prompts rather than runs
     otherwise inherits the runner's tty and blocks until the timeout expires
-    (measured: 4.00s stall on an inherited tty, 0.00s with DEVNULL). win32
-    returns before either step: opencode-on-Windows is unverified for this
-    adapter (README adapter table), so there is nothing to probe for.
+    (measured: 4.00s stall on an inherited tty, 0.00s with DEVNULL).
 
     Deliberately a function and not a ``skipif`` constant beside
     ``needs_strict_codec``: a module-level constant here would spawn a
@@ -330,8 +452,6 @@ def opencode_runs() -> bool:
     own in-file ``HAVE_OPENCODE`` gate, which the ``*_live.py`` suffix
     convention requires anyway.
     """
-    if sys.platform == "win32":
-        return False
     if (binary := shutil.which("opencode")) is None:
         return False
     try:
@@ -345,6 +465,25 @@ def opencode_runs() -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return probe.returncode == 0
+
+
+@pytest.fixture
+def emulate_windows_newlines(monkeypatch):
+    """Return an activator that makes `Path.write_text` translate newlines like Windows.
+
+    With ``newline=None`` a text write maps ``\n`` to ``\r\n`` there. The translation
+    is compiled into `io.TextIOWrapper`, so patching `os.linesep` cannot reproduce it;
+    without this, a "no CRLF" assertion passes on Linux whether or not the fix is in.
+    Call the activator after test setup so the fixture's own writes stay untranslated.
+    """
+    real = Path.write_text
+
+    def write_text(self, data, encoding=None, errors=None, newline=None):
+        if newline is None:
+            data, newline = data.replace("\n", "\r\n"), ""
+        return real(self, data, encoding=encoding, errors=errors, newline=newline)
+
+    return lambda: monkeypatch.setattr(Path, "write_text", write_text)
 
 
 @pytest.fixture
@@ -427,6 +566,55 @@ def write_script_launcher(directory: Path, name: str, body: str) -> Path:
     return launcher
 
 
+def read_pid(pid_file: Path) -> int | None:
+    """The pid a test child recorded in ``pid_file``, or None before it has."""
+    try:
+        text = pid_file.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def pid_gone(pid: int) -> bool:
+    """Dead or a zombie awaiting its (new) parent's reap — either way no longer
+    running anything."""
+    if sys.platform.startswith("linux"):
+        try:
+            stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except (FileNotFoundError, ProcessLookupError):
+            return True
+        return stat_line.rsplit(")", 1)[1].split()[0] in ("Z", "X")
+    from bmad_loop.process_host import get_process_host
+
+    return not get_process_host().is_alive(pid)
+
+
+def wait_pid_gone(pid: int, timeout: float = 5.0) -> bool:
+    """Poll :func:`pid_gone` until it holds or ``timeout`` passes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pid_gone(pid):
+            return True
+        time.sleep(0.05)
+    return pid_gone(pid)
+
+
+@pytest.fixture
+def reap_leftovers() -> Iterator[list[int]]:
+    """Pids a failing row may have leaked; force-killed at teardown so a red row
+    never leaves a long sleeper behind. Append a pid as soon as it is known,
+    before the first assertion that could fail."""
+    from bmad_loop.process_host import get_process_host
+
+    pids: list[int] = []
+    yield pids
+    host = get_process_host()
+    for pid in pids:
+        if not pid_gone(pid):
+            with contextlib.suppress(Exception):
+                host.force_kill(pid)
+
+
 class _WindowsLauncher:
     """``Path(sys.argv[0]).absolute()`` as a Windows install presents it, on any
     test host: ``str`` is the Windows path the relay registration quotes, while
@@ -495,6 +683,19 @@ def _file_exists_cmd(path) -> str:
     if sys.platform == "win32":
         return f'if exist "{path}\\NUL" (exit 1) else if exist "{path}" (exit 0) else (exit 1)'
     return f'test -f "{path}"'
+
+
+def assert_multiline_notice_keeps_its_lines(run_dir: Path, title: str, notice: str) -> None:
+    """A `gates.notify(..., multiline=True)` notice in ATTENTION: its header record
+    (the one carrying ``title``) holds the notice's first line unfolded (no
+    ` ⏎ `), and the next ATTENTION line is the notice's second line. Ablation:
+    drop the site's `multiline=True` and the notice folds onto the header line."""
+    lines = (run_dir / "ATTENTION").read_text(encoding="utf-8").splitlines()
+    (header,) = [i for i, ln in enumerate(lines) if title in ln]
+    first, second = notice.splitlines()[:2]
+    assert " ⏎ " not in lines[header]
+    assert lines[header].endswith(first)
+    assert lines[header + 1] == second
 
 
 def scripted_verify_runner(expected_root: Path, next_results):
@@ -744,7 +945,7 @@ def machine_json(argv, capsys, *, rc: int = 0, err_contains: str | None = None):
     return json.loads(out)
 
 
-def make_validate_document(findings, *, stories_on: bool = False, spec_folder: str = ""):
+def make_validate_document(findings, *, mode: str = "sprint", spec_folder: str = ""):
     """Build a REAL `validate --json` document from (check, severity, message,
     detail) tuples, for tests that need to *stub* one rather than run validate.
 
@@ -763,7 +964,7 @@ def make_validate_document(findings, *, stories_on: bool = False, spec_folder: s
     report = ValidationReport()
     for check, severity, message, detail in findings:
         report.add(check, severity, message, detail)
-    return documents.validate_document(report, stories_on, spec_folder)
+    return documents.validate_document(report, mode, spec_folder)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -796,8 +997,58 @@ def _isolate_ambient_git_ignores(tmp_path_factory: pytest.TempPathFactory):
     mp.undo()
 
 
+class StateRootAllocator:
+    """Hands out distinct, freshly created state roots under one per-worker base.
+
+    Linear by construction: `allocate` does one `mkdir` (two on the first child of a
+    bucket) and never lists a directory. `tmp_path_factory.mktemp` does not have that
+    property — pytest's numbered-dir allocation scans the parent for the highest
+    existing suffix on every call, so one numbered state root per test made the
+    autouse fixture quadratic in the tests a worker had already run, and every
+    ordinary `tmp_path` allocation scanned those roots too because they shared its
+    parent. The counter is plain per-instance state: each xdist worker is its own
+    process with its own session fixture, so no two allocators share a base.
+
+    Children are bucketed `BUCKET_SIZE` to a directory so no directory ever holds
+    more than that many entries. `mkdir` without `exist_ok` is the distinctness
+    proof: an existing path is an error, never a silently shared root. Names stay
+    short (`state0/b3/s17`) so no root is longer than the `state-rootN` it replaced
+    — Windows path budgets are measured from here."""
+
+    BUCKET_SIZE = 256
+
+    def __init__(self, base: Path) -> None:
+        self.base = base
+        self._allocated = 0
+
+    def allocate(self) -> Path:
+        index = self._allocated
+        self._allocated += 1
+        bucket, slot = divmod(index, self.BUCKET_SIZE)
+        bucket_dir = self.base / f"b{bucket}"
+        if slot == 0:
+            bucket_dir.mkdir()
+        root = bucket_dir / f"s{slot}"
+        root.mkdir()
+        return root
+
+
+def point_state_root(mp: pytest.MonkeyPatch, allocator: StateRootAllocator) -> Path:
+    """Aim `BMAD_LOOP_STATE_DIR` at a fresh root, through ``mp`` so ``mp.undo()``
+    restores the operator's own value (or its absence). The only variable touched."""
+    root = allocator.allocate()
+    mp.setenv(envvars.STATE_DIR, str(root))
+    return root
+
+
+@pytest.fixture(scope="session")
+def _state_root_allocator(tmp_path_factory: pytest.TempPathFactory) -> StateRootAllocator:
+    """One numbered base per worker session; every per-test root is a child of it."""
+    return StateRootAllocator(tmp_path_factory.mktemp("state"))
+
+
 @pytest.fixture(autouse=True)
-def _isolate_state_root(tmp_path_factory: pytest.TempPathFactory, monkeypatch):
+def _isolate_state_root(_state_root_allocator: StateRootAllocator, monkeypatch):
     """Point the user-scoped state root at a per-test temp dir, for every test.
 
     `runs.state_root()` resolves to `~/.local/state/bmad-loop` (POSIX) or
@@ -820,7 +1071,48 @@ def _isolate_state_root(tmp_path_factory: pytest.TempPathFactory, monkeypatch):
     Tests that grade the cascade itself `delenv` this variable and monkeypatch
     the ones they need, and share this fixture's monkeypatch instance, so the
     override comes off cleanly for exactly that test."""
-    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path_factory.mktemp("state-root")))
+    point_state_root(monkeypatch, _state_root_allocator)
+
+
+# The absolute pwsh the psmux backend resolves to under the suite (see
+# `_isolate_mux_registry`).
+PINNED_PWSH = r"C:\Program Files\PowerShell\7\pwsh.exe"
+# The absolute psmux the parked-window trailer calls under the suite: a space
+# and an apostrophe, so every trailer assertion exercises the quoting.
+PINNED_PSMUX = r"C:\Program Files\psmux's build\psmux.exe"
+
+
+# What the stubbed `install.cli_version` reports: newer than any floor a shipped
+# profile declares in `hooks.event_min_versions`.
+STUB_CLI_VERSION = (999, 0, 0)
+
+
+@pytest.fixture(autouse=True)
+def _stub_cli_version(monkeypatch):
+    """Answer the hook-event version gate (#865) without running a real CLI.
+
+    `install.gated_hook_events` spawns `<binary> --version` for a profile that
+    declares `hooks.event_min_versions` (claude). Unstubbed, what `init` and
+    worktree provisioning register would depend on whether the host happens to
+    have `claude` on PATH, and how new it is — a developer box and a CI runner
+    would register different events. Tests of the gate itself patch over this, or
+    call the real probe they captured at import."""
+    monkeypatch.setattr(install, "cli_version", lambda profile: STUB_CLI_VERSION)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_skill_roots(monkeypatch, tmp_path_factory):
+    """Pin the home directory and environment the skill locator reads.
+
+    `skill_locate.scope_for` resolves each profile's `[user_skills]` roots
+    against the user's home and checks their disabler variables (CLAUDE_CONFIG_DIR,
+    CODEX_HOME, ...) in bmad-loop's environment. Unpinned, a developer with
+    `npx skills add -g` or an exported CODEX_HOME would see results CI never does.
+    The home is an empty base-temp dir (never created per test). Tests of real
+    behaviour pass `home=` / `environ=` or monkeypatch these seams."""
+    empty = tmp_path_factory.getbasetemp() / "no-user-skill-home"
+    monkeypatch.setattr(skill_locate, "user_home", lambda: empty)
+    monkeypatch.setattr(skill_locate, "ambient_environ", lambda: {})
 
 
 @pytest.fixture(autouse=True)
@@ -855,7 +1147,24 @@ def _isolate_mux_registry(monkeypatch):
     and for a sharper reason: it is written by the same export, it survives in
     module state rather than in the environment (which is the whole point of
     it), and a leftover value makes `legacy_registries()` hand every later test
-    an extra registry to sweep."""
+    an extra registry to sweep.
+
+    `runs._SETTLED_PROJECT` is reset on the same rule: the export records the
+    project it configured, and the ownership gate reads it, so a leftover would
+    judge a later test's sessions against an earlier test's project. Its record
+    of refused kills (`runs._REFUSED_KILLS`) likewise.
+
+    The psmux backend's `pwsh` resolution is pinned to ``PINNED_PWSH`` and its
+    per-process PowerShell version answers are seeded with that path admitted:
+    every psmux window launch resolves and probes pwsh first, and the unit tests
+    that fake `subprocess.run` for psmux would otherwise hand the probe a psmux
+    answer (or, on a host without pwsh, find nothing to resolve) and see every
+    launch refused. The pinned path holds a space, as a default install under
+    Program Files does. Tests of the gate itself, and the live module,
+    reset the answers to empty; the live module also restores real resolution.
+    The psmux path the parked-window trailer bakes in is pinned to
+    ``PINNED_PSMUX`` likewise, so trailer assertions do not depend on whether
+    the host has psmux installed."""
     from bmad_loop.adapters import psmux_backend
 
     monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
@@ -863,6 +1172,29 @@ def _isolate_mux_registry(monkeypatch):
     monkeypatch.delenv("TMUX_PANE", raising=False)
     monkeypatch.delenv("PSMUX_BARE_ENV", raising=False)
     monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    monkeypatch.setattr(psmux_backend.PsmuxMultiplexer, "_pwsh_path", lambda self: PINNED_PWSH)
+    monkeypatch.setattr(psmux_backend.PsmuxMultiplexer, "_psmux_path", lambda self: PINNED_PSMUX)
+    monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {PINNED_PWSH: "7.6.6"})
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", None)
+    monkeypatch.setattr(runs, "_REFUSED_KILLS", [])
+
+
+def seed_project_files(root: Path) -> ProjectPaths:
+    """Write the sandbox's file tree under ``root`` (which must not exist yet).
+
+    The ONE definition of what a sandbox holds before Git: `_project_template` commits
+    exactly this, and `project_tree` hands it out with no repository at all, so the
+    two fixtures cannot drift into describing different projects."""
+    paths = ProjectPaths(
+        project=root,
+        implementation_artifacts=root / "_bmad-output" / "implementation-artifacts",
+        planning_artifacts=root / "_bmad-output" / "planning-artifacts",
+    )
+    paths.implementation_artifacts.mkdir(parents=True)
+    paths.planning_artifacts.mkdir(parents=True)
+    (root / "src.txt").write_text("original\n")
+    (root / ".gitignore").write_text(".bmad-loop/runs/\n")  # as `bmad-loop init` would
+    return paths
 
 
 @pytest.fixture(scope="session")
@@ -873,13 +1205,14 @@ def _project_template(
     a test — a mutation would poison every later test in the worker; tests get
     disposable copies via `project`. (Do not chmod it read-only either: copytree
     preserves modes, so the copies would inherit it and break every write.)"""
-    root = tmp_path_factory.mktemp("project-template") / "sandbox"
-    impl = root / "_bmad-output" / "implementation-artifacts"
-    plan = root / "_bmad-output" / "planning-artifacts"
-    impl.mkdir(parents=True)
-    plan.mkdir(parents=True)
-    (root / "src.txt").write_text("original\n")
-    (root / ".gitignore").write_text(".bmad-loop/runs/\n")  # as `bmad-loop init` would
+    root = seed_project_files(tmp_path_factory.mktemp("project-template") / "sandbox").project
+    _commit_template(root)
+    return root
+
+
+def _commit_template(root: Path) -> None:
+    """Turn a seeded template tree into its one-commit `main` repo: the setup every
+    session template shares, so the v7 template cannot drift from `_project_template`."""
     git(root, "init", "-q", "-b", "main")
     # `git init` seeds 14 dead `*.sample` hooks nothing here reads, and every test
     # replicated all 14 through `project`'s copytree. Drop the files only — NOT via
@@ -904,16 +1237,12 @@ def _project_template(
     git(root, "config", "maintenance.auto", "false")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "initial")
-    return root
 
 
-@pytest.fixture
-def project(tmp_path: Path, _project_template: Path) -> ProjectPaths:
-    """Git repo with BMAD-shaped artifact dirs and an initial commit — a copytree
-    clone of the per-worker template, so no git subprocesses per test (git spawn
-    plus fsync made this fixture ~3s per test on Windows CI)."""
-    root = tmp_path / "sandbox"
-    shutil.copytree(_project_template, root)
+def copy_project(template: Path, root: Path) -> ProjectPaths:
+    """A private copytree of the template repo at ``root``: its own `.git` directory,
+    index, refs and hooks, nothing linked back to the template or any other copy."""
+    shutil.copytree(template, root)
     return ProjectPaths(
         project=root,
         implementation_artifacts=root / "_bmad-output" / "implementation-artifacts",
@@ -921,12 +1250,143 @@ def project(tmp_path: Path, _project_template: Path) -> ProjectPaths:
     )
 
 
+def grant_plugin(root: Path, name: str, *, store_project: Path | None = None) -> GrantSet:
+    """An operator grant for the project plugin ``name`` discovered under ``root``
+    (``root/.bmad-loop/plugins/<name>``), as the frozen `GrantSet` a launch would
+    thread to `PluginRegistry.build` / `Engine(plugin_grants=...)`.
+
+    The digest is taken NOW, so write the plugin's final bytes (absolute markers
+    included) first. Snapshots land under the autouse-isolated state root. With
+    ``store_project`` the grant is also persisted to that project's out-of-tree
+    store, for code paths that read the store themselves."""
+    from bmad_loop.plugins.digest import read_tree
+    from bmad_loop.plugins.grants import GrantRecord
+    from bmad_loop.plugins.loader import USER_PLUGINS_REL
+    from bmad_loop.plugins.store import save_grants
+
+    tree = read_tree(root / USER_PLUGINS_REL / name)
+    rel = (USER_PLUGINS_REL / name).as_posix()
+    record = GrantRecord.from_tree(name, rel, tree, "2026-10-10T00:00:00Z")
+    owner = store_project if store_project is not None else root
+    if store_project is not None:
+        save_grants(store_project, [record], expected=None)
+    return GrantSet(records=(record,), snapshot_root=runs.plugin_snapshots_root(owner))
+
+
+@pytest.fixture
+def project(tmp_path: Path, _project_template: Path) -> ProjectPaths:
+    """Git repo with BMAD-shaped artifact dirs and an initial commit — a copytree
+    clone of the per-worker template, so no git subprocesses per test (git spawn
+    plus fsync made this fixture ~3s per test on Windows CI)."""
+    return copy_project(_project_template, tmp_path / "sandbox")
+
+
+V7_GITIGNORE = ".bmad-loop/runs/\n_bmad/custom/*.user.toml\n"
+
+
+@pytest.fixture(scope="session")
+def _project_template_v7(
+    tmp_path_factory: pytest.TempPathFactory, _isolate_ambient_git_ignores: None
+) -> Path:
+    """The v7 twin of `_project_template`, built once per xdist worker and never
+    handed to a test: a committed v7 install with `DEFAULT_TREE` as a tracked store
+    inside the checkout (layout T1, upstream's default). The personal config layer is
+    gitignored as `bmad setup` leaves it, so it exists in every copy but is never
+    committed — which is what makes a worktree miss `active_initiative`."""
+    root = tmp_path_factory.mktemp("project-template-v7") / "sandbox"
+    root.mkdir()
+    (root / "src.txt").write_text("original\n", encoding="utf-8")
+    (root / ".gitignore").write_text(V7_GITIGNORE, encoding="utf-8")
+    write_ticket_tree(install_bmad_v7(root), DEFAULT_TREE)
+    _commit_template(root)
+    return root
+
+
+@pytest.fixture
+def project_v7(tmp_path: Path, _project_template_v7: Path) -> V7Layout:
+    """A private copytree of the v7 template at `tmp_path / "sandbox"`, like `project`."""
+    root = tmp_path / "sandbox"
+    shutil.copytree(_project_template_v7, root)
+    return v7_layout(root)
+
+
+def _store_repo(store: Path) -> None:
+    """Make ``store`` its own git repository with its contents committed."""
+    git(store, "init", "-q", "-b", "main")
+    git(store, "config", "user.email", "store@example.invalid")
+    git(store, "config", "user.name", "store")
+    git(store, "add", "-A")
+    git(store, "commit", "-q", "-m", "store")
+
+
+@pytest.fixture
+def project_v7_store_repo(project_v7: V7Layout) -> Iterator[V7Layout]:
+    """`project_v7` with the ticket store (`_bmad-output`) turned into its own git
+    repository NESTED in the code checkout and gitignored by it — layout T3. The
+    code repo stops tracking the store (one commit), the store repo commits it."""
+    root, rel = project_v7.project, project_v7.output_folder.relative_to(project_v7.project)
+    git(root, "rm", "-r", "-q", "--cached", rel.as_posix())
+    with (root / ".gitignore").open("a", encoding="utf-8") as f:
+        f.write(f"/{rel.as_posix()}/\n")
+    git(root, "add", ".gitignore")
+    git(root, "commit", "-q", "-m", "the store is its own repository")
+    _store_repo(project_v7.output_folder)
+    yield project_v7
+    remove_tree(project_v7.output_folder / ".git")
+
+
+@pytest.fixture
+def project_v7_external_store(project_v7: V7Layout, tmp_path: Path) -> Iterator[V7Layout]:
+    """`project_v7` with the ticket store moved OUTSIDE the project into its own git
+    repository and `output_folder` set to its absolute path — layout T4."""
+    root = project_v7.project
+    rel = project_v7.output_folder.relative_to(root).as_posix()
+    store = tmp_path / "store"
+    shutil.move(str(project_v7.output_folder), str(store))
+    config = root / "_bmad" / "config.toml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            '"{project-root}/_bmad-output"', json.dumps(str(store))
+        ),
+        encoding="utf-8",
+    )
+    git(root, "rm", "-r", "-q", "--cached", rel)
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "the store moved out")
+    _store_repo(store)
+    yield v7_layout(root, initiative=project_v7.initiative, output_folder=str(store))
+    remove_tree(store / ".git")
+
+
+@pytest.fixture
+def project_tree(tmp_path: Path) -> ProjectPaths:
+    """The `project` file tree at the same `tmp_path / "sandbox"` spot, with NO Git.
+
+    For tests whose assertion and exercised code path never consult a repository:
+    it skips the `.git` copy entirely. Opt in explicitly and only with a reason —
+    nothing here guesses from a test's name, and nothing creates a repository lazily
+    if the code under test turns out to want one. Code that does reach Git finds no
+    repository here and may DEGRADE rather than fail, so a green run on this fixture
+    is not by itself evidence that Git was incidental — read the exercised path.
+    Anything that commits, diffs, stashes, installs hooks or reads `HEAD` stays on
+    `project`.
+
+    Admitted so far, each on two grounds — the product path is Git-free by reading
+    (every TUI Git contact goes through `verify._run_git`, only on launch, decision
+    publish, story-checkpoint subject and re-arm; nothing reads `.git` directly) AND
+    the test measured zero subprocess spawns on `project`: `test_sprintstatus.py`
+    parsing, `test_tui_data.py` config/ledger/sprint readers, and `test_tui_app.py`
+    render, input, layout and lifecycle rows that never reach one of those actions."""
+    return seed_project_files(tmp_path / "sandbox")
+
+
 # --------------------------------------- divergent roots (`repo_root` override)
 #
-# `isolation = "none"` plus a `repo_root:` key in _bmad/bmm/config.yaml is the ONE
-# supported shape where `paths.project` and `paths.repo_root` name different
-# directories (`bmadconfig.worktree_isolation_conflict` refuses the other, and
-# `ProjectPaths.rebased` sets both roots, so worktree isolation never diverges).
+# A `repo_root:` key in _bmad/bmm/config.yaml is the shape where `paths.project` and
+# `paths.repo_root` name different directories. Under `isolation = "none"` any such
+# key is supported; under `isolation = "worktree"` only a `repo_root` that CONTAINS
+# the project is (`bmadconfig.worktree_isolation_conflict` refuses a disjoint one),
+# and `ProjectPaths.rebased` keeps the project's offset inside the mount (DW-379).
 # The `project` fixture above sets no override, so `repo_root == project` there and
 # nothing built on it can tell the two apart. These helpers centralize the shared
 # marker probes, config writer, and nested builder so new coverage does not have to
@@ -996,11 +1456,11 @@ _ARTIFACT_PATH_KEYS = (
 def write_repo_root_override(paths: ProjectPaths, code_root: Path) -> None:
     """Rewrite `_bmad/bmm/config.yaml` with a `repo_root:` pointing at `code_root`.
 
-    The one supported divergent-roots config: `isolation = "none"` plus a
-    `repo_root:` key (`bmadconfig.worktree_isolation_conflict` refuses the other
-    combination, and `ProjectPaths.rebased` sets both roots, so worktree isolation
-    never diverges). Overwrites rather than appends, so it is exact whether or not
-    `install_bmad_config` ran first.
+    The divergent-roots config: a `repo_root:` key, supported beside
+    `isolation = "none"` for any `code_root` and beside `isolation = "worktree"` only
+    when `code_root` contains the project (`bmadconfig.worktree_isolation_conflict`
+    refuses a disjoint one, DW-379). Overwrites rather than appends, so it is exact
+    whether or not `install_bmad_config` ran first.
 
     `code_root` need not be a git checkout, and several rows deliberately pass a
     plain directory or a missing one.
@@ -1107,6 +1567,19 @@ def nested_repo_root_paths(paths: ProjectPaths) -> ProjectPaths:
     git(repo_root, "add", NESTED_SUBDIR)
     git(repo_root, "commit", "-q", "-m", f"seed the {NESTED_SUBDIR}/ project")
     return load_paths(project)
+
+
+def session_checkout_root(paths: ProjectPaths, cwd: Path) -> Path:
+    """The checkout root a session launched at ``cwd`` works in.
+
+    Sessions run in the mount project (DW-484), which a nested `repo_root` puts at
+    ``<checkout>/<offset>``; a fake session editing code or rebasing `paths` needs
+    the checkout itself. Lexical: strips one parent per offset component, so it is
+    ``cwd`` unchanged in the default config."""
+    root = Path(cwd)
+    for _ in paths.project.relative_to(paths.repo_root).parts:
+        root = root.parent
+    return root
 
 
 OUTER_DECOY_LEDGER = b"# outer ledger\n"
@@ -1294,6 +1767,667 @@ def install_bmad_central_config(paths: ProjectPaths) -> None:
     (bmad / "custom" / "config.user.toml").write_text(CENTRAL_CUSTOM_USER_STUB, encoding="utf-8")
 
 
+# BMAD-METHOD v7: the initiative ticket tree. `tests/fixtures/bmad_v7` holds upstream's
+# `tickets.py` and `config_utils.py` byte-for-byte at the commit `PIN.toml` names, so
+# every v7 sandbox runs the real script with no network and no `uv`. The layout below
+# is what upstream's `bmad setup` writes (`skills/bmad/assets/config.template.toml`,
+# `skills/bmad/references/initiative.md`) and what `tickets.py` reads: the three
+# config layers via `_bmad/scripts/config_utils.py`, `[core] active_initiative` in the
+# personal (gitignored) layer, and `{output_folder}/{initiative}/` as the tree.
+V7_FIXTURE = Path(__file__).parent / "fixtures" / "bmad_v7"
+V7_TICKETS_REL = Path("_bmad") / "method" / "scripts" / "tickets.py"
+V7_CONFIG_UTILS_REL = Path("_bmad") / "scripts" / "config_utils.py"
+V7_USER_CONFIG_REL = Path("_bmad") / "custom" / "config.user.toml"
+V7_STORE_CONFIG_REL = Path("_bmad") / "custom" / "ticketing-store-config.toml"
+V7_DEFAULT_INITIATIVE = "initiative-demo"
+
+
+@dataclass(frozen=True)
+class EntrySpec:
+    """One `[[entry]]` of an epic's `tickets.toml`. ``after`` holds upstream refs: a
+    bare int is a sibling id, ``"E.M"`` another epic's entry, ``"epic-<x>"`` a whole
+    epic. ``refine=None`` leaves the key out (upstream then refines bugs only).
+    ``refined=True`` also writes the pulled leaf file with ``refined: true``, the only
+    way upstream ever reports a ticket as refined. ``v6_key`` is the old sprint key
+    the v6→v7 migration records on the entry; None leaves the key out."""
+
+    id: int
+    title: str
+    type: str = "story"
+    after: tuple[int | str, ...] = ()
+    hitl: bool = False
+    refine: bool | None = None
+    refined: bool = False
+    plan_checkpoint: bool = False
+    done_checkpoint: bool = False
+    v6_key: str | None = None
+
+
+@dataclass(frozen=True)
+class EpicSpec:
+    """One epic folder. ``slug`` is the folder name (``epic-<x>``), which is also
+    upstream's `[[epic]] slug`. ``gated_by`` names epic slugs that must be closed
+    (`status: done` in their epic file) first: it is written as the epic file's
+    `after:`, the only epic gate `next` enforces, plus the advisory initiative-level
+    `after` that keeps `unpinned_after` empty."""
+
+    id: int
+    slug: str
+    title: str
+    entries: tuple[EntrySpec, ...]
+    gated_by: tuple[str, ...] = ()
+    status: str = "in-progress"
+
+
+@dataclass(frozen=True)
+class V7Layout:
+    project: Path
+    initiative: str
+    output_folder: Path
+    initiative_folder: Path
+    tickets_script: Path
+    store: str
+
+
+# 2 epics x 2 entries, one of each kind a tickets run treats differently, in build
+# order: 1.1 is the only ready ticket (an unrefined plan_checkpoint, so two legs, and
+# a done_checkpoint); 1.2 waits on 1.1 and is hitl; epic 2 is gated on epic 1's
+# closure; 2.1 is a refined plan_checkpoint; 2.2 is a bug, so it needs refinement.
+DEFAULT_TREE: tuple[EpicSpec, ...] = (
+    EpicSpec(
+        1,
+        "epic-cart",
+        "Cart",
+        (
+            EntrySpec(1, "Cart model", plan_checkpoint=True, done_checkpoint=True),
+            EntrySpec(2, "Cart rules", after=(1,), hitl=True),
+        ),
+    ),
+    EpicSpec(
+        2,
+        "epic-checkout",
+        "Checkout",
+        (
+            EntrySpec(1, "Checkout form", plan_checkpoint=True, refined=True),
+            EntrySpec(2, "Checkout crash", type="bug", after=(1,)),
+        ),
+        gated_by=("epic-cart",),
+    ),
+)
+
+
+def v7_layout(
+    root: Path,
+    *,
+    initiative: str = V7_DEFAULT_INITIATIVE,
+    output_folder: str = "_bmad-output",
+    store: str = "repo",
+) -> V7Layout:
+    """The paths `install_bmad_v7` writes under ``root``, computed without touching disk."""
+    out = Path(output_folder) if Path(output_folder).is_absolute() else root / output_folder
+    return V7Layout(
+        project=root,
+        initiative=initiative,
+        output_folder=out,
+        initiative_folder=out / initiative,
+        tickets_script=root / V7_TICKETS_REL,
+        store=store,
+    )
+
+
+def install_bmad_v7(
+    root: Path,
+    *,
+    initiative: str = V7_DEFAULT_INITIATIVE,
+    output_folder: str = "_bmad-output",
+    store: str = "repo",
+    bmod_version: str = "7.0.0",
+    skill_tree: str = ".claude/skills",
+) -> V7Layout:
+    """Install a v7 project under ``root``: the config layers, the vendored scripts at
+    their installed paths, the `bmod-method` module record and the store config, plus
+    an empty initiative folder. No tree: `write_ticket_tree` writes that."""
+    layout = v7_layout(root, initiative=initiative, output_folder=output_folder, store=store)
+    bmad = root / "_bmad"
+    (bmad / "custom").mkdir(parents=True, exist_ok=True)
+    folder = (
+        output_folder if Path(output_folder).is_absolute() else f"{{project-root}}/{output_folder}"
+    )
+    (bmad / "config.toml").write_text(
+        f"[core]\nproject_name = {json.dumps(root.name)}\noutput_folder = {json.dumps(folder)}\n",
+        encoding="utf-8",
+    )
+    (bmad / "custom" / "config.toml").write_text(CENTRAL_CUSTOM_STUB, encoding="utf-8")
+    (root / V7_USER_CONFIG_REL).write_text(
+        f"[core]\nactive_initiative = {json.dumps(initiative)}\n", encoding="utf-8"
+    )
+    (root / V7_STORE_CONFIG_REL).write_text(
+        f"[tickets]\nstore = {json.dumps(store)}\n", encoding="utf-8"
+    )
+    for rel, name in ((V7_CONFIG_UTILS_REL, "config_utils.py"), (V7_TICKETS_REL, "tickets.py")):
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(V7_FIXTURE / name, root / rel)
+    record = root / skill_tree / "bmod-method" / "bmod.toml"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(
+        "[bmod]\n"
+        'code = "method"\n'
+        f"version = {json.dumps(bmod_version)}\n"
+        'update_source = "github:bmad-code-org/BMAD-METHOD/skills"\n'
+        'skills = ["bmad-build-auto", "bmad-agent-po"]\n',
+        encoding="utf-8",
+    )
+    layout.initiative_folder.mkdir(parents=True, exist_ok=True)
+    return layout
+
+
+def _toml_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    raise TypeError(f"no TOML rendering for {value!r}")
+
+
+def _frontmatter_value(value: object) -> str:
+    """A value as upstream's frontmatter parser reads it: inline lists, bare
+    true/false and ints, and plain text."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(str(v) for v in value) + "]"
+    return str(value)
+
+
+def _frontmatter(fields: dict[str, object], body: str) -> str:
+    lines = "".join(f"{k}: {_frontmatter_value(v)}\n" for k, v in fields.items())
+    return f"---\n{lines}---\n\n{body}"
+
+
+def ticket_slug(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+
+
+def _breakdown(container: Path, *, flat: bool) -> Path:
+    """Where ``container``'s `tickets.toml`, epic folders, leaves and plans go: its
+    `tickets/` folder, or the container itself in the preview layout (``flat``)."""
+    return container if flat else container / ticketlayout.TICKETS
+
+
+def write_ticket_tree(
+    layout: V7Layout, epics: tuple[EpicSpec, ...] | list[EpicSpec], *, flat: bool = False
+) -> None:
+    """Hand-write the initiative's breakdown in upstream's `tickets/` layout: the
+    initiative's own frontmatter file, `tickets/tickets.toml` with the `[[epic]]` table
+    in build order, and per epic `tickets/<epic>/` holding its `<epic>.md` and its own
+    `tickets/` folder with `tickets.toml` (plus a pulled leaf file for every
+    ``refined`` entry). ``flat`` writes the "7 preview" layout instead, every
+    breakdown beside its container's file, which only a preview-era script reads: keep
+    it to reader tests that never spawn the vendored script. Plans are separate:
+    `write_plan`."""
+    folder = layout.initiative_folder
+    breakdown = _breakdown(folder, flat=flat)
+    breakdown.mkdir(parents=True, exist_ok=True)
+    (folder / f"{layout.initiative}.md").write_text(
+        _frontmatter(
+            {"type": "initiative", "title": layout.initiative, "parent": "none"},
+            f"# {layout.initiative}\n",
+        ),
+        encoding="utf-8",
+    )
+    ids = {epic.slug: epic.id for epic in epics}
+    table = []
+    for epic in epics:
+        block = f"[[epic]]\nid = {epic.id}\nslug = {json.dumps(epic.slug)}\n"
+        if epic.gated_by:
+            gates = ", ".join(
+                f"{{ epic = {ids[g]}, needs = {json.dumps(f'{g} closed')} }}" for g in epic.gated_by
+            )
+            block += f"after = [{gates}]\n"
+        table.append(block)
+    (breakdown / ticketlayout.BREAKDOWN).write_text("\n".join(table), encoding="utf-8")
+    for epic in epics:
+        epic_dir = breakdown / epic.slug
+        leaves = _breakdown(epic_dir, flat=flat)
+        leaves.mkdir(parents=True, exist_ok=True)
+        fields: dict[str, object] = {"type": "epic", "title": epic.title, "status": epic.status}
+        if epic.gated_by:
+            fields["after"] = list(epic.gated_by)
+        (epic_dir / f"{epic.slug}.md").write_text(
+            _frontmatter(fields, f"# {epic.title}\n"), encoding="utf-8"
+        )
+        entries = []
+        for e in epic.entries:
+            block = (
+                f"[[entry]]\nid = {e.id}\ntype = {json.dumps(e.type)}\n"
+                f"title = {json.dumps(e.title, ensure_ascii=False)}\n"
+            )
+            if e.after:
+                block += f"after = {_toml_value(e.after)}\n"
+            for key in ("hitl", "plan_checkpoint", "done_checkpoint"):
+                if getattr(e, key):
+                    block += f"{key} = true\n"
+            if e.refine is not None:
+                block += f"refine = {_toml_value(e.refine)}\n"
+            if e.v6_key is not None:
+                block += f"v6_key = {json.dumps(e.v6_key)}\n"
+            entries.append(block)
+            if e.refined:
+                (leaves / f"{e.type}-{ticket_slug(e.title)}.md").write_text(
+                    _frontmatter(
+                        {
+                            "id": e.id,
+                            "type": e.type,
+                            "title": json.dumps(e.title, ensure_ascii=False),
+                            "parent": epic.slug,
+                            "after": list(e.after),
+                            "refined": True,
+                            "hitl": e.hitl,
+                        },
+                        f"# {e.title}\n",
+                    ),
+                    encoding="utf-8",
+                )
+        (leaves / ticketlayout.BREAKDOWN).write_text("\n".join(entries), encoding="utf-8")
+
+
+def write_plan(
+    layout: V7Layout,
+    epic_slug: str,
+    stem: str,
+    ticket: int | str,
+    status: str,
+    *,
+    flat: bool = False,
+    **fm: object,
+) -> Path:
+    """Write ``tickets/<epic>/tickets/<stem>.md`` under the initiative (``<epic>/<stem>.md``
+    when ``flat``, as `write_ticket_tree`), a build plan for entry ``ticket``, with
+    frontmatter `ticket` and `status` plus ``fm``. Upstream names plans
+    ``<type>-<title slug>-plan.md``; pass that stem to look like a real build."""
+    epic_dir = _breakdown(layout.initiative_folder, flat=flat) / epic_slug
+    path = _breakdown(epic_dir, flat=flat) / f"{stem}.md"
+    fields: dict[str, object] = {"ticket": ticket, "status": status, **fm}
+    path.write_text(_frontmatter(fields, f"# {stem}\n"), encoding="utf-8")
+    return path
+
+
+def run_tickets(layout: V7Layout, *argv: str, rc: int = 0) -> dict[str, object]:
+    """Run the sandbox's installed `tickets.py` the way bmad-loop will (isolated, no
+    bytecode, UTF-8 mode) and return its JSON document: stdout on rc 0, stderr
+    otherwise. Every call is a real spawn: count it against the calling file's
+    real-spawn budget."""
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-X",
+            "utf8",
+            str(layout.tickets_script),
+            "--project-root",
+            str(layout.project),
+            *argv,
+        ],
+        cwd=layout.project,
+        capture_output=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    assert proc.returncode == rc, f"tickets.py {argv}: rc {proc.returncode}\n{proc.stderr}"
+    doc = json.loads(proc.stdout if rc == 0 else proc.stderr)
+    assert isinstance(doc, dict)
+    return doc
+
+
+# ---- FakeTicketTree: the in-memory `tickettree.TicketTreeLike` engine tests inject.
+
+_FAKE_STATE_OF = {
+    "": "planned",
+    "draft": "backlog",
+    "ready-for-dev": "backlog",
+    "in-progress": "in-progress",
+    "blocked": "in-progress",
+    "in-review": "review",
+    "built": "review",
+    "done": "done",
+    "dropped": "dropped",
+    # a build session's own park token: upstream reads it as an unknown status (a
+    # `problems` row) and forces the ticket to blocked, which `state` derives as
+    # in-progress. The fake's `mark` still decides on it natively, as the real
+    # chokepoint reads the plan's own `status`.
+    "awaiting-operator": "in-progress",
+}
+
+
+def ticket_row(
+    ref: str, *, epic: str = "epic-cart", status: str = "", **fields: object
+) -> TicketRow:
+    """A `TicketRow` with upstream-shaped defaults: ``ref`` ``"E.M"`` gives id
+    ``M``, the title is derived from the ref, and ``state`` follows ``status``
+    (``planned`` with no plan). Any field can be overridden."""
+    _, _, n = ref.rpartition(".")
+    base: dict[str, object] = {
+        "ref": ref,
+        "epic": epic,
+        "id": n or ref,
+        "file": None,
+        "type": "story",
+        "tracker_id": "",
+        "title": f"Ticket {ref}",
+        "status": status,
+        "tracker_status": "",
+        "state": _FAKE_STATE_OF[status],
+        "assignee": "",
+        "hitl": False,
+        "risk": "",
+        "refine": False,
+        "refined": False,
+        "blocked_at": "",
+        "blocked_reason": "",
+        "after": (),
+        "gated_by": (),
+        "waiting_on": (),
+        "unknown": "",
+        "plan_checkpoint": False,
+        "done_checkpoint": False,
+        "drift": False,
+        "blocks": (),
+    }
+    base.update(fields)
+    return TicketRow(**base)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class FakeMark:
+    """One `FakeTicketTree.mark` call the transition table let through, as
+    recorded (``outcome`` is ``written`` or ``noop``)."""
+
+    ref: str
+    target: str
+    reason: str
+    expected_plan: Path | None
+    blocked: str | None
+    outcome: str = "written"
+
+
+class FakeTicketTree:
+    """An in-memory `tickettree.TicketTreeLike`: canned views, find results keyed
+    by ref, recorded calls and marks, and configurable faults — so engine tests
+    never spawn `tickets.py`.
+
+    Build it with `from_rows` (groups as `next` would print them; `status` lists
+    every row; `find` answers each row's ref with a plan path under
+    ``project_root/_bmad-output/<initiative>/<epic>/``), or pass views directly.
+    ``faults[verb]`` (``"next"``, ``"status"``, ``"find"``, ``"capability"``,
+    ``"mark"``, ``"discard"``, ``"restore"``) is raised on every call of that
+    verb until removed. Writes run the real `statemachine.check_plan_transition`
+    on the row's status (a row with status ``""`` has no plan), so an engine test
+    sees the same refusals and no-ops as the real chokepoint. With a
+    ``pinned_initiative``, set ``live_initiative`` to simulate the operator
+    switching initiatives: every tree read then raises `TicketsPinMismatch`
+    before recording a call, as the real tree refuses before spawning."""
+
+    def __init__(
+        self,
+        project_root: Path = Path("."),
+        *,
+        next_view: NextView | None = None,
+        status_view: StatusView | None = None,
+        finds: dict[str, FindResult] | None = None,
+        capability: Capability | None = None,
+        pinned_initiative: str | None = None,
+    ) -> None:
+        self._project_root = Path(project_root)
+        self._pinned_initiative = pinned_initiative
+        self.live_initiative: str | None = pinned_initiative
+        self.next_view = next_view or fake_next_view()
+        self.status_view = status_view or fake_status_view(())
+        self.finds: dict[str, FindResult] = dict(finds or {})
+        self.cap = capability or Capability(
+            verbs=frozenset({"next", "status", "find", "pull", "mark", "mirror"}),
+            statuses=frozenset(ticketmodel.PLAN_STATUSES),
+            requires_python=">=3.11",
+        )
+        self.faults: dict[str, Exception] = {}
+        self.calls: list[tuple[str, ...]] = []
+        self.marks: list[FakeMark] = []
+        self.discards: list[str] = []
+        self.restores: list[tuple[Path, bytes | None]] = []
+
+    @classmethod
+    def from_rows(
+        cls,
+        project_root: Path = Path("."),
+        *,
+        initiative: str = V7_DEFAULT_INITIATIVE,
+        ready_to_refine: tuple[TicketRow, ...] = (),
+        ready_to_start: tuple[TicketRow, ...] = (),
+        in_progress: tuple[TicketRow, ...] = (),
+        blocked: tuple[TicketRow, ...] = (),
+        others: tuple[TicketRow, ...] = (),
+        pinned_initiative: str | None = None,
+    ) -> FakeTicketTree:
+        """``others`` are rows `next` does not list (done, dropped) but `status`
+        and `find` do."""
+        project_root = Path(project_root)
+        rows = (*ready_to_refine, *ready_to_start, *in_progress, *blocked, *others)
+        folder = project_root / "_bmad-output" / initiative
+        return cls(
+            project_root,
+            next_view=fake_next_view(
+                folder=initiative,
+                ready_to_refine=ready_to_refine,
+                ready_to_start=ready_to_start,
+                in_progress=in_progress,
+                blocked=blocked,
+            ),
+            status_view=fake_status_view(rows, folder=initiative),
+            finds={r.ref: fake_find(r, folder / r.epic) for r in rows if r.ref is not None},
+            pinned_initiative=pinned_initiative,
+        )
+
+    @property
+    def project_root(self) -> Path:
+        return self._project_root
+
+    @property
+    def pinned_initiative(self) -> str | None:
+        return self._pinned_initiative
+
+    def _enter(self, verb: str, *args: str, tree: bool = True) -> None:
+        if (
+            tree
+            and self._pinned_initiative is not None
+            and self.live_initiative != self._pinned_initiative
+        ):
+            raise TicketsPinMismatch(self._pinned_initiative, self.live_initiative)
+        self.calls.append((verb, *args))
+        fault = self.faults.get(verb)
+        if fault is not None:
+            raise fault
+
+    def capability(self) -> Capability:
+        self._enter("capability", tree=False)
+        return self.cap
+
+    def next(self) -> NextView:
+        self._enter("next")
+        return self.next_view
+
+    def status(self, folder: Path | None = None) -> StatusView:
+        self._enter("status", *(() if folder is None else (str(folder),)))
+        return self.status_view
+
+    def find(self, ref: str) -> FindResult:
+        self._enter("find", ref)
+        try:
+            return self.finds[ref]
+        except KeyError:
+            raise TicketsNoMatch(f"no ticket matches {ref!r}") from None
+
+    def _write_target(self, ref: str, expected_plan: Path | None) -> FindResult:
+        found = self.find(ref)
+        self.calls.pop()  # the inner find is not a call of its own
+        if expected_plan is not None and Path(found.plan) != Path(expected_plan):
+            raise TicketsPlanMismatch(
+                f"{ref}: find names plan {found.plan}, expected {expected_plan}"
+            )
+        return found
+
+    def mark(
+        self,
+        ref: str,
+        target: str,
+        *,
+        reason: str,
+        expected_plan: Path | None = None,
+        blocked: str | None = None,
+        journal: Journal | None = None,
+    ) -> PlanMark:
+        """Decide the mark with the real transition table, record it, and reflect
+        a write in `find` (status, blocked fields). ``expected_plan`` None skips
+        the cross-check; a ``journal`` gets the real chokepoint's ``ticket-mark``."""
+        self._enter("mark", ref, target)
+        found = self._write_target(ref, expected_plan)
+        row = found.row
+        try:
+            write = check_plan_transition(
+                ref,
+                row.status,
+                target,
+                reason,  # type: ignore[arg-type]
+                has_plan=row.status != "",
+                blocked_reason=row.blocked_reason,
+                blocked=blocked,
+                blocked_at=row.blocked_at,
+            )
+        except PlanTransitionRefused as e:
+            raise TicketsTransitionRefused(e.ref, e.current, e.target, e.reason, e.why) from e
+        outcome = "written" if write else "noop"
+        self.marks.append(FakeMark(ref, target, reason, expected_plan, blocked, outcome))
+        if write:
+            row = dataclasses.replace(
+                row,
+                status=target,
+                state=_FAKE_STATE_OF[target],
+                blocked_at="2026-01-01" if blocked is not None else "",
+                blocked_reason=blocked or "",
+            )
+            self.finds[ref] = dataclasses.replace(found, row=row)
+        if journal is not None:
+            journal.append(
+                "ticket-mark",
+                ref=ref,
+                reason=reason,
+                before=found.row.status,
+                after=row.status,
+                outcome=outcome,
+                created=False,
+                plan=found.plan,
+            )
+        return PlanMark(ref, Path(found.plan), found.row.status, row.status, outcome)
+
+    def discard_unbuilt_plan(
+        self, ref: str, expected_plan: Path | None = None, journal: Journal | None = None
+    ) -> PlanMark:
+        """Record the discard and reset the row to "no plan" (the fake has no
+        plan bodies, so every plan counts as frontmatter-only)."""
+        self._enter("discard", ref)
+        found = self._write_target(ref, expected_plan)
+        before = found.row.status
+        if before == "":
+            return PlanMark(ref, Path(found.plan), "", "", "noop")
+        try:
+            check_plan_transition(
+                ref,
+                before,
+                "ready-for-dev",
+                "rollback",
+                has_plan=True,
+                blocked_reason=found.row.blocked_reason,
+            )
+        except PlanTransitionRefused as e:
+            raise TicketsTransitionRefused(e.ref, e.current, "", e.reason, e.why) from e
+        self.discards.append(ref)
+        row = dataclasses.replace(found.row, status="", state="planned")
+        self.finds[ref] = dataclasses.replace(found, row=row)
+        return PlanMark(ref, Path(found.plan), before, "", "discarded")
+
+    def restore_preimage(
+        self, plan: Path, data: bytes | None, journal: Journal | None = None
+    ) -> None:
+        """Record the restore; the fake does not touch disk."""
+        self._enter("restore", str(plan), tree=False)
+        self.restores.append((Path(plan), data))
+
+
+def fake_next_view(
+    *,
+    store: str = "repo",
+    folder: str = V7_DEFAULT_INITIATIVE,
+    ready_to_refine: tuple[TicketRow, ...] = (),
+    ready_to_start: tuple[TicketRow, ...] = (),
+    in_progress: tuple[TicketRow, ...] = (),
+    blocked: tuple[TicketRow, ...] = (),
+) -> NextView:
+    return NextView(
+        store=store,
+        folder=folder,
+        ready_to_refine=ready_to_refine,
+        ready_to_start=ready_to_start,
+        in_progress=in_progress,
+        blocked=blocked,
+        problems=(),
+        unpinned_after=(),
+        undeclared_after=(),
+        order_conflict=(),
+    )
+
+
+def fake_status_view(
+    tickets: tuple[TicketRow, ...],
+    *,
+    store: str = "repo",
+    folder: str = V7_DEFAULT_INITIATIVE,
+    epics: tuple[EpicRow, ...] = (),
+) -> StatusView:
+    counts: dict[str, int] = {"total": len(tickets)}
+    for t in tickets:
+        counts[t.state] = counts.get(t.state, 0) + 1
+    return StatusView(
+        store=store,
+        folder=folder,
+        tickets=tickets,
+        counts=counts,
+        epics=epics,
+        next_id=None,
+        longest_remaining_chain=(),
+        problems=(),
+    )
+
+
+def fake_find(row: TicketRow, epic_dir: Path) -> FindResult:
+    """`find`'s answer for ``row``: the plan where a build would write it
+    (``<type>-<title slug>-plan.md`` in ``epic_dir``), the epic file beside it."""
+    return FindResult(
+        row=row,
+        folder=row.epic,
+        description="",
+        verify="",
+        references=(),
+        notes=(),
+        unknown=row.unknown,
+        epic_file=str(epic_dir / f"{row.epic}.md"),
+        story_file=str(epic_dir / row.file) if row.file else None,
+        plan=str(epic_dir / f"{row.type}-{ticket_slug(row.title)}-plan.md"),
+    )
+
+
 def _write_skill_stubs(skills: Path, catalog: dict) -> None:
     """Stub every skill in `catalog` (an install.py {skill: marker_files} map) under
     `skills`. Reading the catalog instead of restating it means a newly required
@@ -1311,6 +2445,72 @@ RENDERER_STUB_SKILL_MD = (
 )
 RENDERER_WORKFLOW_MD = "Read [[bmad-snapshot:step-04-review.md]] fully.\n"
 RENDERER_SCRIPT_IMPORTING_SIBLING = "from config_utils import load_central_config\n"
+
+# `validate --render-probe` fixtures: a stub whose fenced render command launches
+# this interpreter, and fake renderers that record each execution to a marker file.
+# The prose line also names render_skill.py, so a parser that took the first line
+# anywhere (rather than the first FENCED line) would pick the wrong command.
+_RENDER_PROBE_PREAMBLE = """\
+import json, os, pathlib, sys
+args = sys.argv[1:]
+root = pathlib.Path(args[args.index("--project-root") + 1])
+skill = pathlib.Path(args[args.index("--skill") + 1])
+pathlib.Path({marker!r}).write_text(json.dumps({{
+    "root": str(root),
+    "skill": str(skill),
+    "cwd": os.getcwd(),
+    "argv": args,
+    "stale_render": (root / "_bmad" / "render").exists(),
+    "skill_md": (skill / "SKILL.md").is_file(),
+}}), encoding="utf-8")
+"""
+RENDER_PROBE_OK_BODY = """\
+out = root / "_bmad" / "render" / skill.name / "workflow.md"
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text("rendered\\n", encoding="utf-8")
+print(f"read and follow {out}")
+"""
+RENDER_PROBE_HALT_BODY = """\
+print(f"HALT: missing config value x under {root}")
+sys.exit(1)
+"""
+RENDER_PROBE_TRACEBACK_BODY = 'raise RuntimeError("renderer exploded")\n'
+
+
+def render_probe_stub_skill_md(launcher: str | None = None) -> str:
+    """A renderer-stub SKILL.md shaped like upstream's, launching ``launcher``
+    (default: this interpreter) on the project's render_skill.py."""
+    import shlex
+
+    if launcher is None:
+        launcher = shlex.quote(Path(sys.executable).as_posix())
+    return (
+        "---\nname: bmad-build-auto\n---\n\n"
+        "Run the `render_skill.py` command below exactly once:\n\n"
+        "```bash\n"
+        f'{launcher} "{{project-root}}/_bmad/scripts/render_skill.py" '
+        '--project-root "{project-root}" --skill "{skill-root}"\n'
+        "```\n"
+    )
+
+
+def install_render_probe_fixture(
+    root: Path, marker: Path, body: str, tree: str = ".claude/skills"
+) -> Path:
+    """A renderer-stub dev primitive with a complete presence surface whose
+    render_skill.py is a fake that writes ``marker`` whenever it executes.
+    Returns the primitive's skill dir."""
+    from bmad_loop.install import CENTRAL_CONFIG_REL, DEV_PRIMITIVE_NEW, RENDERER_SCRIPT_REL
+
+    skills = install_build_auto_skill(root, tree, renderer_stub=True)
+    primitive = skills / DEV_PRIMITIVE_NEW
+    (primitive / "SKILL.md").write_text(render_probe_stub_skill_md(), encoding="utf-8")
+    script = Path(root) / RENDERER_SCRIPT_REL
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(_RENDER_PROBE_PREAMBLE.format(marker=str(marker)) + body, encoding="utf-8")
+    config = Path(root) / CENTRAL_CONFIG_REL
+    config.write_text("[core]\nname = 'fixture'\n", encoding="utf-8")
+    return primitive
 
 
 def install_dev_base_skills(root: Path, tree: str = ".claude/skills", *, folder_id: bool) -> Path:
@@ -1385,6 +2585,31 @@ def install_build_auto_skill(
     return skills
 
 
+def install_build_auto_v7_skill(
+    root: Path, tree: str = ".claude/skills", *, tickets_route: bool = True
+) -> Path:
+    """The BMAD v7 `bmad-build-auto`: :func:`install_build_auto_skill` (so the base
+    and stories probes pass too) with a step-01 that also resolves a ticket from the
+    tree, carrying the marker `install.missing_tickets_support` content-probes for.
+    ``tickets_route=False`` leaves the pre-v7 step-01, the stale install."""
+    from bmad_loop.install import (
+        DEV_PRIMITIVE_NEW,
+        STORIES_PROBE_TEXT,
+        TICKETS_PROBE_FILE,
+        TICKETS_PROBE_TEXT,
+    )
+
+    skills = install_build_auto_skill(root, tree, folder_id=True)
+    if tickets_route:
+        (skills / DEV_PRIMITIVE_NEW / TICKETS_PROBE_FILE).write_text(
+            f"This is a **{STORIES_PROBE_TEXT}** router.\n"
+            f"Resolve a ticket with `uv run {{project-root}}/_bmad/{TICKETS_PROBE_TEXT} "
+            "--project-root {project-root} find <ref>`.\n",
+            encoding="utf-8",
+        )
+    return skills
+
+
 def install_dev_shim(root: Path, tree: str = ".claude/skills", *, with_review: bool = True) -> Path:
     """Lay down ONLY the post-rename forwarding shim: a lone `bmad-dev-auto/SKILL.md`
     with no marker files and no new-name skill beside it.
@@ -1415,11 +2640,31 @@ def install_base_skills(paths: ProjectPaths, trees=(".claude/skills", ".agents/s
 
     BASE_SKILLS names BOTH primitive eras, so this lays down both and the tree
     resolves to `bmad-build-auto`. For a single-era scaffold use
-    :func:`install_dev_base_skills` (legacy) or :func:`install_build_auto_skill`."""
+    :func:`install_dev_base_skills` (legacy) or :func:`install_build_auto_skill`.
+    Each tree also gets a real copy of the bundled `bmad-loop-sweep`
+    (:func:`install_sweep_skill`), as `bmad-loop init` would lay it down."""
     from bmad_loop.install import BASE_SKILLS
 
     for tree in trees:
         _write_skill_stubs(paths.project / tree, BASE_SKILLS)
+        install_sweep_skill(paths.project, tree)
+
+
+def install_sweep_skill(root: Path, tree: str = ".claude/skills") -> Path:
+    """Copy the wheel's bundled `bmad-loop-sweep` into ``root/tree``, the way
+    `bmad-loop init` lays it down, so the triage-tree preflight
+    (`install.missing_sweep_skill`) passes for the right reason: the file set it
+    requires is read from the same bundle, so a stub list here would drift the
+    moment a mode file is added. Idempotent. Returns the skill directory."""
+    from bmad_loop.install import SWEEP_SKILL, bundled_skill_files, skills_root
+
+    src = skills_root().joinpath(SWEEP_SKILL)
+    dst = Path(root) / tree / SWEEP_SKILL
+    for rel in bundled_skill_files(SWEEP_SKILL):
+        target = dst.joinpath(*rel.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(src.joinpath(*rel.split("/")).read_bytes())
+    return dst
 
 
 def attach_profile(adapter, name: str = "claude", project: Path | None = None):
@@ -1928,11 +3173,13 @@ def ignore_before_commit(project: ProjectPaths, *patterns: str) -> None:
 
 
 def crash_at_merge_back(engine, *, after: str = "merge") -> None:
-    """Kill the host inside the isolated DONE arm, in one of its two windows.
+    """Kill the host inside the isolated DONE arm, in one of its three windows.
 
     `WorktreeFlow.integrate_unit`'s DONE arm runs merge -> carry -> latch, and each
     gap has its own recovery contract:
 
+    - ``"commit"``: after the DONE save, before `merge_local` (DW-385). The unit
+      commit exists on its mounted branch; no `unit-merge-started` row was written.
     - ``"merge"``: after `merge_local`, before `_carry_isolated_ledger_writes`. The
       branch landed and the worktree is gone; no ledger write happened.
     - ``"carry"``: after the whole carry, before `isolated_ledger_carried` is set
@@ -1946,10 +3193,18 @@ def crash_at_merge_back(engine, *, after: str = "merge") -> None:
     Replaces a method on the engine INSTANCE rather than monkeypatching the class.
     `WorktreeFlow` is handed `carry_isolated_ledger_writes=lambda task:
     self._carry_isolated_ledger_writes(task)`, a late-binding lambda, so instance
-    assignment is what the callback sees.
+    assignment is what the callback sees. ``"commit"`` replaces `merge_local` on
+    the engine's `WorktreeFlow` instance, which `integrate_unit` calls via `self`.
     """
-    if after not in ("merge", "carry"):
+    if after not in ("commit", "merge", "carry"):
         raise ValueError(f"unknown crash window: {after!r}")
+    if after == "commit":
+
+        def crash_before_merge(*_args, **_kwargs) -> None:
+            raise RuntimeError("host died after the DONE save, before the merge")
+
+        engine._worktree_flow.merge_local = crash_before_merge
+        return
     if after == "merge":
 
         def crash_before_carry(_task) -> None:
@@ -2246,6 +3501,11 @@ def escalated_run(
         restore_patch=restore_patch,
         sentinel_kind=sentinel_kind,
         worktree_path=worktree_path,
+        # the mount's mint-time identity (DW-446) when the caller built the mount
+        # first; None otherwise, which re-arm/resume backfill
+        worktree_identity=(
+            platform_util.root_identity_record(Path(worktree_path)) if worktree_path else None
+        ),
     )
     if with_session:
         task.sessions.append(
@@ -2264,4 +3524,100 @@ def escalated_run(
     )
     run_dir = project / ".bmad-loop" / "runs" / run_id
     save_state(run_dir, state)
+    # the run dir's mint-time identity (DW-446), as the composers record it
+    state.run_dir_identity = platform_util.root_identity_record(run_dir)
+    save_state(run_dir, state)
     return EscalatedRun(run_dir=run_dir, state=state, task=task)
+
+
+def clear_escalation_pause(run: EscalatedRun) -> EscalatedRun:
+    """Persist ``run`` with its pause cleared and its task still ESCALATED: the
+    state a resume leaves when it clears the pause and its engine exits before the
+    run ends (#958). Mutates and returns ``run`` so a caller can chain it on
+    `escalated_run`."""
+    run.state.clear_pause()
+    save_state(run.run_dir, run.state)
+    return run
+
+
+# DW-522: an in-place run paused on a story whose attempt committed above its
+# baseline — shared by the `rearm_for_reverify` (tests/test_runs.py) and
+# `resolve --reverify` (tests/test_cli.py) tests.
+_REVERIFY_KEY = "1-1-a"
+_REVERIFY_SPEC_REL = "_bmad-output/implementation-artifacts/1-1-a.md"
+_REVERIFY_SPEC_BYTES = (
+    b"---\r\ntitle: t\r\nstatus: in-review\r\n---\r\n\r\n## Intent\r\n\r\nbody\r\n"
+)
+
+
+def _reverify_run(tmp_path, *, phase="deferred", spec="live", env_fault_site=None):
+    """An in-place run paused on a story whose attempt committed above its baseline:
+    the reported shape (isolation none, rollback off). `phase` is the story's terminal
+    phase; `spec` is "live" (in the artifacts dir) or "stashed" (moved under the run
+    dir the way `Engine._defer` stashes it)."""
+    from bmad_loop.model import PAUSE_ESCALATION, Phase, SessionRecord
+
+    project = tmp_path / "proj"
+    config = project / "_bmad" / "bmm" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        "implementation_artifacts: '{project-root}/_bmad-output/implementation-artifacts'\n"
+        "planning_artifacts: '{project-root}/_bmad-output/planning-artifacts'\n",
+        encoding="utf-8",
+    )
+    (project / ".gitignore").write_text(".bmad-loop/\n", encoding="utf-8")
+    git(project, "init", "-q", "-b", "main")
+    git(project, "config", "user.email", "test@test")
+    git(project, "config", "user.name", "test")
+    git(project, "add", "-A")
+    git(project, "commit", "-q", "-m", "initial")
+    baseline = git(project, "rev-parse", "HEAD")
+    (project / "app.py").write_text("print('attempt')\n", encoding="utf-8")
+    git(project, "add", "app.py")
+    git(project, "commit", "-q", "-m", "attempt")
+
+    run_dir = project / ".bmad-loop" / "runs" / "r1"
+    spec_path = project / _REVERIFY_SPEC_REL
+    spec_path.parent.mkdir(parents=True)
+    if spec == "live":
+        spec_path.write_bytes(_REVERIFY_SPEC_BYTES)
+    else:
+        stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)
+        stash.parent.mkdir(parents=True)
+        stash.write_bytes(_REVERIFY_SPEC_BYTES)
+
+    task = StoryTask(
+        story_key=_REVERIFY_KEY,
+        epic=1,
+        phase=Phase.DEFERRED if phase == "deferred" else Phase.ESCALATED,
+        attempt=2,
+        review_cycle=1,
+        followup_reviews_spent=1,
+        baseline_commit=baseline,
+        baseline_untracked=[],
+        spec_file=_REVERIFY_SPEC_REL,
+        defer_reason="verify failed: e2e" if phase == "deferred" else None,
+        env_fault_site=env_fault_site,
+        salvage_refile_pending=True,
+        resolved_redrive=False,
+        board_advance_intended="review",
+    )
+    task.sessions.append(
+        SessionRecord(
+            task_id="1-1-a-dev-2", role="dev", status="completed", result_json={"status": "done"}
+        )
+    )
+    state = RunState(
+        run_id="r1",
+        project=str(project),
+        started_at="2026-10-01T10:00:00",
+        repo_root=str(project.resolve()),
+        paused_reason="manual recovery",
+        paused_stage=PAUSE_ESCALATION,
+        paused_story_key=_REVERIFY_KEY,
+        tasks={_REVERIFY_KEY: task},
+    )
+    save_state(run_dir, state)
+    state.run_dir_identity = platform_util.root_identity_record(run_dir)
+    save_state(run_dir, state)
+    return run_dir, spec_path

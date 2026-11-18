@@ -1,16 +1,21 @@
-# OpenAI Codex CLI (>= 0.139). Slash commands are NOT expanded when passed as
+# OpenAI Codex CLI (>= 0.156). Slash commands are NOT expanded when passed as
 # the initial prompt argument; the $skill-name mention syntax attaches the
 # skill instead (skills live in .agents/skills/) — live-verified 2026-06-11.
 # "use subagents as needed" is required or Codex runs the skill's parallel
-# phases (e.g. review layers) without spawning subagents. Codex has no
-# SessionEnd hook event — the adapter's window-death fallback covers crashes.
+# phases (e.g. review layers) without spawning subagents. Codex defines
+# SessionEnd and SubagentStop hook events, but bmad-loop maps only SessionStart
+# and Stop; the adapter's window-death fallback covers crashes.
+# `--no-daemon` keeps tools and hooks in this client's process, so they inherit
+# the window's BMAD_LOOP_* env. A shared app-server daemon (Codex's default since
+# 0.157) runs them with the daemon's env instead.
 name = "codex"
 binary = "codex"
+launch_args = ["--no-daemon"]
 prompt_template = "Use the ${skill} skill now, and use subagents as needed: {args}"
 bypass_args = ["--dangerously-bypass-approvals-and-sandbox"]
 model_flag = "--model"
 usage_parser = "codex-rollout"
-first_run_note = "run `codex` once in the project and accept BOTH prompts: workspace trust, then 'Hooks need review' -> 'Trust all and continue' (untrusted hooks silently never fire); requires Codex >= 0.139"
+first_run_note = "run `codex` once in the project and accept BOTH prompts: workspace trust, then 'Hooks need review' -> 'Trust all and continue' (untrusted hooks silently never fire); requires Codex >= 0.156"
 skill_tree = ".agents/skills"
 # Project-scoped Codex config (MCP servers under [mcp_servers]) — gitignored, so
 # a worktree checkout omits it and isolated sessions lose their MCP servers.
@@ -20,3 +25,57 @@ seed_files = [".codex/config.toml"]
 dialect = "codex-hooks-json"
 config_path = ".codex/hooks.json"
 events = { SessionStart = "SessionStart", Stop = "Stop" }
+
+# `adapter.permission_mode = "sandboxed"` (#727): a workspace-write sandbox with
+# approvals off (`never` returns every failure to the model; no prompt is shown).
+# Plain `--sandbox workspace-write` is NOT enough: it keeps `<root>/.git`
+# read-only, so the dev skill's `git add --refresh` preflight and its commit
+# fail. The permission profile below extends `:workspace` with a `.git` write
+# grant instead (it replaces `--sandbox`: Codex refuses `sandbox_mode` beside
+# `default_permissions`). Network stays off. Per Codex's agent-approvals-security
+# and permissions docs; live-checked 2026-10-27 on codex-cli 0.164.0.
+# In a linked worktree (`scm.isolation = "worktree"`) `.git` is a file, and git
+# writes the worktree's gitdir (`<main>/.git/worktrees/<name>`, its index) and the
+# common dir (`<main>/.git`, objects and refs), both read-only to the sandbox.
+# `linked_worktree_args` grants the two exact paths (Codex grants no globs): the
+# adapter appends them after `args` only when the session's cwd is a linked
+# worktree, each placeholder rendered as a TOML string. A child profile extends
+# `bmad_loop` (its filesystem map merges) and a later `default_permissions` selects
+# it: a second `filesystem` table on `bmad_loop` would REPLACE the one above, and a
+# dotted per-path key cannot work since Codex splits `-c` keys on every `.`. Both
+# grants are needed. Live-checked 2026-10-28 on codex-cli 0.165.0.
+# Windows is unverified, hence the platform list.
+[permission_modes.sandboxed]
+args = [
+  "-c",
+  'default_permissions="bmad_loop"',
+  "-c",
+  'permissions.bmad_loop.extends=":workspace"',
+  "-c",
+  'permissions.bmad_loop.filesystem={":workspace_roots"={".git"="write"}}',
+  "--ask-for-approval",
+  "never",
+]
+platforms = ["linux", "darwin"]
+linked_worktree_args = [
+  "-c",
+  'permissions.bmad_loop_worktree.extends="bmad_loop"',
+  "-c",
+  'permissions.bmad_loop_worktree.filesystem={{gitdir}="write",{common_dir}="write"}',
+  "-c",
+  'default_permissions="bmad_loop_worktree"',
+]
+
+# The home-relative skill folders Codex loads on its own, read only with
+# `[skills] user_roots = true` (see bmad_loop.skill_locate). ~/.agents/skills and
+# the deprecated $CODEX_HOME/skills both load, with no stated order on a name
+# clash; CODEX_HOME moves the second away from ~/.codex.
+# Source: https://learn.chatgpt.com/docs/build-skills (2026-11-15).
+[user_skills]
+precedence = "unordered"
+roots = [
+  "~/.agents/skills",
+  { path = "~/.codex/skills", disabled_by = [
+    "CODEX_HOME",
+  ] },
+]

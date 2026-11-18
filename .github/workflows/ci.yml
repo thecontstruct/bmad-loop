@@ -23,12 +23,22 @@ jobs:
       matrix:
         python-version: ['3.11', '3.12', '3.13', '3.14']
     steps:
+      - name: Set the test deadline
+        # First, so the clock starts as close to the job's own as a step can. The
+        # test run is stopped (by scripts/run_test_benchmark.py) four minutes short
+        # of the job's `timeout-minutes: 15` above — change the two together — so
+        # a wedged run still ends as a red step with its metrics uploaded rather
+        # than as a cancelled job with nothing to read. The reserve covers the
+        # wrapper's stop bound (grace 20s + reap 15s), the summary, and the
+        # upload step's full `timeout-minutes: 3`.
+        run: echo "TEST_DEADLINE_EPOCH=$(( $(date +%s) + 15 * 60 - 240 ))" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -85,20 +95,43 @@ jobs:
         run: uv sync --locked --all-extras
 
       - name: Run tests
-        run: uv run pytest -q -n logical --durations=15
+        # The wrapper runs pytest with `--test-metrics-dir` (tests/perf_report.py),
+        # records the process lifetime, preserves pytest's exit status, and stops
+        # the tree at the deadline set above (exit 124). No retries.
+        run: >-
+          uv run python scripts/run_test_benchmark.py
+          --metrics-dir "$RUNNER_TEMP/test-metrics/suite"
+          --deadline-epoch "$TEST_DEADLINE_EPOCH"
+          -- -q -n logical --durations=15
+          "--junitxml=$RUNNER_TEMP/test-metrics/suite/junit.xml"
 
-  test-windows:
-    # Real-Windows runner for the deterministic suite plus the live psmux gate,
-    # which this job installs psmux for and runs in its own serial step.
-    name: test (windows, py${{ matrix.python-version }})
+      - name: Upload test metrics
+        # `always()`: a failed or deadline-stopped run is the one whose records
+        # matter most. A job cancelled outright may still lose this upload.
+        if: always()
+        timeout-minutes: 3
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-metrics-linux-py${{ matrix.python-version }}
+          path: ${{ runner.temp }}/test-metrics/
+          if-no-files-found: warn
+          retention-days: 14
+          # A re-run attempt replaces its predecessor's records instead of
+          # failing on the name.
+          overwrite: true
+
+  test-windows-shard:
+    # Real-Windows runner for the deterministic suite, in two shards per Python
+    # leg (`--ci-shard I/2`, tests/perf_report.py): whole test functions with all
+    # their parameter variants, and whole xdist groups, assigned by a stable
+    # digest, so a new test lands in exactly one shard with no list to maintain.
+    # Sharding buys latency, not work: each shard pays its own setup and full
+    # collection. The `test-windows` aggregator below proves the two shards ran
+    # every collected test exactly once.
+    name: test (windows, py${{ matrix.python-version }}, shard ${{ matrix.shard }}/2)
     runs-on: windows-latest
-    # 30, not the 15 the Linux test job uses: the slowest pre-lever Windows run
-    # took 888s against a 900s cap, so one slow runner was a bad minute away from
-    # a timeout that reads as a test failure. The levers below cut the measured
-    # mean to ~316s at the time, but the wave-5 suite has since tripled it: at
-    # PR #796's tip the py3.14 leg ran the suite green in 1060s and was then
-    # cancelled at 20:11 during pytest's tmp-dir cleanup, py3.11 finishing at
-    # 19:45. The headroom keeps a green suite from reading as a failure.
+    # 30, not the 15 the Linux test job uses: one slow Windows runner must not
+    # turn a green suite into a timeout that reads as a test failure.
     timeout-minutes: 30
     # The suite reads/writes UTF-8 files; Windows' cp1252 default would break plain
     # text I/O. UTF-8 mode (PEP 686's Python 3.15 default) makes the runner match the
@@ -111,13 +144,101 @@ jobs:
         # PRs run the version boundaries only (Windows failures here have been
         # platform-shaped, not version-shaped); push-to-main runs the full spread.
         python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11", "3.14"]') || fromJSON('["3.11", "3.12", "3.13", "3.14"]') }}
+        shard: [1, 2]
     steps:
+      - name: Set the test deadline
+        # First, so the clock starts as close to the job's own as a step can. The
+        # test step is stopped (by scripts/run_test_benchmark.py) short of the
+        # job's `timeout-minutes: 30` above — change them together — so a wedged
+        # run ends as a red step whose metrics still upload, not as a cancelled
+        # job with nothing to read. The five-minute reserve covers the wrapper's
+        # Windows stop bound (taskkill 30s + job sweep + reap 15s), the summary,
+        # and the upload step's full `timeout-minutes: 3`.
+        shell: pwsh
+        run: |
+          $start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          Add-Content -Path $env:GITHUB_ENV -Value "TEST_DEADLINE_EPOCH=$($start + 30 * 60 - 300)"
+
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the project
+        run: uv sync --locked --all-extras
+
+      - name: Run tests
+        # pytest roots `tmp_path` at `tempfile.gettempdir()`, which follows
+        # TMP/TEMP on Windows. Measured on the windows-2025 image (2026-08-14):
+        # the default is C:\Users\RUNNER~1\AppData\Local\Temp while the workspace
+        # and RUNNER_TEMP sit on D:\a — so every per-test sandbox copy crossed to
+        # the slower volume. Pinning both to RUNNER_TEMP keeps them on D:.
+        # Step-level, not job-level: the `runner` context is unavailable in a
+        # job `env:` block, where this would silently expand to empty.
+        # Through the metrics wrapper, as in the Linux job: pytest's exit status is
+        # preserved; the deadline set above stops the tree with exit 124. The live
+        # psmux module runs in its own job below, never in a shard.
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          CI_SHARD: ${{ matrix.shard }}/2
+        run: >-
+          uv run python scripts/run_test_benchmark.py
+          --metrics-dir "$env:RUNNER_TEMP/test-metrics/suite"
+          --deadline-epoch $env:TEST_DEADLINE_EPOCH
+          -- -q -n logical --durations=15 --ignore=tests/test_psmux_live.py
+          "--ci-shard=$env:CI_SHARD"
+          "--junitxml=$env:RUNNER_TEMP/test-metrics/suite/junit.xml"
+
+      - name: Upload suite metrics
+        # `always()`: a failed or deadline-stopped run is the one whose records
+        # matter most; a job cancelled outright may still lose the upload, and
+        # the aggregator then fails on the missing shard. `overwrite`: a re-run
+        # attempt replaces its predecessor's records rather than failing on the
+        # name. An attempt that never reaches this step leaves the older records
+        # in place, which is why the aggregator also checks each job's latest
+        # conclusion.
+        if: always()
+        timeout-minutes: 3
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-metrics-windows-py${{ matrix.python-version }}-shard${{ matrix.shard }}
+          path: ${{ runner.temp }}/test-metrics/suite/
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
+
+  test-windows-live:
+    # The live psmux gate, once per Python leg, serial, on a machine of its own.
+    name: psmux gate (windows, py${{ matrix.python-version }})
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11", "3.14"]') || fromJSON('["3.11", "3.12", "3.13", "3.14"]') }}
+    steps:
+      - name: Set the test deadline
+        # As in the shard job, with the same five-minute reserve: the gate
+        # stops short of the job cap so its metrics still upload.
+        shell: pwsh
+        run: |
+          $start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          Add-Content -Path $env:GITHUB_ENV -Value "LIVE_GATE_DEADLINE_EPOCH=$($start + 30 * 60 - 300)"
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -129,80 +250,121 @@ jobs:
         # Bounded, for the reason the Linux `Ensure tmux` step above documents at
         # length: an unbounded fetch wedged that job for 14 minutes with no exit
         # status for `|| true` to discard. Here the retries are bounded by
-        # Invoke-WebRequest and everything else by the step timeout.
+        # Invoke-WebRequest and everything else by the step timeout. After
+        # `Install the project`, because the action's floor assertion runs
+        # `uv run`; the aggregator's `verify-executed` then refuses any skip
+        # inside the gate itself.
         timeout-minutes: 6
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        # After `Install the project`, because the assertion below runs `uv run`.
-        # What this buys: the 9 tests of the serial gate step below, measured on
-        # this runner at 9.6s (py3.11) and 12.4s (py3.14) against the job's
-        # 20-minute cap. A dev box took 46-68s for the same nine — the runner is
-        # the faster of the two, so the cap is sized off the slower number.
-        run: |
-          $ErrorActionPreference = 'Stop'
-          # The release archive, not `choco install`. Chocolatey's community feed
-          # answered the V2 package lookup with 503 on BOTH matrix legs of this
-          # job's first run, while the package itself sat published and healthy.
-          # Chocolatey document that feed as neither supported nor guaranteed and
-          # rate-limited per IP behind Cloudflare, and hosted runners share egress
-          # addresses — other projects track the same feed-503 flake. This is one
-          # GET against the host the job already depends on.
-          #
-          # `releases/latest`, not a pinned tag: the floor assertion below stays
-          # the only version gate, so a psmux release needs no edit here.
-          $url = gh api repos/psmux/psmux/releases/latest --jq '.assets[] | select(.name | endswith("windows-x64.zip")) | .browser_download_url'
-          if (-not $url) { throw 'no windows-x64 asset on the latest psmux release' }
-          $zip = Join-Path $env:RUNNER_TEMP 'psmux.zip'
-          $dir = Join-Path $env:RUNNER_TEMP 'psmux'
-          Invoke-WebRequest -Uri $url -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
-          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
-          $exe = Get-ChildItem -Path $dir -Recurse -Filter psmux.exe | Select-Object -First 1
-          if (-not $exe) { throw "no psmux.exe in $url" }
-          # The archive ships tmux.exe beside psmux.exe, which looks alarming on a
-          # PATH but is inert: test_generic_tmux's HAVE_TMUX gates on
-          # `sys.platform != "win32"` before it ever looks for the binary.
-          # PATH for this step, GITHUB_PATH for `Run tests` and the gate step.
-          $env:PATH = "$($exe.Directory.FullName);$env:PATH"
-          Add-Content -Path $env:GITHUB_PATH -Value $exe.Directory.FullName
-          psmux -V
-          # `psmux -V` is not the assertion. test_psmux_live.py skips itself on
-          # PsmuxMultiplexer.available(), so an install at or below the version
-          # floor would leave this job green with the entire live gate never run
-          # — the one failure a "did it install?" check cannot see. Calling
-          # available() also keeps the floor in a single place (it reads
-          # `_LAST_UNSUPPORTED`, so a floor bump needs no edit here) and covers
-          # `pwsh`, which every parked window needs.
-          uv run python -c "import sys; from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer as M; m = M(); sys.exit(0 if m.available() else f'psmux is not an admitted version: {m.version()!r}')"
-
-      - name: Run tests
-        # pytest roots `tmp_path` at `tempfile.gettempdir()`, which follows
-        # TMP/TEMP on Windows. Measured on the windows-2025 image (2026-08-14):
-        # the default is C:\Users\RUNNER~1\AppData\Local\Temp while the workspace
-        # and RUNNER_TEMP sit on D:\a — so every per-test sandbox copy crossed to
-        # the slower volume. Pinning both to RUNNER_TEMP keeps them on D:.
-        # Step-level, not job-level: the `runner` context is unavailable in a
-        # job `env:` block, where this would silently expand to empty.
-        env:
-          TMP: ${{ runner.temp }}
-          TEMP: ${{ runner.temp }}
-        run: uv run pytest -q -n logical --durations=15 --ignore=tests/test_psmux_live.py
+        uses: ./.github/actions/ensure-psmux
+        with:
+          # A pinned release, not `releases/latest`: the gate's `test_premise_*`
+          # rows turn red by design when a psmux release fixes what they pin, so
+          # an unpinned install turned every PR red the day psmux 3.4.0 shipped.
+          # Moving this pin is a deliberate PR that also moves the floor and
+          # retires the workarounds; psmux-canary.yml runs the same gate against
+          # `latest` to say when that PR is due.
+          version: v3.4.0
+          github-token: ${{ github.token }}
 
       - name: Run the live psmux gate
-        # Serial, and deliberately out of the parallel run above: these nine
-        # tests drive real psmux servers, which are a single-machine resource
-        # rather than per-worker state. Interleaved with the other ~2800 tests
-        # under `-n logical`, the window mint in the prune test came back empty
-        # on a dev box and failed the degraded-mint assertion; the registry
-        # isolation that lands with this step fixes that test's own asymmetry,
-        # and running the gate off the shared workers keeps the whole module
-        # from contending for the machine in the first place. A flake here
-        # cannot be retried away — this repo has no retry mechanism by policy.
-        # Cost: 9.6-12.4s measured here, 46-68s on a dev box.
+        # Serial, and out of the parallel shards: these 15 tests drive real psmux
+        # servers, which are a single-machine resource rather than per-worker
+        # state. Interleaved with the rest of the suite under `-n logical`, the
+        # window mint in the prune test came back empty on a dev box and failed
+        # the degraded-mint assertion; running the gate on its own machine keeps
+        # the module from contending with anything in the first place. A flake
+        # here cannot be retried away — this repo has no retry mechanism by policy.
         env:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
-        run: uv run pytest -q tests/test_psmux_live.py --durations=15
+        run: >-
+          uv run python scripts/run_test_benchmark.py
+          --metrics-dir "$env:RUNNER_TEMP/test-metrics/live"
+          --deadline-epoch $env:LIVE_GATE_DEADLINE_EPOCH
+          -- -q tests/test_psmux_live.py --durations=15
+          "--junitxml=$env:RUNNER_TEMP/test-metrics/live/junit.xml"
+
+      - name: Upload live-gate metrics
+        if: always()
+        timeout-minutes: 3
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-metrics-windows-py${{ matrix.python-version }}-live
+          path: ${{ runner.temp }}/test-metrics/live/
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
+
+  test-windows:
+    # One verdict per Windows Python leg, under the check name the unsharded job
+    # used. Judged from that leg's own records, not from `needs.*.result` (which
+    # aggregates the whole matrix, so one leg's red would redden every leg): a
+    # shard or gate that failed, was cancelled, timed out or never uploaded fails
+    # here, and so does any collected test that ran in no shard or in both.
+    # Artifacts are run-scoped, so a re-run job that fails before its upload
+    # leaves the earlier attempt's green records downloadable; each of this
+    # leg's jobs must therefore also have succeeded in its latest execution.
+    # `always()`: a skipped aggregator would read as a pass.
+    name: test (windows, py${{ matrix.python-version }})
+    needs: [test-windows-shard, test-windows-live]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # The run's job listing, for the latest-execution check below.
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11", "3.14"]') || fromJSON('["3.11", "3.12", "3.13", "3.14"]') }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the project
+        run: uv sync --locked
+
+      - name: Download this leg's shard and gate records
+        uses: actions/download-artifact@v8
+        with:
+          pattern: test-metrics-windows-py${{ matrix.python-version }}-*
+          path: ${{ runner.temp }}/windows-metrics
+
+      - name: Verify the shards ran every collected test exactly once
+        env:
+          LEG: test-metrics-windows-py${{ matrix.python-version }}
+        run: >-
+          uv run python tests/perf_report.py verify-shards --count 2
+          "$RUNNER_TEMP/windows-metrics/$LEG-shard1"
+          "$RUNNER_TEMP/windows-metrics/$LEG-shard2"
+
+      - name: Verify the live gate ran every test
+        if: always()
+        env:
+          LEG: test-metrics-windows-py${{ matrix.python-version }}
+        run: uv run python tests/perf_report.py verify-executed "$RUNNER_TEMP/windows-metrics/$LEG-live"
+
+      - name: Verify this leg's jobs succeeded in their latest execution
+        # `filter=latest` keeps a job carried over by "re-run failed jobs" at the
+        # attempt it last ran in, so its records and its conclusion still agree.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PY: ${{ matrix.python-version }}
+        run: |
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" > "$RUNNER_TEMP/jobs.json"
+          uv run python tests/perf_report.py verify-jobs "$RUNNER_TEMP/jobs.json" \
+            --expect "test (windows, py$PY, shard 1/2)" \
+            --expect "test (windows, py$PY, shard 2/2)" \
+            --expect "psmux gate (windows, py$PY)"
 
   version-sync:
     name: version-sync
@@ -214,7 +376,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@v10.3.3
 
       - name: Check version fields + the CHANGELOG release contract
         run: uv run --no-project python scripts/release.py check
@@ -249,7 +411,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           python-version: '3.11'
@@ -266,6 +428,17 @@ jobs:
         # runs locally, resolving the same pinned version from uv.lock.
         run: uv run pyright
 
+      # This job runs on Linux, whose `os` stubs include POSIX/Linux-only names
+      # (O_DIRECTORY, setxattr, sysconf). A native Windows or macOS host checks
+      # against a narrower surface, so these steps keep `uv run pyright` clean
+      # there too: code that needs such a name fetches it with a default-free
+      # `getattr` inside its runtime check.
+      - name: Pyright (Windows os surface)
+        run: uv run pyright --pythonplatform Windows
+
+      - name: Pyright (Darwin os surface)
+        run: uv run pyright --pythonplatform Darwin
+
   build:
     # Packaging smoke test. Every other job runs from the source tree, so a
     # packaging break is invisible to them — it has bitten before (`.trunk` had
@@ -280,7 +453,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           # A clean-room build: nothing here should come from a restored cache.
           enable-cache: false

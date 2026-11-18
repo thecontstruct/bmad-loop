@@ -64,9 +64,10 @@ session``. For the lost-session probe
 rather than inventing one — and the collision it needs is an independently
 created session sharing a ``bmad-loop-<run-id>`` name: an operator's, or
 another run's on a colliding id (see #531). The psmux
-behaviors cited in this module were read from the psmux source at tag
-``v3.3.8`` — the oldest build ``available()`` admits — and the safe
-observable subset is probed in ``tests/test_psmux_live.py``.
+behaviors cited in this module were read from the psmux source at the tag
+each citation names, most at ``v3.3.8``; ``available()`` admits 3.4.0 and
+later, and the safe observable subset is probed live on the installed build in
+``tests/test_psmux_live.py``.
 See :mod:`.multiplexer` for the contract.
 """
 
@@ -79,10 +80,11 @@ import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
-from .tmux_base import PARKED_RETURN_DETACH, BaseTmuxBackend, TmuxError
+from .multiplexer import Unset
+from .tmux_base import PARKED_RETURN_DETACH, TMUX_TIMEOUT_S, BaseTmuxBackend, TmuxError
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # psmux's registry-root variable, as psmux spells it. `runs.PSMUX_DATA_DIR` holds
@@ -99,6 +101,20 @@ def _pwsh_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+# The PowerShell floor for every window launch, the query that reads the
+# version (a query Windows PowerShell 5.1 answers too), and each executable's answer
+# keyed by its absolute path, probed once per process — see
+# `PsmuxMultiplexer._require_pwsh_floor`.
+_PWSH_FLOOR = (7, 3)
+_PWSH_VERSION_QUERY = "$PSVersionTable.PSVersion.ToString()"
+_PWSH_VERSIONS: dict[str, str] = {}
+# The whole stripped answer: two to four numeric parts (Windows PowerShell reports
+# four, pwsh three) and an optional prerelease suffix (`7.6.0-preview.4`).
+# Anything else — a prefix with trailing text, a second line — is unreadable.
+_PWSH_VERSION_SHAPE = re.compile(r"(\d+)\.(\d+)(?:\.\d+){0,2}(?:-[0-9A-Za-z.]+)?")
+# Prepended to every window's source; see `PsmuxMultiplexer._shell_wrap`.
+_STANDARD_ARGUMENT_PASSING = "$PSNativeCommandArgumentPassing = 'Standard'; "
+
 # One warning per process about `PSMUX_BARE_ENV`, not per verb — see
 # `PsmuxMultiplexer._warn_if_bare_env`.
 _BARE_ENV_WARNED = False
@@ -109,6 +125,21 @@ def _bare_env_on(value: str | None) -> bool:
     source-read at v3.3.8): on iff the value is "1" or case-insensitively
     "true"."""
     return value is not None and (value == "1" or value.lower() == "true")
+
+
+def bare_env_warning(env: Mapping[str, str]) -> str | None:
+    """The ``PSMUX_BARE_ENV`` warning for a process with environment ``env``,
+    or ``None`` when the mode is off. See ``PsmuxMultiplexer._warn_if_bare_env``."""
+    if not _bare_env_on(env.get("PSMUX_BARE_ENV")):
+        return None
+    return (
+        "PSMUX_BARE_ENV is on, which bmad-loop does not support — psmux clears each "
+        "pane's environment, so a session's window-0 shell loses BMAD_LOOP_STATE_DIR "
+        "and derives its own state root and registry (a bmad-loop command typed into "
+        "one can read a run as gone), and coding-CLI windows lose every variable "
+        "bmad-loop does not set for them, such as credentials, configuration and "
+        "APPDATA (git's global excludes); unset PSMUX_BARE_ENV for bmad-loop's sessions"
+    )
 
 
 # The `PSMUX_DATA_DIR` that was in force before this process derived its own and
@@ -158,10 +189,28 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # the distinct psmux name never collides with another tmux-family install
     # (e.g. a tmux-windows port owning ``tmux`` on the same PATH).
     _BINARY = "psmux"
+    # The shell every window's source runs under (see _shell_wrap).
+    _PWSH = "pwsh"
     # psmux emits UTF-8; decoding with the console codepage (cp1252) garbles
     # format-string output, and a stray byte must degrade visibly, not raise.
     _ENCODING = "utf-8"
     _ERRORS = "backslashreplace"
+    # list-sessions prints any server reply other than `ERROR: Authentication
+    # required` as a row, so a server whose key file does not match lists as a
+    # session named `ERROR: Invalid session key` (measured on 3.4.0, #919).
+    _NON_SESSION_ROW_PREFIXES = ("ERROR:",)
+    # Since psmux/psmux#809 a server that does not answer gets no row: it is
+    # named on stderr as `psmux: list-sessions: session <name>: <reason>` and
+    # the command exits 1 after printing the rows that did answer.
+    _PARTIAL_LISTING_STDERR_PREFIX = "psmux: list-sessions: session "
+    # A live psmux session always has a window (its server exits with the
+    # last one), and the client can answer one at exit 0 with nothing: its
+    # reply loop stops on any read error but a timeout and prints what it got
+    # (`send_control_with_response_bounded`, source-read at v3.4.0). The live
+    # gate caught it once: list-windows answered empty between two window
+    # mints. Read as an answer, that silence is a crash to the liveness probe
+    # and a verified kill to the prune, so it raises instead.
+    _EMPTY_LISTING_IS_AN_ANSWER = False
 
     def __init__(self, *, default_registry: bool = False, registry_root: str | None = None) -> None:
         """``default_registry=True`` binds this instance to psmux's OWN registry
@@ -253,41 +302,38 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         Under it psmux ``env_clear``s every pane child and repopulates from a
         14-name allowlist (``src/pane.rs:889-908``, source-read at v3.3.8;
         measured in a real pane) that drops ``BMAD_LOOP_STATE_DIR`` *and* the
-        ``LOCALAPPDATA`` its default cascade falls back to. Coding-CLI windows
-        still get the state root — their env rides the in-source
-        ``-EncodedCommand`` prelude, which runs in the pane after the clear
-        (see ``_window_launch``) — but a session's window-0 shell and the TUI's
-        parked engine windows rely on inheritance, so a bmad-loop run in one of
-        those re-derives the state root from what survived. That diverges, and
-        the run then reads this very session as gone, in exactly two cases:
-        ``BMAD_LOOP_STATE_DIR`` was in force (the clear drops it, and the
+        ``LOCALAPPDATA`` its default cascade falls back to. Two kinds of pane
+        are covered anyway: coding-CLI windows get the state root through the
+        in-source ``-EncodedCommand`` prelude, which runs in the pane after the
+        clear (see ``_window_launch``), and the TUI's parked engine windows get
+        it, and the registry root, in their argv (``tui.launch.start_detached``,
+        #731). A session's window-0 shell still relies on inheritance, so a
+        bmad-loop command typed into one re-derives the state root from what
+        survived. That diverges, and the run then reads as gone, in exactly two
+        cases: ``BMAD_LOOP_STATE_DIR`` was in force (the clear drops it, and the
         default cascade answers somewhere else), or ``LOCALAPPDATA`` names
         something other than ``%USERPROFILE%\\AppData\\Local`` (a redirected
         or roaming profile). ``USERPROFILE`` *is* on the allowlist, so on a
-        default profile the fallback arm lands on the same root and nothing
-        diverges — the mode is unsupported because the failure is silent when
-        it does happen, not because it always does. Supporting it means an env
-        transport on the session and parked-window verbs, which is its own
-        seam change — tracked
-        as a follow-up issue, deliberately outside #537.
+        default profile the fallback arm lands on the same root. The clear also
+        drops every variable a pane's env dict does not name: a coding CLI can
+        miss credentials or configuration, and without ``APPDATA`` git no longer
+        reads the operator's global excludes in ``%APPDATA%\\Git\\ignore``,
+        all silently. That is psmux's documented trade for the mode.
 
         Warned, not refused: the variable is psmux's (an operator may run their
         own sessions under it), and most commands never open a window. Ceiling:
         psmux reads the switch in the *server* process at pane spawn; this
         process's effective env is a proxy for it, so a server already running
-        with the mode on under a clean client is not detected here.
+        with the mode on under a clean client is not detected here. The TUI
+        re-surfaces the line (``bare_env_warning``), because this firing lands
+        before Textual takes the screen.
         """
         global _BARE_ENV_WARNED
-        if _BARE_ENV_WARNED or not _bare_env_on(effective.get("PSMUX_BARE_ENV")):
+        warning = bare_env_warning(effective)
+        if _BARE_ENV_WARNED or warning is None:
             return
         _BARE_ENV_WARNED = True
-        print(
-            "warning: PSMUX_BARE_ENV is on, which bmad-loop does not support — "
-            "session and parked-window shells lose BMAD_LOOP_STATE_DIR and derive "
-            "their own state root and registry, so a run can read as gone; unset "
-            "PSMUX_BARE_ENV for bmad-loop's sessions",
-            file=sys.stderr,
-        )
+        print(f"warning: {warning}", file=sys.stderr)
 
     def registry_root(self) -> str | None:
         """The registry root a verb from this instance inherits — the process
@@ -407,8 +453,110 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # psmux joins the trailing argv and re-parses it through an outer shell,
         # which strips embedded quoting; -EncodedCommand (base64 of UTF-16LE) is
         # the lossless transport for arbitrary shell source.
+        #
+        # Standard argument passing first: under the default Windows mode,
+        # PowerShell 7.3+ still builds a batch launcher's (.cmd/.bat, e.g. an
+        # npm-installed CLI's shim) command line the legacy way, which drops an
+        # empty argument and mangles an embedded quote (measured on 7.6; an .exe
+        # or .ps1 target is unaffected either way). Batch launchers keep
+        # further argument limits of their own, tracked separately.
+        #
+        # The executable is the absolute path the floor just probed, so the
+        # window runs exactly the pwsh that was admitted (#863). It ships as one
+        # PowerShell call-operator line: psmux 3.3.8 runs a `&`-led window or
+        # pipe-pane command under its own PowerShell (`pwsh`, else `powershell`,
+        # `-Command`) without tokenizing it, so a path holding a space, `( )`, an
+        # apostrophe or a doubled space arrives verbatim. Unquoted, psmux would
+        # tokenize it and fall back to that shell on any metacharacter, which
+        # breaks `C:\Program Files (x86)`.
+        pwsh = self._require_pwsh_floor()
+        source = _STANDARD_ARGUMENT_PASSING + source
         encoded = base64.b64encode(source.encode("utf-16-le")).decode("ascii")
-        return ["pwsh", "-NoProfile", "-EncodedCommand", encoded]
+        return [self._join_argv([pwsh, "-NoProfile", "-EncodedCommand", encoded])]
+
+    def _pwsh_path(self) -> str:
+        # Resolved on every launch rather than cached, so a PATH change takes
+        # effect at once and the probe cache, keyed by this path, follows it.
+        found = shutil.which(self._PWSH)
+        if found is None:
+            raise TmuxError(
+                f"{self._PWSH} not found on PATH; psmux windows need PowerShell 7.3 or later"
+            )
+        return os.path.abspath(found)
+
+    def _psmux_path(self) -> str:
+        # The psmux `available` admits the backend on, resolved per trailer the
+        # way `_pwsh_path` is. Unresolvable falls back to the bare name, which
+        # leaves the lookup to the pane's PATH as before rather than refusing.
+        found = shutil.which(self._BINARY)
+        return os.path.abspath(found) if found else self._BINARY
+
+    def _require_pwsh_floor(self) -> str:
+        """Refuse a window launch under PowerShell older than 7.3 (#861), and
+        return the absolute path of the pwsh that passed.
+
+        ``_join_argv`` hands each argument to PowerShell's native-command
+        builder, and before 7.3 that builder corrupts argv: an argument with
+        whitespace and a trailing backslash is wrapped in quotes without
+        escaping the backslash, so it swallows the next one; an empty argument
+        is dropped; an embedded quote is stripped (measured on Windows
+        PowerShell 5.1 through a real parked window; pwsh 7.6 delivers all of
+        them intact). A path ending in a backslash and holding a space is
+        enough. So every window launch checks the version first — in
+        ``_shell_wrap``, the one place a window's ``pwsh`` argv is built, and in
+        ``new_session``, whose initial window runs psmux's default shell — which
+        no backend selection (automatic or forced) routes around, and refuses
+        before psmux mints anything. ``pwsh`` is resolved to one absolute path
+        on this process's PATH (refused when it does not resolve), and that
+        path is both what the probe runs and what ``_shell_wrap`` launches, so
+        the psmux server's own PATH never picks the window's pwsh (#863).
+        Probed once per process per path; an answer is cached (and an
+        unreadable one refused each time), while a probe that failed to run or
+        exited nonzero is retried, and raises, each time.
+
+        Ceiling, named: ``new_session``'s initial window runs psmux's own
+        default shell, which psmux resolves on its server's PATH — the server
+        inherits the env of whichever process created the session, so it is
+        the same PATH in every bmad-loop flow unless an operator changes it
+        between the probe and the create. Pinning that window too means
+        passing an explicit shell command to ``new-session``, which changes how
+        the window starts, so it is left as psmux's choice.
+        """
+        pwsh = self._pwsh_path()
+        reported = _PWSH_VERSIONS.get(pwsh)
+        if reported is None:
+            try:
+                proc = subprocess.run(
+                    [pwsh, "-NoProfile", "-NonInteractive", "-Command", _PWSH_VERSION_QUERY],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="backslashreplace",
+                    timeout=TMUX_TIMEOUT_S,
+                )
+            except (subprocess.SubprocessError, OSError) as exc:
+                raise TmuxError(f"could not read the {self._PWSH} version: {exc}") from exc
+            if proc.returncode != 0:
+                raise TmuxError(
+                    f"could not read the {self._PWSH} version: exit {proc.returncode}: "
+                    f"{proc.stderr.strip()}"
+                )
+            reported = proc.stdout.strip()
+            _PWSH_VERSIONS[pwsh] = reported
+        parsed = _PWSH_VERSION_SHAPE.fullmatch(reported)
+        if parsed is None:
+            raise TmuxError(
+                f"could not read the {self._PWSH} version: unrecognized answer "
+                f"{reported!r}; psmux windows need PowerShell 7.3 or later"
+            )
+        if (int(parsed[1]), int(parsed[2])) < _PWSH_FLOOR:
+            raise TmuxError(
+                f"psmux windows need PowerShell 7.3 or later, and {pwsh} reports "
+                f"{reported!r}: older versions corrupt command arguments "
+                "(a path with a space and a trailing backslash, an empty or quoted "
+                "argument); upgrade pwsh to 7.3 or later"
+            )
+        return pwsh
 
     def _parked_trailer(self, return_opt: str) -> str:
         # The base's trailer re-expressed in pwsh — the tmux verbs are protocol-
@@ -429,7 +577,19 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # Both captures go through "$(...)".Trim(): a bare capture yields an
         # array when psmux emits more than one line, and `-eq` on an array
         # filters instead of comparing — silently taking neither branch.
-        mux = self._BINARY
+        #
+        # Every psmux call is a call-operator line on the absolute path the
+        # backend resolves (`_psmux_path`), because a bare name resolves on the
+        # pane's PATH: another build, or none at all, with every error going to
+        # $null (#877). The admitted builds give a pane the PATH of the process
+        # that started its server (psmux/psmux#773), but that need not be this
+        # launcher's: a long-lived control session can be served by a server
+        # started earlier, from another PATH or by a pre-floor psmux still
+        # running after an upgrade (which rebuilds PATH from the registry), and
+        # a relative PATH entry stops resolving once the pane's working
+        # directory differs. The path is baked in when the window is minted, so
+        # a window parked before an upgrade keeps its own.
+        mux = "& " + _pwsh_quote(self._psmux_path())
         probe = (
             '"$(' + mux + " display-message -p -t $env:TMUX_PANE '#{window_id}' 2>$null)\".Trim()"
         )
@@ -500,10 +660,35 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             )
         }
         env["PSMUX_ALLOW_NESTING"] = "1"
+        # psmux's warm pool (spare shells per server) and its hidden `__warm__`
+        # standby server serve only default-shell creates: every window this
+        # backend opens carries a command and every session passes `-c`, so
+        # neither is ever claimed, yet together they cost about 0.75 GiB of
+        # summed working sets per idle project (#903). The server reads this at
+        # boot, and this call is the one that boots it; scoped to the spawn, so
+        # the operator's own psmux keeps its pool. Ceilings: the server's panes
+        # inherit it, so a psmux session started from inside one starts cold;
+        # and a psmux config that says `set -g warm on` re-enables the pool at
+        # load, which stays the operator's call (forcing `warm off` at runtime
+        # would also kill the registry's shared standby).
+        env["PSMUX_NO_WARM"] = "1"
+        # The initial window is a window launch too: the same PowerShell floor
+        # as `_shell_wrap`, checked before psmux creates anything.
+        self._require_pwsh_floor()
         geometry = ["-x", str(cols), "-y", str(lines)] if cols and lines else []
         try:
             proc = self._run(
-                ["new-session", "-d", "-s", name, "-c", str(cwd), *geometry],
+                [
+                    "new-session",
+                    "-d",
+                    "-s",
+                    name,
+                    "-n",
+                    self._INITIAL_WINDOW_NAME,
+                    "-c",
+                    str(cwd),
+                    *geometry,
+                ],
                 check=False,
                 env=env,
             )
@@ -519,6 +704,31 @@ class PsmuxMultiplexer(BaseTmuxBackend):
                 f"{self._BINARY} new-session exited 0 but session {name!r} was not "
                 "created (nesting guard no-op?)"
             )
+        # A user config with `destroy-unattached on` would tear this session
+        # down when its last client detaches (psmux reaps only on that edge, not
+        # at a detached create as tmux does), so turn it off for this session
+        # (#951). psmux 3.4.0 keeps session options in the server's one store
+        # (psmux/psmux#803, fixed only on master), so there the write lands in
+        # the server-wide value: harmless while this server holds only this
+        # session, but a later runtime `set -g destroy-unattached on` (a config
+        # reload) re-arms the reap. A release with that fix keeps the session's
+        # own value and leaves the user's global alone. Best-effort: the session
+        # exists, and raising here would leave it untagged (the caller's tag
+        # write never runs), which a shared registry's cleanup refuses to own.
+        # psmux reaps only on a last-client detach, so a failed write is said,
+        # not fatal. Printed unconditionally, and kept for take_setup_notes so
+        # a caller whose stderr reaches nobody (the TUI) can show it too.
+        try:
+            self.set_session_option(name, "destroy-unattached", "off")
+        except TmuxError as exc:
+            note = f"could not set destroy-unattached off on {name}: {exc}"
+            print(f"warning: {note}", file=sys.stderr)
+            vars(self).setdefault("_setup_notes", []).append(note)
+
+    def take_setup_notes(self) -> list[str]:
+        """The setup degradations new_session said since the last call, oldest
+        first; the instance is process-wide, so each is handed out once."""
+        return vars(self).pop("_setup_notes", [])
 
     @staticmethod
     def _qualified_window_id(session: str, window_id: str) -> str:
@@ -549,7 +759,14 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # the base's return rather than reformatting `-F` so the argv stays
         # byte-identical to the base's.
         window_id = super().new_window(session, name, cwd, env, command)
-        return self._qualified_window_id(session, window_id)
+        qualified = self._qualified_window_id(session, window_id)
+        panes = self._launched_panes()
+        if window_id in panes:
+            # pane_target is asked with the qualified id this returns.
+            panes[qualified] = panes.pop(window_id)
+        else:
+            panes.pop(qualified, None)
+        return qualified
 
     def list_window_ids(self, session: str) -> list[str]:
         # psmux's list-windows emits bare `@N` lines; qualify them identically
@@ -566,6 +783,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # connection timed out`. Both were rc 1 with the windows demonstrably
         # alive — this backend is where the bug was actually reachable, because
         # a per-session TCP server has failure modes tmux's socket does not.
+        #
+        # An exit-0 EMPTY listing proves nothing either; see
+        # `_EMPTY_LISTING_IS_AN_ANSWER` below.
         return [
             self._qualified_window_id(session, window_id)
             for window_id in super().list_window_ids(session)
@@ -789,12 +1009,21 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # break, and leading/trailing whitespace stay refused however cleanly
         # the wire now carries them — a value that reads back different is the
         # same silently-unprunable window whichever hop mangled it. An empty
-        # value is a silent server-side no-op (`-u` is the verb for that), and a
-        # `-`-leading one is still dropped as a flag server-side, or flips the
-        # key to unset at rc 0 (psmux/psmux#583, open upstream).
-        if not value or value.startswith("-"):
+        # value is a silent server-side no-op (`-u` is the verb for that).
+        #
+        # A few `-`-leading shapes still lose the WIRE half, to the client's
+        # argv normalizers that run before `set-option` parses (psmux/psmux#795,
+        # cli.rs at v3.4.0): `normalize_flag_equals` splits `-X=value` (one
+        # ASCII letter, a nonempty suffix) into `-X value` and the write
+        # succeeds silently; `normalize_attached_target_flag` splits `-t…` into
+        # a target flag, and `--` ends the options, so those two fail rc 1 and
+        # would leave a stale value in place. Other `-` values (`-u`, `-1=x`,
+        # `--x=y`, `-x=`) are stored verbatim since #583.
+        if not value:
             return False
         if '"' in value or value != value.strip():
+            return False
+        if value == "--" or value.startswith("-t") or re.match(r"-[A-Za-z]=.", value):
             return False
         return value.splitlines() == [value]
 
@@ -1072,9 +1301,12 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # at rc!=0. Only a pane-shaped value may reach `-t`.
         if not re.fullmatch(r"%\d+", pane):
             return None
+        # A transport fault warns as in the base (DW-463); the unpinnable and
+        # dead-pane Nones above and below are answers and stay silent.
         try:
             proc = self._run(["display-message", "-p", "-t", pane, fmt], check=False)
-        except (subprocess.SubprocessError, OSError):
+        except (subprocess.SubprocessError, OSError) as exc:
+            self._warn_unanswered_display(fmt, exc)
             return None
         return proc.stdout.strip() if proc.returncode == 0 else None
 
@@ -1194,6 +1426,19 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # switch_client hangs on the rc and not on the verdict — see the comment
     # there; a verdict-gated fallback keeps that drag alive for every rc-0
     # switch the gate merely cannot vouch for.
+
+    def _session_clients(self, session: str) -> int | None:
+        # The base's `-t =session:` read can answer for another server's
+        # session here; _attached_clients refuses that answer (see it). Its
+        # None is silent by design for the switch_client verdict; here it would
+        # stop an attached operator following tasks, so say why.
+        count = self._attached_clients(session)
+        if count is None:
+            self._warn_detached(
+                f"{self._BINARY} could not read the attached-client count of {session} "
+                "(the probe failed, or answered for another session)"
+            )
+        return count
 
     def _attached_clients(self, session: str) -> int | None:
         """Clients attached to ``session``, or None when psmux cannot say.
@@ -1387,16 +1632,17 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # is pwsh source shipped through the same `-EncodedCommand` transport as
         # every other window command (psmux 3.3.8 passes dash-flag tokens and
         # quoting through pipe-pane intact — psmux/psmux#482, psmux/psmux#563).
-        # Space-joining the wrapped argv needs no quoting of its own: base64 is
-        # `[A-Za-z0-9+/=]`, and the log path rides inside the encoded source via
+        # The wrapped command is _shell_wrap's one call-operator line, which
+        # psmux runs under its own PowerShell, so the pinned pwsh path is quoted
+        # there (#863). The log path rides inside the encoded source via
         # _pwsh_quote, so a spaced, `$`-bearing or backticked path is carried
-        # verbatim rather than re-parsed. The sink is byte-exact like `cat >>`
-        # (raw stream copy: no console decode of the pane bytes, no re-encode, no
-        # CRLF normalization) and flushes per chunk: the run log is live-tailed
-        # for activity detection, and a buffered copy never surfaces bytes — pipe
-        # EOF is unreliable on psmux. Known ceiling: a spawn race that exits 0
-        # still yields a silent empty log — the warning below covers surfaced
-        # failures only.
+        # verbatim rather than re-parsed. The sink is byte-exact like
+        # `cat >>` (raw stream copy: no console decode of the pane bytes, no
+        # re-encode, no CRLF normalization) and flushes per chunk: the run log is
+        # live-tailed for activity detection, and a buffered copy never surfaces
+        # bytes — pipe EOF is unreliable on psmux. Known ceiling: a spawn race
+        # that exits 0 still yields a silent empty log — the warning below covers
+        # surfaced failures only.
         sink = (
             "$in = [System.Console]::OpenStandardInput()\n"
             f"$out = [System.IO.File]::Open({_pwsh_quote(str(log_file))}, "
@@ -1407,7 +1653,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             "$out.Dispose()\n"
         )
         try:
-            self._tmux("pipe-pane", "-t", window_id, "-o", " ".join(self._shell_wrap(sink)))
+            # No `-o`, as the base: replace a user-opened pipe, never toggle it
+            # off (#947).
+            self._tmux("pipe-pane", "-t", window_id, *self._shell_wrap(sink))
         except (TmuxError, UnicodeEncodeError) as exc:
             # Best-effort, as the base: a window that died on launch (or psmux's
             # first-pipe-after-new-window spawn race, noted in psmux/psmux#482)
@@ -1420,15 +1668,39 @@ class PsmuxMultiplexer(BaseTmuxBackend):
                 file=sys.stderr,
             )
 
+    def inherited_env(
+        self,
+        session: str,
+        name: str,
+        *,
+        on_fault: Callable[[str], None] | None = None,
+    ) -> str | Unset | None:
+        """The seam query (#731), with tmux's replies since psmux/psmux#775
+        (``src/environ.rs``, source-read at v3.4.0): the session scope first,
+        then the global one, through the base's ``_show_environment``. Two
+        psmux specifics, both measured on 3.4.0. ``-g`` is session-targeted:
+        one server per session makes "global" that session's server start
+        environment, and an untargeted ``-g`` answers from whichever server it
+        lands on. The echoed name is matched case-insensitively: the reply
+        spells the name as the environment block stores it (``PATH`` can come
+        back ``Path=``).
+
+        Ceiling: under ``PSMUX_BARE_ENV`` a pane gets an allowlist, not what
+        this answers (see ``_warn_if_bare_env``); bmad-loop does not support
+        that mode and already warns about it."""
+        target = ["-t", f"={session}"]
+        return self._show_environment([target, ["-g", *target]], name, on_fault, fold_case=True)
+
     # Releases up to this version are refused. 3.3.6 and older force-kill a
     # recycled PID during pane teardown and let orphaned servers accumulate —
-    # engine-fatal on its own. 3.3.7 is excluded for a second reason: 3.3.8 is
-    # the build this backend is written against, and several verbs here now
-    # assume its fixes rather than routing around the defects (a direct
-    # `pipe-pane -o` flag transport, a `select-window` id target, the `=name`
-    # kill-session form, and the control-line shapes `_transportable` admits).
-    # On 3.3.7 those would fail silently, so the floor forbids it outright.
-    _LAST_UNSUPPORTED = (3, 3, 7)
+    # engine-fatal on its own. 3.3.7 lacks the fixes several verbs here assume
+    # rather than route around (a direct `pipe-pane -o` flag transport, a
+    # `select-window` id target, the `=name` kill-session form, and the
+    # control-line shapes `_transportable` admits). 3.3.8 stores a `-`-leading
+    # option value as the unset flag at rc 0 (psmux/psmux#583), a value
+    # `_transportable` no longer refuses. On those builds the failures are
+    # silent, so the floor forbids them outright.
+    _LAST_UNSUPPORTED = (3, 3, 8)
     # Class-level default; instances shadow it on first probe. Never assign on
     # the class outside tests — that would poison every future instance.
     _version_ok: bool | None = None
@@ -1444,7 +1716,7 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # version query; the lru-cached selected instance re-probes a swapped
         # install only on restart (detect_multiplexers' fresh instances
         # re-probe every call).
-        if not all(shutil.which(exe) for exe in (self._BINARY, "pwsh")):
+        if not all(shutil.which(exe) for exe in (self._BINARY, self._PWSH)):
             return False
         if self._version_ok is None:
             # A missing patch segment reads as 0 — psmux hardwires three-part

@@ -14,6 +14,7 @@ treating every CLI as a dumb terminal:
 
 from __future__ import annotations
 
+import dataclasses
 import stat
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -28,6 +29,21 @@ if TYPE_CHECKING:
     # cycle-free too; TYPE_CHECKING keeps the adapter seam's import graph as thin as
     # it was (journal pulls in model + platform_util) for the annotation alone.
     from ..journal import Journal
+
+
+# `env_fault_evidence` stamped by `CodingCLIAdapter._classify_zero_token_timeout`
+# (DW-364). Lands verbatim in the pause reason / ATTENTION line, e.g.
+# `environment fault: dev session timeout (<this>)`.
+ZERO_TOKEN_TIMEOUT_EVIDENCE = (  # nosec B105 - diagnostic prose, not a credential
+    "session timed out having consumed zero tokens (tracked usage) — "
+    "the CLI never got a usable response from the provider"
+)
+
+# `SessionResult.usage_limit_class` values (DW-591): which profile list a live
+# usage-limit sighting matched — `usage_limit_patterns` (blocked: an operator
+# must act) or `usage_wait_patterns` (waiting on a reset the CLI continues from).
+USAGE_LIMIT_BLOCKED = "blocked"
+USAGE_LIMIT_WAIT = "wait"
 
 
 class AdapterTaskDirectoryError(ValueError):
@@ -207,11 +223,54 @@ class SessionSpec:
     # Reasoning effort (#643), free-form because the legal names are provider- and
     # model-specific; "" = provider default. Resolved per stage by
     # `AdapterPolicy.resolved()` with the same client-specific inheritance as
-    # `model`. Only the opencode-http adapter has a channel for it — it rides every
-    # `prompt_async` body as `variant` — and the tmux generic family ignores it
+    # `model`. Only the opencode-http adapter has a channel for it — the model
+    # `variant` (every 1.x `prompt_async` body; the 2.x session's model ref at
+    # create) — and the tmux generic family ignores it
     # (`bmad-loop validate` warns). Never reaches argv, so `config_digest` is
     # untouched. Kept LAST so positional SessionSpec constructions stay valid.
     effort: str = ""
+    # The frontmatter statuses that END this session successfully, handed to the
+    # generic read-back (`devcontract.synthesize_result`, the candidate scans, the
+    # mid-session transition sampler and the post-kill rescue). The default is the
+    # v6 contract: a spec finishes at `done`. A BMAD v7 ticket session finishes its
+    # plan at `built` (dev) or `built`/`done` (review), so the tickets engine
+    # sets it; nothing else ever does.
+    success_statuses: tuple[str, ...] = ("done",)
+    # Extra directories the read-back probes for the skill's no-spec fallback
+    # result (`devcontract.FALLBACK_RESULT_PREFIXES`) when the spec the session
+    # owed (`expected_spec`) yields nothing: a v7 build that cannot resolve its
+    # ticket HALTs into the initiative folder, never into the plan. Prefixed files
+    # only, never a scan for other specs (#261). A relative entry is rebased on
+    # `cwd`. Empty for every v6 session. Both kept LAST, after `effort`.
+    fallback_result_dirs: tuple[Path, ...] = ()
+    # Usage-limit wait cap (DW-396), in seconds: the most cumulative time this
+    # session may sit in a quota wait — the visible pane matches the profile's
+    # `usage_wait_patterns` while the transcript is idle — with its session
+    # timeout frozen and its stall nudge held. Past it the session ends stalled +
+    # parked with usage-limit evidence. 0.0 (the raw constructor default) = off,
+    # so adapters constructed outside the engine (tests, MockAdapter, resolve)
+    # keep the plain timeout. The engine sets limits.quota_wait_max_min * 60 for
+    # every session it drives. Kept LAST so positional constructions stay valid.
+    quota_wait_max_s: float = 0.0
+    # Usage relaunch (#959, `limits.usage_limit_action = "relaunch"`), set by the
+    # engine on primary story sessions (dev, fix, review) only; False on every
+    # other session and on constructions outside the engine.
+    # `usage_relaunch_mode`: a usage limit or account StopFailure relaunches this
+    # session. `usage_relaunch_left`: relaunch mode with relaunch budget left, so
+    # the session should end at once on a limit rather than wait it out.
+    # Appended after `quota_wait_max_s` so positional constructions stay valid.
+    usage_relaunch_mode: bool = False
+    usage_relaunch_left: bool = False
+    # Where the prompt's skill was located (`skill_locate.prompt_skill_dir`), for
+    # the profile's `{skill_dir}` placeholder: None for a primary-tree hit, a miss
+    # or a prompt naming no skill (the renderer then spells `<skill_tree>/<skill>`),
+    # `<extra_tree>/<skill>` for an extra project tree, or the absolute folder for
+    # a user-root hit. `user_skill_ids`: the BMAD module skill ids this session's
+    # CLI loads from a user root (`install.user_root_skill_ids`), empty unless
+    # `[skills] user_roots` is on. Both set by the engine only; appended LAST so
+    # positional constructions stay valid.
+    skill_dir: str | None = None
+    user_skill_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -219,6 +278,15 @@ class SessionHandle:
     task_id: str
     native_id: str  # tmux window id, HTTP session id, ...
     launched_ns: int = 0  # wall-clock ns just before launch; floor for hook events
+    # The CLI session id the adapter chose at launch (DW-505) and passed via the
+    # profile's `session_id_flag`; seeds hook-event attribution
+    # (`signals.SessionAttribution(pinned_id=...)`). None = the profile declares
+    # no such flag, so attribution learns the id from the first SessionStart.
+    # Never persisted. Kept LAST so positional constructions stay valid.
+    pinned_session_id: str | None = None
+    # The launched pane as a mux `pane_target` (#948): nudges and the screen read
+    # go here, not to `native_id`'s active pane. None = not pinned; use native_id.
+    pane_target: str | None = None
 
 
 @dataclass(frozen=True)
@@ -281,6 +349,99 @@ class SessionResult:
     # byte floor, which a rendered dialog clears). Default `True` so every
     # positional construction keeps today's routing. APPENDED, never inserted.
     produced_work: bool = True
+    # Parked-session signal (DW-348/DW-350): the CLI was waiting on a human — a
+    # permission, idle or quota prompt — when the stall grace expired, so the
+    # wait loop WITHHELD the stall wake nudge (its Enter could answer the prompt,
+    # #727) and ended the session `stalled`. Set only on that `stalled` exit,
+    # from a latched parked hook event or a `parked_prompt_patterns` match on the
+    # visible pane; never on a completed result, and never on a `crashed` one
+    # (window death outranks it) except a result-less window death after a
+    # latched account StopFailure, which `wait_for_completion` labels parked
+    # with the same evidence the live exit carries (#959). Every engine/sweep site PAUSEs on it like `env_fault` (which
+    # outranks it), so re-arm restores the attempt instead of a retry relaunching
+    # into the same prompt. `parked_evidence` names what matched. APPENDED.
+    parked: bool = False
+    parked_evidence: str | None = None
+    # Why the dev read-back last came up empty (#780): the verdict and detail of
+    # the session's last `resultless-stops.jsonl` crumb, folded in by
+    # `_DevSynthesisMixin.run` when the session ends non-completed. That file has
+    # no reader, so a spec nested one directory down rode to timeout with no
+    # visible reason; the engine journals these on `session-end` instead.
+    # Diagnostic only: never read by routing, never set on a completed result.
+    # APPENDED.
+    resultless_verdict: str | None = None
+    resultless_detail: str | None = None
+    # The evidence line an `env_fault_patterns` match found in the log tail but a
+    # tracked nonzero `read_usage` overruled (#764): measured token use disproves
+    # "the CLI never reached the API", so `env_fault` stays False and the session
+    # is charged like any timeout/stall/crash. Set only on a non-completed result,
+    # by `EnvFaultMixin._classify_env_fault`; journaled on `session-end` and named
+    # in `session_failure_reason`. Diagnostic only: never read by routing.
+    # APPENDED.
+    env_fault_overruled: str | None = None
+    # Usage-limit evidence (#610): the line a `usage_limit_patterns` /
+    # `usage_wait_patterns` match found LIVE. Two sources: the tmux adapters'
+    # visible pane — at stall-grace expiry (ending the session stalled + parked)
+    # or the instant the session timeout fired, never on a `crashed` result
+    # except a result-less window death after a latched blocked or wait usage
+    # StopFailure or during an open quota wait, which `wait_for_completion`
+    # labels with that latched evidence (#959) — and
+    # opencode-http's provider-error line, formatted from a typed SSE frame for
+    # this session while it ran (DW-592), carried onto a `timeout`, `stalled` or
+    # `crashed` result its wait returns (ENV_FAULT_STATUSES, the verdicts
+    # `_classify_env_fault` reads). Never from the post-mortem log tail, never on
+    # a completed, aborted or over_budget result.
+    # A set value makes
+    # `_classify_env_fault` stamp `env_fault` WITHOUT the #764 token veto (the
+    # limit is on screen now, not a stale match), and both pause reasons name it
+    # as a usage limit. APPENDED.
+    usage_limited: str | None = None
+    # Cumulative seconds this session spent in a usage-limit quota wait (DW-396)
+    # with its session timeout frozen; 0.0 = it never waited. Carried on every
+    # result `wait_for_completion` returns, journaled on `session-end` only when
+    # positive. APPENDED.
+    quota_wait_s: float = 0.0
+    # The usage limit's reset (#610), parsed from the same live pane line as
+    # `usage_limited` (`usagereset.parse_reset`): ISO-8601 when resolved, else
+    # the raw clause text (an unknown zone, an unknown shape — crumbed as
+    # `usage-reset-unparsed`). None = no `resets` clause on the line, or not
+    # usage-limited. Named by the pause reason; journaled present-only. APPENDED.
+    usage_limit_resets: str | None = None
+    # Which usage-limit list the live sighting in `usage_limited` matched
+    # (DW-591): USAGE_LIMIT_BLOCKED for `usage_limit_patterns` (the CLI will not
+    # continue by itself, e.g. credit exhaustion), USAGE_LIMIT_WAIT for
+    # `usage_wait_patterns` (it continues after the reset). None exactly when
+    # `usage_limited` is None. Journaled present-only. APPENDED.
+    usage_limit_class: str | None = None
+    # The `error` value of the latest Claude Code `StopFailure` hook event (#865)
+    # this session saw and no later `Stop` cleared: the API error that ended the
+    # turn (`server_error`, `billing_error`, `rate_limit`, ...). None = no
+    # uncleared StopFailure. Diagnostic only: routing never reads it, except that
+    # `_classify_env_fault` skips the log-tail scan for a parked result carrying
+    # it, so the parked pause reason names the error. Stamped on every result
+    # `wait_for_completion` returns; journaled on `session-end` present-only.
+    # APPENDED.
+    stop_failure: str | None = None
+    # The `[hooks.stop_failure_types]` action the profile maps `stop_failure`'s
+    # error to (`account`, `account-fatal`, `rate_limit`, `transient`,
+    # `ignore`), None when the error is unmapped or there is no uncleared
+    # StopFailure. Stamped with `stop_failure` on every result
+    # `wait_for_completion` returns. Diagnostic, plus #959 usage-relaunch
+    # routing (`account` qualifies, `account-fatal` never does). APPENDED.
+    stop_failure_action: str | None = None
+    # Lost-hook-channel signal (#752): the session ended `timeout` or `stalled`
+    # on a hook-signal adapter whose profile maps `SessionStart`, and NO hook
+    # event of any kind — admitted, foreign or id-less — reached the wait loop
+    # for this attempt. On a working relay even a hung agent delivers its
+    # SessionStart, so this means the relay never fired: unregistered, untrusted
+    # hooks, a CLI attached to a shared daemon, or a window that lost its
+    # BMAD_LOOP_* environment. Stamped only by `GenericAdapter.wait_for_completion`;
+    # `False` on every other adapter (MockAdapter, opencode-http's SSE channel),
+    # on a Stop-only or hookless profile, and on every completed, crashed,
+    # over_budget or aborted result. It NEVER makes a session complete and never
+    # reads result.json: it only routes a non-completed session to an uncharged
+    # pause instead of a charged retry. APPENDED.
+    hook_channel_silent: bool = False
 
 
 class CodingCLIAdapter(ABC):
@@ -330,7 +491,8 @@ class CodingCLIAdapter(ABC):
         finally:
             self.kill(handle)
         result = self._post_kill_reconcile(handle, spec, result)
-        return self._classify_env_fault(handle, spec, result)
+        result = self._classify_env_fault(handle, spec, result)
+        return self._classify_zero_token_timeout(result)
 
     def _post_kill_reconcile(
         self, handle: SessionHandle, spec: SessionSpec, result: SessionResult
@@ -381,5 +543,59 @@ class CodingCLIAdapter(ABC):
         transport. This docstring used to say HTTP adapters had no
         post-mortem signal; that stopped being true once opencode_http began
         teeing its server log, and the stale premise is why a provider quota
-        outage went unclassified and burned three stories' retry budgets."""
+        outage went unclassified and burned three stories' retry budgets.
+
+        A second, transport-agnostic post-mortem runs after this hook in
+        ``run()``: ``_classify_zero_token_timeout`` (DW-364) labels a timeout
+        with tracked zero usage an environment fault. It lives in ``run()``
+        rather than here because ``EnvFaultMixin`` overrides this hook without
+        calling super."""
         return result
+
+    def _classify_zero_token_timeout(self, result: SessionResult) -> SessionResult:
+        """Label a ``timeout`` that consumed zero tokens an environment fault
+        (DW-364): a CLI whose session clock ran out without one billed token
+        never got a usable response from the provider (a quota stall, an API
+        error, a dead endpoint), so charging it as a dev attempt burns the
+        retry budget on a wall. Stamps ``env_fault`` / ``ZERO_TOKEN_TIMEOUT_EVIDENCE``; the
+        ``decide_*`` env-fault arms then PAUSE without charging the attempt
+        (re-arm resets it).
+
+        Runs LAST in ``run()``, after ``_classify_env_fault``, so a
+        pattern-matched evidence line wins (and ``read_usage`` is not even
+        consulted) and a reconcile upgrade to ``completed`` is never touched.
+        A pattern match that tracked nonzero usage overruled (``env_fault_overruled``,
+        #764) is skipped too: usage was already read and was nonzero.
+        Only ``status == "timeout"`` with ``result_json is None`` is inspected —
+        ``stalled`` / ``crashed`` / ``over_budget`` are never classified here.
+
+        Tracked-zero only: ``read_usage`` must return a ``TokenUsage`` whose
+        ``total`` is 0. ``None`` means no usage signal (no transcript, an
+        unparsed format) — untracked never reads as free, so the session is
+        charged as before. Any ``read_usage`` fault leaves the verdict unchanged
+        here — usage is metadata, never a gate, and an escape would unwind
+        ``run()`` before the engine records the session: the engine's own
+        ``read_usage`` call right after ``run()`` re-raises it on its journaled
+        path, so the degrade stays visible rather than being folded into a
+        classification.
+
+        Cost: on timeout sessions only, this reads usage once more than the
+        engine does. ``read_usage`` is idempotent (DW-117), so the engine's
+        later read is unaffected; on an untracked timeout the generic adapter's
+        ``usage_grace_s`` poll (copilot: 8s) runs here too."""
+        if (
+            result.env_fault
+            or result.env_fault_overruled is not None
+            or result.status != "timeout"
+            or result.result_json is not None
+        ):
+            return result
+        try:
+            usage = self.read_usage(result)
+        except Exception:  # usage is metadata, never a gate; the engine re-raises it
+            return result
+        if usage is None or usage.total != 0:
+            return result
+        return dataclasses.replace(
+            result, env_fault=True, env_fault_evidence=ZERO_TOKEN_TIMEOUT_EVIDENCE
+        )

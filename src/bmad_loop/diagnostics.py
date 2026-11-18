@@ -52,7 +52,7 @@ from typing import Any
 
 from . import __version__, sanitize
 from .journal import SELF_MINTED_FIELDS, VERIFY_DIR, Journal, load_state
-from .model import RunState, StoryTask
+from .model import UNATTRIBUTED_MODEL, RunState, StoryTask
 from .platform_util import walk_files_unlinked
 
 # The guard machinery (fail-closed egress self-check + alias-substitution
@@ -128,8 +128,16 @@ _JOURNAL_ALIAS_FIELDS = {
     "log_task": "story",
     "task_id": "story",
     "bundle": "bundle",
+    # A tickets-mode epic slug (`epic-<name>`, the epic folder's name) on the
+    # `retro-auto-*` rows and the epic-closure rows, beside `epic` 0. The slug is
+    # the customer's epic name, so it is aliased in its own namespace: one epic,
+    # one alias across the retro and its closure.
+    "epic_ref": "epic",
     "branch": "branch",
     "target_branch": "branch",
+    # The branch the main checkout had instead of the target, when a merge paused
+    # (`merge-target-not-checked-out`).
+    "checked_out_branch": "branch",
     "commit": "commit",
     "baseline": "commit",
     # The baseline a re-arm's re-stamp replaced (`rearm-baseline-restamped`). Its
@@ -161,6 +169,27 @@ _JOURNAL_ALIAS_FIELDS = {
     # benign inventory follows from that inventory's own rule: a name carrying a sha
     # belongs in a `diagnostics` table.
     "old_baseline": "commit",
+    # The baseline `resume --accept-baseline` replaced (`baseline-accepted`, DW-371),
+    # journaled beside the adopted `baseline` — both shas aliased so the comparison
+    # the record exists for survives a dump.
+    "previous_baseline": "commit",
+    # The attempt HEAD a rollback could not park (`attempt-preserve-failed`) or
+    # fell through past (`attempt-preserve-fallthrough`, DW-481) — the sha a
+    # reflog rescue starts from, so one HEAD gets one alias across both kinds.
+    "head": "commit",
+    # The gate-time worktree tree hash `verify-pass-reused` records beside `head`
+    # (#1002) — a git object id, so the same `commit` alias namespace.
+    "tree": "commit",
+    # The worktree snapshot `sweep._migration_reset` parked before a reset it then
+    # refused (DW-435), on `ledger-snapshot-probe-failed` and
+    # `sweep-migration-restore-diverged`. A REF NAME, not a sha —
+    # `refs/attempt-preserve-dirty/<story slug>-<baseline[:8]>-<attempt>` — so it
+    # embeds the story slug and a baseline prefix, and gets its own `ref` namespace
+    # rather than `commit`: one parked snapshot, one alias across both kinds.
+    # Routed rather than left to `scrub_json`, which redacts it today only because
+    # the `/` fails `_IDENTIFIER_RE` — the accident of shape `repo` and `spec`
+    # above refuse to rest on.
+    "snapshot_ref": "ref",
     # A spec name IS the customer's feature name — `Pseudonymizer`'s own docstring
     # has always listed "spec filenames" among what it exists to alias, so the
     # omission here was a routing gap, not a policy. A producer that journals a
@@ -244,18 +273,56 @@ _JOURNAL_ALIAS_FIELDS = {
 # row here. `sentinel` is scoped for a different reason: its sole producer carries a
 # spec basename, so that known shape is aliased without making the same claim about a
 # future kind that reuses the generic name.
+#
+# `source` on the three merge kinds is the unit's commit SHA (DW-318). Left to
+# `scrub_json`, an identifier-shaped 40-hex value shipped verbatim; it now shares the
+# `commit` namespace with `pre_target_revision`, so one revision gets one alias across
+# both fields. Scoped rather than by-name for the same reason as `target`: `source` is
+# a generic name (`state.source` is a run mode). The producers keep the name for the
+# same correlation reason too — `_replay_unlatched_ledger_carries` keys on it.
 _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
     "unit-merge-started": {
         "target": "branch",
         "operation_id": "operation",
+        "source": "commit",
         "pre_target_revision": "commit",
     },
     "unit-merged": {
         "target": "branch",
         "operation_id": "operation",
+        "source": "commit",
     },
-    "resume-unit-merge": {"target": "branch", "operation_id": "operation"},
+    "resume-unit-merge": {"target": "branch", "operation_id": "operation", "source": "commit"},
+    # The replay's refusal of an ordinary unit's bare `unit-merged` row: the unit's
+    # commit and the target `head` it was checked against (`head` is routed by name).
+    "unit-merged-unverified": {"target": "branch", "commit_sha": "commit"},
     "sentinel-cleared": {"sentinel": "spec"},
+    # A BMAD v7 ticket key (`story-acme-vault-rotation`, `1.3`): the plan's title
+    # slug, identifier-shaped, so `scrub_json` would ship it verbatim. Kind-scoped
+    # because `ref` elsewhere names a git ref (`attempt-worktree-preserved`).
+    "ticket-mark": {"ref": "ticket"},
+    "ticket-foreign-active": {"ref": "ticket"},
+    "ticket-skipped": {"ref": "ticket"},
+    "ticket-hitl-pause": {"ref": "ticket"},
+    "ticket-refine-pause": {"ref": "ticket"},
+    "ticket-pick-halt": {"ref": "ticket"},
+    "ticket-story-approved": {"ref": "ticket"},
+    # A BMAD v7 initiative slug (the parent's and the closed child's folder names):
+    # the customer's initiative name, identifier-shaped, aliased in its own
+    # namespace so one initiative gets one alias. Kind-scoped: `parent` and `slug`
+    # are generic names.
+    "initiative-mark": {"parent": "initiative", "slug": "initiative"},
+    # `cli._drive_initiative_chain`: the parent and the children it switches
+    # between, in the same `initiative` namespace.
+    "initiative-chain-next": {
+        "parent": "initiative",
+        "from_child": "initiative",
+        "to_child": "initiative",
+    },
+    "initiative-chain-end": {"parent": "initiative"},
+    "initiative-chain": {"parent": "initiative", "previous_child": "initiative"},
+    # `cli._close_drained_children`: a drained child left open, and its parent.
+    "initiative-close-skipped": {"parent": "initiative", "slug": "initiative"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's
@@ -342,6 +409,11 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # free-text rule above (it is a `GitError` string quoting git's own stderr),
         # not this identifier-shape argument — same set, different rationale.
         "repo",
+        # The usage sources a parser skipped as unreadable (`session-end`), as
+        # "<file name>: <ExcType>". A codex rollout's file name embeds the session
+        # id, so the list reduces to a presence flag here; the operator reads the
+        # names from the raw journal.
+        "usage_unread",
         # An absolute host path naming the folder a sentinel's upstream correction has
         # to land in (`rearm-upstream-write-unreachable`). Dropped for `repo`'s reason,
         # not aliased for `spec_file`'s: it is a DIRECTORY, journalled by one kind, and
@@ -371,8 +443,9 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # drop per kind at the routing seam — both need updating by hand.
         "patch",
         # The absolute deferred-stash target embeds the run directory, story key,
-        # and spec filename. Drop rather than create a second spec correlation;
-        # the fallback redacts it only by virtue of its current separators.
+        # and spec filename (also the run-dir copy `restore-patch-evacuated` moves a
+        # ticket plan's intent-gap patch to). Drop rather than create a second spec
+        # correlation; the fallback redacts it only by virtue of its current separators.
         "stashed_to",
         # A non-completed sweep triage/migration session's post-mortem (#752):
         # a nested mapping carrying the session task id, validation errors that
@@ -386,6 +459,31 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # correlation beyond the record's story key, so every kind gets the same
         # presence-only treatment.
         "path",
+        # A BMAD v7 ticket plan's absolute path (`ticket-mark`,
+        # `ticket-plan-restored`): a host path embedding the initiative and epic
+        # folders and the ticket's title slug. Presence-only for `path`'s reason;
+        # `ticket-mark` correlates through its `ref`.
+        "plan",
+        # The kept worktree's path BEFORE the DW-525 replay moved it into the replay
+        # run (`unit-replay-start`, `unit-replay-handoff`): a host path embedding the
+        # finished run dir and the story slug, presence-only for `path`'s reason —
+        # `story_key` already correlates the record.
+        "from_worktree",
+        # `pinned-config-edit-refused`'s (DW-368) per-file descriptions of a story's
+        # edit to a pinned hook config: each quotes the worktree-relative config
+        # path, the changed top-level keys of the operator's settings, and an
+        # OSError/JSON error text. Free text under this set's rule; `story_key`
+        # already correlates the record, so presence-only.
+        "edits",
+        # `artifact-observation-unpinned` (DW-444): the absolute artifacts root
+        # whose fallback observation ran on a degraded pin, and the full
+        # filesystem label (`platform_util.filesystem_name`: `"<fs> at <volume>"`,
+        # or `"unknown (<reason>)"`, whose reason may quote a path). Both are host
+        # paths for `repo`'s reason; `story_key` already correlates the record, so
+        # presence-only. The filesystem TYPE stays visible through the record's
+        # separate `fs_type` field, routed as a value in `_scrub_entry`.
+        "root",
+        "filesystem",
     }
 )
 # Journal fields whose value is a LIST of identifiers, aliased element-wise rather
@@ -413,11 +511,31 @@ _JOURNAL_KIND_KEYLIST_FIELDS: dict[str, dict[str, str]] = {
     # ship verbatim, `scrub_json` being the identity on a list of
     # identifier-shaped strings.
     "sweep-bundle-dwids-adopted": {"previous_dw_ids": "dw"},
+    # `cli._drive_initiative_chain`: child initiative slugs passed over, still
+    # waiting on a prerequisite (`waiting`, and per prerequisite `waiting_child`),
+    # or waited on (`waiting_on`), aliased in the `initiative` namespace the
+    # kind-scoped `parent`/`*_child` rows use.
+    "initiative-chain-next": {"passed_over": "initiative"},
+    "initiative-chain-end": {
+        "passed_over": "initiative",
+        "waiting": "initiative",
+        "waiting_child": "initiative",
+        "waiting_on": "initiative",
+    },
 }
 _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
     "merge-preflight-refused": frozenset({"tolerated"}),
     "merge-target-cleaned": frozenset({"paths"}),
+    "merge-target-preserved": frozenset({"paths"}),
     "merge-target-tolerated": frozenset({"paths"}),
+    # The auto retrospective (DW-389): the worktree paths it left dirty (whatever
+    # the session touched, customer source included) and its retro doc filenames.
+    "retro-auto-dirty": frozenset({"paths"}),
+    "retro-auto-finished": frozenset({"docs"}),
+    # The harvested findings whose declared severity no alias reads (#913): each
+    # item carries the dev session's summary and severity text, so only the count
+    # ships.
+    "spec-deferrals-severity-unrecognized": frozenset({"items"}),
     "stale-restore-excluded": frozenset({"files"}),
 }
 
@@ -442,7 +560,7 @@ _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
 # precisely because an earlier version of this comment got it wrong: the sole
 # producer of this kind is ``engine._review_and_commit``, splatting a
 # bmad-build-auto REVIEW session's ``result.json`` entries. Sweep does not journal
-# ``preference-escalation`` at all. ``data/skills/bmad-loop-sweep/automation-mode.md``
+# ``preference-escalation`` at all. ``skills/bmad-loop-sweep/automation-mode.md``
 # declares the same three-key shape for a DIFFERENT session type, so it corroborates
 # the shape and is not the contract that produces this record. Anything outside those
 # three keys is off-schema and has no diagnostic claim on being shown verbatim.
@@ -483,8 +601,8 @@ _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
 # field because some other table happened to cover it would mislead the next reader.
 _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     "preference-escalation": frozenset({"type", "severity", "detail"}),
-    # The six kinds `render_markdown` lifts out of the scrubbed collection and
-    # prints as a JSON block in the DEFAULT dump (DW-191/192/201/246). Their names ARE
+    # The seven kinds `render_markdown` lifts out of the scrubbed collection and
+    # prints as a JSON block in the DEFAULT dump (DW-191/192/201/246/337). Their names ARE
     # authored here, so the premise above does not hold for them — an unclaimed
     # key on one of these is a field a future producer added without routing.
     # Declared anyway, because Markdown is the render an operator pastes into an
@@ -502,7 +620,37 @@ _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     # DW-246/250. `dw_ids` is a `_JOURNAL_KEYLIST_FIELDS` name and aliases before
     # this table is consulted; named for the same completeness as `commit` above.
     "sweep-ledger-commit-withheld": frozenset({"message", "file", "reason", "dw_ids"}),
+    # #772: the engine's hooks-off commit of its own ledger bookkeeping before a
+    # session. `story_key` and `commit` alias, `error` drops; `site` is the closed
+    # session role (or `defer`), `added` a bare boolean, `refuse_cause` the closed
+    # `verify.unpublishable_target` enum.
+    "engine-ledger-commit": frozenset({"story_key", "site", "commit", "added"}),
+    "engine-ledger-commit-failed": frozenset({"story_key", "site", "error"}),
+    "engine-ledger-commit-refused": frozenset({"story_key", "site", "refuse_cause", "error"}),
     "sweep-repeat-done": frozenset({"cycles", "reason", "stop_cause"}),
+    # DW-337. Both producers (`_cycle`'s dispatch gate and `_loop`'s in-flight
+    # recovery withhold) write `cycle` and `bundles_not_run`; `reason` is a DROP
+    # field and `story_keys` a `_JOURNAL_KEYLIST_FIELDS` name, both reached first.
+    "sweep-bundles-withheld": frozenset({"cycle", "bundles_not_run", "reason", "story_keys"}),
+    # `tickettree.TicketTree.mark_initiative_done`: `file` is the child initiative
+    # file's absolute host path, which the by-name benign `file` (a code-constant
+    # basename elsewhere) would ship through `scrub_json`; left off the schema, it
+    # collapses to `file_present`. `before`, `after` and `outcome` are closed
+    # status/outcome tokens; `parent`/`slug` are kind-aliased, which runs first.
+    "initiative-mark": frozenset({"before", "after", "outcome"}),
+    # `cli._drive_initiative_chain`: `passed_over_why` holds closed pass-over
+    # tokens (`no-folder`, `drained`), `end` a closed chain-end token,
+    # `waiting_on_status` closed prerequisite-status tokens (an initiative status,
+    # `open`, `no-folder`, `?`), and `previous_run` a run id; the slugs are
+    # kind-aliased or kind-keylisted, which runs first, and `error` is dropped by
+    # name. `initiative-close-skipped`'s `why` is a closed skip token (`run-live`,
+    # `run-unfinished`, `runs-unread`, `work-left`, `store-refused`,
+    # `uncommitted-edit`) and `blocking_run` a run id (or empty); `detail` is
+    # dropped by name.
+    "initiative-chain-next": frozenset({"passed_over_why"}),
+    "initiative-chain-end": frozenset({"end", "passed_over_why", "waiting_on_status"}),
+    "initiative-chain": frozenset({"previous_run"}),
+    "initiative-close-skipped": frozenset({"why", "blocking_run"}),
 }
 
 # Policy keys whose values can carry secrets/paths/free text. Dropped or reduced
@@ -580,6 +728,11 @@ class TaskDiag:
     # `context.json` — a story whose older escalations are filtered out dumps
     # identically to one that only ever raised the entries shown. A counter too.
     escalations_resolved_upto: int
+    # #959 refunds: the uncharged usage-limit relaunches counted inside `attempt` /
+    # `review_cycle`. Without them an `attempt` past `max_dev_attempts` reads as a
+    # broken cap. Counters, no customer content; additive — no SCHEMA_VERSION bump.
+    dev_usage_relaunches: int
+    review_usage_relaunches: int
     dw_count: int
     n_sessions: int
     sessions: SessionTally
@@ -862,6 +1015,8 @@ def _task_diag(task: StoryTask, pseudo: sanitize.Pseudonymizer, weight: float) -
         worktree_isolated=bool(task.worktree_path),
         generation=task.generation,
         escalations_resolved_upto=task.escalations_resolved_upto,
+        dev_usage_relaunches=task.dev_usage_relaunches,
+        review_usage_relaunches=task.review_usage_relaunches,
         dw_count=len(task.dw_ids),
         n_sessions=len(task.sessions),
         sessions=_session_tally([task]),
@@ -974,6 +1129,55 @@ def _reserved_output_names(
     return frozenset(generated)
 
 
+# A model id as the coding CLIs report it: `claude-opus-4-6[1m]`,
+# `anthropic/claude-sonnet-4-5`, `gpt-5.5-codex`, `models/gemini-3-pro@001`.
+# Starts alphanumeric, so an absolute path (`/home/…`) never matches.
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/\[\]-]{0,127}$")
+_REDACTED_STR = "<redacted:str>"
+
+
+def _scrub_model_id(value: object) -> str:
+    """`value` verbatim while it is a model-id-shaped string that does not look
+    like a credential, else `<redacted:str>`. Shared by every journal field that
+    carries an observed model id."""
+    if (
+        isinstance(value, str)
+        and _MODEL_ID_RE.fullmatch(value)
+        and not sanitize.looks_like_secret(value)
+    ):
+        return value
+    return _REDACTED_STR
+
+
+_TOKEN_COUNT_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
+)
+
+
+def _scrub_tokens_by_model(value: object) -> dict[str, dict[str, int]] | str:
+    """A `session-end` `tokens_by_model` map, safe to ship: each key through
+    `_scrub_model_id` (the `UNATTRIBUTED_MODEL` sentinel verbatim — engine
+    authored, never input), each value cut to its int counts of the four token
+    fields (a non-dict value keeps none). Keys that scrub to the same string
+    merge by summing; a non-dict map is `<redacted:str>`."""
+    if not isinstance(value, dict):
+        return _REDACTED_STR
+    out: dict[str, dict[str, int]] = {}
+    for model, counts in value.items():
+        key = model if model == UNATTRIBUTED_MODEL else _scrub_model_id(model)
+        merged = out.setdefault(key, {})
+        if not isinstance(counts, dict):
+            continue
+        for name in _TOKEN_COUNT_FIELDS:
+            count = counts.get(name)
+            if type(count) is int:
+                merged[name] = merged.get(name, 0) + count
+    return out
+
+
 def _scrub_entry(
     entry: dict,
     pseudo: sanitize.Pseudonymizer,
@@ -1057,6 +1261,27 @@ def _scrub_entry(
             out[k] = v if type(v) is int and v >= 0 else None
         elif kind == "artifact-publication-refused" and k == "measurement_is_lower_bound":
             out[k] = v if type(v) is bool else None
+        elif kind == "artifact-observation-unpinned" and k == "fs_type":
+            # DW-444: the filesystem type alone (`NTFS`, `ReFS`, `unknown`) —
+            # `platform_util.filesystem_type` already stripped the volume path.
+            # Kept only while identifier-shaped, so a label that somehow still
+            # carries a path or prose never ships.
+            out[k] = v if isinstance(v, str) and sanitize.looks_like_identifier(v) else None
+        elif kind == "session-end" and k == "models":
+            # #859: observed model ids. `scrub_json` would blank every
+            # `provider/model` (opencode) and `…[1m]` (claude) id, because `/`
+            # and brackets fail `looks_like_identifier`; keep each element that
+            # is model-id shaped, redact the rest one by one.
+            out[k] = [_scrub_model_id(each) for each in v] if isinstance(v, list) else _REDACTED_STR
+        elif kind == "session-end" and k == "tokens_by_model":
+            # DW-618: the per-model token split. Keys are model ids, so they go
+            # through `_scrub_model_id` like `models` (the engine's own
+            # `<unattributed>` sentinel is kept); values keep only the four int
+            # counts. Keys that redact to the same string merge by summing.
+            out[k] = _scrub_tokens_by_model(v)
+        elif kind == "session-model" and k == "model":
+            # #859: the hook-reported launch model, one id of the same shapes.
+            out[k] = _scrub_model_id(v)
         elif declared is not None and k not in declared and k not in SELF_MINTED_FIELDS:
             # A kind with a declared schema (`_JOURNAL_KIND_SCHEMAS`) replaces the
             # `scrub_json` fallback with a fail-closed one, because on such a kind an
@@ -1387,17 +1612,20 @@ def render_markdown(
             # `gen` on that same rule: DW-11's watermark is the only field separating
             # "this story raised one escalation" from "its earlier ones are filtered
             # out as already answered", and a short `context.json` is read off exactly
-            # this report.
+            # this report. `relaunch` (`dev/review`, #959) rides beside `rev`: the
+            # uncharged usage relaunches are why `att` / `rev` can exceed their caps.
             out.append(
-                "| alias | epic | phase | att | gen | esc-upto | rev | committed | spec | dw "
-                "| sessions | weighted | raw |"
+                "| alias | epic | phase | att | gen | esc-upto | rev | relaunch | committed "
+                "| spec | dw | sessions | weighted | raw |"
             )
-            out.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+            out.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
             for t in r.tasks:
                 out.append(
                     f"| `{t.alias}` | {t.epic} | {t.phase} | {t.attempt} | {t.generation} "
                     f"| {t.escalations_resolved_upto} "
-                    f"| {t.review_cycle} | {t.committed} | {t.spec_present} | {t.dw_count} "
+                    f"| {t.review_cycle} "
+                    f"| {t.dev_usage_relaunches}/{t.review_usage_relaunches} "
+                    f"| {t.committed} | {t.spec_present} | {t.dw_count} "
                     f"| {t.n_sessions} | {t.tokens.get('weighted', 0)} "
                     f"| {t.tokens.get('total', 0)} |"
                 )
@@ -1438,6 +1666,10 @@ def render_markdown(
                 # `file` names which file, `reason` collapses to presence.
                 "sweep-ledger-commit-withheld",
                 "sweep-repeat-done",
+                # #772: the engine's own pre-session ledger bookkeeping commits.
+                "engine-ledger-commit",
+                "engine-ledger-commit-failed",
+                "engine-ledger-commit-refused",
             }
         ]
         if sweep_entries:

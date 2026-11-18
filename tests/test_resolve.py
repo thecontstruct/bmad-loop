@@ -4,19 +4,21 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
-from conftest import escalated_run, git, json_recursion_payload
+from conftest import clear_escalation_pause, escalated_run, git, json_recursion_payload
 
 from bmad_loop import devcontract, platform_util, resolve, runs, verify
 from bmad_loop.engine import _session_task_id
-from bmad_loop.journal import JOURNAL_FILE, TASK_CYCLE_ARTIFACTS, load_state, save_state
+from bmad_loop.journal import JOURNAL_FILE, TASK_CYCLE_ARTIFACTS, Journal, load_state, save_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
     Phase,
     RunState,
     SessionRecord,
+    StoryTask,
 )
 from bmad_loop.platform_util import safe_segment
 
@@ -264,6 +266,25 @@ def test_set_frontmatter_field_inserts_without_introducing_a_foreign_line_ending
     assert verify.read_frontmatter(spec)["baseline_revision"] == "abc123"
 
 
+def test_set_frontmatter_field_keep_bom_edits_behind_a_byte_order_mark(tmp_path):
+    """A leading BOM hides the block unless `keep_bom` (a v7 file read as
+    `utf-8-sig`): then the key is inserted behind it and the BOM is kept.
+
+    Ablation: drop the BOM peel and the `keep_bom` call returns False."""
+    spec = tmp_path / "initiative.md"
+    original = "\ufeff---\ntype: initiative\n---\n\nbody\n".encode("utf-8")
+    spec.write_bytes(original)
+    assert verify.set_frontmatter_field(spec, "status", "done", confine_root=tmp_path) is False
+    assert spec.read_bytes() == original
+    assert (
+        verify.set_frontmatter_field(spec, "status", "done", confine_root=tmp_path, keep_bom=True)
+        is True
+    )
+    assert spec.read_bytes().decode("utf-8") == (
+        "\ufeff---\ntype: initiative\nstatus: done\n---\n\nbody\n"
+    )
+
+
 # --- set_frontmatter_field: atomic write (#379) ---
 #
 # Three rows for the three distinct choices at this call site — that it routes
@@ -296,7 +317,7 @@ def test_set_frontmatter_field_write_failure_raises_and_keeps_the_spec(tmp_path,
     spec.write_text(SPEC, encoding="utf-8")
     before = spec.read_bytes()
 
-    def boom(path, data, *, confine_root, require_writable_target=False):
+    def boom(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         raise OSError("no space left on device")
 
     monkeypatch.setattr(verify, "atomic_write_bytes_confined", boom)
@@ -329,7 +350,7 @@ def test_set_frontmatter_field_hands_the_helper_bytes_not_text(tmp_path, monkeyp
     seen: list[bytes | str] = []
     real = verify.atomic_write_bytes_confined
 
-    def record(path, data, *, confine_root, require_writable_target=False):
+    def record(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         seen.append(data)
         blob = data if isinstance(data, bytes) else data.encode("utf-8")
         real(
@@ -337,6 +358,7 @@ def test_set_frontmatter_field_hands_the_helper_bytes_not_text(tmp_path, monkeyp
             blob,
             confine_root=confine_root,
             require_writable_target=require_writable_target,
+            root_identity=root_identity,
         )
 
     monkeypatch.setattr(verify, "atomic_write_bytes_confined", record)
@@ -1982,7 +2004,7 @@ def test_rearm_restores_the_spec_when_the_result_strip_faults(tmp_path, monkeypa
     before = spec.read_bytes()
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
 
-    def boom(spec_path, *, confine_root):
+    def boom(spec_path, *, confine_root, root_identity=None):
         raise OSError(28, "No space left on device")
 
     # patched on the module under test, so the flip runs for real and PUBLISHES
@@ -2030,7 +2052,7 @@ def test_rearm_restores_an_isolated_tasks_spec_that_sits_outside_the_worktree(
     before = spec.read_bytes()
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), worktree_path=str(wt))
 
-    def boom(spec_path, *, confine_root):
+    def boom(spec_path, *, confine_root, root_identity=None):
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(runs.devcontract, "strip_auto_run_result", boom)
@@ -2488,6 +2510,129 @@ def test_rearm_rejects_unescalated_story(tmp_path):
         runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
 
+# #958: a resume clears the pause before its engine starts, so an engine that exits
+# before run end leaves the run unpaused with the story still ESCALATED.
+
+
+def _cleared_run(tmp_path, **kw):
+    run = clear_escalation_pause(escalated_run(tmp_path, **kw))
+    assert run.state.paused_stage is None and run.task.phase == Phase.ESCALATED
+    return run
+
+
+def test_rearm_admits_cleared_pause_escalated_task(tmp_path):
+    """The #958 shape re-arms, defaulting to the unresolved escalated story."""
+    run = _cleared_run(tmp_path)
+    outcome = runs.rearm_escalation(run.run_dir, isolated_redrive=False, resolution_recorded=False)
+    assert outcome.story_key == "s1"
+    assert load_state(run.run_dir).tasks["s1"].phase == Phase.PENDING
+
+
+def test_rearm_cleared_pause_story_must_be_unresolved(tmp_path):
+    """Unpaused, a named story must be an unresolved escalation: a task that is
+    not escalated keeps its refusal, and an attempt-0 stories wedge is not admitted.
+
+    Ablation: drop the `escalation_story_admitted` check in
+    `_rearm_escalation_locked` and the wedge row re-arms."""
+    run = _cleared_run(tmp_path, source="stories")
+    run.state.tasks["s2"] = StoryTask(story_key="s2", epic=1, phase=Phase.DONE, attempt=1)
+    run.state.tasks["w"] = StoryTask(story_key="w", epic=1, phase=Phase.ESCALATED, attempt=0)
+    save_state(run.run_dir, run.state)
+    with pytest.raises(runs.RearmError, match="not escalated"):
+        runs.rearm_escalation(run.run_dir, "s2", isolated_redrive=False, resolution_recorded=False)
+    with pytest.raises(runs.RearmError, match=r"not paused at an escalation \(stage: none\)"):
+        runs.rearm_escalation(run.run_dir, "w", isolated_redrive=False, resolution_recorded=False)
+    with pytest.raises(runs.RearmError, match="no task for story"):
+        runs.rearm_escalation(
+            run.run_dir, "ghost", isolated_redrive=False, resolution_recorded=False
+        )
+    assert load_state(run.run_dir).tasks["w"].phase == Phase.ESCALATED
+
+
+def test_rearm_cleared_pause_refuses_sweep(tmp_path):
+    """A sweep's ESCALATED tasks are cleared by a plain resume, so an unpaused
+    sweep keeps stage-only admission.
+
+    Ablation: drop the sweep exclusion in `runs.escalation_resolvable` and this
+    re-arms."""
+    run = _cleared_run(tmp_path, run_type="sweep")
+    with pytest.raises(runs.RearmError, match=r"not paused at an escalation \(stage: none\)"):
+        runs.rearm_escalation(run.run_dir, isolated_redrive=False, resolution_recorded=False)
+    assert load_state(run.run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
+def test_rearm_cleared_pause_refuses_finished(tmp_path):
+    """Ablation: drop the finished exclusion in `runs.escalation_resolvable` and
+    this re-arms."""
+    run = _cleared_run(tmp_path)
+    run.state.finished = True
+    save_state(run.run_dir, run.state)
+    with pytest.raises(runs.RearmError, match=r"not paused at an escalation \(stage: none\)"):
+        runs.rearm_escalation(run.run_dir, isolated_redrive=False, resolution_recorded=False)
+    assert load_state(run.run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
+@pytest.mark.parametrize("source", ["stories", "tickets"])
+def test_rearm_cleared_pause_ignores_stories_attempt0_wedge(tmp_path, source):
+    """A checkpoint-flow run's pick-time wedge (attempt 0) is lifted by a hand fix
+    and a resume, so an unpaused run holding only that wedge is not admitted.
+
+    Ablation: drop the attempt narrowing in `unresolved_escalation_keys` and this
+    re-arms."""
+    run = _cleared_run(tmp_path, source=source, attempt=0)
+    with pytest.raises(runs.RearmError, match=r"not paused at an escalation \(stage: none\)"):
+        runs.rearm_escalation(run.run_dir, isolated_redrive=False, resolution_recorded=False)
+    assert load_state(run.run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
+def test_rearm_cleared_pause_keeps_the_other_stage_refusals(tmp_path):
+    """Admission by task applies only to a null stage: an environment pause (or any
+    other non-escalation stage) with an escalated task still refuses."""
+    run = escalated_run(tmp_path)
+    for stage in ("environment", "story-gate"):
+        run.state.paused_stage = stage
+        save_state(run.run_dir, run.state)
+        with pytest.raises(runs.RearmError, match=f"stage: {stage}"):
+            runs.rearm_escalation(run.run_dir, isolated_redrive=False, resolution_recorded=False)
+    assert load_state(run.run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
+def test_build_context_reason_reads_the_journal_after_a_cleared_pause(tmp_path):
+    """Unpaused (#958), the run carries no `paused_reason`, so the context takes the
+    story's LAST `story-escalated` row; none at all reads as None.
+
+    Ablation: return `state.paused_reason` unconditionally and this reddens."""
+    run_dir, state, _ = _escalated_run(tmp_path)
+    key = "6-4-cli-list-command"
+    state.clear_pause()
+    save_state(run_dir, state)
+    assert _context_reason(state, run_dir, key) is None
+    journal = Journal(run_dir)
+    journal.append("story-escalated", story_key=key, reason="first escalation")
+    journal.append("story-escalated", story_key="other", reason="not this story")
+    journal.append("story-escalated", story_key=key, reason="latest escalation")
+    assert _context_reason(state, run_dir, key) == "latest escalation"
+
+
+def test_build_context_reason_for_another_story_than_the_paused_one(tmp_path):
+    """Resolving `--story B` while paused on A hands B's session B's own reason, never
+    A's; the paused story keeps the run's `paused_reason`."""
+    run_dir, state, _ = _escalated_run(tmp_path)
+    key = "6-4-cli-list-command"
+    state.tasks["b"] = StoryTask(story_key="b", epic=6, phase=Phase.ESCALATED, attempt=1)
+    save_state(run_dir, state)
+    Journal(run_dir).append("story-escalated", story_key="b", reason="b's escalation")
+    assert _context_reason(state, run_dir, "b") == "b's escalation"
+    assert _context_reason(state, run_dir, key) == (
+        "CRITICAL escalation from review session: names not unique"
+    )
+
+
+def _context_reason(state, run_dir, story_key):
+    path = _context(state, run_dir, story_key, isolation="")
+    return json.loads(path.read_text(encoding="utf-8"))["paused_reason"]
+
+
 # ------------------------------------------------- _gather_escalations
 
 
@@ -2577,9 +2722,11 @@ def _two_session_dirs(tmp_path):
     directories. `task.sessions` is append-only and chronological, so `sessions[1]`
     is the NEWER attempt and `reversed(...)` must reach its directory first.
 
-    This shape exists because no single-directory row can see either of this
-    reader's cross-session contracts: rescope the content map per directory, or
-    drop `reversed`, and every one-directory row below stays green."""
+    This shape exists because no single-directory row can see this reader's
+    cross-session dedupe contract: rescope the content map per directory and every
+    one-directory row below stays green. (The other cross-session contract, the
+    `reversed` newest-first order, is pinned by
+    `test_gather_escalations_shows_the_whole_trail_at_watermark_zero`.)"""
     run_dir, state, task = _escalated_run(tmp_path)
     key = "6-4-cli-list-command"
     older = _session_task_id(key, "triage", 1, 0)
@@ -2609,22 +2756,6 @@ def test_gather_escalations_dedupes_one_entry_across_two_sessions(tmp_path):
 
     found, _ = resolve._gather_escalations(run_dir, state, key)
     assert [e["detail"] for e in found] == ["unresolved across attempts"]
-
-
-def test_gather_escalations_orders_distinct_sessions_newest_first(tmp_path):
-    """The documented "newest first" order is a CROSS-SESSION property: nothing
-    inside one directory can pin it, because `reversed(task.sessions)` is what
-    reaches the newer record's directory before the older one's. Drop `reversed`
-    and only this row notices."""
-    run_dir, state, key, older_dir, newer_dir = _two_session_dirs(tmp_path)
-    for d, detail in ((older_dir, "older"), (newer_dir, "newer")):
-        (d / "escalation.json").write_text(
-            json.dumps({"escalations": [{"severity": "CRITICAL", "detail": detail}]}),
-            encoding="utf-8",
-        )
-
-    found, _ = resolve._gather_escalations(run_dir, state, key)
-    assert [e["detail"] for e in found] == ["newer", "older"]
 
 
 def _task_dir(run_dir, task):
@@ -3056,7 +3187,12 @@ def _redrive_escalates(run_dir, key, detail, *, escalated=False):
 def test_gather_escalations_shows_the_whole_trail_at_watermark_zero(tmp_path):
     """The default is the PRE-DW-11 walk, byte-for-byte. 0 is what a task that was
     never resolved carries and what a pre-upgrade `state.json` deserializes to, so
-    this row is also the legacy-state contract at the reader."""
+    this row is also the legacy-state contract at the reader.
+
+    It also pins the documented "newest first" order, a CROSS-SESSION property:
+    nothing inside one directory can pin it, because `reversed(task.sessions)` is
+    what reaches the newer record's directory before the older one's. Drop
+    `reversed` and this row reds."""
     run_dir, state, task, key = _watermarked_trail(tmp_path, [["older"], ["newer"]])
     assert task.escalations_resolved_upto == 0
 
@@ -3315,6 +3451,7 @@ def test_build_context_keeps_the_withheld_count_out_of_the_payload(tmp_path):
         "spec_file",
         "baseline_commit",
         "paused_reason",
+        "env_fault_site",
         "escalations",
         "resolution_path",
         "restore_supported",
@@ -3706,6 +3843,59 @@ def test_run_session_threads_model_and_effort_onto_the_spec(tmp_path, monkeypatc
     assert plain.specs[0].model == "" and plain.specs[0].effort == ""
 
 
+def test_run_epic_close_session_builds_the_spec_and_returns_the_returncode(tmp_path, monkeypatch):
+    """The epic-close session carries its prompt verbatim on a dev spec rooted at
+    the project, with the run dir and epic ref in its env and no BMAD_LOOP_MODE (a
+    human is present), and hands the process returncode back for the journal."""
+    calls: list = []
+
+    def fake_subprocess_run(argv, cwd, env):
+        calls.append((argv, cwd, env))
+        return SimpleNamespace(returncode=3)
+
+    monkeypatch.setattr(resolve.subprocess, "run", fake_subprocess_run)
+    adapter = _SpecCapture()
+    prompt = "/bmad-agent-po Run your epic closure check for epic e1 of initiative i1."
+    rc = resolve.run_epic_close_session(
+        adapter,
+        tmp_path,
+        tmp_path / "run",
+        "e1",
+        prompt,
+        model="anthropic/claude-x",
+        effort="max",
+    )
+    assert rc == 3
+    spec = adapter.specs[0]
+    assert spec.prompt == prompt
+    assert spec.role == "dev"
+    assert spec.cwd == tmp_path
+    assert spec.env == {"BMAD_LOOP_RUN_DIR": str(tmp_path / "run"), "BMAD_LOOP_EPIC_REF": "e1"}
+    assert spec.task_id == _session_task_id("e1", "epic-close", 1, 0)
+    assert (spec.model, spec.effort) == ("anthropic/claude-x", "max")
+    [(argv, cwd, env)] = calls
+    assert argv == ["fake-agent", prompt]
+    assert cwd == str(tmp_path)
+    assert env["BMAD_LOOP_EPIC_REF"] == "e1"
+    assert env["BMAD_LOOP_RUN_DIR"] == str(tmp_path / "run")
+    assert "BMAD_LOOP_MODE" not in spec.env
+
+
+def test_run_epic_close_session_propagates_no_interactive_mode(tmp_path, monkeypatch):
+    """An adapter with no interactive mode raises out of `interactive_argv`; the
+    caller owns that answer, so it propagates and nothing is spawned."""
+
+    class _NoInteractive(_FakeAdapter):
+        def interactive_argv(self, spec):
+            raise NotImplementedError
+
+    monkeypatch.setattr(resolve.subprocess, "run", lambda *a, **k: pytest.fail("spawned a session"))
+    with pytest.raises(NotImplementedError):
+        resolve.run_epic_close_session(
+            _NoInteractive(None), tmp_path, tmp_path / "run", "e1", "/bmad-agent-po x"
+        )
+
+
 def test_run_session_id_is_byte_identical_to_the_hand_mint_at_generation_zero(
     tmp_path, monkeypatch
 ):
@@ -3847,18 +4037,10 @@ def test_build_context_keeps_recorded_sentinel_mode_after_its_file_disappears(tm
     assert ctx["spec_reaches_the_redrive"] is None
 
 
-def test_build_context_sprint_mode_has_no_stories_block(tmp_path):
-    """Sprint mode leaves the context contract unchanged — no stories block."""
-    run_dir, state, _ = _escalated_run(tmp_path, spec_file="/abs/spec.md")  # sprint source
-    ctx = json.loads(
-        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
-    )
-    assert "stories" not in ctx
-
-
 def test_build_context_sprint_mode_does_not_resolve_a_stories_root(tmp_path, monkeypatch):
-    """A sprint context has no consumer for stories-root data, so it performs no
-    stories-only filesystem lookup.
+    """Sprint mode leaves the context contract unchanged — no stories block. A sprint
+    context has no consumer for stories-root data, so it performs no stories-only
+    filesystem lookup either.
 
     The seam is planted on `live_stories_root`, the module global
     `_context_stories_root` delegates to, so the row grades the delegation as well as
@@ -4058,39 +4240,16 @@ def test_build_context_stories_block_stays_on_the_mount_for_an_out_of_mount_spec
     assert "sentinel" not in ctx["stories"]  # task never recorded a sentinel verdict
 
 
-def test_build_context_reports_whether_the_spec_reaches_the_redrive(tmp_path):
-    """The agent is told when the file it is being sent to edit has no future.
+def test_build_context_names_where_an_unreachable_correction_has_to_land(tmp_path):
+    """The agent is told when the file it is being sent to edit has no future, and
+    where the correction has to land instead.
 
     Under isolation `engine._finish_inflight` discards the mount, so an edit to a
     worktree-local spec succeeds and then vanishes before the re-drive reads anything.
     `rearm_escalation` already journals `rearm-spec-write-unreachable` on this verdict;
     emitting it here is what lets the session act on it rather than discover it after.
 
-    Ablation: hardcode the field to `True` and the isolated leg reddens.
-    """
-    wt = tmp_path / ".bmad-loop" / "runs" / "20260613-111429-6a14" / "worktrees" / "1"
-    run_dir, state, _ = _escalated_run(tmp_path, spec_file="specs/6-4.md", worktree_path=str(wt))
-    ctx = json.loads(
-        _context(state, run_dir, "6-4-cli-list-command", isolation="worktree").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert ctx["spec_reaches_the_redrive"] is False
-
-    plain_dir, plain_state, _ = _escalated_run(
-        tmp_path, "20260613-111429-6a15", spec_file=str(tmp_path / "specs" / "6-4.md")
-    )
-    plain = json.loads(
-        _context(plain_state, plain_dir, "6-4-cli-list-command", isolation="").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert plain["spec_reaches_the_redrive"] is True
-
-
-def test_build_context_names_where_an_unreachable_correction_has_to_land(tmp_path):
-    """`spec_reaches_the_redrive: false` on its own states a problem with no remedy.
-
+    `spec_reaches_the_redrive: false` on its own states a problem with no remedy.
     The session is told its edit is doomed, and both obvious repairs fail silently for
     an isolated unit: committing from the main checkout cannot include a file that
     lives in the linked unit worktree, and committing on the unit's own branch does
@@ -4101,6 +4260,8 @@ def test_build_context_names_where_an_unreachable_correction_has_to_land(tmp_pat
 
     Ablation: return `"HEAD"` unconditionally and the isolated leg reddens; drop the
     key and the skill-contract guard reddens too, since the schema documents it.
+    Hardcode `spec_reaches_the_redrive` to `True` and the isolated leg reddens; to
+    `False` and the in-place leg does.
     """
     wt = tmp_path / ".bmad-loop" / "runs" / "20260613-111429-6a14" / "worktrees" / "1"
     run_dir, state, _ = _escalated_run(tmp_path, spec_file="specs/6-4.md", worktree_path=str(wt))
@@ -4124,6 +4285,7 @@ def test_build_context_names_where_an_unreachable_correction_has_to_land(tmp_pat
             encoding="utf-8"
         )
     )
+    assert plain["spec_reaches_the_redrive"] is True
     assert plain["redrive_base_ref"] == "HEAD"
 
 
@@ -4148,10 +4310,21 @@ def test_rearm_warns_about_an_unreachable_spec_write_only_when_it_is_actionable(
     Both legs keep the WORKTREE spec at `blocked`, so the only thing separating them is
     what git has committed — which is the whole claim.
 
+    Neither leg pins `target_branch`, on purpose: that is the pre-upgrade state.json
+    shape (`ensure_target_branch` pins the field before any worktree can mount, so only
+    an older state reaches here with a `worktree_path` and no target), and an
+    unrecorded target is a MISSING value, not a divergent one. `_redrive_base_ref` must
+    degrade to `HEAD` rather than to `""`, which would make `_redrive_spec_status`
+    unprovable for every re-arm of such a run and hold the resume on a
+    per-configuration constant. The `ready-for-dev` leg is what separates the two:
+    only an anchor that actually resolves can suppress.
+
     Ablation: restore the gate to a bare `if task.worktree_path:` and the
     `committed_status="ready-for-dev"` row reddens on `assert True is False`, while the
     `"blocked"` row keeps passing. That asymmetry IS the narrowing; a gate that fires
-    for both is indistinguishable from no gate at all.
+    for both is indistinguishable from no gate at all. Make `_redrive_base_ref` return
+    `""` on the migrated shape and the `"ready-for-dev"` row reddens on the record
+    appearing.
     """
     rel = "_bmad-output/specs/6-4-cli-list-command.md"
     _resolve_repo(tmp_path)
@@ -4700,41 +4873,6 @@ def test_rearm_event_notice_reads_a_pre_discriminator_record_as_isolated():
     _, message, next_step = runs.rearm_event_notice(legacy)
     assert "Commit the corrected spec on `main`" in next_step
     assert "mount a fresh worktree" in message
-
-
-def test_rearm_base_ref_degrades_to_head_for_a_run_that_pinned_no_target(tmp_path, monkeypatch):
-    """An unrecorded `target_branch` is a MISSING value, not a divergent one.
-
-    `ensure_target_branch` pins the field before any worktree can mount, so only a
-    state.json predating it reaches here with a `worktree_path` and no target — and it
-    must degrade to the ref it read before the fix rather than to `""`. Answering `""`
-    would make `_redrive_spec_status` unprovable for every re-arm of such a run and
-    hold the resume on a per-configuration constant, the exact failure the record's
-    narrowing exists to avoid.
-
-    The committed spec here already carries the target status, so a degrade to `""`
-    is separable from the read succeeding: only an anchor that actually resolves can
-    suppress. Ablation: make `_redrive_base_ref` return `""` on the migrated shape and
-    this reddens on the record appearing.
-    """
-    rel = "_bmad-output/specs/6-4-cli-list-command.md"
-    _resolve_repo(tmp_path)
-    spec = tmp_path / rel
-    spec.parent.mkdir(parents=True, exist_ok=True)
-    spec.write_text("---\nstatus: ready-for-dev\n---\n\n## Intent\n\nx\n", encoding="utf-8")
-    git(tmp_path, "add", "-A")
-    git(tmp_path, "commit", "-q", "-m", "corrected spec")
-    wt_spec = tmp_path / "wt" / rel
-    wt_spec.parent.mkdir(parents=True, exist_ok=True)
-    wt_spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
-
-    # no `target_branch=`: the pre-upgrade shape, worktree_path set all the same
-    run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
-    monkeypatch.chdir(tmp_path)
-
-    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
-
-    assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"] == []
 
 
 @pytest.mark.parametrize("committed_status", ["ready-for-dev", "blocked"])
@@ -5576,3 +5714,615 @@ def test_journal_entries_or_none_drops_a_non_mapping_line(tmp_path):
 
     assert entries is not None
     assert [e["kind"] for e in entries] == ["a", "b"]
+
+
+def test_build_context_absolutizes_a_nested_mount_spec_onto_the_mount_project(
+    tmp_path, monkeypatch
+):
+    """DW-379: under a `repo_root` that CONTAINS the project (`<repo>/app`), an isolated
+    unit's spec is persisted relative to the MOUNT PROJECT, `<mount>/app`, so the
+    context names that copy — not `<mount>/<rel>`, the outer tree's same-named path,
+    which is planted here as a decoy.
+
+    Ablation: anchor `runs.task_spec_root` on the raw `worktree_path` and this reddens
+    on the decoy."""
+    rel = "_bmad-output/specs/6-4-cli-list-command.md"
+    repo = tmp_path / "repo"
+    app = repo / "app"
+    wt = tmp_path / "wt"
+    for root in (wt / "app", wt, app):  # the run's copy, an outer decoy, main's twin
+        spec = root / rel
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text(SPEC, encoding="utf-8")
+
+    run_dir, state, _ = _escalated_run(
+        app, spec_file=rel, worktree_path=str(wt), repo_root=str(repo)
+    )
+    monkeypatch.chdir(app)
+
+    path = _context(state, run_dir, "6-4-cli-list-command", isolation="worktree")
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert ctx["spec_file"] == (wt / "app" / rel).as_posix()
+
+
+# ---- tickets mode: the resolve context's `tickets` block, and the re-arm through the
+# ticket chokepoint. Real-spawn budget: 4 vendored `tickets.py` spawns (`find` + `mark`
+# in each of the two real-tree re-arm rows); the patch rows inject a FakeTicketTree.
+
+TICKET_PLAN_BODY = """\
+# story-cart-model-plan
+
+<intent-contract>
+Model the cart.
+</intent-contract>
+
+## Auto Run Result
+
+Status: blocked
+intent gap: does a cart survive logout?
+"""
+
+
+def _ticket_binding(plan: Path):
+    from bmad_loop.model import TicketBinding
+
+    return TicketBinding(
+        ref="1.1",
+        id="1",
+        epic_slug="epic-cart",
+        epic_id="1",
+        title="Cart model",
+        plan=str(plan),
+        risk="",
+        refined=False,
+        plan_checkpoint=False,
+        done_checkpoint=False,
+        hitl=False,
+    )
+
+
+def _escalated_ticket_run(project: Path, plan: Path, *, initiative: str = ""):
+    """An escalation-paused tickets run whose task is bound to ticket 1.1 and whose
+    `spec_file` is that ticket's plan, as `TicketsEngine` records them."""
+    run_dir, state, task = _escalated_run(project, spec_file=str(plan), source="tickets")
+    task.ticket = _ticket_binding(plan)
+    state.initiative = initiative
+    save_state(run_dir, state)
+    return run_dir, state, task
+
+
+def _blocked_ticket_plan(layout, *, reason: str = "intent gap") -> Path:
+    from conftest import write_plan
+
+    plan = write_plan(
+        layout,
+        "epic-cart",
+        "story-cart-model-plan",
+        1,
+        "blocked",
+        blocked_at='"2026-10-15"',
+        blocked_reason=f'"{reason}"',
+        baseline_revision="abc123",
+    )
+    plan.write_text(
+        plan.read_text(encoding="utf-8").split("# story-cart-model-plan")[0] + TICKET_PLAN_BODY,
+        encoding="utf-8",
+    )
+    return plan
+
+
+def _fake_rearm_tree(monkeypatch, plan: Path, *, status: str = "blocked"):
+    """A FakeTicketTree whose `find` names ``plan`` for ticket 1.1, installed as the
+    re-arm's tree."""
+    import dataclasses
+
+    from conftest import FakeTicketTree, fake_find, ticket_row
+
+    row = ticket_row("1.1", status=status, blocked_reason="intent gap")
+    tree = FakeTicketTree(plan.parent, finds={"1.1": fake_find(row, plan.parent)})
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
+    monkeypatch.setattr(runs, "_rearm_ticket_tree", lambda _root, _pin, folder=None: tree)
+    return tree
+
+
+def test_tickets_context_block(tmp_path):
+    """A tickets run's resolve context carries the ticket binding and the plan as it
+    reads now: status, the blocked reason build-auto's HALT left, and an excerpt of
+    its `## Auto Run Result`. An unreadable plan reads as nulls and is journaled, so
+    the nulls are never an empty plan; a sprint run carries no `tickets` block.
+    Ablation (performed): drop the `tickets` assignment in `build_context` and the
+    block is missing — this FAILS; drop the journal append and the unreadable row
+    FAILS."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(
+        "---\nticket: 1\nstatus: blocked\nblocked_reason: intent gap\n---\n" + TICKET_PLAN_BODY,
+        encoding="utf-8",
+    )
+    run_dir, state, _ = _escalated_ticket_run(tmp_path, plan)
+
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    tk = ctx["tickets"]
+    assert tk["ref"] == "1.1" and tk["ticket_id"] == "1" and tk["epic"] == "epic-cart"
+    assert tk["title"] == "Cart model"
+    assert tk["plan"] == plan.as_posix() == ctx["spec_file"]
+    assert (tk["plan_status"], tk["blocked_reason"]) == ("blocked", "intent gap")
+    assert tk["auto_run_result"].startswith("Status: blocked")
+    assert "does a cart survive logout?" in tk["auto_run_result"]
+
+    plan.write_bytes(b"---\nstatus: \xff\n---\n")
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    tk = ctx["tickets"]
+    assert tk["ref"] == "1.1"
+    assert (tk["plan_status"], tk["blocked_reason"], tk["auto_run_result"]) == (None, None, None)
+    (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "resolve-ticket-context-unreadable"]
+    assert rec["story_key"] == "6-4-cli-list-command" and rec["plan"] == str(plan)
+    assert rec["error"].startswith("UnicodeDecodeError")
+
+    state.source = "sprint-status"
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    assert "tickets" not in ctx
+
+
+@pytest.mark.parametrize(
+    "head, fault",
+    [
+        ("", "no frontmatter block"),
+        ("---\nstatus: [blocked\n---\n", "unparseable frontmatter YAML"),
+        ("---\n- blocked\n---\n", "frontmatter is not a mapping"),
+    ],
+)
+def test_tickets_context_malformed_plan_frontmatter_is_journaled(tmp_path, head, fault):
+    """A plan whose frontmatter is missing, unparseable or not a mapping reads as
+    null status fields, never a healthy-looking `""`, and the fault is journaled;
+    the body's `## Auto Run Result` still reaches the resolver. Ablation
+    (performed): drop the `frontmatter_fault` check and `plan_status` reads `""`
+    with no journal row — this FAILS."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(head + TICKET_PLAN_BODY, encoding="utf-8")
+    run_dir, state, _ = _escalated_ticket_run(tmp_path, plan)
+
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    tk = ctx["tickets"]
+    assert (tk["plan_status"], tk["blocked_reason"]) == (None, None)
+    assert tk["auto_run_result"].startswith("Status: blocked")
+    (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "resolve-ticket-context-unreadable"]
+    assert rec["story_key"] == "6-4-cli-list-command" and rec["plan"] == str(plan)
+    assert rec["error"].startswith(fault)
+
+
+def test_tickets_context_plan_without_a_status_reads_null(tmp_path):
+    """A well-formed plan with no `status` key reads `plan_status` null, as the
+    skill documents, and journals nothing."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("---\nticket: 1\n---\n" + TICKET_PLAN_BODY, encoding="utf-8")
+    run_dir, state, _ = _escalated_ticket_run(tmp_path, plan)
+
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    assert ctx["tickets"]["plan_status"] is None
+    journal = run_dir / "journal.jsonl"
+    assert not journal.exists() or "resolve-ticket-context-unreadable" not in journal.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_tickets_context_plan_moves_with_a_renamed_project(tmp_path):
+    """A tickets task with no recorded spec reads its plan from the binding, which
+    names it absolute under the launch-time project `state.project` keeps. After a
+    project move the context names, and reads, the plan under the live project.
+    Ablation (performed): pass `context_spec_path` alone and the context names the
+    old path with null fields — this FAILS."""
+    live = tmp_path / "live"
+    plan = live / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(
+        "---\nticket: 1\nstatus: blocked\nblocked_reason: intent gap\n---\n" + TICKET_PLAN_BODY,
+        encoding="utf-8",
+    )
+    launched = tmp_path / "launched-here"
+    run_dir, state, task = _escalated_run(live, source="tickets")
+    task.spec_file = ""
+    task.ticket = _ticket_binding(launched / plan.relative_to(live))
+    state.project = str(launched)
+    save_state(run_dir, state)
+
+    path, _, _ = resolve.build_context(
+        state, run_dir, "6-4-cli-list-command", isolation="", project_root=live
+    )
+
+    tk = json.loads(path.read_text(encoding="utf-8"))["tickets"]
+    assert tk["plan"] == plan.as_posix()
+    assert (tk["plan_status"], tk["blocked_reason"]) == ("blocked", "intent gap")
+
+
+def test_rearm_tickets_uses_mark_and_clears_blocked_fields(project_v7):
+    """A tickets-mode re-arm moves the plan's status through the real chokepoint —
+    `tickets.py mark`, reason `rearm`, the plan as the cross-check — which also
+    clears the `blocked_at`/`blocked_reason` build-auto's HALT set; the stale result
+    section is still stripped. Ablation (performed): route the flip back through
+    `verify.set_frontmatter_status` and the plan keeps its `blocked_*` fields and no
+    `ticket-mark` is journaled — this FAILS."""
+    from bmad_loop import frontmatter
+
+    plan = _blocked_ticket_plan(project_v7)
+    run_dir, _, _ = _escalated_ticket_run(
+        project_v7.project, plan, initiative=project_v7.initiative
+    )
+
+    outcome = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    fm = frontmatter.read_frontmatter(plan)
+    assert frontmatter.status_of(fm) == "ready-for-dev"
+    assert not fm.get("blocked_reason") and not fm.get("blocked_at")
+    assert "Auto Run Result" not in plan.read_text(encoding="utf-8")
+    assert "<intent-contract>" in plan.read_text(encoding="utf-8")
+    (mark,) = [e for e in _kinds(run_dir) if e["kind"] == "ticket-mark"]
+    assert (mark["ref"], mark["reason"], mark["before"], mark["after"], mark["outcome"]) == (
+        "1.1",
+        "rearm",
+        "blocked",
+        "ready-for-dev",
+        "written",
+    )
+    assert load_state(run_dir).tasks[outcome.story_key].phase == Phase.PENDING
+
+
+@pytest.mark.parametrize("in_mount", [False, True])
+def test_rearm_chained_ticket_tree_pins_like_the_engine(
+    project_v7, tmp_path, monkeypatch, in_mount
+):
+    """A chained run's re-arm marks the plan through a tree pinned as the engine
+    pins it: in the main checkout, the parent the live config names, through the
+    child's folder; in a worktree mount, the child with no folder (the mount's
+    config names it). Ablation (performed): pass `state.initiative` and
+    `folder=None` again and the main-checkout row FAILS."""
+    child = "initiative-child"
+    if in_mount:
+        root = tmp_path / "wt" / "u1"
+        plan = root / "epic-cart" / "story-cart-model-plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("---\nticket: 1\nstatus: blocked\n---\n" + TICKET_PLAN_BODY, "utf-8")
+        run_dir, state, task = _escalated_run(
+            tmp_path, spec_file=str(plan), source="tickets", worktree_path=str(root)
+        )
+        task.ticket = _ticket_binding(plan)
+    else:
+        root = project_v7.project
+        plan = _blocked_ticket_plan(project_v7)
+        run_dir, state, _ = _escalated_ticket_run(root, plan)
+    state.initiative, state.parent_initiative = child, project_v7.initiative
+    save_state(run_dir, state)
+    tree = _fake_rearm_tree(monkeypatch, plan)
+    built: list = []
+
+    def factory(project_root, pin, *, folder=None):
+        built.append((project_root, pin, folder))
+        return tree
+
+    monkeypatch.setattr(runs, "_rearm_ticket_tree", factory)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    if in_mount:
+        assert built == [(root, child, None)]
+    else:
+        folder = project_v7.initiative_folder.parent / child
+        assert built == [(root, project_v7.initiative, folder)]
+    assert [(m.target, m.reason) for m in tree.marks] == [("ready-for-dev", "rearm")]
+
+
+def test_rearm_chained_ticket_refuses_a_moved_parent_before_any_write(project_v7, monkeypatch):
+    """A chained run whose live config no longer names its parent refuses the
+    re-arm before its first write: the escalation stays armed, the plan as it
+    was."""
+    plan = _blocked_ticket_plan(project_v7)
+    before = plan.read_bytes()
+    run_dir, state, _ = _escalated_ticket_run(project_v7.project, plan)
+    state.initiative, state.parent_initiative = "initiative-child", "initiative-platform"
+    save_state(run_dir, state)
+    monkeypatch.setattr(runs, "_rearm_ticket_tree", lambda *_a, **_k: pytest.fail("built"))
+
+    with pytest.raises(runs.RearmError, match="set it back to 'initiative-platform'"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
+    assert plan.read_bytes() == before
+
+
+def test_rearm_rollback_restores_plan_bytes_on_fault(project_v7, monkeypatch):
+    """A fault after the mark — here `save_state` itself — rolls the plan back to the
+    exact bytes the re-arm found, through the chokepoint's `restore_preimage` (journaled
+    `ticket-plan-restored`), and the story stays escalated. Ablation (performed): drop
+    the tickets branch of `_restore_rearmed_spec` and the confined byte write restores
+    the bytes with no `ticket-plan-restored` row — this FAILS."""
+    plan = _blocked_ticket_plan(project_v7)
+    before = plan.read_bytes()
+    run_dir, _, _ = _escalated_ticket_run(
+        project_v7.project, plan, initiative=project_v7.initiative
+    )
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runs, "save_state", boom)
+    with pytest.raises(OSError, match="disk full"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert plan.read_bytes() == before
+    kinds = _kinds(run_dir)
+    (restored,) = [e for e in kinds if e["kind"] == "ticket-plan-restored"]
+    assert (restored["before"], restored["after"], restored["outcome"]) == (
+        "ready-for-dev",
+        "blocked",
+        "restored",
+    )
+    (aborted,) = [e for e in kinds if e["kind"] == "rearm-aborted"]
+    assert aborted["rollback"] == "restored"
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
+
+
+def test_patch_evacuated_and_latched_from_run_dir(tmp_path, monkeypatch):
+    """A patch-restore re-arm naming build-auto's intent-gap patch beside the plan
+    (`<plan>.patch`) moves it out of the tracked tree to `{run_dir}/restore/<key>.patch`
+    and latches that copy; the plan is re-armed to `in-review` through `mark`.
+    Ablation (performed): skip `_evacuate_plan_patch` and the patch stays beside the
+    plan with the latch on it — this FAILS."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("---\nticket: 1\nstatus: blocked\n---\n" + TICKET_PLAN_BODY, encoding="utf-8")
+    patch = plan.with_suffix(".patch")
+    patch.write_bytes(b"diff --git a/x b/x\r\n")
+    tree = _fake_rearm_tree(monkeypatch, plan)
+    run_dir, _, _ = _escalated_ticket_run(tmp_path, plan)
+
+    outcome = runs.rearm_escalation(
+        run_dir, restore_patch=str(patch), isolated_redrive=False, resolution_recorded=True
+    )
+
+    copy = runs.evacuated_patch_path(run_dir, outcome.story_key)
+    assert copy.parent == run_dir / "restore"
+    assert not patch.exists() and copy.read_bytes() == b"diff --git a/x b/x\r\n"
+    assert load_state(run_dir).tasks[outcome.story_key].restore_patch == str(copy)
+    assert [(m.ref, m.target, m.reason, m.expected_plan) for m in tree.marks] == [
+        ("1.1", "in-review", "rearm", plan)
+    ]
+    (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "restore-patch-evacuated"]
+    assert (rec["patch"], rec["stashed_to"], rec["latched"]) == (str(patch), str(copy), True)
+
+
+def test_from_scratch_rearm_evacuates_stray_patch(tmp_path, monkeypatch):
+    """A from-scratch re-arm still moves a stray intent-gap patch out of the tree —
+    left there it fails the re-drive's clean-tree check and `finalize_commit` would
+    commit it — but latches nothing. Ablation (performed): gate the evacuation on a
+    restore latch and the patch stays beside the plan — this FAILS."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("---\nticket: 1\nstatus: blocked\n---\n" + TICKET_PLAN_BODY, encoding="utf-8")
+    patch = plan.with_suffix(".patch")
+    patch.write_text("diff\n", encoding="utf-8")
+    tree = _fake_rearm_tree(monkeypatch, plan)
+    run_dir, _, _ = _escalated_ticket_run(tmp_path, plan)
+
+    outcome = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert not patch.exists()
+    assert (
+        runs.evacuated_patch_path(run_dir, outcome.story_key).read_text(encoding="utf-8")
+        == "diff\n"
+    )
+    assert load_state(run_dir).tasks[outcome.story_key].restore_patch is None
+    assert [(m.target, m.reason) for m in tree.marks] == [("ready-for-dev", "rearm")]
+    (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "restore-patch-evacuated"]
+    assert rec["latched"] is False
+
+
+def test_aborted_rearm_returns_the_evacuated_patch(tmp_path, monkeypatch):
+    """An aborted tickets re-arm puts the evacuated patch back beside the plan, so a
+    retried resolve finds the path the resolution names. Ablation (performed): drop
+    `_return_evacuated_patch` from the guard and the patch is gone — this FAILS."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("---\nticket: 1\nstatus: blocked\n---\n" + TICKET_PLAN_BODY, encoding="utf-8")
+    patch = plan.with_suffix(".patch")
+    patch.write_bytes(b"diff\n")
+    _fake_rearm_tree(monkeypatch, plan)
+    run_dir, _, _ = _escalated_ticket_run(tmp_path, plan)
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runs, "save_state", boom)
+    with pytest.raises(OSError, match="disk full"):
+        runs.rearm_escalation(
+            run_dir, restore_patch=str(patch), isolated_redrive=False, resolution_recorded=True
+        )
+
+    assert patch.read_bytes() == b"diff\n"
+
+
+def test_rearm_tickets_refused_transition_keeps_the_escalation(tmp_path, monkeypatch):
+    """A re-arm the plan table refuses — a restore to `in-review` from a plan that
+    never left `ready-for-dev` — aborts with the escalation still armed and the plan
+    untouched. Ablation (performed): swallow the `TicketsError` in
+    `_rearm_ticket_plan` and the re-arm completes — this FAILS."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("---\nticket: 1\nstatus: ready-for-dev\n---\n# plan\n", encoding="utf-8")
+    patch = tmp_path / "attempt.patch"
+    patch.write_text("diff\n", encoding="utf-8")
+    _fake_rearm_tree(monkeypatch, plan, status="ready-for-dev")
+    run_dir, _, _ = _escalated_ticket_run(tmp_path, plan)
+
+    with pytest.raises(runs.RearmError, match="tickets.py refused"):
+        runs.rearm_escalation(
+            run_dir, restore_patch=str(patch), isolated_redrive=False, resolution_recorded=True
+        )
+
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
+    assert "status: ready-for-dev" in plan.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("recorded", [True, False])
+def test_ticket_context_journal_is_pinned_to_the_run_state(tmp_path, recorded):
+    """`_tickets_context` journals an unreadable plan through a journal pinned to the
+    run's state: a recorded run writes the row alone, a record-less one (a state.json
+    that predates the record) writes one `journal-unpinned` notice ahead of it.
+
+    Ablation: build that journal bare and the record-less row loses its notice."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    state = RunState(
+        run_id="r1",
+        project=str(tmp_path),
+        started_at="now",
+        run_dir_identity=platform_util.root_identity_record(run_dir) if recorded else None,
+    )
+    plan = tmp_path / "plan.md"
+    plan.write_bytes(b"---\nstatus: \xff\n---\n")
+
+    resolve._tickets_context(state, run_dir, "1-1-a", None, plan_path=plan)
+
+    kinds = [e["kind"] for e in _kinds(run_dir)]
+    if recorded:
+        assert kinds == ["resolve-ticket-context-unreadable"]
+    else:
+        assert kinds == ["journal-unpinned", "resolve-ticket-context-unreadable"]
+
+
+_INIT = Path("/w/_bmad-output/initiatives/shop")
+_EPIC = _INIT / "epics" / "epic-cart"
+
+
+def _close_prompt(**kw) -> str:
+    args = {
+        "slug": "epic-cart",
+        "initiative": "shop",
+        "initiative_folder": _INIT,
+        "epic_file": _EPIC / "epic-cart.md",
+        "retrospective": _EPIC / "epic-cart-retrospective.md",
+        "verdict": "accepted",
+        "parent": None,
+        "rejected": False,
+        "versioning": "code-repo",
+        "repo": Path("/w"),
+    } | kw
+    return resolve.epic_close_prompt(**args)
+
+
+def test_epic_close_prompt_names_the_epic_and_its_paths():
+    """One canonical `/bmad-agent-po` line naming the epic, the initiative, the
+    absolute epic file and retrospective with its verdict; a run with no recorded
+    verdict says so, and a plain run carries neither the chained nor the rejected
+    clause."""
+    prompt = _close_prompt()
+
+    assert prompt.startswith("/bmad-agent-po Run your epic closure check for epic epic-cart ")
+    assert "\n" not in prompt
+    assert "of initiative shop." in prompt
+    assert f"Initiative folder: {_INIT.as_posix()}." in prompt
+    assert f"Epic file: {(_EPIC / 'epic-cart.md').as_posix()}." in prompt
+    assert (
+        f"Retrospective: {(_EPIC / 'epic-cart-retrospective.md').as_posix()} "
+        "(verdict: accepted)."
+    ) in prompt
+    assert "parent" not in prompt and "stays held" not in prompt
+    assert "(verdict: none recorded by this run)" in _close_prompt(verdict=None)
+
+
+def test_epic_close_prompt_chained_and_rejected_clauses():
+    """A chained child names its parent and points the agent at the child folder;
+    a rejected verdict says the run stays held. Ablation (performed): drop the
+    chained clause and its assertion FAILS."""
+    prompt = _close_prompt(parent="platform", rejected=True, verdict="rejected")
+
+    assert (
+        "shop is a child of parent platform, which [core] active_initiative names; "
+        "work in the child folder above."
+    ) in prompt
+    assert "The run stays held until this epic is closed." in prompt
+
+
+@pytest.mark.parametrize(
+    ("versioning", "repo", "commit", "clean"),
+    [
+        ("code-repo", Path("/w"), "then commit the epic file in the repo at /w.", True),
+        (
+            "store-repo",
+            Path("/store"),
+            "then commit the epic file in the store repo at /store.",
+            True,
+        ),
+        ("none", None, "the store is unversioned, so there is nothing to commit.", False),
+    ],
+    ids=["T1", "T3", "T2"],
+)
+def test_epic_close_prompt_versioning_hint(versioning, repo, commit, clean):
+    """Where the closed epic file is committed follows the store's versioning, and
+    only a versioned store is told its epic folder must be clean."""
+    prompt = _close_prompt(versioning=versioning, repo=repo)
+
+    assert commit in prompt
+    assert ("epic folder has no uncommitted change" in prompt) is clean
+    assert prompt.endswith(".")
+
+
+@pytest.mark.parametrize(
+    ("versioning", "repo"), [("code-repo", None), ("store-repo", None), ("git", Path("/w"))]
+)
+def test_epic_close_prompt_refuses_an_unknown_commit_target(versioning, repo):
+    with pytest.raises(ValueError, match="no epic-close commit hint"):
+        _close_prompt(versioning=versioning, repo=repo)
+
+
+_PREFIX = "_bmad-output/initiatives/shop/epics/epic-cart"
+_DIRT = {
+    "inside": [f"{_PREFIX}/epic-cart.md", "src/app.py"],
+    "outside": ["src/app.py", "_bmad-output/initiatives/shop/epics/epic-cartography/x.md"],
+    "clean": [],
+}
+
+
+@pytest.mark.parametrize("versioning", ["code-repo", "store-repo", "none"])
+@pytest.mark.parametrize("dirt", ["inside", "outside", "clean"])
+@pytest.mark.parametrize("status", ["in-progress", "done", "dropped"])
+def test_epic_close_missing(status, dirt, versioning):
+    """Verified is an empty list: a closed epic (`done`/`dropped`) and, on a
+    versioned store, no dirt in or around the epic folder. Dirt elsewhere —
+    including a sibling folder sharing the prefix's spelling — is not the
+    session's. Ablation (performed): treat `none` like `code-repo` and the
+    T2 dirty-inside rows FAIL."""
+    missing = resolve.epic_close_missing(status, _DIRT[dirt], _PREFIX, versioning)
+
+    expected = [] if status in ("done", "dropped") else [f"the epic reads {status}"]
+    if dirt == "inside" and versioning != "none":
+        expected.append(f"{_PREFIX}: uncommitted {_PREFIX}/epic-cart.md")
+    assert missing == expected
+
+
+def test_epic_close_missing_reads_a_nested_repo_and_a_blank_status():
+    """An untracked nested repository above the folder (`dirty_paths` spells it with
+    a trailing slash) is dirt on it, and an epic with no status is not closed; more
+    than five dirty paths are summarized."""
+    nested = resolve.epic_close_missing("", ["_bmad-output/"], _PREFIX, "code-repo")
+    many = resolve.epic_close_missing(
+        "done", [f"{_PREFIX}/t{i}.md" for i in range(7)], _PREFIX, "store-repo"
+    )
+
+    assert nested == ["the epic reads no status", f"{_PREFIX}: uncommitted _bmad-output"]
+    assert many == [
+        f"{_PREFIX}: uncommitted "
+        + ", ".join(f"{_PREFIX}/t{i}.md" for i in range(5))
+        + " and 2 more"
+    ]

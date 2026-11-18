@@ -34,23 +34,53 @@ puts it. The legacy per-module `_bmad/bmm/config.yaml` may or may not be beside 
 - With no TOML layer at all the YAML is read exactly as it always was.
 
 `{project-root}` is substituted with the renderer's spelling (a literal replace
-with the canonical root) by `_resolve`, for both sources."""
+with the canonical root) by `_resolve`, for both sources, and a value still relative
+after that is joined onto the project root, as v7 `tickets.py` joins it — not onto
+bmad-loop's own cwd. Upstream `render_skill` pastes a relative value into the skill as
+is, so a session reads it against its cwd, which is the project.
+
+**BMAD v7** drops the two `[modules.bmm]` keys: the artifact home is the initiative
+folder, ``{output_folder}/{active_initiative}``, both read strictly from ``[core]``
+by the project's ``_bmad/method/scripts/tickets.py``. :func:`load_paths` picks the
+era (``ProjectPaths.era``):
+
+- **v6** when both v6 keys resolve, unless tickets mode asks for v7 on a mixed
+  install — exactly the behavior above.
+- **v7** when the marker FILE :data:`V7_MARKER_REL` exists and either no v6 key
+  resolves or the caller wants tickets (``want_tickets``). Both artifact dirs become
+  the initiative folder, or `output_folder` when no initiative is active, so every
+  consumer of `implementation_artifacts` (the deferred-work ledger, artifact scans)
+  follows without a per-site change. `output_folder` and `active_initiative` come
+  from :func:`read_core_value` — upstream's three layers (:data:`V7_CENTRAL_LAYERS_REL`)
+  and the dotted ``[core]`` key, as `tickets.py` reads them. `repo_root`
+  keeps the short-key lookup: it is bmad-loop's own key on either era. A v6 key left
+  beside a v7 resolution is reported in ``ProjectPaths.ignored_v6_keys`` for
+  `validate` to warn about, never silently honored.
+- Otherwise the missing-key error, with a hint naming the v7 marker.
+
+The marker is the script file, not the `_bmad/method` folder: an install can carry
+an empty ``_bmad/method/scripts/`` without being a v7 project."""
 
 from __future__ import annotations
 
 import errno
 import stat
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Literal
 
 import yaml
 
+from .mountpaths import rebased_project
 from .platform_util import resolve_or_lexical
 
 
 class BmadConfigError(Exception):
     pass
+
+
+BmadEra = Literal["v6", "v7"]
 
 
 def _diagnostic_text(text: str) -> str:
@@ -71,6 +101,23 @@ class ProjectPaths:
     # the git root code/git work happens against; defaults to `project`. Phase 1
     # foundation for worktree isolation — see ProjectPaths.rebased and Workspace.
     repo_root: Path = field(default=None)  # type: ignore[assignment]
+    # which BMAD config shape `load_paths` resolved: "v6" (the `[modules.bmm]` artifact
+    # keys) or "v7" (the `[core]` initiative tree) — see the module docstring
+    era: BmadEra = "v6"
+    # v7 only: `[core] active_initiative` as resolved at load time, and its canonical
+    # folder (`implementation_artifacts` and `planning_artifacts` on v7). "" and None
+    # mean no active initiative — an explicit signal, not a fallback: the artifact
+    # dirs then fall back to `output_folder` and validate warns.
+    active_initiative: str = ""
+    initiative_folder: Path | None = None
+    # v7 only: the origin of each v6 artifact key that is configured but ignored
+    # because tickets mode resolved the project as v7 (a mixed install)
+    ignored_v6_keys: tuple[str, ...] = ()
+    # v7 tickets runs only: the ticket store (``output_folder``) when no checkout
+    # carries its own copy — an ignored folder, its own repository, or a folder
+    # outside the project (``ticketstore``). Every artifact dir under it is shared:
+    # :meth:`rebased` leaves it unmoved, and a worktree mount is redirected to it.
+    shared_store: Path | None = None
 
     def __post_init__(self) -> None:
         if self.output_folder is None:
@@ -88,62 +135,113 @@ class ProjectPaths:
 
     def rebased(self, new_root: Path) -> ProjectPaths:
         """Re-resolve the project and its artifact dirs onto `new_root` (a full
-        checkout, e.g. a git worktree). Artifact dirs configured outside the
-        project tree are shared, not per-checkout, so they don't move. The new
-        ProjectPaths is rooted at `new_root` for both `project` and `repo_root`."""
+        checkout of `repo_root`, e.g. a git worktree).
+
+        `repo_root` becomes `new_root`. The project becomes the MOUNT PROJECT —
+        :func:`mountpaths.rebased_project`, the single definition: the project's
+        offset inside `repo_root` re-joined onto `new_root` (``new_root`` itself in
+        the default config, ``<new_root>/app`` for a project at ``<repo>/app``), or
+        the project itself, unmoved, when it does not lie inside `repo_root`
+        (a disjoint layout, which worktree isolation refuses — see
+        :func:`worktree_isolation_conflict`). Artifact dirs move with the project:
+        each is re-joined onto the new project at its offset inside the old one, and
+        one configured outside the project tree is shared, not per-checkout, so it
+        doesn't move (DW-379); nor does one under the shared ticket store
+        (:attr:`shared_store`), which carries over as is."""
         new_root = new_root.resolve()
-
-        def rebase(p: Path) -> Path:
-            try:
-                rel = p.relative_to(self.project)
-            except ValueError:
-                return p  # configured outside the project tree; doesn't move
-            return (new_root / rel).resolve()
-
+        new_project = rebased_project(self.project, self.repo_root, new_root)
         return ProjectPaths(
-            project=new_root,
-            implementation_artifacts=rebase(self.implementation_artifacts),
-            planning_artifacts=rebase(self.planning_artifacts),
-            output_folder=rebase(self.output_folder),
+            project=new_project,
+            implementation_artifacts=self.artifact_at(self.implementation_artifacts, new_project),
+            planning_artifacts=self.artifact_at(self.planning_artifacts, new_project),
+            output_folder=self.artifact_at(self.output_folder, new_project),
             repo_root=new_root,
+            era=self.era,
+            active_initiative=self.active_initiative,
+            initiative_folder=(
+                None
+                if self.initiative_folder is None
+                else self.artifact_at(self.initiative_folder, new_project)
+            ),
+            ignored_v6_keys=self.ignored_v6_keys,
+            shared_store=self.shared_store,
         )
+
+    def with_initiative(self, child: str) -> ProjectPaths:
+        """These paths re-rooted on ``child``, a child initiative of the active
+        (parent) one: its folder is the parent folder's sibling named ``child``
+        (upstream ``tickets.py``'s ``folder.parent / slug``), and both artifact
+        dirs — so the ``deferred-work.md`` ledger and the sprint-status path with
+        them — move onto it, as :func:`_assemble_v7` places them for an active
+        initiative. ``active_initiative`` names the child; every other member is
+        kept. Pure: nothing is read, written or canonicalized. Raises ValueError
+        off v7, with no active initiative folder, or for a ``child`` that is not a
+        single folder name."""
+        if self.era != "v7" or self.initiative_folder is None:
+            raise ValueError("with_initiative needs a v7 project with an active initiative folder")
+        if child in ("", ".", "..") or Path(child).name != child or "\\" in child:
+            raise ValueError(f"child initiative {child!r} is not a single folder name")
+        folder = self.initiative_folder.parent / child
+        return replace(
+            self,
+            implementation_artifacts=folder,
+            planning_artifacts=folder,
+            active_initiative=child,
+            initiative_folder=folder,
+        )
+
+    def in_shared_store(self, path: Path) -> bool:
+        """True when ``path`` is the shared ticket store or lies under it."""
+        store = self.shared_store
+        return store is not None and (path == store or path.is_relative_to(store))
+
+    def artifact_at(self, artifact: Path, mount_project: Path) -> Path:
+        """Where `artifact` (one of this config's dirs) sits for the project mounted
+        at `mount_project`: re-joined there at its offset inside `project`, or
+        unmoved when configured outside the project tree, which is shared rather
+        than per-checkout (DW-379). The rule :meth:`rebased` applies to every
+        artifact dir, exposed for callers that hold the mount PROJECT rather than
+        the checkout root — the session cwd (DW-484). A dir under the shared
+        ticket store (:attr:`shared_store`) is unmoved for the same reason: every
+        checkout reads and writes that one store."""
+        if self.in_shared_store(artifact):
+            return artifact
+        try:
+            rel = artifact.relative_to(self.project)
+        except ValueError:
+            return artifact
+        return (mount_project / rel).resolve()
 
 
 def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | None:
-    """The refusal message for ``isolation = "worktree"`` under a `repo_root`
-    override, or None when the combination is supported (#414).
+    """The refusal message for ``isolation = "worktree"`` when the project directory
+    does not lie inside `repo_root` (a DISJOINT layout), or None when the combination
+    is supported (#414, narrowed by DW-379).
 
-    Worktree provisioning reads ``repo_root`` for every surface it seeds *off disk*
-    — the upstream skill trees, `_bmad/` and the `_bmad/custom/` overrides inside
-    it, and each `seed_files`/`seed_globs` entry — and bakes the absolute hook-relay
-    path from it into the worktree's hook config, while `init`, `validate` and the
-    run preflight write and probe those same surfaces under ``project``. (The relay
-    itself is pointed at, never copied. The `MODULE_SKILLS` this wheel bundles are
-    seeded from package data and are unaffected by either root; nothing is seeded
-    from ``project``, which `provision_worktree` is never even passed.)
-    `load_paths` *requires* its config under `project/_bmad/`, so `_bmad/` is under
-    `project` by definition and `repo_root/_bmad/` generally does not exist. When
-    the two diverge the preflight therefore approves a surface the isolated run
-    never receives, and the seed-completeness gates go inert rather than fire: an
-    isolated session dispatches into a worktree with no dev primitive and no
-    renderer, and stops with no result and nothing journaled naming the cause.
+    A unit worktree is a checkout of `repo_root`, so it can carry the project-local
+    surfaces provisioning seeds — `_bmad/` and the `_bmad/custom/` overrides inside
+    it, the upstream and bundled skill trees, the hook configs, each
+    `seed_files`/`seed_globs` entry — only when they live inside that checkout.
+    `load_paths` *requires* its config under `project/_bmad/`, so those surfaces are
+    under `project` by definition. A NESTED layout (the default `repo_root ==
+    project` included, or a monorepo whose BMAD project is `<repo>/app`) is
+    supported: the mount mirrors the main checkout and provisioning lands every
+    surface at the project's offset inside it (`worktree_flow.provision_worktree`'s
+    ``project=``). A disjoint layout — a sibling project, or `repo_root` nested inside
+    the project such as ``project/moved-code`` — has no mirror to build: the
+    checkout carries no copy of the project at all, so an isolated session would
+    dispatch into a worktree with no dev primitive and no renderer and stop with
+    nothing journaled naming the cause (the #414 silent stall). That layout is
+    refused by design, not pending a fix.
 
-    **This function exists to be deleted.** The real fix is #443 — plumb ``project``
-    through provisioning for the non-git reads — and landing it removes this
-    function, all five of its call sites, the `policy.isolation-repo-root` id and
-    both doc sentences. It is a refusal rather than the fix because "which root
-    wins" is a separate decision per seeded surface (the relay only exists under
-    `project`; operator-configured `seed_files` may legitimately name a path outside
-    it), and `ProjectPaths.rebased` encodes `project == repo_root` besides. So the
-    message names only remediations that exist today. Both are named because either
-    alone is sufficient and which one is right is the operator's call: the override
-    buys a decoupled git root, the isolation mode buys per-unit worktrees, and until
-    #443 lands the orchestrator cannot give both.
+    The message names three remediations, because which one is right is the
+    operator's call: move the project inside `repo_root` (or point `repo_root` at
+    an ancestor of it), drop the `repo_root` override, or give up per-unit worktrees.
 
-    Sole producer of the text, shared by `cmd_validate`, the run/sweep preflight,
-    the dry-run honesty banner and the TUI's pre-launch guard, so the four cannot
-    drift. Compares resolved paths: `load_paths` resolves both sides, but a
-    hand-built :class:`ProjectPaths` (tests) need not have."""
+    Sole producer of the text, shared by `cmd_validate`, the run/sweep/resume/resolve
+    preflights, the dry-run honesty banner, the auto-sweep factory and the TUI's
+    guards, so they cannot drift. Compares canonical paths: `load_paths` resolves
+    both sides, but a hand-built :class:`ProjectPaths` (tests) need not have."""
     if isolation != "worktree":
         return None
     # The default config — no `repo_root` key, so `__post_init__` makes the two the
@@ -153,7 +251,8 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
     # a persistent WinError 64) could have one side degrade to lexical while the other
     # succeeds and canonicalizes, making one path unequal to itself and refusing an
     # ordinary isolated run with the #414 text. Comparing raw first means the common
-    # shape cannot reach that window at all.
+    # shape cannot reach that window at all. (Only equality is settled raw: a lexical
+    # containment test would accept `repo/../elsewhere`, which canonicalizes outside.)
     if paths.repo_root == paths.project:
         return None
     # Degrades rather than raises (#552): this gate runs in `cmd_validate` *before*
@@ -163,20 +262,52 @@ def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | No
     # degrade below covers only hand-built instances and a share flapping between
     # the load and this gate. Both sides take the same treatment, so a host that
     # cannot canonicalize compares lexical to lexical; the cost, stated rather than
-    # hidden: two spellings that only canonicalization folds together (`p/../p` vs
-    # `p`) would be refused with a wrong message, where the alternative is no
-    # message and no command at all.
-    if resolve_or_lexical(paths.repo_root) == resolve_or_lexical(paths.project):
+    # hidden: two spellings that only canonicalization relates (`p/../p` vs `p`)
+    # would be refused with a wrong message, where the alternative is no message
+    # and no command at all.
+    project = resolve_or_lexical(paths.project)
+    if project.is_relative_to(resolve_or_lexical(paths.repo_root)):
         return None
     return (
-        'isolation = "worktree" is not supported when repo_root differs from the project '
-        f"directory: worktree provisioning seeds from repo_root ({paths.repo_root}) while "
-        f"init, validate and the run preflight read the project ({paths.project}), so an "
-        "isolated session would get none of the skills the preflight just approved. "
-        "Remove the `repo_root` key from the BMAD config (_bmad/bmm/config.yaml or a "
-        "_bmad/ TOML layer), or set "
-        '`isolation = "none"` under [scm] in .bmad-loop/policy.toml.'
+        'isolation = "worktree" needs the project directory to be inside repo_root: '
+        f"the project ({paths.project}) is not inside repo_root ({paths.repo_root}), "
+        "and a unit worktree is a checkout of repo_root, so it can only carry the "
+        "project-local surfaces (_bmad/, skills, hooks) found inside it — an isolated "
+        "session would get none of the skills the preflight just approved. Move the "
+        "project inside repo_root (or point `repo_root` at an ancestor of the project), "
+        "remove the `repo_root` key from the BMAD config (_bmad/bmm/config.yaml or a "
+        '_bmad/ TOML layer), or set `isolation = "none"` under [scm] in '
+        ".bmad-loop/policy.toml."
     )
+
+
+ARTIFACT_DIR_KEYS = ("implementation_artifacts", "planning_artifacts", "output_folder")
+
+
+def shared_artifact_dirs(paths: ProjectPaths, isolation: str) -> list[tuple[str, Path]]:
+    """The configured artifact dirs a worktree-isolated run shares with the main
+    checkout, as ``(key, dir)`` in :data:`ARTIFACT_DIR_KEYS` order (DW-485).
+
+    :meth:`ProjectPaths.rebased` moves only a dir inside the PROJECT into the unit
+    worktree. One inside `repo_root` but outside the project — reachable only in a
+    nested layout, the project at ``<repo>/app`` — stays pointed at the main
+    checkout, so every isolated session reads and writes that one copy, though
+    the unit worktree carries its own checkout of the same path. `rebased` is right
+    to keep it (the operator configured that exact dir); this names it so the
+    sharing is not a surprise. A dir inside the project is per-worktree, and one
+    outside `repo_root` entirely is outside every checkout, so neither is listed;
+    nor is anything under ``isolation = "none"``, where there is only one checkout.
+
+    Compares the members as :func:`load_paths` canonicalized them — the same
+    spelling `rebased`'s ``relative_to`` reads."""
+    if isolation != "worktree":
+        return []
+    dirs = (paths.implementation_artifacts, paths.planning_artifacts, paths.output_folder)
+    return [
+        (key, path)
+        for key, path in zip(ARTIFACT_DIR_KEYS, dirs, strict=True)
+        if path.is_relative_to(paths.repo_root) and not path.is_relative_to(paths.project)
+    ]
 
 
 def _canonical(expanded: Path, label: str) -> Path:
@@ -205,8 +336,11 @@ def _resolve(raw: str, project: Path, origin: str) -> Path:
     junction carries it to a dead share outside — so any in-tree/external answer
     `rebased`'s `relative_to` reads off the spelling is a guess, and a wrong guess
     sends a worktree-isolated run's artifact writes into a worktree-local directory
-    instead of the configured destination. No member enters a snapshot unresolved."""
-    expanded = Path(raw.replace("{project-root}", str(project)))
+    instead of the configured destination. No member enters a snapshot unresolved.
+    A relative value is joined onto `project` first rather than read against the
+    process cwd; the join leaves an absolute one as is (on Windows, a drive-relative
+    value on another drive keeps that drive's cwd, as `pathlib` joins it)."""
+    expanded = project / raw.replace("{project-root}", str(project))
     return _canonical(expanded, f"configured path {raw!r} ({origin})")
 
 
@@ -218,6 +352,19 @@ CENTRAL_LAYERS_REL: tuple[Path, ...] = (
     Path("_bmad") / "custom" / "config.toml",
     Path("_bmad") / "custom" / "config.user.toml",
 )
+# Lowest to highest — upstream v7 `config_utils.load_central_config`: three layers.
+# v7 `bmad setup` deletes `_bmad/config.user.toml` as a v6 leftover, and `tickets.py`
+# never reads it, so the v7 `[core]` reader must not either.
+V7_CENTRAL_LAYERS_REL: tuple[Path, ...] = (
+    Path("_bmad") / "config.toml",
+    Path("_bmad") / "custom" / "config.toml",
+    Path("_bmad") / "custom" / "config.user.toml",
+)
+# The v7 era marker: the ticket-tree script v7 setup installs. A FILE — the folder
+# around it can exist empty on a v6 install.
+V7_MARKER_REL = Path("_bmad") / "method" / "scripts" / "tickets.py"
+# The helper `tickets.py` execs to merge the config layers.
+V7_CONFIG_UTILS_REL = Path("_bmad") / "scripts" / "config_utils.py"
 _REQUIRED_KEYS = ("implementation_artifacts", "planning_artifacts")
 _PATH_KEYS = (*_REQUIRED_KEYS, "repo_root", "output_folder")
 
@@ -271,11 +418,11 @@ def _load_layer(path: Path) -> dict[str, object] | None:
         raise BmadConfigError(_diagnostic_text(f"cannot read {path}: {e}")) from e
 
 
-def _legacy_is_file(path: Path) -> bool:
-    """`path.is_file()` for the legacy YAML, with its probe failures typed. A missing
-    entry (or a dangling/looping link) is not a file, as `is_file()` always said;
-    any other failure — an unreadable `_bmad/bmm`, a dead share — raises, where
-    `is_file()` raises it untyped through 3.13 and reads it as absent on 3.14+,
+def _is_file(path: Path) -> bool:
+    """`path.is_file()` for the legacy YAML and the v7 marker, with its probe failures
+    typed. A missing entry (or a dangling/looping link) is not a file, as `is_file()`
+    always said; any other failure — an unreadable `_bmad/bmm`, a dead share — raises,
+    where `is_file()` raises it untyped through 3.13 and reads it as absent on 3.14+,
     misreporting an unreadable fallback as a missing key."""
     try:
         return stat.S_ISREG(path.stat().st_mode)
@@ -310,14 +457,71 @@ def _overlay(base: dict[str, object], layer: dict[str, object], source: Path) ->
     return merged
 
 
-def _load_central(project: Path) -> dict[str, object] | None:
-    """The merged four-layer central config, or None when no layer exists."""
+def _load_central(
+    project: Path, layers: tuple[Path, ...] = CENTRAL_LAYERS_REL
+) -> dict[str, object] | None:
+    """The merged central config over `layers` (the four v6 layers by default), or
+    None when no layer exists."""
     merged: dict[str, object] | None = None
-    for rel in CENTRAL_LAYERS_REL:
+    for rel in layers:
         layer = _load_layer(project / rel)
         if layer is not None:
             merged = _overlay(merged or {}, layer, project / rel)
     return merged
+
+
+def _core_value(central: dict[str, object], key: str) -> tuple[str, str] | None:
+    """(value, origin) for the dotted `core.<key>` in a merged config, or None when
+    unset. Present but unusable — `core` not a table, the value not a non-blank
+    string — raises: upstream's renderer refuses the same value, and `tickets.py`
+    would read it as unset and run against a folder the operator did not choose."""
+    core = central.get("core")
+    if core is None:
+        return None
+    if not isinstance(core, _Table):
+        assert isinstance(core, _Leaf)
+        raise BmadConfigError(
+            _diagnostic_text(
+                f"`core` in {core.layer} must be a table, got {type(core.value).__name__}"
+            )
+        )
+    node = core.get(key)
+    if node is None:
+        return None
+    if isinstance(node, _Table):
+        layers = ", ".join(str(layer) for layer in node.layers)
+        raise BmadConfigError(
+            _diagnostic_text(f"`core.{key}` in {layers} must be a string, got table")
+        )
+    assert isinstance(node, _Leaf)
+    origin = f"`core.{key}` in {node.layer}"
+    if not isinstance(node.value, str):
+        raise BmadConfigError(
+            _diagnostic_text(f"{origin} must be a string, got {type(node.value).__name__}")
+        )
+    if not node.value.strip():
+        raise BmadConfigError(_diagnostic_text(f"{origin} must not be empty"))
+    return node.value, origin
+
+
+def read_core_value(project: Path, key: str) -> tuple[str, str] | None:
+    """(value, origin) for ``[core] <key>`` the way BMAD v7's `tickets.py` reads it:
+    the three upstream layers (:data:`V7_CENTRAL_LAYERS_REL`) merged, then the dotted
+    key — strict where the v6 short-key lookup is not, so an entry of the same name
+    under another table (``[modules.bmm] active_initiative``, the pre-v7 home) is not
+    this key. None when unset; raises :class:`BmadConfigError` on an unreadable
+    layer or a present value that is not a non-blank string."""
+    central = _load_central(Path(project), V7_CENTRAL_LAYERS_REL)
+    return None if central is None else _core_value(central, key)
+
+
+def active_initiative(project: Path) -> str | None:
+    """The project's live ``[core] active_initiative`` (stripped, as `tickets.py`
+    strips it), or None when none is active. Read fresh on every call: the value is
+    personal config the operator may switch under a paused run, and the run's pinned
+    copy (``RunState.initiative``) is compared against this."""
+    hit = read_core_value(project, "active_initiative")
+    return None if hit is None else hit[0].strip()
 
 
 def _find(tree: dict[str, object], key: str, prefix: str = "") -> list[tuple[str, object]]:
@@ -396,7 +600,9 @@ def _load_legacy(config_path: Path) -> dict[object, object]:
     return doc
 
 
-def load_paths(project: Path) -> ProjectPaths:
+def load_paths(project: Path, *, want_tickets: bool = False) -> ProjectPaths:
+    # `want_tickets`: the caller is about to drive the v7 ticket tree, so a mixed
+    # install (v6 keys left beside the v7 marker) resolves as v7 — module docstring.
     # The root must canonicalize or there is no consistent ProjectPaths to hand back
     # (#552). Every member is compared against `project` — `rebased` decides "is this
     # artifact dir inside the tree" with `relative_to` — so a lexical root next to a
@@ -419,9 +625,29 @@ def load_paths(project: Path) -> ProjectPaths:
         )
         raise BmadConfigError(_diagnostic_text(message)) from e
     config_path = project / LEGACY_CONFIG_REL
-    central = _load_central(project)
+    marker = project / V7_MARKER_REL
+    # v7's `config_utils` never reads the v6-only `_bmad/config.user.toml`, so a v7
+    # resolution must not fail on it either. A tickets caller on a v7 install skips it
+    # up front. An auto-detecting caller retries without it when the marker is present,
+    # and its fault (`v6_fault`) still raises unless the project then resolves as v7.
+    v7_layers = want_tickets and _is_file(marker)
+    v6_fault: BmadConfigError | None = None
+    try:
+        central = _load_central(project, V7_CENTRAL_LAYERS_REL if v7_layers else CENTRAL_LAYERS_REL)
+    except BmadConfigError as e:
+        if v7_layers or not _is_file(marker):
+            raise
+        v6_fault = e
+        central = _load_central(project, V7_CENTRAL_LAYERS_REL)
     if central is None:
-        if not _legacy_is_file(config_path):
+        # No TOML layer at all, so v7's required base layer is absent too: a v7
+        # install (the marker, under tickets mode or with no legacy YAML to fall back
+        # on) gets `_assemble_v7`'s refusal, never a healthy-looking v6 snapshot.
+        if (want_tickets or not _is_file(config_path)) and _is_file(marker):
+            return _assemble_v7(project, None, ())
+        if v6_fault is not None:
+            raise v6_fault
+        if not _is_file(config_path):
             layers = ", ".join(str(project / rel) for rel in CENTRAL_LAYERS_REL)
             raise BmadConfigError(
                 f"BMAD config not found: neither the central TOML ({layers}) nor "
@@ -439,20 +665,91 @@ def load_paths(project: Path) -> ProjectPaths:
         if hit is not None:
             return hit
         if legacy is None:
-            legacy = _load_legacy(config_path) if _legacy_is_file(config_path) else {}
+            legacy = _load_legacy(config_path) if _is_file(config_path) else {}
         raw = legacy.get(key)
         return (str(raw), f"`{key}` in {config_path}") if raw else None
 
-    found = {key: lookup(key) for key in _PATH_KEYS}
+    v6 = {key: lookup(key) for key in _REQUIRED_KEYS}
+    v6_hits = [hit for hit in v6.values() if hit is not None]
+    # The marker is probed only when it can change the answer: a complete v6 config
+    # outside tickets mode resolves exactly as it always did.
+    if (want_tickets or not v6_hits) and _is_file(marker):
+        return _assemble_v7(project, lookup("repo_root"), tuple(origin for _, origin in v6_hits))
+    if v6_fault is not None:
+        raise v6_fault
+    found = {**v6, "repo_root": lookup("repo_root"), "output_folder": lookup("output_folder")}
     for key in _REQUIRED_KEYS:
         if found[key] is None:
             layers = ", ".join(str(project / rel) for rel in CENTRAL_LAYERS_REL)
             raise BmadConfigError(
                 _diagnostic_text(
-                    f"missing `{key}`: not in the central TOML ({layers}) nor in {config_path}"
+                    f"missing `{key}`: not in the central TOML ({layers}) nor in "
+                    f"{config_path}{_v7_hint(marker, v6_hits)}"
                 )
             )
     return _assemble(project, found)
+
+
+def _v7_hint(marker: Path, v6_hits: list[tuple[str, str]]) -> str:
+    """The BMAD v7 half of the missing-key error: what would have made this a v7
+    project, so an operator on a fresh v7 install is not sent hunting for v6 keys."""
+    if v6_hits and _is_file(marker):
+        return (
+            f" — {marker} marks a BMAD v7 install, but the leftover v6 key "
+            f"{v6_hits[0][1]} keeps it on v6: remove it (accept `bmad setup`'s v6 "
+            "cleanup) to resolve the project as v7"
+        )
+    return (
+        f" — a BMAD v7 project is recognized by the file {marker}, which is absent; "
+        "on a v7 install, run `bmad setup` to finish it"
+    )
+
+
+def _assemble_v7(
+    project: Path, repo_root_hit: tuple[str, str] | None, ignored_v6_keys: tuple[str, ...]
+) -> ProjectPaths:
+    """The v7 snapshot: `output_folder` and `active_initiative` from the strict
+    ``[core]`` reader, both artifact dirs on the initiative folder (or on
+    `output_folder` when none is active), `repo_root` from the short-key lookup.
+    The base layer is required, as upstream's `config_utils` loads it: without it
+    every `tickets.py` command fails, so the snapshot must not read healthy."""
+    base = project / V7_CENTRAL_LAYERS_REL[0]
+    if not _is_file(base):
+        raise BmadConfigError(
+            _diagnostic_text(
+                f"{base} is missing — BMAD v7's tickets.py requires it; "
+                "run `bmad setup` to finish the install"
+            )
+        )
+    central = _load_central(project, V7_CENTRAL_LAYERS_REL) or {}
+    out_hit = _core_value(central, "output_folder")
+    output_folder = (
+        _resolve(out_hit[0], project, out_hit[1])
+        if out_hit
+        # unset, `tickets.py` joins "" onto the project root: the tree lives there,
+        # not under v6's `_bmad-output` default
+        else _canonical(project, "default output folder")
+    )
+    name_hit = _core_value(central, "active_initiative")
+    initiative = name_hit[0].strip() if name_hit else ""
+    initiative_folder = (
+        _canonical(output_folder / initiative, f"initiative folder ({name_hit[1]})")
+        if name_hit
+        else None
+    )
+    repo_root = _resolve(repo_root_hit[0], project, repo_root_hit[1]) if repo_root_hit else project
+    artifacts = initiative_folder or output_folder
+    return ProjectPaths(
+        project=project,
+        implementation_artifacts=artifacts,
+        planning_artifacts=artifacts,
+        output_folder=output_folder,
+        repo_root=repo_root,
+        era="v7",
+        active_initiative=initiative,
+        initiative_folder=initiative_folder,
+        ignored_v6_keys=ignored_v6_keys,
+    )
 
 
 def _paths_from_legacy(project: Path, config_path: Path, doc: dict[object, object]) -> ProjectPaths:

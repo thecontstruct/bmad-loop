@@ -170,7 +170,7 @@ def _fake_script(scripts_dir, name, rc):
     (scripts_dir / name).write_text(f"import sys\nsys.exit({rc})\n", encoding="utf-8")
 
 
-def _ctx(stage, scripts_dir, *, agents=()):
+def _ctx(stage, scripts_dir, *, agents=(), **fields):
     return HookContext(
         stage,
         run_id="r",
@@ -179,6 +179,7 @@ def _ctx(stage, scripts_dir, *, agents=()):
         run_dir=str(scripts_dir),
         worktree=str(scripts_dir),
         agents=tuple(agents),
+        **fields,
     )
 
 
@@ -253,6 +254,25 @@ def test_rollback_hooks_run_quiesce_with_phase_and_timeout(tmp_path, monkeypatch
     ]
 
 
+@pytest.mark.parametrize("outcome", ["paused", "failed"])
+def test_post_rollback_quiesces_after_an_unfinished_rollback(tmp_path, monkeypatch, outcome):
+    """DW-322: post_rollback also fires after a paused/failed rollback; the Unity
+    hook tolerates that context and still runs the post quiesce (re-import)."""
+    inst = _make_unity({}, tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        inst,
+        "_run_script",
+        lambda name, ctx, *, timeout, extra_env=None: (
+            calls.append((name, ctx.rollback_outcome, extra_env)) or (0, "")
+        ),
+    )
+    ctx = _ctx("post_rollback", tmp_path, rollback_outcome=outcome)
+    inst.on_post_rollback(ctx)
+    assert calls == [("unity_quiesce.py", outcome, {"BMAD_LOOP_QUIESCE_PHASE": "post"})]
+    assert not ctx.vetoed
+
+
 def test_rollback_hooks_skipped_when_disabled(tmp_path, monkeypatch):
     inst = _make_unity({"quiesce_on_rollback": False}, tmp_path)
     calls = []
@@ -301,6 +321,19 @@ def test_run_script_merges_extra_env(tmp_path):
     assert rc == 0 and out == "pre"
     # base engine_env is unchanged: without extra_env the var is absent
     assert "BMAD_LOOP_QUIESCE_PHASE" not in inst.engine_env(_ctx("pre_rollback", tmp_path))
+
+
+def test_run_script_helper_output_round_trips_non_ascii(tmp_path, monkeypatch):
+    """The helper's stdio is pinned to utf-8 to match the parent's decode, so its
+    non-ASCII diagnostics survive even when the inherited env names a legacy
+    codepage (cp932 stands in for a Japanese Windows locale)."""
+    monkeypatch.setenv("PYTHONIOENCODING", "cp932")
+    (tmp_path / "echo_jp.py").write_text(
+        "import sys\nsys.stderr.write('エディタ準備完了')\n", encoding="utf-8"
+    )
+    inst = _make_unity({}, tmp_path)
+    rc, out = inst._run_script("echo_jp.py", _ctx("pre_rollback", tmp_path), timeout=30)
+    assert rc == 0 and out == "エディタ準備完了"
 
 
 # ------------------------------------------------------ UnityPlugin env contract
@@ -942,6 +975,20 @@ def test_unity_ready_not_ready_when_tool_never_answers(tmp_path, monkeypatch):
     assert mod._ready_ivanmurzak(time.monotonic() + 0.2) == 1
 
 
+def test_unity_ready_tolerates_undecodable_cli_output(tmp_path, monkeypatch):
+    """A CLI emitting bytes that are not valid UTF-8 (cp932-encoded text, as on a
+    Japanese Windows locale) degrades to U+FFFD instead of raising
+    UnicodeDecodeError out of the strict decode."""
+    mod = _load_unity_ready()
+    payload = "エディタ準備完了".encode("cp932")  # 0x83 lead bytes: invalid UTF-8
+    body = f"import sys\nsys.stdout.buffer.write({payload!r})\nsys.stdout.flush()\n"
+    script = write_script_launcher(tmp_path, "fake-unity-mcp-cli", body)
+    monkeypatch.setenv("BMAD_LOOP_WORKTREE", str(tmp_path))
+    rc, out = mod._wait_for_ready(str(script), 10.0)
+    assert rc == 0
+    assert "\ufffd" in out
+
+
 # ------------------------------------------ unity_setup custom/local-mode launch
 
 
@@ -992,6 +1039,15 @@ def test_unity_setup_local_url_missing_returns_none(tmp_path, monkeypatch):
     mod = _load_unity_setup()
     _clear_setup_knobs(monkeypatch)
     assert mod._local_url(tmp_path) is None  # no .mcp.json, no override
+
+
+def test_unity_setup_setup_mcp_unlaunchable_cli_returns_nonzero(tmp_path, capsys):
+    """An unlaunchable CLI fails setup-mcp with a non-zero rc and a stderr line,
+    not an OSError traceback out of the hook."""
+    mod = _load_unity_setup()
+    missing = str(tmp_path / "no-such-unity-mcp-cli")
+    assert mod._run_setup_mcp(missing, "claude-code", tmp_path) == 1
+    assert "setup-mcp claude-code could not run" in capsys.readouterr().err
 
 
 def test_unity_setup_open_command_local_defaults(tmp_path, monkeypatch):
@@ -1231,3 +1287,133 @@ def test_unity_setup_fails_loud_when_agent_config_leaks(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_CODEX_FORCE_URL", "http://localhost:23191")
     # isolation check rejects -> non-zero so the engine defers the unit (no work)
     assert mod._setup_ivanmurzak(tmp_path) == 1
+
+
+# ------------------------------- [verify] reuse_unchanged vs plugin hooks (#1002)
+#
+# A hook from a plugin not declared `read_only` voids a reuse token at dispatch
+# (`plugin-hook`); a `read_only` plugin's writes are caught by the gate-time
+# fingerprint alone, and only where git can see them.
+
+
+def _reuse_hook_run(project, monkeypatch, write, *, read_only=True):
+    from conftest import dev_effect, scripted_verify_runner, write_sprint
+
+    from bmad_loop import verify
+    from bmad_loop.adapters.mock import MockAdapter
+    from bmad_loop.journal import Journal
+    from bmad_loop.model import RunState, TokenUsage
+    from bmad_loop.plugins import Plugin, PluginRegistry
+    from bmad_loop.plugins.model import LoadedPlugin
+    from bmad_loop.policy import GatesPolicy, ReviewPolicy, VerifyPolicy
+
+    class Writer(Plugin):
+        def on_post_dev_phase(self, c):
+            write(project.project)
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    manifest = PluginManifest(name="writer", api_version=1, read_only=read_only)
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    engine = Engine(
+        paths=project,
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+            verify=VerifyPolicy(commands=("pytest -q",), reuse_unchanged=True),
+        ),
+        adapter=MockAdapter(
+            [dev_effect(project, "1-1-a", followup_review=False)],
+            usage_per_session=TokenUsage(input_tokens=1, output_tokens=1),
+        ),
+        run_dir=run_dir,
+        journal=Journal(run_dir),
+        state=RunState(run_id="test-run", project=str(project.project), started_at="now"),
+        registry=PluginRegistry([LoadedPlugin(manifest=manifest, instance=Writer(manifest, {}))]),
+    )
+    ran = []
+    green = [verify.CommandResult("pytest -q", 0, "ok", "ok", "")]
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: ran.append(1) or green),
+    )
+    summary = engine.run()
+    kinds = {
+        kind: [e for e in engine.journal.entries() if e["kind"] == kind]
+        for kind in ("verify-pass-reused", "verify-reuse-declined")
+    }
+    return summary, ran, kinds
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        lambda root: (root / "src.txt").write_text("hook rewrote a tracked file\n"),
+        lambda root: (root / "hook-output.txt").write_text("untracked, not ignored\n"),
+    ],
+    ids=["tracked", "untracked"],
+)
+def test_verify_reuse_sees_a_post_dev_phase_hook_write(project, monkeypatch, write):
+    """A Python hook on `post_dev_phase` (between the dev pass and the skip
+    gate) writing a git-visible file forces a real run with `tree-mismatch` —
+    the plugin is declared `read_only` (wrongly), so the fingerprint, not a
+    hook-dispatch void, is what catches it.
+
+    Ablation: make `verify._decide_reuse` skip its tree comparison and the
+    gate reuses."""
+    summary, ran, kinds = _reuse_hook_run(project, monkeypatch, write)
+
+    assert summary.done == 1
+    assert len(ran) == 2
+    assert [e["decline"] for e in kinds["verify-reuse-declined"]] == ["tree-mismatch"]
+    assert not kinds["verify-pass-reused"]
+
+
+def _ignore_hook_cache(project):
+    gitignore = project.project / ".gitignore"
+    existing = gitignore.read_text() if gitignore.exists() else ""
+    gitignore.write_text(existing + "hook-cache/\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=project.project, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "ignore"],
+        cwd=project.project,
+        check=True,
+    )
+
+
+def _write_ignored(root):
+    (root / "hook-cache").mkdir(exist_ok=True)
+    (root / "hook-cache" / "state.bin").write_text("ignored\n")
+
+
+def test_verify_reuse_voids_on_a_writer_hook_writing_an_ignored_file(project, monkeypatch):
+    """A plugin not declared `read_only` closes the ignored-file blind spot: its
+    hook's dispatch voids the token (`plugin-hook`, detail `<plugin>:<stage>`)
+    although the fingerprint stays equal, so the gate runs its commands."""
+    _ignore_hook_cache(project)
+
+    summary, ran, kinds = _reuse_hook_run(project, monkeypatch, _write_ignored, read_only=False)
+
+    assert (project.project / "hook-cache" / "state.bin").exists()  # the hook ran
+    assert summary.done == 1
+    assert len(ran) == 2
+    assert [(e["decline"], e["detail"]) for e in kinds["verify-reuse-declined"]] == [
+        ("plugin-hook", "writer:post_dev_phase")
+    ]
+    assert not kinds["verify-pass-reused"]
+
+
+def test_verify_reuse_is_blind_to_a_read_only_hook_writing_an_ignored_file(project, monkeypatch):
+    """The documented blind spot of `read_only`: a plugin declared so whose
+    hook writes only an IGNORED file leaves the fingerprint equal and voids
+    nothing, so the gate still reuses the dev pass."""
+    _ignore_hook_cache(project)
+
+    summary, ran, kinds = _reuse_hook_run(project, monkeypatch, _write_ignored)
+
+    assert (project.project / "hook-cache" / "state.bin").exists()  # the hook ran
+    assert summary.done == 1
+    assert len(ran) == 1
+    assert [e["reused_stage"] for e in kinds["verify-pass-reused"]] == ["dev"]
+    assert not kinds["verify-reuse-declined"]
