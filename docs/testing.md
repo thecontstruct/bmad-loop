@@ -2,7 +2,7 @@
 
 How bmad-loop is tested: the layer model, the doctrines behind the suite's shape, and the
 policies a new test is expected to follow. [AGENTS.md](../AGENTS.md) owns the terse testing
-invariants agents must not violate; this document is the strategy behind them — why each rule
+invariants agents must not violate; this document is the strategy behind them: why each rule
 exists, where a new test belongs, and which absences are decisions rather than gaps. When the
 two disagree, fix this document first and re-derive the terse rule (see
 [Doc-sync rules](#policy-quick-reference-and-doc-sync-rules)).
@@ -12,54 +12,53 @@ and every negative assertion proven by ablation.**
 
 ## The suite at a glance
 
-- Flat `tests/` — roughly 70 `test_*.py` files mirroring `src/bmad_loop` modules by name,
-  ~5,100 collected tests. No package nesting, one `tests/conftest.py`, one data file
-  (`tests/fixtures/stories.yaml`, the dogfooded stories-mode contract from BMAD-METHOD
-  PR #2549).
-- Configuration is three settings under `[tool.pytest.ini_options]` in `pyproject.toml`:
-  `testpaths = ["tests"]`, `asyncio_mode = "auto"`, and `addopts = "--dist loadgroup"`. The
-  `addopts` line is a _scheduling_ declaration and nothing else (DW-95): it selects xdist's
-  loadgroup scheduler so the `xdist_group` marks on the real-tmux E2Es actually bite, because
-  under the default `load` scheduler xdist ignores those marks silently. It lives here rather
-  than in the CI workflow so a local `-n logical` run schedules exactly the way CI does, and
-  `--dist` is accepted with or without `-n`. It does make pytest-xdist a hard prerequisite for
-  every pytest invocation — without it a run aborts before collection with `unrecognized
-arguments: --dist`, naming neither xdist nor this setting — but xdist is already a `dev`-group
-  dependency, so only a `pytest` from outside the uv environment hits that. There is still no
-  marker registry and no `filterwarnings` (the latter is under triage — #548).
-- `uv run pytest -q` runs everything runnable on the host; `-n logical` (pytest-xdist) is
-  supported because every test builds its state from per-test fixtures (the template repo is
-  per-worker). Prefer `logical` over `auto`: `psutil` is installed on every platform here
-  (the `non-linux` extra carries no environment marker, and CI syncs `--all-extras`), so
-  xdist's `auto` resolves to the _physical_ core count — half the vCPUs on the hosted
-  runners. CI passes `-n logical` in both test jobs for that reason. A test that fails only
-  under xdist load is a flake, which is a bug. Live/E2E modules skip themselves when their
-  host requirements are absent — selection is in-file, never in config.
-- Only builtin pytest marks appear — `parametrize`, `skipif`, `usefixtures`, and exactly one
-  `xfail(strict=True)` (a pinned known defect, see [Ablation records](#ablation-records)) —
-  plus `xdist_group`, which pytest-xdist registers itself. **No custom markers, deliberately**:
-  a marker registry is a second selection mechanism that can drift from the tests it
-  classifies. The filename suffix and the module-level `skipif` encode the same fact where the
-  reader already is. `xdist_group` needs no registry entry because pytest-xdist registers the
-  marker itself, so it cannot drift out of sync with a registry this suite maintains. It IS
-  selectable — `pytest -m xdist_group tests/test_generic_tmux.py` collects 8 of 261 — but the
-  suite never selects on it: what it classifies is _scheduling_, not a test category anything
-  chooses by, and no run, workflow or doc keys off it. It appears on exactly one population,
-  the real-tmux E2Es, all of which take it from the single `real_mux_e2e` alias in
-  `tests/conftest.py`; a guard (below) refuses any that do not.
+- Flat `tests/`: `test_*.py` files mirroring `src/bmad_loop` modules by name, no package
+  nesting, one `tests/conftest.py`, and a small `tests/fixtures/` data dir (`stories.yaml`, the
+  stories-mode contract, plus the captured claude trust-prompt pane log that
+  `test_generic_tmux.py` replays). `tests/fixtures/claude-stopfailure/` holds Claude Code's
+  `StopFailure` payloads and pane logs for seven scripted API failures, captured zero-token by
+  `scripts/capture_claude_stopfailure.py` (the real `claude` against a local fake API);
+  `test_claude_stopfailure_capture.py` replays them through the relay and the claude adapter.
+  `tests/fixtures/bmad_v7/` vendors upstream BMAD-METHOD's
+  `tickets.py`, `config_utils.py` and `LICENSE-BMAD-METHOD` byte for byte at the commit named in
+  `PIN.toml`; `test_vendored_bmad_v7_matches_pin` checks them by sha256.
+- Configuration is four settings under `[tool.pytest.ini_options]` in `pyproject.toml`:
+  `testpaths = ["tests"]`, `asyncio_mode = "auto"`, `addopts = "--dist loadgroup"`, and
+  `filterwarnings`.
+- **`--dist loadgroup` is a scheduling declaration.** It makes the `xdist_group` marks on the
+  real-tmux E2Es bite; under xdist's default `load` scheduler those marks are silently ignored.
+  It lives in `addopts` so a local `-n logical` run schedules exactly as CI does. It makes
+  pytest-xdist (a `dev`-group dependency) a prerequisite: a `pytest` from outside the uv
+  environment aborts with `unrecognized arguments: --dist`.
+- **Deprecations are errors.** `filterwarnings` carries `error::DeprecationWarning` and
+  `error::PendingDeprecationWarning`, so a new deprecation fails the test that triggers it. A
+  test that expects one uses `pytest.warns(DeprecationWarning)`. A dependency warning we cannot
+  fix gets a targeted `ignore:<message regex>:DeprecationWarning:<module>` entry after the two
+  `error::` lines, never a blanket category ignore. The filter covers only the pytest process.
+- `uv run pytest -q` runs everything runnable on the host. `-n logical` (pytest-xdist) is
+  supported because every test builds its state from per-test fixtures. Prefer `logical` over
+  `auto`: with `psutil` installed, `auto` resolves to the physical core count, half the vCPUs
+  on hosted runners. A test that fails only under xdist load is a flake, which is a bug.
+  Live/E2E modules skip themselves when their host requirements are absent.
+- **No custom markers, deliberately.** Only builtin marks appear (`parametrize`, `skipif`,
+  `usefixtures`, `xfail(strict=True)` to pin a known defect) plus `xdist_group`, which
+  pytest-xdist registers itself. A marker registry is a second selection mechanism that can
+  drift from the tests it classifies; the filename suffix and the module-level `skipif` encode
+  the same fact. `xdist_group` classifies scheduling, not a test category, and appears only on
+  the real-tmux E2Es, all through the single `real_mux_e2e` alias in `tests/conftest.py`.
 
 ## Layers: where a test belongs
 
 New behavior lands with a test at the **lowest layer that can catch its regression**. The
 layers, from cheapest to most expensive:
 
-| Layer                         | What it is                                                                                                                                                                                            | Machinery                                                                                                                                                                                                                                                                 |
-| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **L1 — pure core**            | Unit tests over the pyright-strict seven: `model`, `statemachine`, `policy`, `documents`, `machine`, `checks`, `sanitize`. No process, git, or mux I/O; fixtures limited to `tmp_path`/`monkeypatch`. | Plain asserts; exhaustive `parametrize` grids                                                                                                                                                                                                                             |
-| **L2 — seam**                 | Tests that drive one injection seam with a scripted double.                                                                                                                                           | `MockAdapter`, TOML adapter profiles, the `force_tmux_backend` fixture, the injectable `make_adapters` and engine-class parameters of `runsetup.compose_run` (`engine_cls`, `stories_engine_cls`), `compose_sweep` (`sweep_engine_cls`), and `compose_resume` (all three) |
-| **L3 — sandbox integration**  | Engine/CLI flows over a real git repo, no multiplexer.                                                                                                                                                | The `project` fixture (a copied template repo) plus the conftest effect helpers                                                                                                                                                                                           |
-| **L4 — real-mux integration** | A real tmux server drives a scripted shell script standing in for the CLI.                                                                                                                            | The `HAVE_TMUX`-gated tests in `tests/test_generic_tmux.py`                                                                                                                                                                                                               |
-| **L5 — live gates**           | Real external binaries, still zero tokens.                                                                                                                                                            | `tests/test_stories_e2e.py`, `tests/test_opencode_live.py`, `tests/test_psmux_live.py`                                                                                                                                                                                    |
+| Layer                         | What it is                                                                                                                                                                                                                                                                              | Machinery                                                                                                                                                                                                                                                                                       |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **L1 — pure core**            | Unit tests over the pyright-strict modules: `model`, `statemachine`, `policy`, `documents`, `machine`, `checks`, `sanitize`, `plugins/digest`, `plugins/grants`, `worksource`, `ticketmodel`, `ticketstore`. No process, git, or mux I/O; fixtures limited to `tmp_path`/`monkeypatch`. | Plain asserts; exhaustive `parametrize` grids                                                                                                                                                                                                                                                   |
+| **L2 — seam**                 | Tests that drive one injection seam with a scripted double.                                                                                                                                                                                                                             | `MockAdapter`, TOML adapter profiles, the `force_tmux_backend` fixture, the injectable `make_adapters` and engine-class parameters of `runsetup.compose_run` (`engine_cls`, `stories_engine_cls`, `tickets_engine_cls`), `compose_sweep` (`sweep_engine_cls`), and `compose_resume` (all three) |
+| **L3 — sandbox integration**  | Engine/CLI flows over a real git repo, no multiplexer.                                                                                                                                                                                                                                  | The `project` fixture (a copied template repo) plus the conftest effect helpers                                                                                                                                                                                                                 |
+| **L4 — real-mux integration** | A real tmux server drives a scripted shell script standing in for the CLI.                                                                                                                                                                                                              | The `HAVE_TMUX`-gated tests in `tests/test_generic_tmux.py`                                                                                                                                                                                                                                     |
+| **L5 — live gates**           | Real external binaries, still zero tokens.                                                                                                                                                                                                                                              | `tests/test_stories_e2e.py`, `tests/test_tickets_e2e.py`, `tests/test_opencode_live.py`, `tests/test_opencode_live_turn.py`, `tests/test_psmux_live.py`                                                                                                                                         |
 
 Placement rules:
 
@@ -68,189 +67,184 @@ Placement rules:
   `plugins/loader.py` → `test_plugin_loader.py`), and adapter internals are covered through
   their transport suites. Cross-module flows live with the module that owns the behavior under
   assertion (engine flows in `test_engine.py`, CLI contract in `test_cli.py`). A module without
-  a mirror file is a smell the gap register tracks — five top-level modules currently lack one
-  (see the register's mirror-gap rows; #545 tracks the sharpest, `machine.py`).
+  a mirror file is a smell; see [Gaps and deviations](#gaps-and-deviations).
 - **Suffix convention is the selection mechanism.** `*_e2e.py` and `*_live.py` name the modules
-  with host requirements; each carries a module-level
-  `pytestmark = pytest.mark.skipif(...)` naming its requirement (`HAVE_TMUX`, `HAVE_OPENCODE`,
-  `HAVE_PSMUX`; the opencode module adds an `importorskip` on httpx, and its `HAVE_OPENCODE` is
-  probe-backed rather than `which`-backed — conftest's `opencode_runs()` runs the binary's
-  `--version`, so a resolvable-but-dead shim skips instead of failing, #294). Ordinary runs collect
-  them and skip them; a capable host runs them with no extra flags. Do not add a marker, an env-var opt-in, or a separate pytest invocation for
-  these — the filename plus the in-file gate is the whole mechanism.
+  with host requirements; each carries a module-level `pytestmark = pytest.mark.skipif(...)`
+  naming its requirement (`HAVE_TMUX`, `HAVE_OPENCODE`, `HAVE_OPENCODE_V2`, `HAVE_PSMUX`).
+  `HAVE_OPENCODE` runs the binary's `--version`, so a resolvable but dead shim skips instead
+  of failing; `HAVE_OPENCODE_V2` also requires that version to be 2.x. Ordinary runs
+  collect and skip them; a capable host runs them with no extra flags. Do not add a marker, an
+  env-var opt-in, or a separate pytest invocation for these.
 - **Prefer a lower layer over a broader one.** If a defect is expressible as a pure-core case,
   do not pin it in a sandbox flow: L3+ tests are slower, and their failures triangulate worse.
-  The inverse also holds — a seam contract (say, adapter timeout instrumentation) cannot be
+  The inverse also holds: a seam contract (say, adapter timeout instrumentation) cannot be
   proven by an L1 test and belongs at L2 with a parity twin (see
   [Duplicate tests and contract parity](#duplicate-tests-and-contract-parity)).
 
 ## Fixtures and helpers
 
-`tests/conftest.py` holds **fixtures for lifecycle and isolation only — currently exactly
-five** — and everything else is a plain function or constant a test imports by name:
+`tests/conftest.py` holds **fixtures for lifecycle and isolation only**; everything else is a
+plain function or constant a test imports by name. The fixtures:
 
-- `project` — the workhorse: a disposable copy of a session-scoped template repo
-  (`_project_template`), BMAD-shaped artifact dirs plus an initial commit. Never hand-roll a
-  temp repo and never touch the template — a mutation there poisons every later test in the
-  worker; the copy exists so per-test git init/fsync cost is paid once per xdist worker.
-- `force_tmux_backend` — pins `BMAD_LOOP_MUX_BACKEND=tmux` and clears the selection cache on
-  both ends, so tests asserting tmux argv through the mux seam cannot be hijacked by an
-  installed external backend that happens to match the platform.
-- `_project_template` — session-scoped, built once per xdist worker, reached only through
-  `project`.
-- `_isolate_ambient_git_ignores` — session-scoped and **autouse**: it wraps every test, not
-  just sandbox ones, shadowing the developer's global gitignore sources (`GIT_CONFIG_GLOBAL`,
-  `XDG_CONFIG_HOME`). Without it, a dev box that globally ignores `.claude/` makes shield
-  tests measure the wrong thing while passing.
-- `_isolate_state_root` — **autouse** and function-scoped: points `BMAD_LOOP_STATE_DIR` at a
-  per-test temp dir. `runs.state_root()` does not merely read the user-scoped state location,
-  it mkdirs into it, so without this every test that builds an adapter would litter the
-  developer's (or the runner's) real state directory with one tree per run id, on a path no
-  fixture cleans up.
+- **Sandboxes.** `project` is the workhorse: a disposable copy of a session-scoped template
+  repo (`_project_template`, built once per xdist worker) with BMAD-shaped artifact dirs and an
+  initial commit. Never hand-roll a temp repo and never touch the template: a mutation there
+  poisons every later test in the worker. `project_tree` is the same file tree with no Git,
+  opted into only by tests whose code path never consults a repository. `project_v7` is the
+  BMAD v7 twin: a copy of a per-worker v7 template with the vendored `tickets.py` installed and
+  the ticket tree tracked in the checkout (layout T1). `project_v7_store_repo` (T3) and
+  `project_v7_external_store` (T4) derive from it. Plain helpers build the rest:
+  `install_bmad_v7`, `v7_layout`/`V7Layout`, `write_ticket_tree`, and `FakeTicketTree` for unit
+  tests that must not spawn `tickets.py`.
+- **Backend pins.** `force_tmux_backend` and `force_psmux_backend` pin the transport backend
+  by name and clear the selection cache, so tests asserting backend argv cannot be hijacked by
+  the host's default or an installed external backend.
+- **Private tmux server.** Every tmux-gated test requests `private_tmux_server`, either as
+  an argument or module-wide through `pytest.mark.usefixtures`. The fixture points `TMUX_TMPDIR`
+  at a fresh directory, drops `TMUX`, and yields the socket path. On teardown it kills that
+  server by explicit socket (`tmux -S <socket> kill-server`). Probes and kills in tests also
+  name the socket with `-S`, never the inherited env, so a lost redirect can leak a session
+  but can never kill the developer's default server. `private_tmux_socket` is the same
+  thing as a context manager. A guard in `tests/test_conftest.py` refuses a tmux-gated test
+  that opts out. It sees only tests whose `skipif` reason names tmux. Run real-tmux ablations under a throwaway root:
+  `env -u TMUX -u TMUX_PANE TMUX_TMPDIR=$(mktemp -d) uv run pytest ...`.
+- **Autouse isolation.** `_isolate_ambient_git_ignores` (session-scoped) shadows the
+  developer's global gitignore sources (`GIT_CONFIG_GLOBAL`, `XDG_CONFIG_HOME`), so a dev box
+  that globally ignores `.claude/` cannot make shield tests measure the wrong thing.
+  `_isolate_state_root` points `BMAD_LOOP_STATE_DIR` at a per-test directory (allocated by
+  `_state_root_allocator`), because `runs.state_root()` creates directories in the real state
+  location. `_isolate_mux_registry` keeps the psmux registry root and the inside-a-pane marker
+  out of the cross-test environment.
+- **Per-test helpers that need teardown.** `emulate_windows_newlines` makes `Path.write_text`
+  translate newlines as Windows does, so a "no CRLF" assertion can fail on Linux.
+  `reap_leftovers` force-kills pids a failing row may have leaked.
 
-Everything else is a **plain helper — a function or constant** (`from conftest import
-write_spec, dev_effect, machine_json, ...`). The rule is deliberate: a fixture is ambient — its consumers are invisible
-at the call site and to grep — so it is reserved for setup/teardown that must wrap the test.
-Construction and simulation (`write_spec`, `write_sprint`, `dev_effect`, `review_effect`,
-`escalated_run`, ...) are explicit imports, so each test names its dependencies. Local fixtures
-inside a single test file are fine for file-scoped concerns.
+Everything else is a **plain helper** (`from conftest import write_spec, dev_effect,
+machine_json, ...`). A fixture is ambient, invisible at the call site and to grep, so it is
+reserved for setup and teardown that must wrap the test. Construction and simulation helpers
+are explicit imports, so each test names its dependencies. Local fixtures inside a single test
+file are fine for file-scoped concerns.
 
-Two helpers carry suite-wide contracts and are worth knowing before writing any CLI or engine
-test:
+Two helpers carry suite-wide contracts:
 
-- `machine_json(argv, capsys, *, rc=0, err_contains=None)` — runs a `--json` command and parses
+- `machine_json(argv, capsys, *, rc=0, err_contains=None)` runs a `--json` command and parses
   the **whole** of stdout. Parsing the full stream is itself the assertion that nothing but the
-  document was printed (the `machine.py` purity contract); the default `err == ""` is the strict
-  form, and `err_contains` is an opt-in to a different assertion, never a waiver.
-- `dev_effect` / `review_effect` and their bundle twins — simulate what a real skill session
-  does to disk (spec frontmatter flips, code edits) and, just as deliberately, what it does
-  **not** do: `dev_effect` never writes sprint-status — the orchestrator is the single
-  sprint-status writer at dev time, and a test double that helpfully did both would mask a
-  regression. (`review_effect` does advance the board when it finalizes, modeling what real
-  review sessions do and the orchestrator re-verifies; the bundle twins write none, because
-  bundles have no sprint-status entry.)
+  document was printed (the `machine.py` purity contract); `err == ""` is the default, and
+  `err_contains` opts into a different assertion, never a waiver.
+- `dev_effect` / `review_effect` and their bundle twins simulate what a real skill session does
+  to disk, and just as deliberately what it does **not** do: `dev_effect` never writes
+  sprint-status, because the orchestrator is the single sprint-status writer at dev time.
+  `review_effect` advances the board when it finalizes, as real review sessions do; the bundle
+  twins write none, because bundles have no sprint-status entry.
 
 Divergent-root tests choose a topology for the distinction they need to prove:
 
 - **Default** (`project`) keeps `project == repo_root`. Use it for ordinary sandbox behavior,
   never for an assertion that claims to distinguish those roots.
-- **Sibling** places `repo_root` beside or otherwise outside the BMAD project. Lower-level seam
-  rows may hand-build this shape (`test_verify.py::_repo_root_override`); caller/config coverage
-  writes it with `write_repo_root_override` and reloads it through `load_paths`. Use it to prove
-  that code commands run in the configured root while artifact reads stay in the project.
-  Artifact-derived excludes correctly collapse to `()` from the disjoint code tree; a non-empty
-  project-relative spelling may still match nothing there, so this shape cannot grade pathspec
-  selection by outcome alone.
-- **Nested monorepo** (`nested_repo_root_paths`) puts the BMAD project at `<repo>/app`, writes
-  and commits `_bmad/bmm/config.yaml`, and returns `load_paths(app)`. Use it when both right-
-  and wrong-root pathspecs must be non-empty and separable: the correct value carries `app/`,
-  while the wrong value can select a plausible outer-tree decoy. The helper accepts alias
-  spellings but returns canonical paths and commits every seed/config file, so fixture residue
-  cannot masquerade as session work.
+- **Sibling** places `repo_root` outside the BMAD project (`write_repo_root_override`, reloaded
+  through `load_paths`). Use it to prove that code commands run in the configured root while
+  artifact reads stay in the project. It cannot grade pathspec selection by outcome alone.
+- **Nested monorepo** (`nested_repo_root_paths`) puts the BMAD project at `<repo>/app`. Use it
+  when both right- and wrong-root pathspecs must be non-empty and separable.
 - **Isolated worktree** adds a third live root. Use a real relative command against a marker
-  created only in the mounted unit worktree; assert the main checkout lacks it, the command
-  record passed, and classification received the same mounted cwd. Keep the marker under a
-  gitignored generated-state path so it cannot merge back as proof of work.
+  created only in the mounted unit worktree, and assert the main checkout lacks it.
 
-Every divergent-root row guards its premise before its outcome: compare resolved roots, assert
-the nested parent relation when nesting matters, and for cwd tests plant/probe both directions
-(`plant_root_markers`, `REPO_ROOT_MARKER_CMD`, `PROJECT_MARKER_CMD`). A positive marker identifies
-the intended root; the opposite-root marker rules out the tempting alternative. When a wrong
-root could still name a real path, create that decoy and assert the selected value rather than
-asserting only that some path is absent or a gate refused.
+**`MockAdapter` is production code** (`src/bmad_loop/adapters/mock.py`, shipped in the wheel),
+scripted with a list of `SessionResult`s or `callable(spec) -> SessionResult` effects. No
+configuration reaches it, and it exercises **the generic adapter path only**: adapter-specific
+behavior needs an L2 profile test or an L4/L5 gate. It carries no `profile` attribute on
+purpose; `attach_profile` in conftest opts in where the resolved skill name is under test.
 
-**`MockAdapter` is production code** — `src/bmad_loop/adapters/mock.py`, shipped in the wheel,
-scripted with a list of `SessionResult`s or `callable(spec) -> SessionResult` effects. It is
-not reachable from configuration (no `mock` profile exists; `runsetup.make_adapters` builds
-only real CLI adapters — generic-over-mux, or the opencode HTTP pair for hookless profiles),
-and it exercises **the generic adapter path only** — a caveat to
-respect, not to fix: adapter-specific behavior needs an L2 profile test or an L4/L5 gate. It
-also deliberately carries no `profile` attribute; the profile-less shape _is_ the None-tree
-fallback path, and `attach_profile` in conftest opts in where the resolved skill name is under
-test.
+## Premise before outcome
+
+A test asserts its **premise before its outcome**: before checking the result, it proves the
+setup is the situation the test claims to exercise. A negative outcome ("nothing was
+published", "the gate refused") passes for every reason the value could be absent, including
+a setup that never reached the code under test.
+
+- Assert the planted state is really on disk (the entry is `done`, the cache is valid, the
+  tree starts clean) before acting on it.
+- For divergent-root tests, compare resolved roots, assert the nesting when it matters, and
+  plant markers in both directions (`plant_root_markers`, `REPO_ROOT_MARKER_CMD`,
+  `PROJECT_MARKER_CMD`): one identifies the intended root, the other rules out the tempting
+  alternative.
+- When a wrong answer could still name a real path, create that decoy and assert the selected
+  value, rather than asserting only that some path is absent.
 
 ## Quality guards (meta-tests)
 
-A slice of the suite tests the **repo** rather than the product. The inventory:
+A slice of the suite tests the **repo** rather than the product. Each guard's test docstrings
+carry its full rationale and blind spots.
 
-| Guard                         | Where                                                   | Enforces                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| ----------------------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Portability guard             | `tests/test_portability_guard.py`                       | One shared AST scan over every `src/bmad_loop/**/*.py` (data scripts included), carrying thirteen guards: literal `["tmux", ...]` argvs only in the two backend files (the backends' own `[self._BINARY, ...]` spelling is deliberately unmatched, so this tripwire currently flags nothing — #549); sequence-form git argvs (list or tuple, literal or named constant) only as `_run_git`'s argv argument in `verify.py`, with string-form git spawns refused everywhere, `verify.py` included; no bare `/tmp`-class POSIX paths; no `signal.SIGKILL` attribute; `os.kill(pid, 0)` probes only in `process_host.py`; any `os.kill` at all only there too (a second, distinct guard); `start_new_session` only in the detach helpers; `shell=True` only in its two sanctioned files; `BMAD_LOOP_*` env reads only through the `envvars.py` registry, a plugin's own variable family, or the session-protocol vars the two stand-alone hook relays read back; a persisted `spec_file` / `dispatched_spec_file` resolved with a bare `Path(...)` only in the four files that run inside the tree the value was recorded against; `verify_commands_outcome` called only from `verify._verify_review_commands`; its classifier half `verify_command_results_outcome` called only from `verify.verify_commands_outcome` or `Engine._verify_commands_with_results` (a separate guard, because fencing the wrapper alone still lets a gate compose run+classify by hand and pick its own root — #695); plus a scanned-file-count floor so a broken scan root cannot pass vacuously                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| Kind & refusal inventories    | `tests/test_portability_guard.py`                       | Enumerate-vs-declare gates riding the same AST scan, so a new entry on an enumerable surface is a PR-time decision instead of review-pass archaeology: every literal journal kind is a declared `JOURNAL_KINDS` row, via a dedicated literal-kind emit reading the inventoried channels — kind-only writes, the `kind=` literals or parameter defaults that reach a declared dynamic-kind position, and, when the positional slot is empty, a `kind=` keyword or a readable `**` splat on the write itself; unreadable kinds in keyword/splat channels over an empty direct-write slot and in declared dynamic caller channels emit the unresolved sentinel; occupied unreadable direct-write slots retain their literalness finding without keyword inventory; at a declared dynamic-kind position that finding is waived and the direct-write inventory intentionally remains silent, and each such position additionally declares HOW MANY `journalkind` findings it holds (write sites without a positional string-literal kind, including an empty slot with a keyword literal), graded against the tree in both directions so a write added or removed inside an ALREADY-declared position reddens instead of merely falsifying a comment (the waiver is per position, so the declaredness gate passes on such a write by construction); and the f-string family stays out of the kind inventory, governed by the literalness test (which still refuses a keyword-spelled kind outside a declared position) and, since DW-151, by an identity axis alongside the count: a declared position's minted kind SPELLINGS are read off the AST — the f-string's literal parts expanded through the same-function `for` bindings that supply its interpolations — and graded against `JOURNAL_DYNAMIC_KIND_SPELLINGS` over the union of declared and measured positions, so a respelling reddens where the count cannot see it; an interpolation the resolver refuses mints the unresolved sentinel, which no row may declare; every journal kind carrying a `patch` field is a `JOURNAL_PATCH_KINDS` row, since `diagnostics` drops that field by NAME and a new kind would otherwise inherit the drop undecided; every `_refuse_*`/`_reject_*` helper definition is a `REFUSAL_HELPER_DEFS` row; and the #414-family isolation-refusal call sites (`bmadconfig.worktree_isolation_conflict` plus its CLI wrapper `_reject_isolation_conflict`) match `ISOLATION_CONFLICT_CALLERS` with multiplicity, so `cmd_resolve`'s legitimate second call cannot absorb a third. Since DW-150 the same count axis rides the SPLAT holes: `JOURNAL_SPLAT_ALLOW` declares how many UNRESOLVED `**` KEYWORD ARGUMENTS each position holds — never write calls and never call sites, so a single `append(kind, **a, **b)` counts 2, the finer of the two readings chosen deliberately because a second splat must redden whether it arrives as a new call or as a second `**` inside an existing one — and the field inventory it lets through moved to the sibling `JOURNAL_SPLAT_FIELDS` (key sets held equal by their own row), graded over the union of declared and measured positions so an undeclared hole, a stale row and an unresolved argument added or removed inside an ALREADY-declared position all redden — the shape a set comparison was blind to, since a second splat dropped beside the first was waived on arrival and its field names escaped the inventory; the offender filter reports the same over-count at the offending LINES while the producer row reports the NUMBERS — a deliberate overlap on the undeclared and over-count directions, taken because a filter over findings structurally cannot see a position that LOST an unresolved argument, and recorded in both docstrings rather than left to be rediscovered. And since DW-152 the BARE function name every journal position key uses is enforceable rather than assumed: each journal write emits its enclosing DEF identity (name plus `def` lineno, off the resolver's existing node map), and `test_journal_writers_do_not_share_a_bare_name` reddens the day one module holds two same-named journal-writing functions, whose declarations would otherwise aggregate into one row — qualifying the keys to `class.method` stays deliberately deferred, with the bound stated on both position tables. What it establishes is exactly a pair of WRITERS, which is what the four POSITION tables need, and NOT full name safety for the fifth table, `JOURNAL_FORWARDERS`: that row makes `_is_journal_write` read any call to that NAME in that FILE as a journal write, so a same-named twin that never touches the journal still routes its callers' keywords into the field inventory — and being a non-writer it emits nothing, so this guard cannot see it; closing that would mean widening the classifier, which DW-152 does not ask for. All assertions are exact-set or exact-Counter in both directions — a removed or renamed entry reddens its stale row too — and each new detector emit carries must-flag and must-stay-silent probe rows through `_scan_source` |
-| Settings-schema sync          | `tests/test_settings_schema.py`                         | `src/bmad_loop/data/settings/core.toml` stays in lockstep with `policy.py` by reflection, in both directions: every spec maps to a live dataclass field with a matching default wherever one is baked in, every policy field is reachable from exactly one spec (or listed in the explicit `HIDDEN` set), and every `*Policy` dataclass is consciously classified                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| Exit-code allocation          | `tests/test_entry_point.py`                             | `ExitCode` is pinned literally (OK=0, FAILURE=1, USAGE=2, INTERRUPTED=130) **and closed**: the enum's value set equals exactly those four, so codes 3–129/131+ cannot be allocated quietly                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| Extra-less core CLI           | `tests/test_entry_point.py`                             | A fresh interpreter with `pyte`/`rich`/`textual`/`tomlkit` blocked at `find_spec` — the blocker **raises** rather than returning None, so the dev venv's installed copies cannot make it pass vacuously, and an `import pyte` floor proves it bites — imports `bmad_loop.cli` and `bmad_loop.settings_schema`, runs `list` to rc 0, and asserts `tui` degrades to the `bmad-loop[tui]` hint instead of a traceback. Every test job installs `--all-extras`, which is why #650 shipped broken for 23 releases; CI's isolated wheel `list` run is the same floor at install level                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| State-machine table           | `tests/test_statemachine.py`                            | Every `Phase` has a transition row; `TERMINAL_PHASES` (model.py) equals the table's dead ends — a cross-module parity nothing else links; an N×N `parametrize` grid drives every pair (legal pairs land, illegal pairs raise and leave the phase untouched); the awaiting-operator reachability rule is additionally stated independently, because the N² grid reads its expectation out of the table under test                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| Check-id registry             | `checks.py` + `tests/test_cli.py`                       | `ValidationReport.add` asserts its id is in `VALIDATE_CHECKS` at every **executed** call site, and an end-to-end test unions the ids a real passing **and** failing `validate --json` emit and asserts them registered. Both mechanisms are exercised-path enforcement — there is no static call-site scan, so an id on a branch neither reaches can still ship unregistered and raises `AssertionError` only when that branch first executes; a new check site therefore lands together with a test that reaches it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| Skill-drift guard             | `tests/test_module_skills_sync.py`                      | The seeded forks in `.claude/skills/` and `.agents/skills/` are byte-identical to canonical `src/bmad_loop/data/skills/`. **Documented limitation: CI-inert** — both trees are gitignored and absent in CI, so every parametrization skips there; the guard bites on dev boxes only. (The canonical-existence assertion runs before the skip and is CI-live.)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| Schema-version parity         | `tests/test_tui_app.py`                                 | The TUI renderer's pinned validate schema version equals `documents.VALIDATE_SCHEMA_VERSION` — deliberate duplication, because an import would auto-follow a CLI bump and silently render a v2 document as v1                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| Installed-copy drift          | `tests/test_hook_script.py`, `tests/test_probe_hook.py` | The hook relays' copies match their source: `test_hook_script.py` re-runs `install_into` and text-compares the project copy against the source; `test_probe_hook.py` compares the packaged resource — which only bites in a wheel-installed run, since an editable install resolves both sides to the same file                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| Version sync                  | `tests/test_release.py` + CI                            | `scripts/release.py check` runs as the `version-sync` job — `sync_version.check()` in-process, plus the CHANGELOG release contract (the canonical version's section exists; `## [Unreleased]` was reopened; its `compare/v<version>...HEAD` link tracks the bump). `tests/test_release.py` covers the release helpers' pure logic **and** drives `cmd_check`/`cmd_prepare` over fixture changelogs; the version-field comparison itself is still CI-only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| Real-mux xdist grouping       | `tests/test_conftest.py`                                | Every real-tmux E2E is in exactly the shared `real_mux_e2e` group, `pyproject.toml`'s `addopts` selects `--dist loadgroup`, and the scheduler actually honours the mark — three halves that are each silently inert alone, so each is asserted (DW-95). An AST scan over every `tests/test_*.py` finds each `test_*` gated by a `skipif` whose `reason` mentions "tmux" (decorator, class decorator, or module-level `pytestmark`; single mark or list; inline or bound to a module-level/conftest-imported alias) and requires the set of `xdist_group` names on it to EQUAL `{REAL_MUX_XDIST_GROUP}` — so a private group of one, and a second group mark xdist would merge into a composite name, both fail. Keyed on the reason string because `HAVE_TMUX` reaches the AST as a bare boolean, which also keeps `test_psmux_live.py` (its own non-xdist CI invocation) and `test_opencode_live.py` out; a non-literal reason is a recorded blind spot with its own row. Split scan (`_scan_source`) with must-flag rows per gating form and must-stay-silent rows per lookalike, exact per-module gated-def counts against a vacuous pass (equality, so an added def fails the guard just as a deleted one does — re-pin the inventory for intentional changes; DW-173), a live-object row pinning the alias to the group name the scan trusts, and — because every other row reads only source text — a subprocess row running a synthetic module under real xdist, asserting the group lands on one worker with the `@group` node-id suffix under `loadgroup` and no suffix under `load`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| Tmux SessionSpec + reap walls | `tests/test_conftest.py`                                | Real-tmux generic `SessionSpec` waits must use the imported `REAL_MUX_HANG_CEILING_S`; the two named deliberate timeout tests must retain literal `6.0` (DW-95). The shared ceiling is pinned at `90.0`. The source detector checks only direct `SessionSpec` constructor keywords, including missing timeouts, with expected-function/site coverage and synthetic accepted/rejected probes. Later replacements and binding/dataflow changes are outside this focused guard. A second scanner (DW-108) extends the same doctrine to `tests/test_stories_e2e.py`, the one real-tmux module the SessionSpec scan excludes: every `time.monotonic() + <budget>` reap deadline in a tmux-gated test there must spell the conftest-imported ceiling (either import form), graded with its own named expected-site inventory — which is what fails a scan that found nothing, since most stories E2Es hold no deadline — plus accepted/rejected probe rows through the same function. The `assert time.monotonic() < deadline` poll lines are comparisons, not additions, and fall outside without special-casing. A third scanner (DW-174) grades that same module's MODULE-LEVEL AST for the `detach_ack_ceiling_s=` splice the detached-writer fake hands to bash: the fragment must be followed by `int(<conftest-imported REAL_MUX_HANG_CEILING_S>)` under either import form, with a plain literal carrying the fragment counting as both a site and an offender — the hardcoded-`90` case, which renders byte-identically to the splice and so slips past that module's own rendered-text asserts. It too carries a named expected-site inventory (keyed by the assigned constant) that fails a scan finding nothing, plus accepted/rejected probe rows and must-stay-silent lookalikes; scanning module level only is what keeps `_run_detach_gate`'s deliberately varying in-def budget out of scope without an exception list. Stories budgets that are NOT scanned by any of the three guards retain their existing scope: the subprocess `timeout=` walls, the `end["teardown_s"] < 15.0` teardown-gap assertion, and the `time.time() - hb["ts"] < 120` heartbeat-freshness assertion.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Guard                         | Test file                                               | What it prevents                                                                                                                                          |
+| ----------------------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Portability guard             | `tests/test_portability_guard.py`                       | tmux argv, git spawns, POSIX-only calls, `BMAD_LOOP_*` env reads, spec-path anchoring and encoding-less text I/O escaping their sanctioned seams          |
+| Kind & refusal inventories    | `tests/test_portability_guard.py`                       | an undeclared journal kind, `patch` carrier, splat hole, `_refuse_*`/`_reject_*` helper or isolation-refusal call site landing without a PR-time decision |
+| Settings-schema sync          | `tests/test_settings_schema.py`                         | `core.toml` drifting from the `policy.py` dataclasses: a spec without a live field, a mismatched default, or an unclassified field                        |
+| Exit-code allocation          | `tests/test_entry_point.py`                             | renumbering an `ExitCode` or quietly allocating one outside {0, 1, 2, 130}                                                                                |
+| Extra-less core CLI           | `tests/test_entry_point.py`                             | the core CLI crashing without the `[tui]` packages; `tui` must degrade to an install hint instead of a traceback                                          |
+| State-machine table           | `tests/test_statemachine.py`                            | a `Phase` without a transition row, terminal phases out of step with the table's dead ends, or an illegal move that lands                                 |
+| Check-id registry             | `checks.py` + `tests/test_cli.py`                       | a `validate` check id emitted on an executed path without being in `VALIDATE_CHECKS` (exercised paths only; no static scan)                               |
+| Skill-drift guard             | `tests/test_module_skills_sync.py`                      | seeded `.claude/skills` and `.agents/skills` forks drifting from the canonical skills (dev boxes only; CI has no forks)                                   |
+| Schema-version parity         | `tests/test_tui_app.py`                                 | the TUI rendering a newer validate document schema as the old one after a CLI bump                                                                        |
+| Installed-copy drift          | `tests/test_hook_script.py`, `tests/test_probe_hook.py` | the packaged hook relays drifting from their source (wheel-installed runs only), or `init` writing a workspace relay copy                                 |
+| Version sync                  | `tests/test_release.py` + CI                            | version fields disagreeing, or a release leaving `## [Unreleased]` and its compare link unreopened                                                        |
+| Real-mux xdist grouping       | `tests/test_conftest.py`                                | real-tmux E2Es scheduled onto concurrent workers: each must carry exactly the `real_mux_e2e` group, honored by `--dist loadgroup`                         |
+| Private tmux server           | `tests/test_conftest.py`                                | a tmux-gated test running on the developer's default tmux server instead of requesting `private_tmux_server` (or entering `private_tmux_socket`)          |
+| Tmux SessionSpec + reap walls | `tests/test_conftest.py`                                | load-sensitive literal timeouts in real-tmux waits; they must use `REAL_MUX_HANG_CEILING_S`                                                               |
+| Deprecation posture           | `tests/test_conftest.py`                                | deprecation warnings passing silently, including through a later blanket `ignore` that leaves the `error::` entries inert                                 |
+| Docs hygiene                  | `tests/test_docs_hygiene.py`                            | broken relative links and anchors in the docs, and a stale generated policy table in the configuration reference                                          |
 
 Rules for adding or touching a guard:
 
 - **Fix the source, not the allowlist.** A new finding means routing the call through the seam;
   widening an allowlist is the last resort and needs the same scrutiny as a production change.
 - **Exemptions are scoped and acknowledged.** Most file-keyed allowlists (paths, detach,
-  kill-probe, `shell=True`) require a per-line `# portability:` ack on top; whole-file passes
+  kill-probe, `shell=True`) also require a per-line `# portability:` ack. Whole-file passes
   exist only where the file _is_ the sanctioned spot (the tmux backends; `process_host.py` for
-  `os.kill`), and `verify.py`'s git exemption is narrowed further, to the `_run_git` argv
-  position. Env-read exemptions are scoped **by variable name or family, never by file** — a
-  file-wide pass would let a hook read a core knob unnoticed.
-- **The detector itself gets executable coverage.** Every detector added since this bar was set
-  carries a probe matrix — env-read, git-argv, the two verify-composition ones, spec-anchor,
-  task-artifact, session-task-id, the re-arm call, the journal field / kind / kind-literal /
-  minted-kind / def-identity family, refusal-def, isolation-call, real-mux group mark, generic-tmux completion wall,
-  stories-E2E reap deadline, and stories-E2E detach-ceiling splice: the source detectors
-  (`_scan_source`, `_scan_session_walls`, `_scan_reap_deadlines`,
-  `_scan_detach_ceiling_splices`) are split so probe fixtures run the same code path as the
-  real scan, with a must-flag row per claimed access form and a must-stay-silent row per
-  lookalike. When a new form turns up, add the failing probe row first, then fix the
-  detector. The green "no findings today" assertion cannot grade a detector — it is equally
-  green when the scan silently stopped scanning, which is why the matrices exist. The seven
-  older tripwires predate this bar and have no probe rows; #549 tracks bringing them up to it.
-- **The guard's boundary is `src/bmad_loop`,** enforced structurally by its scan root rather
-  than by an allowlist. The deliberate exceptions are the real-mux grouping, completion-wall,
-  stories reap-deadline and stories detach-ceiling guards, whose subject is the suite's own
-  scheduling and waits.
-  There is no production artifact to scan, so they are rooted at `tests/` and live in
-  `tests/test_conftest.py` rather than
-  `tests/test_portability_guard.py` precisely so that file's `src/bmad_loop` scan root stays
-  the structural boundary it is. Tests, `scripts/`, and CI workflows deliberately spawn their own git —
-  a harness must not depend on the artifact it validates (AGENTS.md states this for git; the
-  same reasoning covers their env reads).
+  `os.kill`), and `verify.py`'s git exemption is narrowed to the `_run_git` argv position.
+  Env-read exemptions are scoped **by variable name or family, never by file**.
+- **The detector itself gets executable coverage.** Source detectors are split (`_scan_source`
+  and its siblings) so probe fixtures run the same code path as the real scan, with a
+  must-flag row per claimed access form and a must-stay-silent row per lookalike. When a new
+  form turns up, add the failing probe row first, then fix the detector. A green "no findings
+  today" assertion cannot grade a detector: it is equally green when the scan silently stopped
+  scanning.
+- **The guard's boundary is `src/bmad_loop`,** enforced by its scan root rather than an
+  allowlist. Guards whose subject is the suite's own scheduling and waits are rooted at
+  `tests/` and live in `tests/test_conftest.py`, so the portability guard's scan root stays
+  the boundary. Tests, `scripts/`, and CI workflows deliberately spawn their own git: a harness
+  must not depend on the artifact it validates.
 
 ## The zero-token invariant
 
 **No test, at any layer, ever spends an LLM token.** AGENTS.md states the hard invariant for
-the live/E2E gates ("Live/E2E tests must consume zero LLM tokens"); in practice it holds
-everywhere, and the mechanism differs per gate — worth knowing before touching any of them:
+the live/E2E gates; in practice it holds everywhere, and the mechanism differs per gate:
 
-| Gate                                                               | Real component                                     | Zero-token mechanism                                                                                                                                                                                                                                                                                                                                                             | Runs where                                                                                                                  |
-| ------------------------------------------------------------------ | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `test_generic_tmux.py` (6 `HAVE_TMUX` test functions, 8 collected) | tmux server                                        | The spawned "CLI" is a tiny shell script written by the test                                                                                                                                                                                                                                                                                                                     | CI Linux job + any POSIX dev box with tmux                                                                                  |
-| `test_stories_e2e.py`                                              | tmux + the real `bmad-loop run/resolve/resume` CLI | Scripted fake `claude` variants (bash, defined as string constants in the test module) wired in as a custom TOML profile (`fakestories`); the fake writes its own SessionStart/Stop hook events, so no `bmad-loop init` and no real CLI exists anywhere in the run                                                                                                               | CI Linux job (Linux-only gate: the fakes use GNU coreutils + `setsid`)                                                      |
-| `test_opencode_live.py`                                            | A real `opencode serve` HTTP server                | **Never sends a prompt**: only the spawn/teardown paths are used — nothing that prompts — and the tests touch health/doc/session/event endpoints; the prompt endpoint is asserted against the OpenAPI schema, never called. One test asserts the session's token/cost aggregates are zero                                                                                        | Manual — POSIX box with a **runnable** `opencode` — the gate probes `--version`, so a resolvable-but-dead shim skips (#294) |
-| `test_psmux_live.py`                                               | A real psmux on Windows                            | **Parked windows only**: every parked window runs `pwsh -NoProfile -Command exit 0`, and no coding CLI is ever launched. Includes `test_premise_*` probes with inverted semantics — a red probe means a workaround became droppable — and `test_adopted_*` probes with ordinary semantics — a red probe means psmux regressed a behavior the 3.3.8 floor lets the backend assume | CI Windows job (the job installs psmux) + any Windows dev box with an admitted psmux (3.3.8+) and `pwsh` on PATH            |
+| Gate                                 | Real component                                                | Zero-token mechanism                                                                                                                                                                                                                                                                                                                                       | Runs where                                                             |
+| ------------------------------------ | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `test_generic_tmux.py` (`HAVE_TMUX`) | tmux server                                                   | The spawned "CLI" is a tiny shell script written by the test                                                                                                                                                                                                                                                                                               | CI Linux job + any POSIX dev box with tmux                             |
+| `test_stories_e2e.py`                | tmux + the real `bmad-loop run/resolve/resume` CLI            | Scripted fake `claude` variants (bash string constants) wired in as a custom TOML profile; the fake writes its own SessionStart/Stop hook events                                                                                                                                                                                                           | CI Linux job (the fakes use GNU coreutils + `setsid`)                  |
+| `test_tickets_e2e.py`                | tmux + the real `bmad-loop` CLI and the vendored `tickets.py` | A scripted fake `bmad-build-auto` (bash) resolves its ticket through `tickets.py find`, builds to `built` and writes its own SessionStart/Stop hook events; it never marks `done`. 14 rows cover the pauses, checkpoints, retro and closure, resolve, isolation, store repos, refusals and an isolated sweep, several parametrized over `topology` (T1–T4) | CI Linux job                                                           |
+| `test_opencode_live.py`              | A real `opencode serve` HTTP server                           | **Never sends a prompt**: only spawn/teardown and the health/OpenAPI/session/event endpoints of the detected major (1.x or 2.x); the prompt endpoint is checked against the OpenAPI schema, never called                                                                                                                                                   | Manual: a POSIX or Windows box with a runnable `opencode`              |
+| `test_opencode_live_turn.py`         | A real OpenCode 2.x server running one full turn              | **Prompts reach only a local fake**: the one test that prompts sends every LLM request to an in-process stdlib OpenAI-compatible server on 127.0.0.1, under a scrubbed env (scratch HOME/XDG, no credentials), a mock-only provider config and a deny on the hosted provider, and asserts the fake saw every request                                       | Manual: a POSIX or Windows box with a runnable OpenCode 2.x `opencode` |
+| `test_psmux_live.py`                 | A real psmux on Windows                                       | **No coding CLI, ever**: windows run `pwsh -NoProfile -Command exit 0`, a sleep, or a key-echo child that prints the code of each key it reads. `test_premise_*` probes are inverted (red means a workaround became droppable); `test_adopted_*` probes are ordinary                                                                                       | CI Windows job + any Windows dev box with psmux 3.4.0+ and `pwsh`      |
 
-Never "fix" a gate to call a real CLI, and never add a completion path that trusts LLM output —
+Never "fix" a gate to call a real CLI, and never add a completion path that trusts LLM output:
 sessions complete only on hook Stop events or window death, and the fakes exercise exactly
 those paths.
 
-**Manual-gate cadence:** `test_opencode_live.py` is the one gate CI still cannot see. Run it on a
-POSIX box with opencode installed before every release, and after any change to the adapter it
-covers; a release cut without it is trusting stale evidence. `test_psmux_live.py` left this
-category in #662 — the **test-windows** job installs psmux and runs the gate on every pull
-request and on pushes to `main`/`release/*` (the workflow's own triggers), in its own serial
-step, so its evidence is as fresh as the branch rather than as fresh as someone's memory.
+**Manual-gate cadence:** the two `test_opencode_live*.py` modules are the gates CI cannot run.
+Run them before every release and after any change to the adapter they cover, once with an
+OpenCode 1.x and once with a 2.x `opencode` first on PATH
+(`PATH=<dir>:$PATH uv run pytest tests/test_opencode_live.py tests/test_opencode_live_turn.py -q`).
+They run on native Windows too.
 
 ## Ablation records
 
 The rule (AGENTS.md): **for any test asserting "X is refused/absent", delete the gating code
-and confirm the test fails before trusting it** — a negative assertion passes for every reason
-a value could be absent. The suite records performed ablations in-file, in one house grammar:
+and confirm the test fails before trusting it.** The suite records performed ablations
+in-file, in one house grammar:
 
 - **The canonical form** is a prescriptive, undated sentence in the test's docstring (or a
   nearby comment), naming the exact mutation and the expected failure:
@@ -263,71 +257,91 @@ a value could be absent. The suite records performed ablations in-file, in one h
   `Ablation guard:`, `Ablations:`, `ablation pin:`, and lettered `ABLATION A1`, `A2`, … where
   a test carries several.
 
-- **`INVERSE ablation:`** — used when deleting the gate would not reproduce the bug (the gate
+- **`INVERSE ablation:`** is used when deleting the gate would not reproduce the bug (the gate
   is an _absence_, or the bug needs the old behavior restored). The record states the inverse
   mutation: restore the old code, or add what the rule forbids.
-- **Green-ablation records** — a small set records that a mutation deliberately does _not_
-  redden this test, naming, where one exists, the test that does pin it. That is a durable
-  warning against miscounting coverage, not a guard.
+- **Green-ablation records** note that a mutation deliberately does _not_ redden this test,
+  naming the test that does pin it where one exists: a warning against miscounting coverage.
 
 Two disciplines around the grammar:
 
-- **Records are evidence, not contracts.** A record certifies the ablation that was run when
-  the test was written or last audited. Touching the gate re-opens the question: re-run the
-  ablation, against a `cp` backup of the source (never `git checkout` — it has destroyed
-  in-flight fixes), and restore byte-identical. Dates, pasted assertion output, and run logs
-  belong in the **commit message**, not the file — durable facts in docstrings, records in git
-  history. (Three dated `ABLATION (... 2026-07-25)` comments survive in
-  `test_opencode_http.py` from before this convention settled; trim them to the undated form
-  on next touch.)
-- **Ablate singly.** Two gates deleted together redden everything and grade neither; the
-  envvars work proved its rejection gates hold disjoint row sets by ablating them one at a
-  time — three gates today, four ablations counting the `raw is None` early-out.
+- **Records are evidence, not contracts.** A record certifies the ablation run when the test
+  was written or last audited. Touching the gate re-opens the question: re-run the ablation
+  against a `cp` backup of the source (never `git checkout`, which can destroy in-flight
+  fixes), and restore byte-identical. Dates, pasted assertion output, and run logs belong in
+  the **commit message**, not the file.
+- **Ablate singly.** Two gates deleted together redden everything and grade neither.
 
-A close cousin: a **known defect is pinned with `@pytest.mark.xfail(strict=True)`** naming the
-issue (`test_env_fault_patterns.py`, #194). `strict=True` is the point — the day the defect is
-fixed, the test fails and forces the debt note to be removed with it.
+A **known defect is pinned with `xfail(strict=True)`**, its reason naming the defect.
+`strict=True` is the point: the day the defect is fixed, the test fails and forces the note to
+be removed with it.
 
 ## Typing and lint
 
 - **Staged pyright, deliberate.** `typeCheckingMode = "basic"` over `src/bmad_loop`, with the
-  strict list covering the pure/leaf seven (`model`, `statemachine`, `policy`, `documents`,
-  `machine`, `checks`, `sanitize`). Strictness lives where the code is pure; the I/O edges are
-  not forced over the strict bar. `src/bmad_loop/data` is excluded — data-shipped scripts are
-  standalone templates outside the import graph (with the untested-script consequence #546
-  tracks).
+  strict list covering the pure/leaf modules (`model`, `statemachine`, `policy`, `documents`,
+  `machine`, `checks`, `sanitize`, `plugins/digest`, `plugins/grants`, `worksource`, `ticketmodel`). Strictness lives where
+  the code is pure. `src/bmad_loop/data`
+  is excluded: data-shipped scripts are standalone templates outside the import graph.
+- **Three `os` surfaces.** CI also runs pyright with `--pythonplatform Windows` and `Darwin`,
+  whose `os` stubs lack POSIX/Linux-only names (`O_DIRECTORY`, `setxattr`, `sysconf`). Code that
+  needs such a name fetches it with a default-free `getattr` inside its runtime check.
 - **`tests/` and `scripts/` are outside pyright, deliberately.** Tests get their rigor from
-  ablation, parity, and the guards — annotating monkeypatch-heavy test code buys noise, not
-  safety. Do not add them to the include list as a drive-by.
-- **Pyright is pinned exactly** (`pyright==1.1.411` in the dev group) — it is a gate, and a
-  newer pyright adds checks that fail the build on untouched code. Bump the `==` pin
-  deliberately; an exact pin is not something a lock refresh can move for you.
-- **Ruff rule families are pinned** (`E4`, `E7`, `E9`, `F`) to ruff 0.15.17's default set, so
-  CI (trunk's pinned ruff) and a bare newer ruff share rule families — a newer ruff may still
-  add rules under those prefixes. **Do not ratchet stricter than CI**
-  without moving CI first — the `[tool.ruff.lint]` comment in pyproject.toml is the authority.
+  ablation, parity, and the guards. Do not add them to the include list as a drive-by.
+- **Pyright is pinned exactly** in the dev group: it is a gate, and a newer pyright adds checks
+  that fail the build on untouched code. Bump the `==` pin deliberately.
+- **Ruff rule families are pinned** (`E4`, `E7`, `E9`, `F`), so CI (trunk's pinned ruff) and a
+  bare newer ruff share rule families. **Do not ratchet stricter than CI** without moving CI
+  first; the `[tool.ruff.lint]` comment in pyproject.toml is the authority.
 - Formatting is trunk's (black/isort/prettier/markdownlint); `trunk check` before every push is
   the contract, and the pre-push hook enforces it.
 
 ## CI, flakes, and deliberate absences
 
-Six jobs (`.github/workflows/ci.yml`): **test** (ubuntu, Python 3.11–3.14, tmux installed so
-L4 and `stories_e2e` run), **test-windows** (`PYTHONUTF8=1`, psmux installed so the L5
-`test_psmux_live.py` gate runs; PRs run the 3.11/3.14 boundary only — Windows failures here
-have been platform-shaped, not version-shaped — pushes to `main` and `release/*` run the full
-spread), **version-sync**, **lint** (trunk, including actionlint + zizmor over the
-workflows themselves), **typecheck** (the same pinned pyright a contributor runs), and
-**build** (packaging smoke: sdist + wheel, the console script executed from the installed
-wheel, and a wheel data-file inventory against `git ls-files` — every other job runs from the
-source tree, so packaging breaks were invisible until this job existed).
+Eight jobs (`.github/workflows/ci.yml`):
+
+- **test**: ubuntu, Python 3.11–3.14, tmux installed so L4, `stories_e2e` and `tickets_e2e` run.
+- Three Windows jobs (`PYTHONUTF8=1`). Pull requests run the 3.11/3.14 boundary only; pushes
+  to `main` and `release/*` run the full spread.
+- **version-sync**: `scripts/release.py check`.
+- **lint**: trunk, including actionlint and zizmor over the workflows themselves.
+- **typecheck**: the same pinned pyright a contributor runs, plus the Windows and Darwin
+  target checks.
+- **build**: packaging smoke. Builds the sdist and wheel, runs the console script from the
+  installed wheel, and checks the wheel's data files against `git ls-files`; every other job
+  runs from the source tree.
+
+The Windows jobs split one leg across machines without dropping a test:
+
+- **test-windows-shard** runs the suite minus `test_psmux_live.py` as two shards per Python
+  leg, `--ci-shard=1/2` and `2/2` (`tests/perf_report.py`). A shard receives whole units: a
+  test function with every parameter variant, or a whole xdist group, so a real-mux group can
+  never split. Units are assigned by a SHA-256 digest of the unit's nodeid, never Python's
+  randomized `hash()` or a file list, so a new test is assigned automatically and existing
+  tests do not move. The digest balances test counts, not seconds.
+- **test-windows-live** installs one pinned psmux release and runs the L5 gate once per leg,
+  serially, on a machine of its own. The pin, not `latest`: the gate's `test_premise_*` rows
+  turn red by design when a psmux release fixes what they pin, so an upstream release must
+  never reach a PR's checks. Moving the pin is its own PR, which also moves the version floor
+  and retires the workarounds. The non-required **psmux canary** workflow (weekly, or on
+  demand) runs the same gate against the latest release and goes red when that PR is due.
+- **test-windows** keeps the check name `test (windows, py3.x)` and is the leg's verdict.
+  `perf_report.py verify-shards --count 2` requires both shards present and green, their
+  selections disjoint, and their union equal to the collected set, with no function family
+  straddling shards. `verify-executed` requires every live-gate test to have passed; a skip
+  there means the gate did not run. `verify-jobs` requires each of the leg's jobs to have
+  concluded `success` in its latest execution, so a re-run that fails before uploading cannot
+  pass on an earlier attempt's records.
+
+Sharding buys latency, not work: every shard pays its own runner setup and a full collection.
+It stays only while the extra aggregate job-seconds remain within 15% of the unsharded layout.
 
 **Zero-retry flaky policy.** There is no retry mechanism anywhere: no `--reruns`, no retry
-plugin — `pytest-rerunfailures` was removed from the environment precisely because an installed
-retry plugin is an invitation to paper over a real flake. **A flake is a bug**: it gets an
-issue, a diagnosis, and a deterministic fix — never a rerun loop. The main defense is the
-**frozen-clock pattern, mandatory for time-dependent tests**: no unit or seam test sleeps
-toward a deadline (the real-process gates use short settle polls, which is different from
-waiting out a production timeout). Two sanctioned shapes:
+plugin, because an installed retry plugin is an invitation to paper over a real flake. **A
+flake is a bug**: it gets a diagnosis and a deterministic fix, never a rerun loop. The main
+defense is the **frozen-clock pattern, mandatory for time-dependent tests**: no unit or seam
+test sleeps toward a deadline (the real-process gates use short settle polls, which is
+different from waiting out a production timeout). Two sanctioned shapes:
 
 1. A scoped `_Clock` shim over a mutable dict, monkeypatched in as the module-under-test's
    `time` reference; a scripted watcher callback advances the dict past the deadline
@@ -337,7 +351,7 @@ waiting out a production timeout). Two sanctioned shapes:
    takes `clock`/`sleep` callables, and the test's fake `sleep` credits the fake clock
    (`test_signals.py`).
 
-Deliberate absences — decisions, not gaps:
+Deliberate absences, decisions rather than gaps:
 
 - **No coverage gate.** A percentage threshold optimizes for the metric, and this suite's
   riskiest surfaces (guards, ablations, parity) are exactly what line coverage cannot grade.
@@ -345,25 +359,73 @@ Deliberate absences — decisions, not gaps:
   `uv run --with pytest-cov pytest --cov=bmad_loop --cov-report=term -q`.
 - **No macOS runner.** POSIX portability is held by the seam quarantine plus the portability
   guard; macOS-specific traps found in the field get targeted unit tests (the psutil
-  `create_time` trap being the canonical example). A macOS job would mostly re-run the Linux
-  suite at 10× the queue time.
-- **No opencode install in CI** — so `test_opencode_live.py` is the last manual gate (table
-  above), and faking the server would test the fake. psmux is the counter-example rather than
-  the precedent: it is one zip on a GitHub release, so **test-windows** installs it and runs
-  that gate on every PR and every push to `main`/`release/*` (#662). Chocolatey was tried
-  first and dropped — its community feed 503'd on both matrix legs, and Chocolatey document
-  it as unguaranteed and rate-limited per IP, which hosted runners share.
+  `create_time` trap is the canonical example).
+- **No WSL2 runner.** Hosted runners cannot host WSL2, so run the suite there by hand, from a
+  clone inside the WSL filesystem: a Windows worktree reached through `/mnt/c` carries a `C:/`
+  gitdir that WSL git cannot resolve. A test that spawns an interpreter uses `sys.executable`,
+  never a bare `python` (Ubuntu ships only `python3`). uv's standalone CPython has no
+  `os.pidfd_open`, so the pidfd reap rows skip via `conftest.needs_pidfd`; to run them, build
+  the venv on the distro Python with `uv venv -p /usr/bin/python3`.
+- **No opencode install in CI**, so the `test_opencode_live*.py` modules are the last manual
+  gate (see
+  [The zero-token invariant](#the-zero-token-invariant)); faking the server would test the
+  fake. psmux, one zip on a GitHub release, is installed by **test-windows-live** instead.
+
+## Runtime, metrics, and performance budgets
+
+**Default invocation is serial.** `uv run pytest -q` runs one process: correct everywhere,
+slowest everywhere. Parallelism is opt-in with `-n logical`. Compare like with like: a serial
+local run against a four-worker hosted run measures the worker count, not the change.
+
+**The 2-vCPU Windows comparison** (a small VM or WinBoat guest) is two commands, in this order,
+never alongside another full-suite run on the same guest:
+
+```powershell
+$env:PYTHONUTF8 = '1'
+uv run pytest -q -n 2 --ignore=tests/test_psmux_live.py
+uv run pytest -q tests/test_psmux_live.py
+```
+
+Keep the checkout and `TMP`/`TEMP` on the guest's own disk; a host-shared or network folder
+measures the share. The live gate runs separately and serially because its tests drive real
+psmux servers, a single-machine resource.
+
+**Metrics** (`tests/perf_report.py`, inert unless asked for) answer where the time went,
+including for a run that never finished:
+
+```sh
+uv run python scripts/run_test_benchmark.py --metrics-dir <fresh-dir> -- -q -n logical
+uv run python tests/perf_report.py summarize <fresh-dir>
+```
+
+The wrapper owns the pytest process lifetime, preserves pytest's exit status, and with
+`--timeout`/`--deadline-epoch` stops the whole tree (exit 124) while leaving every flushed
+record behind. Pytest alone takes `--test-metrics-dir=PATH`, spelled with `=`. The summary
+keeps wall-clock elapsed apart from _worker-seconds_ summed across xdist workers, and reports
+fixture setup totals, per-file cost, the cleanup tail, and tests started but never finished.
+`--test-metrics-subprocesses` adds per-test, per-command and per-call-site launch counts; it
+has real overhead and stays off in CI. Recorded data carries no environment values, output, or
+argv beyond a program name and git verb. Metrics directories are run artifacts: CI uploads
+them (`test-metrics-*`) and they never go into Git.
+
+**Budgets.** Each test job has a hard `timeout-minutes` cap, and its test steps stop a few
+minutes short of it through the wrapper's deadline, so a wedged run ends as a red step with its
+metrics uploaded rather than as a cancelled job. Change a cap and its deadline arithmetic
+together (the workflow comments name both). The engineering targets for the Windows legs are
+an ordinary-suite median of at most ten minutes and a completed Windows check within fifteen,
+judged on at least three hosted samples per boundary Python version. These are targets, not
+guarantees. A red sample is recorded as a result, never rerun into a green one.
 
 ## TUI testing
 
 The TUI suite is split by what can regress, across four files:
 
-| File                   | Covers                                                                                                                                                                    | Textual required?                                                                                                                             |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `test_tui_data.py`     | The pure filesystem observation layer — data correctness, no textual involved                                                                                             | No textual — one test _enforces_ that `tui/data.py` imports none — but the file still needs the `tui` extra (`data.py` imports `pyte`/`rich`) |
-| `test_tui_launch.py`   | Exact tmux/CLI argv built by `tui.launch`, against monkeypatched subprocess (plus real-subprocess sanity checks of the captured path); module-wide `force_tmux_backend`   | No                                                                                                                                            |
-| `test_tui_app.py`      | Coarse Pilot smoke over the dashboard: mount, run-table population and auto-select, pane polling, keybinding → modal → `tui.launch` wiring (monkeypatched — no real tmux) | Yes                                                                                                                                           |
-| `test_tui_settings.py` | `PolicyDoc` edit-model semantics plus Pilot tests of the settings screen (minimal diff on save, invalid values blocked)                                                   | Yes                                                                                                                                           |
+| File                   | Covers                                                                                                                         | Textual required?                                                                       |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `test_tui_data.py`     | The pure filesystem observation layer: data correctness                                                                        | No (one test enforces that `tui/data.py` imports no textual), but needs the `tui` extra |
+| `test_tui_launch.py`   | Exact tmux/CLI argv built by `tui.launch`, against monkeypatched subprocess; module-wide `force_tmux_backend`                  | No                                                                                      |
+| `test_tui_app.py`      | Coarse Pilot smoke over the dashboard: mount, run table, pane polling, keybinding → modal → `tui.launch` wiring (no real tmux) | Yes                                                                                     |
+| `test_tui_settings.py` | `PolicyDoc` edit-model semantics plus Pilot tests of the settings screen (minimal diff on save, invalid values blocked)        | Yes                                                                                     |
 
 Doctrine:
 
@@ -371,65 +433,52 @@ Doctrine:
   argv assertions in `test_tui_launch.py`; `test_tui_app.py` proves _wiring_, coarsely, with
   the shared `until(pilot, condition)` poll helper. A fine-grained assertion inside a Pilot
   test is usually in the wrong file.
-- **Without the `tui` extra, the TUI files fail at collection with ImportError — not skip.
-  Deliberate.** The extra is a dev prerequisite (`uv sync --all-extras` in the docs and in
-  every CI job that installs the project), so an environment missing it is a broken dev setup
-  that should fail loudly, not a legitimate configuration that silently runs ~300 fewer tests
-  (the two Pilot files, and `test_tui_data.py` via its `pyte`/`rich` imports —
-  `test_cleanup.py` left that set in #650, when the run-inventory reader it
-  depends on moved to `runs.py`).
+- **Without the `tui` extra, the TUI files fail at collection with ImportError, not skip.
+  Deliberate.** The extra is a dev prerequisite (`uv sync --all-extras`), so an environment
+  missing it is a broken dev setup that should fail loudly rather than silently run hundreds
+  fewer tests.
 - **Snapshot testing is rejected, with revisit triggers.** `pytest-textual-snapshot` is
   unverified against the textual 8 line this repo pins, and every TUI gap observed so far has
-  been behavioral (data, argv, wiring, liveness gates) — exactly what snapshots do not catch,
-  while snapshot churn taxes every layout tweak. Revisit if either changes: the plugin proves
-  out on textual 8+, or a real regression escapes because it was purely visual
-  (#547's attention-pane work is the current best candidate to test that claim).
+  been behavioral (data, argv, wiring, liveness gates), which snapshots do not catch, while
+  snapshot churn taxes every layout tweak. Revisit if the plugin proves out on textual 8+, or
+  a real regression escapes because it was purely visual.
 
 ## Duplicate tests and contract parity
 
-An AST dedup sweep (name collisions plus normalized-body hashes over every test file, PR #540)
-informs this policy:
-
-- **A true duplicate is consolidated at the mirror file of the function it covers** — the one
-  the sweep found now lives beside its function, superset assertions kept.
+- **A true duplicate is consolidated at the mirror file of the function it covers**, superset
+  assertions kept.
 - **Identical names across files are otherwise deliberate contract parity.** The
   timeout-instrumentation and token-budget blocks in `test_generic_tmux.py` and
   `test_opencode_http.py` hold identically named tests over two transports: the
-  `test_generic_tmux.py` headers state the contract — _a behavior change lands in both or
-  records the divergence_ — and the `test_opencode_http.py` headers point back. A cross-link
-  must exist on both sides, because a one-way pointer rots; the layered
-  `test_envvars.py`/`test_engine.py` pair, which carries the full contract sentence in both
-  files, is the model form.
+  `test_generic_tmux.py` headers state the contract (_a behavior change lands in both or
+  records the divergence_) and the `test_opencode_http.py` headers point back. A cross-link
+  must exist on both sides, because a one-way pointer rots.
 - **Layered coverage is not duplication.** `test_envvars.py` and `test_engine.py` pin the same
-  rejection rows at two layers — "what does the parse return" vs "does the policy default
-  survive" are different claims — and each states its parity with the other.
+  rejection rows at two layers ("what does the parse return" vs "does the policy default
+  survive" are different claims), and each states its parity with the other.
+- **A local positive control stays only when no survivor already proves the success path.** A
+  "lands on a clean tree" control beside a refusal test keeps the refusal from passing for a
+  writer that refuses everything. It is kept only when no same-file test with the same setup
+  already proves the write succeeds. Otherwise the refusal test's docstring names that
+  survivor as its positive control, so the pairing stays findable from the refusal.
 - **A shared parametrized contract module is rejected as over-abstraction.** Hoisting the
-  parity blocks into one parametrized-over-transport module would hide the transport-specific
+  parity blocks into one module parametrized over transport would hide the transport-specific
   setup that is most of each test's meaning, and the divergence _note_ is the valuable
-  artifact. Identical bodies under disjoint `parametrize` sets, and one body exercised against
-  two different shipped scripts, were likewise adjudicated deliberate and left alone.
+  artifact.
 
 ## Gaps and deviations
 
-The honest register. Each row is either tracked or a documented deviation with its rationale.
+The honest register. Each row is a known gap or a documented deviation with its rationale.
 
-| Item                                                                                                                                                                                                                                                         | Status                                                                                                                                    |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `machine.py` has no mirror test file; `add_json_flag` uncovered; two contract edges unpinned                                                                                                                                                                 | #545                                                                                                                                      |
-| `checks.py`, `documents.py`, `fences.py`, `workspace.py` also lack mirror files (`checks` and `documents` being pyright-strict modules); today they are reached only from consumer suites (`test_cli.py`, the conftest harnesses, the engine/worktree files) | Known, untracked — file an issue on next touch if a regression risk surfaces that consumer coverage cannot catch                          |
-| `unity_cleanup.py` (data-shipped Unity script) has zero behavioral tests; plugin dispatch guards unpinned                                                                                                                                                    | #546 — test on next touch                                                                                                                 |
-| TUI Attention pane render path (append, truncation reset, toast) untested                                                                                                                                                                                    | #547                                                                                                                                      |
-| No `filterwarnings` posture; a new DeprecationWarning passes the matrix green                                                                                                                                                                                | #548 — `-W error` triage, then targeted config or a recorded reject here                                                                  |
-| "Legal phase transitions live only in `statemachine.py`" is comment-enforced, not guard-enforced: ~14 direct `task.phase =` writes exist outside the state machine, each with a prose ack, inline or in the enclosing docstring                              | Deviation, accepted — the writes are deliberate resets/latches; a guard would need an ack grammar the comments already provide informally |
-| Skill-drift guard is CI-inert (fork trees are gitignored, so absent in CI; the guard skips when a tree is absent)                                                                                                                                            | Documented limitation; drift is caught on dev boxes, which is where forks exist                                                           |
-| Seven older portability tripwires have no probe matrices; the tmux and SIGKILL detectors flag nothing on today's tree, so nothing grades them                                                                                                                | #549                                                                                                                                      |
-| Three dated ablation comments predate the undated house form                                                                                                                                                                                                 | Trim on next touch of `test_opencode_http.py`                                                                                             |
-
-Recently closed by the audit's remediation PRs, for context: the suite's one true duplicate
-test and its vestigial `engine.py` re-export (#540); the untested `envvars.py` registry, the
-unenforced plugin-env-family invariant, and the TUI hard-stop/archive paths (#541, which also
-removed the unused retry plugin and fixed the `inf` session-timeout override it found); CI's
-unlinted workflows and untested packaging (#543).
+| Item                                                                                                                                                                                    | Status                                                                                           |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `machine.py` has no mirror test file                                                                                                                                                    | Known gap                                                                                        |
+| `checks.py`, `documents.py`, `fences.py`, `workspace.py` lack mirror files and are reached only from consumer suites (`test_cli.py`, the conftest harnesses, the engine/worktree files) | Known gap; add a mirror file when a regression risk surfaces that consumer coverage cannot catch |
+| `unity_cleanup.py` (data-shipped Unity script) has no behavioral tests                                                                                                                  | Known gap; test on next touch                                                                    |
+| TUI Attention pane render path (append, truncation reset, toast) is untested                                                                                                            | Known gap                                                                                        |
+| "Legal phase transitions live only in `statemachine.py`" is comment-enforced, not guard-enforced: direct `task.phase =` writes outside the state machine each carry a prose ack         | Deviation, accepted: the writes are deliberate resets and latches                                |
+| Skill-drift guard is CI-inert (fork trees are gitignored, so absent in CI)                                                                                                              | Documented limitation; drift is caught on dev boxes, where forks exist                           |
+| Three dated ablation comments in `test_opencode_http.py` predate the undated house form                                                                                                 | Trim on next touch                                                                               |
 
 ## Policy quick-reference and doc-sync rules
 
@@ -439,28 +488,27 @@ The rules a reviewer actually enforces, in one place:
    only.
 2. New behavior lands at the lowest layer that catches its regression; mirror-file rule for
    placement.
-3. Negative assertion ⇒ ablation, singly, against a `cp` backup; record the undated
-   `Ablation:`/`Ablation target:` sentence in-file, the run evidence in the commit message.
-4. Time-dependent test ⇒ frozen clock. No sleeps toward deadlines, no retries, ever. A flake
-   gets an issue.
+3. Negative assertion ⇒ premise before outcome, and ablation, singly, against a `cp` backup;
+   record the undated `Ablation:`/`Ablation target:` sentence in-file, the run evidence in the
+   commit message.
+4. Time-dependent test ⇒ frozen clock. No sleeps toward deadlines, no retries, ever. A flake is
+   diagnosed and fixed deterministically.
 5. In-process `--json` test expecting a document on stdout ⇒ `machine_json` (whole-stdout
-   parse is the purity assertion); error paths that owe an **empty** stdout and `--json
---out` runs that validate the written file sit outside it. Process-boundary tests —
-   `test_entry_point.py`, and `test_stories_e2e.py` where it runs `validate --json` —
-   spawn a real subprocess and parse its whole stdout themselves; the subprocess _is_ the
-   test, so never convert one to `cli.main`.
+   parse is the purity assertion). Error paths that owe an **empty** stdout, and `--json --out`
+   runs that validate the written file, sit outside it. Process-boundary tests
+   (`test_entry_point.py`, and `test_stories_e2e.py` where it runs `validate --json`) spawn a
+   real subprocess and parse its whole stdout themselves; never convert one to `cli.main`.
 6. Sandbox test ⇒ `project` fixture; never hand-roll a repo, never touch the template.
 7. Cross-transport/cross-layer twins keep identical names and two-way header cross-links.
 8. Guard finding ⇒ fix the source; allowlist widening is a reviewed exception with a scoped,
-   acknowledged entry — and a new detector shape gets its probe row first.
+   acknowledged entry, and a new detector shape gets its probe row first.
 9. New policy field ⇒ `core.toml` entry (the schema-sync guard will insist). New check id ⇒
    `VALIDATE_CHECKS`. New env var ⇒ `envvars.py` or the plugin's own family.
 10. Suite invariants that break silently are AGENTS.md material; everything else about testing
     belongs here.
 
-Doc-sync: **edit this file first.** AGENTS.md's Testing section stays terse — a bullet changes
-there only when the underlying rule changes, and it links here (one Testing bullet plus a
-docs-index row) rather than duplicating.
+Doc-sync: **edit this file first.** AGENTS.md's Testing section stays terse: a bullet changes
+there only when the underlying rule changes, and it links here rather than duplicating.
 CONTRIBUTING.md points contributors here from its Tests bullet. Behavior docs
 ([FEATURES.md](FEATURES.md)) never carry testing policy. When a gap in the register closes,
 delete its row in the same PR.

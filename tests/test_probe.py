@@ -5,13 +5,23 @@ import json
 import re
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 import pytest
-from conftest import machine_json, needs_strict_codec, write_script_launcher
+from conftest import (
+    machine_json,
+    needs_strict_codec,
+    read_pid,
+    wait_pid_gone,
+    write_script_launcher,
+)
+from test_childrun import _RETURN_CEILING_S
 from test_probe_hook import run_hook
 
-from bmad_loop import cli, probe, sanitize
+from bmad_loop import childrun, cli, probe, sanitize
 from bmad_loop.adapters.profile import get_profile
+from bmad_loop.process_host import ProcessHostError
 
 # ----------------------------------------------------------- fixtures / helpers
 
@@ -109,8 +119,8 @@ def test_infer_with_parser_none_still_finds_candidates(tmp_path):
 
 
 # Captured from a live agy 1.1.3 turn (probe-adapter antigravity --probe). Shape
-# pinned deliberately: agy's transcript carries NO usage block, which is why the
-# profile's usage_parser is "none" permanently rather than pending a parser.
+# pinned deliberately: agy 1.1.3's transcript carries no usage, so a 1.1.3
+# session reads as untracked under the antigravity-transcript parser.
 ANTIGRAVITY_ROWS = [
     {
         "step_index": 0,
@@ -130,19 +140,52 @@ ANTIGRAVITY_ROWS = [
         "thinking": "**Processing User Request**",
     },
 ]
+# The sanitized agy 1.4.9 parent transcript (tests/test_tokens.py pins the
+# parser on the whole tree, subagent included).
+ANTIGRAVITY_149_PARENT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "antigravity-1.4.9"
+    / "brain"
+    / "d0000000-0000-4000-8000-000000000001"
+    / ".system_generated"
+    / "logs"
+    / "transcript_full.jsonl"
+)
 
 
 def test_infer_antigravity_transcript_has_no_token_fields(tmp_path):
-    """agy exposes no usage in its transcript — the evidence for usage_parser="none".
-
-    If this ever starts finding candidates, agy began emitting usage and the
-    profile should be revisited (see antigravity.toml).
-    """
+    """agy 1.1.3 exposes no usage in its transcript: no candidates, and the
+    profile's parser reads it as untracked."""
     path = _write_jsonl(tmp_path / "transcript_full.jsonl", ANTIGRAVITY_ROWS)
-    schema = probe.infer_token_schema("none", path)
+    schema = probe.infer_token_schema(get_profile("antigravity").usage_parser, path)
     assert schema.entries_scanned == 2
     assert schema.token_field_candidates == []
+    assert schema.parsed_usage is None
     assert "step_index:int" in schema.key_paths
+
+
+def test_infer_antigravity_149_transcript_self_check():
+    """agy 1.4.9 writes per-step counts, and the packaged profile's parser reads
+    them back as the probe's self-check."""
+    parser = get_profile("antigravity").usage_parser
+    assert parser == "antigravity-transcript"
+    schema = probe.infer_token_schema(parser, ANTIGRAVITY_149_PARENT)
+    assert schema.parser == "antigravity-transcript"
+    assert schema.entries_scanned == 6
+    for key in ("input_tokens:int", "cache_read_tokens:int", "output_tokens:int"):
+        assert key in schema.token_field_candidates
+    # the parent's own steps plus its fixture subagent's
+    assert schema.parsed_usage == {
+        "input_tokens": 25760,
+        "output_tokens": 627,
+        "cache_read_tokens": 26131,
+        "cache_creation_tokens": 0,
+    }
+
+
+def test_antigravity_convention_glob_names_the_transcript():
+    assert probe.TRANSCRIPT_GLOBS["antigravity-transcript"] == probe.FAMILY_GLOBS["antigravity"]
 
 
 # ----------------------------------------------------------- discovery
@@ -204,6 +247,91 @@ def test_discover_location_redacts_username(tmp_path, monkeypatch):
     assert "abc-123.jsonl" in found.location  # the id-like filename survives
 
 
+def _codex_homes(tmp_path, monkeypatch):
+    """A user home and a separate CODEX_HOME, each holding one codex rollout.
+
+    HOME and USERPROFILE both move: `tokens.codex_home` and os.path.expanduser
+    read HOME on POSIX but USERPROFILE on Windows."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    day = Path("sessions", "2026", "10", "12")
+    default = _write_jsonl(home / ".codex" / day / "rollout-default.jsonl", CODEX_ROWS)
+    relocated = _write_jsonl(tmp_path / "codex-home" / day / "rollout-relocated.jsonl", CODEX_ROWS)
+    return default, relocated
+
+
+def test_discover_codex_rollout_honours_codex_home(tmp_path, monkeypatch):
+    """The probe searches the codex root live sessions tally from (DW-546).
+
+    Ablation: replace `_convention_glob`'s codex routing with the plain
+    `os.path.expanduser(pattern)` and this fails. The `~/.codex` decoy is then
+    the only match."""
+    _default, relocated = _codex_homes(tmp_path, monkeypatch)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    # The usage-parser glob and the family fallback both route through it.
+    for parser in ("codex-rollout", "none"):
+        found = probe.discover_transcript(parser, cli="codex", hints=probe.Hints())
+        assert found.real_path == relocated
+        assert found.multiple is False
+        # The display names the variable, never the configured path.
+        assert found.glob == "$CODEX_HOME/sessions/*/*/*/rollout-*.jsonl"
+
+
+@pytest.mark.parametrize("codex_home", [None, ""], ids=["unset", "empty"])
+def test_discover_codex_rollout_defaults_to_home(tmp_path, monkeypatch, codex_home):
+    default, _relocated = _codex_homes(tmp_path, monkeypatch)
+    if codex_home is None:
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+    else:
+        monkeypatch.setenv("CODEX_HOME", codex_home)
+    found = probe.discover_transcript("codex-rollout", cli="codex", hints=probe.Hints())
+    assert found.real_path == default
+    assert found.glob == "~/.codex/sessions/*/*/*/rollout-*.jsonl"
+
+
+def test_discover_codex_rollout_matches_root_literally(tmp_path, monkeypatch):
+    """A CODEX_HOME holding glob metacharacters is a path, not a pattern."""
+    _codex_homes(tmp_path, monkeypatch)
+    root = tmp_path / "codex[x]"
+    rollout = _write_jsonl(root / "sessions" / "2026" / "10" / "12" / "rollout-a.jsonl", CODEX_ROWS)
+    monkeypatch.setenv("CODEX_HOME", str(root))
+    found = probe.discover_transcript("codex-rollout", cli="codex", hints=probe.Hints())
+    assert found.real_path == rollout
+
+
+def test_discover_codex_rollout_without_a_root_notes(tmp_path, monkeypatch):
+    _codex_homes(tmp_path, monkeypatch)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(probe, "codex_home", lambda _env: None)
+    found = probe.discover_transcript("codex-rollout", cli="codex", hints=probe.Hints())
+    assert found.real_path is None
+    assert "no existing transcript matched" in found.note
+    assert found.glob == "~/.codex/sessions/*/*/*/rollout-*.jsonl"
+
+
+def test_scan_codex_rollout_honours_profile_codex_home(tmp_path, monkeypatch):
+    """A profile env's CODEX_HOME relocates the scan's search, as it does the
+    live tally's (`{**os.environ, **profile.env}`)."""
+    from dataclasses import replace
+
+    from bmad_loop import codex_trust
+
+    _default, relocated = _codex_homes(tmp_path, monkeypatch)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(probe, "run_version_help", lambda binary: probe.FlagFinding(binary, True))
+    monkeypatch.setattr(
+        codex_trust,
+        "project_hook_trust",
+        lambda *_a, **_k: codex_trust.TrustResult("trusted", ""),
+    )
+    profile = replace(get_profile("codex"), env={"CODEX_HOME": str(tmp_path / "codex-home")})
+    finding = probe.scan(cli="codex", profile=profile, project=tmp_path, hints=probe.Hints())
+    assert finding.transcript is not None
+    assert finding.transcript.real_path == relocated
+    assert finding.transcript.glob == "$CODEX_HOME/sessions/*/*/*/rollout-*.jsonl"
+
+
 # ----------------------------------------------------------- registration
 
 
@@ -244,12 +372,94 @@ def test_scan_reports_registered_state(project, cli):
     profile = get_profile(cli)
     finding = probe.scan(cli=cli, profile=profile, project=proj, hints=probe.Hints())
     assert finding.registered is False  # nothing installed in the sandbox
+    # the next step states the project-only contract and the fix
+    hook_steps = [s for s in finding.next_steps if "hooks not registered" in s]
+    assert len(hook_steps) == 1
+    assert f"project hook config {profile.hooks.config_path}" in hook_steps[0]
+    assert "user- or local-scope settings, managed policy or plugin hooks" in hook_steps[0]
+    assert f"`bmad-loop init --cli {cli}` against this project registers" in hook_steps[0]
     # now install hooks and re-scan
     from bmad_loop.install import install_into
 
     install_into(proj, clis=(cli,))
     finding2 = probe.scan(cli=cli, profile=profile, project=proj, hints=probe.Hints())
     assert finding2.registered is True
+    assert not any("hooks not registered" in s for s in finding2.next_steps)
+
+
+def _break_hook_config(proj: Path, cli: str, fault: str, monkeypatch) -> None:
+    """Leave the project hook config for `cli` in the named broken state."""
+    from bmad_loop.install import install_into
+
+    profile = get_profile(cli)
+    config = proj / profile.hooks.config_path
+    if fault == "malformed":
+        # a valid installed Stop relay beside a dict-valued SessionStart:
+        # relay_registered alone reads it registered
+        install_into(proj, clis=(cli,))
+        data = json.loads(config.read_text(encoding="utf-8"))
+        data["hooks"]["SessionStart"] = {}
+        config.write_text(json.dumps(data), encoding="utf-8")
+        return
+    config.parent.mkdir(parents=True, exist_ok=True)
+    if fault == "invalid-json":
+        config.write_text("{not json", encoding="utf-8")
+    elif fault == "non-object":
+        config.write_text("[]", encoding="utf-8")
+    else:
+        assert fault == "unreadable"
+        install_into(proj, clis=(cli,))
+        real_read_text = Path.read_text
+
+        def read_text(self, *args, **kwargs):
+            if self == config:
+                raise PermissionError(13, "Permission denied")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read_text)
+
+
+@pytest.mark.parametrize(
+    ("cli", "fault", "expected"),
+    [
+        ("claude", "invalid-json", "is not valid JSON"),
+        ("antigravity", "invalid-json", "is not valid JSON"),
+        ("claude", "non-object", "is not a JSON object"),
+        ("antigravity", "non-object", "is not a JSON object"),
+        ("claude", "malformed", "has malformed handlers for SessionStart"),
+        ("claude", "unreadable", "could not be read (PermissionError)"),
+    ],
+)
+def test_scan_reports_hook_config_fault(project, monkeypatch, cli, fault, expected):
+    """A broken project hook config is a config fault with its own next step, not
+    an unregistered relay blamed on user- or local-scope settings (DW-648)."""
+    proj = project.project
+    profile = get_profile(cli)
+    _break_hook_config(proj, cli, fault, monkeypatch)
+    finding = probe.scan(cli=cli, profile=profile, project=proj, hints=probe.Hints())
+    assert finding.registered is False
+    fault_text = f"{profile.hooks.config_path} {expected}"
+    warnings = [w for w in finding.warnings if "project hook config" in w]
+    assert warnings == [f"project hook config {fault_text}"]
+    steps = [s for s in finding.next_steps if "project hook config" in s]
+    assert len(steps) == 1
+    assert steps[0].startswith(f"fix the project hook config: {fault_text}; ")
+    assert f"`bmad-loop init --cli {cli}` against this project registers" in steps[0]
+    assert not any("hooks not registered" in s for s in finding.next_steps)
+    assert not any("user- or local-scope" in s for s in finding.next_steps)
+    for text in (*warnings, *steps):
+        assert str(proj) not in text
+
+
+def test_scan_missing_hook_config_has_no_fault_warning(project):
+    proj = project.project
+    profile = get_profile("claude")
+    assert not (proj / profile.hooks.config_path).exists()
+    finding = probe.scan(cli="claude", profile=profile, project=proj, hints=probe.Hints())
+    assert finding.registered is False
+    assert not any("project hook config" in w for w in finding.warnings)
+    assert not any(s.startswith("fix the project hook config") for s in finding.next_steps)
+    assert len([s for s in finding.next_steps if "hooks not registered" in s]) == 1
 
 
 # ----------------------------------------------------------- CLI plumbing
@@ -806,7 +1016,11 @@ def test_binary_runs_returns_the_exit_code_of_a_real_child(tmp_path, exit_code):
     of this function is that a process actually launched and exited, and a mock
     proves nothing about that.
     """
-    launcher = write_script_launcher(tmp_path, "shim", f"import sys\nsys.exit({exit_code})\n")
+    # A spaced directory: the argv reaches the launcher as one element, never as a
+    # shell string that the space would split.
+    shim_dir = tmp_path / "shim dir"
+    shim_dir.mkdir()
+    launcher = write_script_launcher(shim_dir, "shim", f"import sys\nsys.exit({exit_code})\n")
 
     assert probe.binary_runs(str(launcher), timeout_s=30) == exit_code
 
@@ -830,63 +1044,138 @@ def test_binary_runs_returns_none_when_the_process_cannot_be_launched(tmp_path):
     assert probe.binary_runs(str(missing), timeout_s=30) is None
 
 
-def test_binary_runs_returns_none_when_the_child_outlives_the_timeout(tmp_path):
-    """A child that never exits is killed at `timeout_s` and reported as None.
-
-    TimeoutExpired is a `subprocess.SubprocessError`, not an OSError, so this row is
-    what proves the guard names BOTH families — a hang is the failure mode of a shim
-    that prompts, which is exactly the shape `stdin=DEVNULL` exists to avoid.
-
-    Ablation target: narrow the guard to `except OSError` and this reddens with a
-    raised subprocess.TimeoutExpired.
-    """
-    launcher = write_script_launcher(tmp_path, "hang", "import time\ntime.sleep(120)\n")
-
-    assert probe.binary_runs(str(launcher), timeout_s=0.5) is None
+def _write_posix_wrapper(directory: Path, name: str, body: str) -> Path:
+    """A POSIX launcher that does NOT exec: sh stays the root and the program is
+    its child — the topology a Windows `.cmd` launcher always has (cmd.exe root),
+    reproduced where CI can show it on every host."""
+    sidecar = directory / f"{name}.py"
+    sidecar.write_text(body, encoding="utf-8")
+    launcher = directory / name
+    launcher.write_text(f'#!/bin/sh\n"{sys.executable}" "{sidecar}" "$@"\n', encoding="utf-8")
+    launcher.chmod(0o755)
+    return launcher
 
 
-def test_binary_runs_pins_devnull_stdin_and_the_caller_timeout():
-    """The one contract row over the call itself: argv is `<binary> --version`, stdin
-    is DEVNULL, the caller's timeout is honored, and a nonzero exit is data rather
-    than an exception (`check=False`).
+_HANG_BODY = (
+    "import os, sys, time\n"
+    "with open(os.environ['BMAD_TEST_PID_FILE'], 'w') as fh:\n"
+    "    fh.write(str(os.getpid()))\n"
+    "time.sleep(120)\n"
+)
 
-    `stdin=DEVNULL` is required, not cosmetic: with the caller's tty inherited a shim
-    that prompts blocks on the read for the entire timeout (measured 4.00s against
-    0.00s), inside an interactive command. Nothing else observes it — the real-child
-    rows above pass either way — so it is pinned here or not at all.
 
-    Asserted as a SUBSET of the recorded kwargs, never dict equality: a future kwarg
-    (`env`, `cwd`, ...) is additive, and equality would turn every such addition into
-    a multi-row breakage in this file.
+@pytest.mark.parametrize(
+    "topology",
+    [
+        # win32: a real `.cmd` — cmd.exe root, the python program its child, the
+        # shape that made a 0.5 s timeout take 120 s. POSIX: an exec'ing launcher,
+        # so the root is the native interpreter itself.
+        "host-launcher",
+        pytest.param(
+            "sh-wrapper",
+            marks=pytest.mark.skipif(sys.platform == "win32", reason="a /bin/sh launcher"),
+        ),
+    ],
+)
+def test_binary_runs_returns_none_when_the_child_outlives_the_timeout(
+    tmp_path, monkeypatch, reap_leftovers, topology
+):
+    """A child that never exits is killed at `timeout_s` and reported as None —
+    promptly, and with the program behind the launcher dead.
 
-    Ablation target: drop `stdin=subprocess.DEVNULL` from `probe.binary_runs` and the
-    stdin assertion reddens with a KeyError. `check=False` is the stdlib default, so
-    dropping it reddens only this row (KeyError) and nothing else — it is pinned as
-    intent against a future flip to `check=True`, which is the mutation that bites:
-    that turns every nonzero exit into a CalledProcessError, a SubprocessError the
-    guard swallows into None, reddening both real-child rows above as well.
-    """
+    The program records its pid first (startup proof: without it a launcher that
+    failed to start would pass as a "timeout"). The return is bounded by the
+    timeout plus the runner's kill/drain allowance (`_RETURN_CEILING_S`, the one
+    tests/test_childrun.py holds), while the child would sleep 120 s. Under
+    `subprocess.run` only the launcher root was killed: on win32 `run` then
+    waited on the pipes until the orphaned program exited by itself (the
+    observed 120 s); on POSIX it waits for the root alone, so it returned on time
+    and left the program running. The 120 s lifetime is the defect's witness and
+    must not be shortened. The pid goes to `reap_leftovers`
+    before any assertion, so a red row leaves no sleeper behind.
+
+    The timeout is 2 s, not the 0.5 s of old, so the program provably starts
+    before it fires on a slow Windows runner; that the caller's timeout reaches
+    the runner exactly is pinned by the seam row below.
+
+    Ablation target: route `binary_runs` back through `subprocess.run(...,
+    capture_output=True, timeout=timeout_s)` and the sh-wrapper row reddens with
+    the program still alive; the win32 `.cmd` row also blows the elapsed bound."""
+    pid_file = tmp_path / "program.pid"
+    monkeypatch.setenv("BMAD_TEST_PID_FILE", str(pid_file))
+    launcher_dir = tmp_path / "hang dir"
+    launcher_dir.mkdir()
+    if topology == "sh-wrapper":
+        launcher = _write_posix_wrapper(launcher_dir, "hang", _HANG_BODY)
+    else:
+        launcher = write_script_launcher(launcher_dir, "hang", _HANG_BODY)
+
+    timeout_s = 2.0
+    started = time.monotonic()
+    try:
+        rc = probe.binary_runs(str(launcher), timeout_s=timeout_s)
+        elapsed = time.monotonic() - started
+    finally:
+        program = read_pid(pid_file)
+        if program is not None:
+            reap_leftovers.append(program)
+
+    assert program is not None, "the program behind the launcher never started"
+    assert rc is None
+    assert elapsed < timeout_s + _RETURN_CEILING_S, f"returned after {elapsed:.2f}s"
+    assert wait_pid_gone(program), f"program {program} outlived the probe's timeout"
+
+
+@pytest.mark.parametrize(
+    ("run", "expected"),
+    [
+        (childrun.ChildRun(0, "", ""), 0),
+        (childrun.ChildRun(5, "", "boom"), 5),
+        (childrun.ChildRun(1, "", "", timed_out=True), None),
+        (childrun.ChildRun(None, "", "", interrupted=True), None),
+        (childrun.ChildRun(None, "", ""), None),
+    ],
+    ids=["rc-0", "rc-5", "timed-out", "interrupted", "unreaped"],
+)
+def test_binary_runs_pins_the_argv_the_caller_timeout_and_the_verdict(monkeypatch, run, expected):
+    """The contract row over the call itself: argv is exactly `[binary,
+    "--version"]` (a list — `run_argv` spawns it with no shell and stdin DEVNULL,
+    pinned in tests/test_childrun.py), the caller's timeout reaches the runner
+    exactly, no cwd/env is added, and the verdict maps the runner's outcome: a
+    return code passes through, a timeout or pre-spawn interrupt is None ("there
+    is no return code to report"), never the killed root's code.
+
+    Ablation target: return `run.returncode` without the `timed_out`/`interrupted`
+    check and the timed-out row reports the killed root's 1."""
     recorded: dict = {}
 
-    def fake_run(argv, **kwargs):
-        recorded["argv"] = argv
-        recorded["kwargs"] = kwargs
-        return subprocess.CompletedProcess(argv, 0)
+    def fake_run_argv(argv, **kwargs):
+        recorded["argv"], recorded["kwargs"] = argv, kwargs
+        return run
 
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(probe.subprocess, "run", fake_run)
-        assert probe.binary_runs("some-cli", timeout_s=3.5) == 0
+    monkeypatch.setattr(probe.childrun, "run_argv", fake_run_argv)
+    assert probe.binary_runs("some cli", timeout_s=3.5) == expected
+    assert recorded["argv"] == ["some cli", "--version"]
+    assert recorded["kwargs"] == {"cwd": None, "timeout": 3.5}
 
-    assert recorded["argv"] == ["some-cli", "--version"]
-    kwargs = recorded["kwargs"]
-    assert kwargs["stdin"] is subprocess.DEVNULL
-    assert kwargs["timeout"] == 3.5
-    assert kwargs["check"] is False
-    assert kwargs["capture_output"] is True
-    # No `text=True`: nothing reads the output, so the locale decode that forced
-    # `errors="replace"` onto `_run_capture` (#383) never happens here and cannot
-    # raise the UnicodeDecodeError the guard above does not name.
-    assert kwargs.get("text") is None
+
+@pytest.mark.parametrize(
+    "fault",
+    [OSError("spawn"), subprocess.SubprocessError("x"), ProcessHostError("bogus host")],
+    ids=["os-error", "subprocess-error", "process-host-error"],
+)
+def test_binary_runs_never_raises_what_the_runner_raises(monkeypatch, fault):
+    """`binary_runs` never raises (cmd_validate has no error path of its own): the
+    guard names the spawn families plus `ProcessHostError`, which the tree kill
+    raises for a bogus `BMAD_LOOP_PROCESS_HOST` override.
+
+    Ablation target: drop `ProcessHostError` from the guard and its row raises."""
+
+    def raising(*_a, **_kw):
+        raise fault
+
+    monkeypatch.setattr(probe.childrun, "run_argv", raising)
+    assert probe.binary_runs("some-cli", timeout_s=1) is None
 
 
 def test_probe_launcher_pins_the_window_to_this_state_root(tmp_path, monkeypatch):
@@ -946,3 +1235,136 @@ def test_probe_launcher_pins_the_window_to_this_state_root(tmp_path, monkeypatch
         tmp_path / "log.txt",
     )
     assert mux.window_env == {"CALLER": "1"}
+
+
+# ------------------------------------------------ --workspace (DW-390)
+
+
+@pytest.fixture
+def agy_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    settings = home / ".gemini" / "antigravity-cli" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    return settings
+
+
+def _agy_workspace(tmp_path):
+    ws = (tmp_path / "proj" / "wt-1").resolve()
+    ws.mkdir(parents=True)
+    return ws
+
+
+def _probe_ws(tmp_path, ws, *extra):
+    project = tmp_path / "proj"
+    return [
+        "probe-adapter",
+        "antigravity",
+        "--project",
+        str(project),
+        "--workspace",
+        str(ws),
+        *extra,
+    ]
+
+
+def test_cli_workspace_trusted_exits_zero(tmp_path, capsys, agy_home):
+    ws = _agy_workspace(tmp_path)
+    agy_home.write_text(json.dumps({"trustedWorkspaces": [str(ws)]}), encoding="utf-8")
+
+    rc = cli.main(_probe_ws(tmp_path, ws))
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "- **workspace trust:** trusted" in out
+    assert str(ws) not in out
+
+
+@pytest.mark.parametrize("state", ["absent", "file-missing"])
+def test_cli_workspace_untrusted_exits_one_with_next_step(tmp_path, capsys, agy_home, state):
+    ws = _agy_workspace(tmp_path)
+    if state == "absent":
+        agy_home.write_text(json.dumps({"trustedWorkspaces": ["/elsewhere"]}), encoding="utf-8")
+
+    rc = cli.main(_probe_ws(tmp_path, ws))
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "- **workspace trust:** untrusted" in out
+    assert "workspace trust untrusted for the requested workspace" in out
+    assert "Run `agy` in the project root and trust it" in out
+    assert str(ws) not in out
+    if state == "file-missing":
+        assert not agy_home.exists()  # read-only
+
+
+def test_cli_workspace_malformed_is_unverifiable(tmp_path, capsys, agy_home):
+    ws = _agy_workspace(tmp_path)
+    agy_home.write_text("{broken", encoding="utf-8")
+
+    rc = cli.main(_probe_ws(tmp_path, ws))
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "- **workspace trust:** unverifiable" in out
+    assert agy_home.read_text(encoding="utf-8") == "{broken"
+
+
+@pytest.mark.parametrize(
+    ("argv_cli", "detail"),
+    [
+        (["claude"], "profile 'claude' declares none"),
+        (["no-such-cli", "--binary", "true"], "no loadable profile for 'no-such-cli'"),
+    ],
+    ids=["no-decl", "unknown"],
+)
+def test_cli_workspace_without_declaration_fails(tmp_path, capsys, argv_cli, detail):
+    rc = cli.main(
+        ["probe-adapter", *argv_cli, "--project", str(tmp_path), "--workspace", str(tmp_path)]
+    )
+    out, err = capsys.readouterr()
+    assert rc == 1
+    assert out == ""
+    assert "FAIL:" in err and "[workspace_trust]" in err
+    assert detail in err
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+def test_cli_workspace_json_carries_the_verdict(tmp_path, capsys, agy_home, trusted):
+    ws = _agy_workspace(tmp_path)
+    listed = [str(ws)] if trusted else []
+    agy_home.write_text(json.dumps({"trustedWorkspaces": listed}), encoding="utf-8")
+
+    doc = machine_json(
+        _probe_ws(tmp_path, ws, "--json"),
+        capsys,
+        rc=0 if trusted else 1,
+        err_contains="ok:" if trusted else "FAIL:",
+    )
+
+    assert doc["workspace_trust"] == ("trusted" if trusted else "untrusted")
+    assert doc["schema_version"] == probe.SCHEMA_VERSION
+    assert str(ws) not in json.dumps(doc)
+
+
+def test_cli_json_without_workspace_reports_null(tmp_path, capsys):
+    doc = machine_json(
+        ["probe-adapter", "antigravity", "--project", str(tmp_path), "--json"],
+        capsys,
+        err_contains="ok:",
+    )
+    assert doc["workspace_trust"] is None
+
+
+def test_probe_argv_carries_codex_launch_args(monkeypatch):
+    """probe-adapter launches Codex as a session would: the shipped
+    `--no-daemon` launch arg sits right after the binary, ahead of the prompt."""
+    from bmad_loop import codex_trust
+
+    monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_: "/bin/codex")
+    argv = probe._probe_argv(get_profile("codex"), "codex", probe.Hints())
+    assert argv[:2] == ["/bin/codex", "--no-daemon"]
+    assert argv[2] == probe.PROBE_PROMPT
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv[3:]

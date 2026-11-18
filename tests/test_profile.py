@@ -1,5 +1,10 @@
+import dataclasses
+import json
+import operator
+import re
+import tomllib
 from importlib import resources
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 from conftest import fault_read_text
@@ -8,10 +13,14 @@ from bmad_loop.adapters import profile as profile_mod
 from bmad_loop.adapters.profile import (
     CLIProfile,
     HookSpec,
+    ParkedAnswersSpec,
+    PermissionModeSpec,
     ProfileError,
     get_profile,
     load_profiles,
+    parse_cli_version,
 )
+from bmad_loop.skill_locate import UserSkillRoot, UserSkillsSpec
 
 MINIMAL_PROFILE = """
 name = "mycli"
@@ -39,6 +48,8 @@ def test_builtin_profiles_load():
     assert {"claude", "codex", "gemini", "cursor", "opencode-http"} <= set(profiles)
     assert profiles["claude"].usage_parser == "claude-jsonl"
     assert profiles["codex"].hooks.dialect == "codex-hooks-json"
+    # tools and hooks run in the client, not a shared app-server daemon (#901)
+    assert profiles["codex"].launch_args == ("--no-daemon",)
     assert "SessionEnd" not in profiles["codex"].hooks.events  # codex has no such hook
     assert profiles["gemini"].hooks.events["AfterAgent"] == "Stop"
     assert profiles["gemini"].launch_args == ("-i",)
@@ -77,6 +88,15 @@ def test_builtin_profiles_load():
         "sessionEnd": "SessionEnd",
     }
     assert profiles["copilot"].usage_parser == "copilot-events"
+    # agy 1.4.9 writes per-step counts into its transcript
+    assert profiles["antigravity"].usage_parser == "antigravity-transcript"
+    # copilot confirms tool calls, file paths and URL fetches separately; an
+    # unattended session needs all three bypassed, or a URL fetch parks it
+    assert profiles["copilot"].bypass_args == (
+        "--allow-all-tools",
+        "--allow-all-paths",
+        "--allow-all-urls",
+    )
     # copilot writes token totals only on shutdown (poll grace) and fires
     # agentStop per turn (multi-turn reviews need more nudges)
     assert profiles["copilot"].usage_grace_s == 8.0
@@ -102,18 +122,18 @@ def test_builtin_profiles_load():
         assert "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" not in profiles[name].env
     # transport/provider fault classification (#194): only the two profiles with
     # captured real-world error output seed patterns — claude (three
-    # capture-anchored patterns, reproducing only COMPLETE Claude Code error
-    # sentences: the "Unable to connect to API" connection failure and the
-    # provider 5xx pair; still no quota cause, since no captured Claude Code
-    # usage-limit line exists) and opencode-http (the serve process's
-    # `error.error="AI_APICallError: …"` field). The other four stay inert on
+    # capture-anchored patterns, each a prefix match on the whole FIRST sentence
+    # of a captured Claude Code error: the "Unable to connect to API" connection
+    # failure and the provider 5xx pair; still no quota cause, since no captured
+    # Claude Code usage-limit line exists) and opencode-http (the serve process's
+    # `error.error="AI_APICallError: …"` field). The other five stay inert on
     # purpose: patterns for them could only be written from strings scraped off
     # public issue trackers, and an unverified pattern that fires on a healthy
     # session pauses the whole run. Precision is asserted in
     # tests/test_env_fault_patterns.py; here we only pin which profiles are seeded.
     for name in ("claude", "opencode-http"):
         assert profiles[name].env_fault_patterns, f"{name} ships no env_fault_patterns"
-    for name in ("codex", "gemini", "copilot", "antigravity"):
+    for name in ("codex", "gemini", "copilot", "cursor", "antigravity"):
         assert profiles[name].env_fault_patterns == ()
     # opencode-http is hookless (HTTP/SSE transport): no hook dialect surfaces,
     # skills read from the claude tree, usage comes over HTTP (no transcript parser)
@@ -130,31 +150,42 @@ def test_builtin_profiles_load():
         assert profiles[name].hookless is False
 
 
-def test_usage_grace_and_nudges_default_when_unset(tmp_path):
-    # MINIMAL_PROFILE omits both -> 0.0 / None
+_MINIMAL_PROFILE_DEFAULTS = [
+    ("usage_grace_s", 0.0),
+    ("stop_without_result_nudges", None),
+    ("subagent_stop_without_transcript", False),
+    ("seed_files", ()),
+    # classification inert
+    ("env_fault_patterns", ()),
+    # parked-signal fields: both inert (DW-348/DW-350)
+    ("hooks.notification_types", {}),
+    ("hooks.stop_failure_types", {}),
+    ("parked_prompt_patterns", ()),
+    # usage fields: both inert (#610)
+    ("usage_limit_patterns", ()),
+    ("usage_wait_patterns", ()),
+    # the overlay parse-time default, separate from the dataclass default
+    ("skill_tree", ".claude/skills"),
+]
+
+
+@pytest.mark.parametrize(
+    "field,expected",
+    _MINIMAL_PROFILE_DEFAULTS,
+    ids=[field for field, _ in _MINIMAL_PROFILE_DEFAULTS],
+)
+def test_minimal_profile_field_defaults(tmp_path, field, expected):
+    """MINIMAL_PROFILE, loaded as a user overlay, declares none of these fields, so
+    each takes its default. One row per field, so one wrong default never hides
+    another."""
     profiles_dir = tmp_path / ".bmad-loop" / "profiles"
     profiles_dir.mkdir(parents=True)
-    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE, encoding="utf-8")
     prof = load_profiles(tmp_path)["mycli"]
-    assert prof.usage_grace_s == 0.0
-    assert prof.stop_without_result_nudges is None
-    assert prof.subagent_stop_without_transcript is False
-
-
-def test_seed_files_default_empty_when_unset(tmp_path):
-    # MINIMAL_PROFILE omits seed_files -> defaults to ()
-    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
-    profiles_dir.mkdir(parents=True)
-    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
-    assert load_profiles(tmp_path)["mycli"].seed_files == ()
-
-
-def test_env_fault_patterns_default_empty_when_unset(tmp_path):
-    # MINIMAL_PROFILE omits env_fault_patterns -> defaults to () (classification inert)
-    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
-    profiles_dir.mkdir(parents=True)
-    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
-    assert load_profiles(tmp_path)["mycli"].env_fault_patterns == ()
+    got = operator.attrgetter(field)(prof)
+    assert got == expected
+    if expected is None or isinstance(expected, bool):
+        assert got is expected
 
 
 def test_env_fault_patterns_parse_from_overlay(tmp_path):
@@ -172,9 +203,626 @@ def test_env_fault_patterns_parse_from_overlay(tmp_path):
     assert prof.env_fault_patterns == ("API Error.*refused", "socket hang up")
 
 
-def test_skill_tree_defaults_when_unset():
-    # MINIMAL_PROFILE omits skill_tree -> defaults to .claude/skills
-    assert get_profile("claude").skill_tree == ".claude/skills"
+@pytest.mark.parametrize(
+    "field",
+    [
+        "env_fault_patterns",
+        "parked_prompt_patterns",
+        "usage_limit_patterns",
+        "usage_wait_patterns",
+        "auto_deny_patterns",
+    ],
+)
+def test_deeply_nested_pattern_is_a_profile_error_not_a_bare_recursion_error(tmp_path, field):
+    """DW-373: `regex.compile` answers a deeply nested pattern with RecursionError,
+    not `regex.error` — it must still surface as a ProfileError naming the field,
+    never escape `load_profiles` bare.
+
+    ABLATION: narrow either loop's except back to `regex.error` and its case
+    reddens with a bare RecursionError."""
+    depth = 5000  # empirically raises RecursionError under regex.compile
+    pattern = "(" * depth + ")" * depth
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f"{field} = ['{pattern}']\n[hooks]")
+    )
+    with pytest.raises(ProfileError, match=f"{field} entry is not a valid regex") as excinfo:
+        load_profiles(tmp_path)
+    # The RecursionError path specifically — not a plain `regex.error`, which the
+    # pre-fix `except` already caught and would pass this test for another reason.
+    assert isinstance(excinfo.value.__cause__, RecursionError)
+
+
+def test_parked_signal_fields_parse_from_overlay(tmp_path):
+    (tmp_path / ".bmad-loop" / "profiles").mkdir(parents=True)
+    (tmp_path / ".bmad-loop" / "profiles" / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace(
+            "[hooks]", 'parked_prompt_patterns = ["Allow t[o] run"]\n[hooks]'
+        ).replace(
+            'Stop = "Stop" }', 'Stop = "Stop", Ask = "PermissionPrompt", Note = "Notification" }'
+        )
+        + '[hooks.notification_types]\nquota_wait = "QuotaPrompt"\n'
+    )
+    prof = load_profiles(tmp_path)["mycli"]
+    assert prof.parked_prompt_patterns == ("Allow t[o] run",)
+    assert prof.hooks.notification_types == {"quota_wait": "QuotaPrompt"}
+    # a native event may map STRAIGHT to a parked kind: canonical, so accepted
+    assert prof.hooks.events["Ask"] == "PermissionPrompt"
+
+
+def test_claude_maps_its_parked_notification_subtypes():
+    """The claude profile relays `Notification` and maps exactly the subtypes that
+    mean "waiting on a human" (verified against code.claude.com/docs/en/hooks):
+    `quota_auto_resume_fired` means it already resumed, so it stays unmapped. The
+    MCP elicitation dialogs block the session like a permission prompt (DW-434);
+    `agent_needs_input` also fires for another (background) session, so it stays
+    unmapped."""
+    claude = get_profile("claude")
+    assert claude.hooks.events["Notification"] == "Notification"
+    assert claude.hooks.notification_types == {
+        "permission_prompt": "PermissionPrompt",
+        "idle_prompt": "IdlePrompt",
+        "quota_auto_resume_stale": "QuotaPrompt",
+        "quota_auto_resume_disabled": "QuotaPrompt",
+        "elicitation_dialog": "PermissionPrompt",
+        "elicitation_url_dialog": "PermissionPrompt",
+    }
+    assert "agent_needs_input" not in claude.hooks.notification_types
+    # the other hook-driven built-ins opt in on their own evidence; none has yet
+    for name, prof in load_profiles().items():
+        if name != "claude":
+            assert prof.hooks.notification_types == {}, name
+            assert prof.parked_prompt_patterns == (), name
+
+
+def test_claude_maps_its_stop_failure_types():
+    """#865: the claude profile relays `StopFailure` and maps every `error` value
+    the hooks reference documents, plus the 2.1.316 build's undocumented
+    `verification_required`, onto an action. `invalid_request` is context-shape (a
+    fresh session fixes it), so it is transient, not an account error.
+    `model_not_found` and `cloud_credential_error` are `account-fatal` (DW-613):
+    no usage relaunch fixes them, so the profile validator must accept the
+    action. Every other built-in stays `{}`: none has a StopFailure event."""
+    claude = get_profile("claude")
+    assert claude.hooks.events["StopFailure"] == "StopFailure"
+    assert claude.hooks.stop_failure_types == {
+        "overloaded": "transient",
+        "server_error": "transient",
+        "unknown": "transient",
+        "max_output_tokens": "transient",
+        "invalid_request": "transient",
+        "rate_limit": "rate_limit",
+        "billing_error": "account",
+        "authentication_failed": "account",
+        "oauth_org_not_allowed": "account",
+        "account_on_hold": "account",
+        "verification_required": "account",
+        "cloud_credential_error": "account-fatal",
+        "model_not_found": "account-fatal",
+    }
+    # Claude Code before 2.1.78 skips the WHOLE settings file over an unknown hook
+    # key, so registration gates the event on the installed version.
+    assert claude.hooks.event_min_versions == {"StopFailure": "2.1.78"}
+    for name, prof in load_profiles().items():
+        if name != "claude":
+            assert prof.hooks.stop_failure_types == {}, name
+            assert "StopFailure" not in prof.hooks.events.values(), name
+            assert prof.hooks.event_min_versions == {}, name
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("2.1.316 (Claude Code)", (2, 1, 316)),
+        ("codex-cli 0.164.0", (0, 164, 0)),
+        ("Python 3.12.3\n", (3, 12, 3)),
+        ("v2.1", None),
+        ("", None),
+    ],
+)
+def test_parse_cli_version(text, expected):
+    assert parse_cli_version(text) == expected
+
+
+def test_stop_failure_types_parse_from_overlay(tmp_path):
+    (tmp_path / ".bmad-loop" / "profiles").mkdir(parents=True)
+    (tmp_path / ".bmad-loop" / "profiles" / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace('Stop = "Stop" }', 'Stop = "Stop", Fail = "StopFailure" }')
+        + '[hooks.stop_failure_types]\nquota = "rate_limit"\nnoise = "ignore"\n',
+        encoding="utf-8",
+    )
+    prof = load_profiles(tmp_path)["mycli"]
+    assert prof.hooks.stop_failure_types == {"quota": "rate_limit", "noise": "ignore"}
+    assert prof.hooks.events["Fail"] == "StopFailure"
+
+
+# The #727 captured pane lines (Claude Code 2.1.246, run 20260826-114252-3da1),
+# concatenated so this file holds no line the shipped patterns match.
+_CAPTURED_BYPASS_LINES = (
+    "WARNING: Claude Code running in Bypass Permissions " + "mode",
+    "Enter to confirm · Esc " + "to cancel",
+)
+
+
+def test_shipped_claude_parked_patterns_match_the_captured_727_lines():
+    """Each seeded pattern matches the captured line it was seeded from — the
+    evidentiary bar: seed only lines captured off the CLI's own screen."""
+    import regex
+
+    patterns = [regex.compile(p) for p in get_profile("claude").parked_prompt_patterns]
+    assert len(patterns) == len(_CAPTURED_BYPASS_LINES)
+    for pattern, line in zip(patterns, _CAPTURED_BYPASS_LINES):
+        assert pattern.search(f"  {line}  "), (pattern.pattern, line)
+
+
+def test_shipped_claude_parked_patterns_do_not_match_their_own_profile_line():
+    """A session that prints or diffs claude.toml must not read as parked: the
+    single-character classes (`mod[e]`, `t[o]`) exist for this. Do not "clean"
+    them up."""
+    import regex
+
+    patterns = [regex.compile(p) for p in get_profile("claude").parked_prompt_patterns]
+    text = (
+        resources.files("bmad_loop.data")
+        .joinpath("profiles")
+        .joinpath("claude.toml")
+        .read_text(encoding="utf-8")
+    )
+    hits = [line for line in text.splitlines() if any(p.search(line) for p in patterns)]
+    assert hits == []
+    # ...nor when a narrow pane wraps it: the live matcher also joins 2-3 adjacent
+    # rows (#727), and joining only adds or drops whitespace, never a bracket.
+    assert _wrapped_hits(text, patterns) == []
+
+
+def _wrapped_hits(text: str, patterns) -> list[tuple[int, str]]:
+    """Every (width, line) of ``text`` that the pane matcher matches once the line
+    is wrapped at a width from 10 to 60 columns, cut mid-word (autowrap) or at
+    spaces (word-wrap)."""
+    import textwrap
+
+    from bmad_loop.adapters.panematch import match_rows
+
+    hits = []
+    for line in text.splitlines():
+        for width in range(10, 61):
+            autowrap = [line[i : i + width].rstrip() for i in range(0, len(line), width)]
+            for rows in (autowrap, textwrap.wrap(line, width=width)):
+                if match_rows(rows, patterns, timeout=2.0) is not None:
+                    hits.append((width, line))
+    return hits
+
+
+_USAGE_FIELDS = ("usage_limit_patterns", "usage_wait_patterns")
+
+
+def test_usage_fields_parse_from_overlay(tmp_path):
+    # a project overlay may seed either list; each parses into a tuple verbatim and
+    # independently of the other (compilation validated, see the invalid-regex cases)
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace(
+            "[hooks]",
+            'usage_limit_patterns = ["Out of credit[s]", "Quota gon[e]"]\n'
+            'usage_wait_patterns = ["Limit hi[t] · resets"]\n[hooks]',
+        ),
+        encoding="utf-8",
+        newline="",
+    )
+    prof = load_profiles(tmp_path)["mycli"]
+    assert prof.usage_limit_patterns == ("Out of credit[s]", "Quota gon[e]")
+    assert prof.usage_wait_patterns == ("Limit hi[t] · resets",)
+    # neither list leaks into the env-fault or parked-prompt fields
+    assert prof.env_fault_patterns == ()
+    assert prof.parked_prompt_patterns == ()
+
+
+@pytest.mark.parametrize("field", _USAGE_FIELDS)
+def test_usage_field_invalid_regex_is_a_profile_error(tmp_path, field):
+    """An invalid usage pattern fails fast at parse, naming its own field — not at
+    match time inside a live pane check, where the caller degrades."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f'{field} = ["resets(unbalanced"]\n[hooks]'),
+        encoding="utf-8",
+        newline="",
+    )
+    with pytest.raises(ProfileError, match=f"{field} entry is not a valid regex"):
+        load_profiles(tmp_path)
+
+
+@pytest.mark.parametrize("field", _USAGE_FIELDS)
+def test_usage_field_must_be_a_list_of_strings(tmp_path, field):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f'{field} = "resets"\n[hooks]'),
+        encoding="utf-8",
+        newline="",
+    )
+    with pytest.raises(ProfileError, match=f"{field} must be a list of strings"):
+        load_profiles(tmp_path)
+
+
+# The #610 captured pane lines, concatenated so this file holds no line the
+# shipped patterns match (only tests/test_env_fault_patterns.py and
+# tests/test_generic_tmux.py may). Credits: psmux/Windows 11, runs
+# 20260907-084618-824f and 20260907-090132-98e3. Session limit: the 2026-09-07
+# psmux capture (zone suffix) and macOS/tmux run 20260913-165153-b850 (two spaces
+# after the gutter glyph, no zone).
+_CAPTURED_USAGE_LIMIT_LINES = (
+    "⎿ You're out of usage credit"
+    + "s. Run /usage-credits to keep using Fable 5.1 or /model to switch models.",
+)
+_CAPTURED_USAGE_WAIT_LINES = (
+    "⎿ You've hit your session limi" + "t · resets 12:50pm (Asia/Ho_Chi_Minh)",
+    "⎿  You've hit your session limi" + "t · resets 7:20pm",
+)
+
+
+def test_shipped_claude_usage_patterns_match_the_captured_610_lines():
+    """Each seeded usage pattern matches the lines it was seeded from, in its OWN
+    list only: the two lists are disjoint by contract (blocked vs waiting), so a
+    credits line read as a session-window wait would sit out a reset that never
+    comes."""
+    import regex
+
+    claude = get_profile("claude")
+    limit = [regex.compile(p) for p in claude.usage_limit_patterns]
+    wait = [regex.compile(p) for p in claude.usage_wait_patterns]
+    assert limit and wait
+    for line in _CAPTURED_USAGE_LIMIT_LINES:
+        assert any(p.search(line) for p in limit), line
+        assert not any(p.search(line) for p in wait), line
+    for line in _CAPTURED_USAGE_WAIT_LINES:
+        assert any(p.search(line) for p in wait), line
+        assert not any(p.search(line) for p in limit), line
+    # the advisory a still-working session prints must never read as the wait
+    advisory = "You've used 90% of your session limi" + "t · resets 7:20pm"
+    assert not any(p.search(advisory) for p in limit + wait)
+
+
+def test_shipped_claude_usage_patterns_do_not_match_their_own_profile_line():
+    """A session that prints or diffs claude.toml must not read as usage-limited:
+    the single-character classes (`credit[s]`, `[.]`, `limi[t]`) exist for this. Do
+    not "clean" them up."""
+    import regex
+
+    claude = get_profile("claude")
+    patterns = [regex.compile(p) for f in _USAGE_FIELDS for p in getattr(claude, f)]
+    assert patterns
+    text = (
+        resources.files("bmad_loop.data")
+        .joinpath("profiles")
+        .joinpath("claude.toml")
+        .read_text(encoding="utf-8")
+    )
+    hits = [line for line in text.splitlines() if any(p.search(line) for p in patterns)]
+    assert hits == []
+    assert _wrapped_hits(text, patterns) == []
+
+
+# The countdown line in the #855 report, split so this file never holds it whole.
+_CAPTURED_AUTO_DENY_LINE = (
+    "⚠ Claude Code will automatically deny this reques"
+    + "t in 2:00, to avoid blocking progress on an unattended session"
+)
+
+
+def test_shipped_claude_auto_deny_pattern_reads_the_captured_855_countdown():
+    """The seeded pattern matches the #855 line and yields its `min`/`sec`, and
+    does not match its own claude.toml line (`reques[t]`), alone or wrapped."""
+    import regex
+
+    claude = get_profile("claude")
+    patterns = [regex.compile(p) for p in claude.auto_deny_patterns]
+    assert patterns
+    found = next(m for p in patterns if (m := p.search(_CAPTURED_AUTO_DENY_LINE)))
+    assert (found.group("min"), found.group("sec")) == ("2", "00")
+    text = (
+        resources.files("bmad_loop.data")
+        .joinpath("profiles")
+        .joinpath("claude.toml")
+        .read_text(encoding="utf-8")
+    )
+    assert [line for line in text.splitlines() if any(p.search(line) for p in patterns)] == []
+    assert _wrapped_hits(text, patterns) == []
+
+
+def test_auto_deny_pattern_without_its_named_groups_is_a_profile_error(tmp_path):
+    """A countdown pattern that cannot yield `min` and `sec` is refused at load,
+    naming the missing group, rather than reading no deadline at every latch.
+
+    ABLATION: drop the groupindex check from `_validate_profile` and this loads."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace(
+            "[hooks]", "auto_deny_patterns = ['deny in (?P<min>[0-9]+):[0-9]{2}']\n[hooks]"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ProfileError, match="missing sec"):
+        load_profiles(tmp_path)
+
+
+# The screen in the #855 report, the countdown line split like the profile
+# comment so this file never quotes it whole.
+_CAPTURED_855_SCREEN = (
+    'Dangerous rm operation on possibly-empty variable path: "$P/[refId]" ...\n'
+    f"{_CAPTURED_AUTO_DENY_LINE}\n"
+    "\n"
+    "Do you want to proceed?\n"
+    "❯ 1. Yes\n"
+    "  2. No\n"
+)
+# Claude Code's bypass startup dialog: Enter there confirms the focused "No, exit".
+_BYPASS_DIALOG_SCREEN = (
+    # split so this file never holds the heading claude's parked pattern matches
+    "WARNING: Claude Code running in Bypass Permissions mod" + "e\n"
+    "\n"
+    "❯ 1. No, exit\n"
+    "  2. Yes, I accept\n"
+)
+
+_PARKED_ANSWERS_TABLE = """
+[parked_answers]
+approve = ["Enter"]
+deny = ["Escape"]
+approve_guard = ['Do you want']
+deny_guard = ['Do you want']
+"""
+
+
+def test_parked_answers_table_parses_into_its_spec(tmp_path):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE + _PARKED_ANSWERS_TABLE, encoding="utf-8"
+    )
+    assert load_profiles(tmp_path)["mycli"].parked_answers == ParkedAnswersSpec(
+        approve=("Enter",),
+        deny=("Escape",),
+        approve_guard=("Do you want",),
+        deny_guard=("Do you want",),
+    )
+    # absent table: no answer keys
+    assert get_profile("gemini").parked_answers is None
+
+
+@pytest.mark.parametrize(
+    ("table", "match"),
+    [
+        (_PARKED_ANSWERS_TABLE + "confirm = ['y']\n", "unknown keys"),
+        (_PARKED_ANSWERS_TABLE.replace('["Enter"]', '"Enter"'), "approve must be a list"),
+        (_PARKED_ANSWERS_TABLE.replace('["Enter"]', '["Return"]'), "approve must list named keys"),
+        (
+            _PARKED_ANSWERS_TABLE.replace('["Escape"]', '["Escape", "q"]'),
+            "deny must list named keys",
+        ),
+        (
+            _PARKED_ANSWERS_TABLE.replace("deny_guard = ['Do you want']", "deny_guard = []"),
+            "deny_guard must list at least one",
+        ),
+        (
+            _PARKED_ANSWERS_TABLE.replace(
+                "approve_guard = ['Do you want']", "approve_guard = ['(']"
+            ),
+            "approve_guard entry is not a valid regex",
+        ),
+        ("parked_answers = 1\n", "must be a table"),
+    ],
+)
+def test_malformed_parked_answers_is_a_profile_error(tmp_path, table, match):
+    """Every shape and value fault refuses the profile at load rather than
+    offering keys that would press something unvetted, or on any screen.
+
+    ABLATION: drop the matching check (`_parse_profile` unknown keys, the
+    ALLOWED_KEYS membership, the empty-guard or compile check in
+    `_validate_profile`) and its case loads."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    body = (
+        MINIMAL_PROFILE.replace("[hooks]", table + "[hooks]")
+        if table.startswith("parked_answers =")
+        else MINIMAL_PROFILE + table
+    )
+    (profiles_dir / "mycli.toml").write_text(body, encoding="utf-8")
+    with pytest.raises(ProfileError, match=match):
+        load_profiles(tmp_path)
+
+
+_PERMISSION_MODES_TABLE = """
+[permission_modes.sandboxed]
+args = ["--sandbox", '{"a": 1}']
+platforms = ["linux", "darwin"]
+"""
+
+
+def _mode_profiles(tmp_path, body: str) -> dict[str, CLIProfile]:
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(body, encoding="utf-8")
+    return load_profiles(tmp_path)
+
+
+def test_permission_modes_table_parses_into_its_spec(tmp_path):
+    prof = _mode_profiles(tmp_path, MINIMAL_PROFILE + _PERMISSION_MODES_TABLE)["mycli"]
+    assert prof.permission_modes == {
+        "sandboxed": PermissionModeSpec(
+            args=("--sandbox", '{"a": 1}'), platforms=("linux", "darwin")
+        )
+    }
+    # absent table: no non-bypass mode
+    assert get_profile("gemini").permission_modes == {}
+
+
+@pytest.mark.parametrize(
+    ("table", "match"),
+    [
+        (_PERMISSION_MODES_TABLE + "allow = ['x']\n", "unknown keys"),
+        (_PERMISSION_MODES_TABLE.replace("sandboxed]", "yolo]"), "unknown mode"),
+        (_PERMISSION_MODES_TABLE.replace("sandboxed]", "bypass]"), "unknown mode"),
+        (_PERMISSION_MODES_TABLE.replace('"darwin"', '"cygwin"'), "platforms must name"),
+        (_PERMISSION_MODES_TABLE.replace('"darwin"]', '"darwin"]\nargs2 = 1'), "unknown keys"),
+        (
+            "\n[permission_modes.sandboxed]\nargs = []\n",
+            "args must list at least one",
+        ),
+        ('\n[permission_modes.sandboxed]\nargs = "--x"\n', "args must be a list"),
+        ("\n[permission_modes]\nsandboxed = 1\n", "sandboxed must be a table"),
+        (
+            _PERMISSION_MODES_TABLE + 'linked_worktree_args = "{gitdir}"\n',
+            "linked_worktree_args must be a list",
+        ),
+        (
+            _PERMISSION_MODES_TABLE + 'linked_worktree_args = ["--grant", "/fixed"]\n',
+            "must use at least one of",
+        ),
+    ],
+)
+def test_malformed_permission_modes_is_a_profile_error(tmp_path, table, match):
+    """ABLATION: drop the matching check (`_parse_profile` unknown keys / shape,
+    the mode-name, args or platform check in `_validate_profile`) and its case loads."""
+    with pytest.raises(ProfileError, match=match):
+        _mode_profiles(tmp_path, MINIMAL_PROFILE + table)
+
+
+def test_for_permission_mode_resolves_the_mode_into_bypass_args(tmp_path):
+    prof = _mode_profiles(tmp_path, MINIMAL_PROFILE + _PERMISSION_MODES_TABLE)["mycli"]
+    assert prof.for_permission_mode("bypass") is prof
+    sandboxed = prof.for_permission_mode("sandboxed", platform="linux")
+    assert sandboxed.bypass_args == ("--sandbox", '{"a": 1}')
+    assert sandboxed.name == prof.name and sandboxed.launch_args == prof.launch_args
+    # extra_args still replaces the resolved args, so a drop is reported against them
+    assert sandboxed.missing_bypass_tokens(("--yes",)) == ("--sandbox", '{"a": 1}')
+
+
+def test_for_permission_mode_carries_the_linked_worktree_args(tmp_path):
+    """DW-599: the mode's grant template rides onto the resolved profile beside
+    its args; bypass (and a mode that declares none) carries none."""
+    body = MINIMAL_PROFILE + _PERMISSION_MODES_TABLE + 'linked_worktree_args = ["-g={gitdir}"]\n'
+    prof = _mode_profiles(tmp_path, body)["mycli"]
+    assert prof.permission_modes["sandboxed"].linked_worktree_args == ("-g={gitdir}",)
+    assert prof.linked_worktree_args == ()
+    assert prof.for_permission_mode("sandboxed", platform="linux").linked_worktree_args == (
+        "-g={gitdir}",
+    )
+    assert (
+        get_profile("claude").for_permission_mode("sandboxed", "linux").linked_worktree_args == ()
+    )
+
+
+def test_render_linked_worktree_args_writes_each_path_as_one_toml_string():
+    """Each placeholder becomes a TOML basic string, so a path holding a quote,
+    a backslash or a control character cannot break out of the value Codex
+    parses; one substitution pass, so a path spelling a placeholder stays put; a
+    path TOML cannot carry (a lone surrogate) raises."""
+    prof = dataclasses.replace(
+        get_profile("claude"), linked_worktree_args=("{gitdir}={common_dir}", "plain")
+    )
+    gitdir = PurePosixPath('/a"b\\c\td/{common_dir}')  # Posix: the bytes are the point
+    rendered = prof.render_linked_worktree_args(gitdir, PurePosixPath("/r"))
+    assert rendered == ('"/a\\"b\\\\c\\u0009d/{common_dir}"="/r"', "plain")
+    key = rendered[0].partition("=")[0]
+    assert tomllib.loads(f"k = {key}")["k"] == str(gitdir)
+    with pytest.raises(ValueError):
+        prof.render_linked_worktree_args(PurePosixPath("/a\udcff"), PurePosixPath("/r"))
+
+
+def test_for_permission_mode_refuses_an_excluded_platform(tmp_path):
+    prof = _mode_profiles(tmp_path, MINIMAL_PROFILE + _PERMISSION_MODES_TABLE)["mycli"]
+    with pytest.raises(ProfileError, match="only on linux, darwin, not win32"):
+        prof.for_permission_mode("sandboxed", platform="win32")
+
+
+def test_for_permission_mode_with_no_platform_list_runs_everywhere(tmp_path):
+    body = MINIMAL_PROFILE + '\n[permission_modes.sandboxed]\nargs = ["--s"]\n'
+    prof = _mode_profiles(tmp_path, body)["mycli"]
+    assert prof.for_permission_mode("sandboxed", platform="win32").bypass_args == ("--s",)
+
+
+def test_shipped_sandboxed_mappings_parse_and_resolve():
+    """claude and codex ship the live-checked sandboxed args (linux/macOS only)."""
+    claude = get_profile("claude").for_permission_mode("sandboxed", platform="linux")
+    assert claude.bypass_args[:2] == ("--permission-mode", "dontAsk")
+    assert "--dangerously-skip-permissions" not in claude.bypass_args
+    settings = claude.bypass_args[claude.bypass_args.index("--settings") + 1]
+    assert json.loads(settings)["sandbox"] == {
+        "enabled": True,
+        "failIfUnavailable": True,
+        "allowUnsandboxedCommands": False,
+    }
+    codex = get_profile("codex").for_permission_mode("sandboxed", platform="darwin")
+    assert codex.bypass_args[-2:] == ("--ask-for-approval", "never")
+    # DW-599: a child of the mode's permission profile with the two exact paths,
+    # selected by a `default_permissions` placed after the mode's own
+    assert codex.linked_worktree_args[-1] == 'default_permissions="bmad_loop_worktree"'
+    assert any("{gitdir}" in a and "{common_dir}" in a for a in codex.linked_worktree_args)
+    assert "--dangerously-bypass-approvals-and-sandbox" not in codex.bypass_args
+    for name in ("claude", "codex"):
+        with pytest.raises(ProfileError, match="not win32"):
+            get_profile(name).for_permission_mode("sandboxed", platform="win32")
+
+
+@pytest.mark.parametrize("name", ["gemini", "copilot", "cursor", "antigravity", "opencode-http"])
+def test_for_permission_mode_refuses_an_unmapped_profile(name):
+    with pytest.raises(ProfileError, match="no permission_mode 'sandboxed' mapping"):
+        get_profile(name).for_permission_mode("sandboxed", platform="linux")
+
+
+def test_shipped_claude_answer_guards_match_the_captured_855_screen():
+    """Approve (Enter) and deny (Escape) guards both match the #855 prompt; on
+    the bypass startup dialog — where Enter chooses "No, exit" and Escape exits —
+    neither does; and no guard matches its own claude.toml line, alone or
+    wrapped (`procee[d]`, `1[.]`)."""
+    import regex
+
+    from bmad_loop.adapters.panematch import Hit, match_rows, screen_rows
+
+    answers = get_profile("claude").parked_answers
+    assert answers is not None
+    assert (answers.approve, answers.deny) == (("Enter",), ("Escape",))
+
+    def all_match(screen, guards):
+        rows = screen_rows(screen)
+        return all(
+            isinstance(match_rows(rows, [regex.compile(g)], timeout=2.0), Hit) for g in guards
+        )
+
+    assert all_match(_CAPTURED_855_SCREEN, answers.approve_guard)
+    assert all_match(_CAPTURED_855_SCREEN, answers.deny_guard)
+    assert not all_match(_BYPASS_DIALOG_SCREEN, answers.approve_guard)
+    assert not all_match(_BYPASS_DIALOG_SCREEN, answers.deny_guard)
+    # focus moved to "2. No": approve's Enter would deny, so approve refuses
+    moved = _CAPTURED_855_SCREEN.replace("❯ 1. Yes", "  1. Yes").replace("  2. No", "❯ 2. No")
+    assert not all_match(moved, answers.approve_guard)
+
+    patterns = [regex.compile(g) for g in (*answers.approve_guard, *answers.deny_guard)]
+    text = (
+        resources.files("bmad_loop.data")
+        .joinpath("profiles")
+        .joinpath("claude.toml")
+        .read_text(encoding="utf-8")
+    )
+    assert [line for line in text.splitlines() if any(p.search(line) for p in patterns)] == []
+    assert _wrapped_hits(text, patterns) == []
+
+
+def test_only_claude_and_opencode_seed_usage_patterns():
+    # the other built-ins opt in on their own captured evidence; none has yet.
+    # opencode-http seeds the blocked list only: its 2.x quota refusal is never
+    # retried, and no 2.x provider error is a window that resets (DW-592).
+    for name, prof in load_profiles().items():
+        if name == "opencode-http":
+            assert prof.usage_limit_patterns != (), name
+            assert prof.usage_wait_patterns == (), name
+        elif name != "claude":
+            assert prof.usage_limit_patterns == (), name
+            assert prof.usage_wait_patterns == (), name
 
 
 def test_legacy_alias_resolves():
@@ -329,6 +977,214 @@ def test_malformed_adapter_value_funnels_into_profile_error(tmp_path, value):
         load_profiles(tmp_path)
 
 
+# --------------------------------------------------------------------------- #
+# `session_id_flag` (DW-505: the CLI's launch flag for a caller-chosen session id)
+
+
+def test_only_claude_ships_a_session_id_flag():
+    """Claude Code honors `--session-id` (probed 2026-09-28); support in the other
+    CLIs is unverified, so they ship without one and attribution stays on the
+    first-start heuristic there."""
+    profiles = load_profiles()
+    assert profiles["claude"].session_id_flag == "--session-id"
+    others = {name: p.session_id_flag for name, p in profiles.items() if name != "claude"}
+    assert others and all(flag == "" for flag in others.values()), others
+
+
+def test_cli_profile_fields_only_ever_append():
+    """An entry-point provider may construct `CLIProfile` positionally, so a new
+    field goes after every existing one; inserting `session_id_flag` after
+    `model_flag` would hand such a provider's `env` dict to it and reject the
+    provider's whole batch. This is the field order as released before DW-505."""
+    released = [
+        "name", "binary", "hooks", "adapter", "skill_tree", "prompt_template",
+        "launch_args", "bypass_args", "model_flag", "env", "usage_parser",
+        "usage_grace_s", "stop_without_result_nudges",
+        "subagent_stop_without_transcript", "first_run_note", "seed_files",
+        "env_fault_patterns", "parked_prompt_patterns", "packaged", "workspace_trust",
+    ]  # fmt: skip
+    names = [f.name for f in dataclasses.fields(CLIProfile)]
+    assert names[: len(released)] == released
+
+
+def test_session_id_flag_defaults_empty_and_parses(tmp_path):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
+    assert load_profiles(tmp_path)["mycli"].session_id_flag == ""
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", 'session_id_flag = "--sid"\n[hooks]')
+    )
+    assert load_profiles(tmp_path)["mycli"].session_id_flag == "--sid"
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        # shape: never `str()`-coerced into an argv token
+        ("5", "session_id_flag must be a string"),
+        ('["--session-id"]', "session_id_flag must be a string"),
+        ("true", "session_id_flag must be a string"),
+        # value: one option token, no whitespace, no `=` (the id is the next argv
+        # element, so `--session-id=` would launch as two tokens)
+        ('"session-id"', "option token"),
+        ('"--a b"', "option token"),
+        ('"--session-id "', "option token"),
+        ('"-"', "option token"),
+        ('"--"', "option token"),
+        ('"--session-id="', "option token"),
+    ],
+)
+def test_malformed_session_id_flag_is_a_profile_error(tmp_path, value, match):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f"session_id_flag = {value}\n[hooks]")
+    )
+    with pytest.raises(ProfileError, match=match):
+        load_profiles(tmp_path)
+
+
+def test_hookless_profile_cannot_set_a_session_id_flag(tmp_path):
+    """A pin only filters hook events, and a hookless profile has none."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        HOOKLESS_PROFILE.replace("[hooks]", 'session_id_flag = "--session-id"\n[hooks]')
+    )
+    with pytest.raises(ProfileError, match="must not set session_id_flag"):
+        load_profiles(tmp_path)
+
+
+def test_subagent_transcript_dir_defaults_from_usage_parser(tmp_path):
+    """Unset derives from usage_parser: claude-jsonl's tree, nothing for the rest."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
+    profiles = load_profiles(tmp_path)
+    assert profiles["claude"].subagent_transcript_dir is None
+    assert profiles["claude"].subagent_transcript_root == "{stem}/subagents"
+    assert profiles["mycli"].subagent_transcript_dir is None
+    assert profiles["mycli"].subagent_transcript_root == ""
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", 'subagent_transcript_dir = "{stem}/agents"\n[hooks]')
+    )
+    assert load_profiles(tmp_path)["mycli"].subagent_transcript_root == "{stem}/agents"
+
+
+def test_explicit_empty_subagent_transcript_dir_disables_the_default(tmp_path):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace(
+            "[hooks]", 'usage_parser = "claude-jsonl"\nsubagent_transcript_dir = ""\n[hooks]'
+        )
+    )
+    mycli = load_profiles(tmp_path)["mycli"]
+    assert mycli.subagent_transcript_dir == ""
+    assert mycli.subagent_transcript_root == ""
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        # shape: never `str()`-coerced into a path template
+        ("5", "subagent_transcript_dir must be a string"),
+        ('["x"]', "subagent_transcript_dir must be a string"),
+        # value: relative, under the transcript's directory
+        ('"/abs/{stem}"', "relative path"),
+        ('"../{stem}"', "relative path"),
+        # value: exactly the {stem} placeholder, so sibling sessions never share it
+        ('"subagents"', "{stem}"),
+        ('"{sid}/x"', "{stem}"),
+        ('"{stem"', "not a valid template"),
+        ('"{stem!r}/x"', "{stem}"),
+        # value: a NUL would crash the tree walk with ValueError, not OSError
+        ('"{stem}\\u0000/x"', "NUL"),
+    ],
+)
+def test_malformed_subagent_transcript_dir_is_a_profile_error(tmp_path, value, match):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f"subagent_transcript_dir = {value}\n[hooks]")
+    )
+    with pytest.raises(ProfileError, match=re.escape(match)):
+        load_profiles(tmp_path)
+
+
+def test_hookless_profile_cannot_set_a_subagent_transcript_dir(tmp_path):
+    """The tree extends the transcript idle notice, and a hookless profile has no
+    transcript path."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        HOOKLESS_PROFILE.replace("[hooks]", 'subagent_transcript_dir = "{stem}/x"\n[hooks]')
+    )
+    with pytest.raises(ProfileError, match="must not set subagent_transcript_dir"):
+        load_profiles(tmp_path)
+
+
+def test_subagent_spawn_marker_defaults_off_and_agy_ships_one(tmp_path):
+    """Unset is off; the packaged agy profile names its spawn file (DW-548)."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
+    profiles = load_profiles(tmp_path)
+    assert profiles["mycli"].subagent_spawn_marker is None
+    assert profiles["claude"].subagent_spawn_marker is None
+    assert (
+        profiles["antigravity"].subagent_spawn_marker
+        == ".system_generated/subagents/{session_id}.json"
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        # shape: never `str()`-coerced into a path template
+        ("5", "subagent_spawn_marker must be a string"),
+        # value: relative, under a conversation folder
+        ('"/abs/{session_id}.json"', "relative path"),
+        ('"../{session_id}.json"', "relative path"),
+        ('"x/../{session_id}.json"', "relative path"),
+        # value: exactly the {session_id} placeholder, so the marker names one child
+        ('"subagents/child.json"', "{session_id}"),
+        ('"{stem}.json"', "{session_id}"),
+        ('"{session_id!r}.json"', "{session_id}"),
+        ('"{session_id"', "not a valid template"),
+        ('"{session_id}\\u0000.json"', "NUL"),
+    ],
+)
+def test_malformed_subagent_spawn_marker_is_a_profile_error(tmp_path, value, match):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f"subagent_spawn_marker = {value}\n[hooks]")
+    )
+    with pytest.raises(ProfileError, match=re.escape(match)):
+        load_profiles(tmp_path)
+
+
+def test_hookless_profile_cannot_set_a_subagent_spawn_marker(tmp_path):
+    """The marker drops a child's Stop hook, and a hookless profile has none."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        HOOKLESS_PROFILE.replace("[hooks]", 'subagent_spawn_marker = "{session_id}.json"\n[hooks]')
+    )
+    with pytest.raises(ProfileError, match="must not set subagent_spawn_marker"):
+        load_profiles(tmp_path)
+
+
+def test_claude_subagent_root_matches_the_tally_anchor(tmp_path):
+    """The idle notice watches the same tree tokens.tally sums for claude."""
+    transcript = tmp_path / "x.jsonl"
+    template = get_profile("claude").subagent_transcript_root
+    rendered = transcript.parent / template.format(stem=transcript.stem)
+    assert rendered == transcript.parent / transcript.stem / "subagents"
+
+
 def test_render_prompt_passthrough_and_template():
     claude = get_profile("claude")
     assert claude.render_prompt("/bmad-dev-auto 1-1-a") == "/bmad-dev-auto 1-1-a"
@@ -342,6 +1198,76 @@ def test_render_prompt_passthrough_and_template():
     )
     # non-slash prompts pass through {prompt}; {skill}/{args} degrade gracefully
     assert claude.render_prompt("just do it") == "just do it"
+
+
+def test_render_prompt_skill_dir_default_is_the_pre_placeholder_text():
+    """copilot's `{skill_dir}` defaults to `<skill_tree>/<skill>`, so a spec with no
+    located folder renders byte-identically to the pre-placeholder template —
+    including the `.agents/skills//SKILL.md` spelling of a slashless prompt — and
+    a given `skill_dir` substitutes. Ablation: default `skill_dir` to `""` (or drop
+    the default) and the byte-identity rows FAIL."""
+    copilot = get_profile("copilot")
+    tail = (
+        ", read its entire contents and follow its directions exactly, using subagents as needed: "
+    )
+    assert copilot.render_prompt("/bmad-dev-auto 1-1-a") == (
+        f"LOAD the FULL .agents/skills/bmad-dev-auto/SKILL.md{tail}1-1-a"
+    )
+    assert copilot.render_prompt("just do it") == (
+        f"LOAD the FULL .agents/skills//SKILL.md{tail}just do it"
+    )
+    assert copilot.render_prompt("/bmad-dev-auto 1-1-a", skill_dir="/home/u/.agents/skills/x") == (
+        f"LOAD the FULL /home/u/.agents/skills/x/SKILL.md{tail}1-1-a"
+    )
+    # a template without the placeholder ignores it
+    claude = get_profile("claude")
+    assert claude.render_prompt("/bmad-dev-auto 1-1-a", skill_dir="/x") == "/bmad-dev-auto 1-1-a"
+
+
+_BYPASS = ("--permission-mode", "bypassPermissions")
+
+
+@pytest.mark.parametrize(
+    ("launch_args", "bypass_args", "extra_args", "missing"),
+    [
+        # inherit: None means the profile's bypass_args are used as-is
+        ((), _BYPASS, None, ()),
+        # kept: every bypass token present in the override
+        ((), _BYPASS, ("--permission-mode", "bypassPermissions", "--verbose"), ()),
+        # partially kept
+        ((), _BYPASS, ("--permission-mode", "acceptEdits"), ("bypassPermissions",)),
+        # dropped
+        ((), _BYPASS, ("--verbose",), _BYPASS),
+        # explicit empty override drops them all
+        ((), _BYPASS, (), _BYPASS),
+        # a token already in launch_args is in the resolved argv
+        (("--yolo",), ("--yolo",), ("--verbose",), ()),
+        # a profile without bypass flags has nothing to drop
+        ((), (), ("--verbose",), ()),
+        # order kept, duplicates collapsed
+        ((), ("-b", "-a", "-b"), (), ("-b", "-a")),
+    ],
+)
+def test_missing_bypass_tokens(launch_args, bypass_args, extra_args, missing):
+    """DW-349: extra_args REPLACES bypass_args, so the helper names the bypass
+    tokens absent from `launch_args + extra_args` — only for an explicit override."""
+    prof = CLIProfile(
+        name="x",
+        binary="x",
+        hooks=HookSpec("none", "", {}),
+        launch_args=launch_args,
+        bypass_args=bypass_args,
+    )
+    assert prof.missing_bypass_tokens(extra_args) == missing
+
+
+def test_missing_bypass_tokens_on_the_shipped_claude_profile():
+    claude = get_profile("claude")
+    assert claude.missing_bypass_tokens(("--verbose",)) == (
+        "--permission-mode",
+        "bypassPermissions",
+    )
+    assert claude.missing_bypass_tokens(None) == ()
 
 
 def test_user_profile_overlay(tmp_path):
@@ -508,6 +1434,124 @@ def test_user_profile_overlay(tmp_path):
         (
             MINIMAL_PROFILE.replace('dialect = "claude-settings-json"', 'dialect = "none"'),
             "hookless",
+        ),
+        # parked-session signals (DW-348/DW-350): a notification subtype must map
+        # onto a PARKED kind, not any canonical event (a `Stop` here would never
+        # complete anything, but would read as a signal it is not)...
+        (
+            MINIMAL_PROFILE.replace(
+                'Stop = "Stop" }', 'Stop = "Stop", Notification = "Notification" }'
+            )
+            + '[hooks.notification_types]\npermission_prompt = "Stop"\n',
+            "parked kinds",
+        ),
+        # ...needs the Notification carrier the subtype rides on...
+        (
+            MINIMAL_PROFILE
+            + '[hooks.notification_types]\npermission_prompt = "PermissionPrompt"\n',
+            "'Notification' carrier",
+        ),
+        # ...is hook plumbing a hookless profile must not carry...
+        (
+            HOOKLESS_PROFILE
+            + '[hooks.notification_types]\npermission_prompt = "PermissionPrompt"\n',
+            "hookless",
+        ),
+        # ...and must be a table of strings, funnelled rather than coerced.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "[hooks]\nnotification_types = 5"),
+            "notification_types must map",
+        ),
+        (
+            MINIMAL_PROFILE + "[hooks.notification_types]\npermission_prompt = 1\n",
+            "notification_types must map",
+        ),
+        # StopFailure signals (#865): an error value must map onto an ACTION, not
+        # a canonical event or parked kind...
+        (
+            MINIMAL_PROFILE.replace(
+                'Stop = "Stop" }', 'Stop = "Stop", StopFailure = "StopFailure" }'
+            )
+            + '[hooks.stop_failure_types]\nbilling_error = "PermissionPrompt"\n',
+            "stop_failure_types values must be actions",
+        ),
+        # ...needs a native event mapped to the canonical StopFailure it rides on...
+        (
+            MINIMAL_PROFILE + '[hooks.stop_failure_types]\nbilling_error = "account"\n',
+            "canonical 'StopFailure' event",
+        ),
+        # ...is hook plumbing a hookless profile must not carry...
+        (
+            HOOKLESS_PROFILE + '[hooks.stop_failure_types]\nbilling_error = "account"\n',
+            "hookless",
+        ),
+        # ...and must be a table of strings, funnelled rather than coerced.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "[hooks]\nstop_failure_types = 5"),
+            "stop_failure_types must map",
+        ),
+        (
+            MINIMAL_PROFILE + "[hooks.stop_failure_types]\nbilling_error = 1\n",
+            "stop_failure_types must map",
+        ),
+        # hook-event version floors (#865): the key must be a mapped native event...
+        (
+            MINIMAL_PROFILE + '[hooks.event_min_versions]\nStopFailure = "2.1.78"\n',
+            "which hooks.events does not map",
+        ),
+        # ...never the Stop carrier (gating it out would end every session on the
+        # stall path)...
+        (
+            MINIMAL_PROFILE + '[hooks.event_min_versions]\nStop = "2.1.78"\n',
+            "carries the canonical 'Stop' completion event",
+        ),
+        # ...must be an X.Y.Z version...
+        (
+            MINIMAL_PROFILE + '[hooks.event_min_versions]\nSessionStart = "latest"\n',
+            "must be an X.Y.Z version",
+        ),
+        # ...is hook plumbing a hookless profile must not carry...
+        (
+            HOOKLESS_PROFILE + '[hooks.event_min_versions]\nStopFailure = "2.1.78"\n',
+            "hookless",
+        ),
+        # ...and must be a table of strings.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "[hooks]\nevent_min_versions = 5"),
+            "event_min_versions must map",
+        ),
+        (
+            MINIMAL_PROFILE + "[hooks.event_min_versions]\nSessionStart = 2\n",
+            "event_min_versions must map",
+        ),
+        # a parked_prompt_patterns entry that is not a valid regex fails fast at parse
+        (
+            MINIMAL_PROFILE.replace(
+                "[hooks]", 'parked_prompt_patterns = ["Enter(unbalanced"]\n[hooks]'
+            ),
+            "parked_prompt_patterns entry is not a valid regex",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'parked_prompt_patterns = "Enter"\n[hooks]'),
+            "parked_prompt_patterns must be a list of strings",
+        ),
+        # a leading `~` is never expanded: each field resolves it to a literal
+        # `<project>/~/...` directory, so it is refused with its own message (#770)
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'skill_tree = "~/.agents/skills"\n[hooks]'),
+            "skill_tree must not start with '~': a leading '~' is not expanded",
+        ),
+        (
+            MINIMAL_PROFILE.replace(
+                'config_path = ".mycli/settings.json"', 'config_path = "~/.mycli/settings.json"'
+            ),
+            "hooks.config_path must not start with '~': a leading '~' is not expanded",
+        ),
+        (
+            MINIMAL_PROFILE.replace(
+                "[hooks]", 'seed_files = [".mcp.json", "~/.mcp.json"]\n[hooks]'
+            ),
+            "seed_files entries must not start with '~': a leading '~' is not expanded",
         ),
     ],
 )
@@ -773,7 +1817,7 @@ def _plugin_profile(name="acme", adapter="acme", **over):
 def test_entry_point_profile_is_discovered(profile_scan):
     """A pip-installed profile provider (a callable returning CLIProfiles) makes
     its profile resolvable with no project TOML — the zero-config selection path."""
-    profile_scan(_FakeEntryPoint("acme", lambda: (lambda: [_plugin_profile()])))
+    profile_scan(_FakeEntryPoint("acme", lambda: lambda: [_plugin_profile()]))
     prof = get_profile("acme")
     assert prof.name == "acme" and prof.adapter == "acme"
     assert profile_mod.external_profile_errors() == {}
@@ -923,10 +1967,74 @@ def test_profile_scan_failure_degrades(profile_scan):
         ({"seed_files": ("/etc/passwd",)}, "seed_files"),
         ({"seed_files": (".",)}, "seed_files"),
         ({"hooks": HookSpec("claude-settings-json", "..", {"Stop": "Stop"})}, "relative"),
+        # a leading `~` is not expanded (#770)
+        ({"skill_tree": "~/.agents/skills"}, "skill_tree must not start with '~'"),
+        ({"seed_files": ("~/.mcp.json",)}, "seed_files entries must not start with '~'"),
+        (
+            {"hooks": HookSpec("claude-settings-json", "~\\.m\\s.json", {"Stop": "Stop"})},
+            "hooks.config_path must not start with '~'",
+        ),
         # a real dialect with nothing to write to
         ({"hooks": HookSpec("claude-settings-json", "", {"Stop": "Stop"})}, "config_path"),
         # hookless carrying hook plumbing is a contradiction either way in
         ({"hooks": HookSpec("none", ".m/s.json", {})}, "hookless"),
+        # parked-session signals (DW-348/DW-350), the same four refusals the TOML
+        # route makes: a non-parked kind, no Notification carrier, a hookless
+        # table, an invalid pane pattern
+        (
+            {
+                "hooks": HookSpec(
+                    "claude-settings-json",
+                    ".m/s.json",
+                    {"Stop": "Stop", "Notification": "Notification"},
+                    {"permission_prompt": "Stop"},
+                )
+            },
+            "parked kinds",
+        ),
+        (
+            {
+                "hooks": HookSpec(
+                    "claude-settings-json",
+                    ".m/s.json",
+                    {"Stop": "Stop"},
+                    {"permission_prompt": "PermissionPrompt"},
+                )
+            },
+            "'Notification' carrier",
+        ),
+        ({"hooks": HookSpec("none", "", {}, {"x": "PermissionPrompt"})}, "hookless"),
+        ({"parked_prompt_patterns": ("Enter(unbalanced",)}, "not a valid regex"),
+        # the #610 usage-limit pane patterns, each list on its own
+        ({"usage_limit_patterns": ("credits(unbalanced",)}, "usage_limit_patterns"),
+        ({"usage_wait_patterns": ("resets(unbalanced",)}, "usage_wait_patterns"),
+        # the #855 auto-deny countdown: it must compile and name `min` + `sec`
+        ({"auto_deny_patterns": ("deny(unbalanced",)}, "auto_deny_patterns"),
+        ({"auto_deny_patterns": ("deny in (?P<min>[0-9]+)",)}, "'min' and 'sec'"),
+        # the #855 answer keys: allowed named keys, non-empty compiling guards
+        ({"parked_answers": ParkedAnswersSpec(("y",), ("Escape",), ("x",), ("x",))}, "approve"),
+        ({"parked_answers": ParkedAnswersSpec(("Enter",), (), ("x",), ("x",))}, "deny"),
+        (
+            {"parked_answers": ParkedAnswersSpec(("Enter",), ("Escape",), (), ("x",))},
+            "approve_guard must list",
+        ),
+        (
+            {"parked_answers": ParkedAnswersSpec(("Enter",), ("Escape",), ("x",), ("(",))},
+            "deny_guard entry is not a valid regex",
+        ),
+        # the #727 permission modes: known non-bypass names, non-empty args, platforms
+        ({"permission_modes": {"yolo": PermissionModeSpec(("--x",))}}, "unknown mode"),
+        ({"permission_modes": {"sandboxed": PermissionModeSpec(())}}, "args must list"),
+        (
+            {"permission_modes": {"sandboxed": PermissionModeSpec(("--x",), ("haiku",))}},
+            "platforms must name",
+        ),
+        # the DW-599 linked-worktree grant: per mode and on the resolved field
+        (
+            {"permission_modes": {"sandboxed": PermissionModeSpec(("--x",), (), ("--y",))}},
+            "must use at least one of",
+        ),
+        ({"linked_worktree_args": ("{gitdir}", "")}, "non-empty strings"),
         # the remaining value-level knobs
         ({"usage_parser": "magic"}, "usage_parser"),
         ({"usage_grace_s": -1.0}, "usage_grace_s"),
@@ -946,6 +2054,16 @@ def test_profile_scan_failure_degrades(profile_scan):
         ({"adapter": " acme "}, "whitespace"),
         ({"name": " acme "}, "whitespace"),
         ({"binary": " acme "}, "whitespace"),
+        # a pin on a hookless profile, and a value that is not one option token
+        ({"session_id_flag": "--session-id"}, "session_id_flag"),
+        (
+            {
+                "adapter": "generic",
+                "hooks": HookSpec("claude-settings-json", ".m/s.json", {"Stop": "Stop"}),
+                "session_id_flag": "--a b",
+            },
+            "session_id_flag",
+        ),
     ],
 )
 def test_entry_point_profile_must_pass_the_parser_invariants(profile_scan, over, match):
@@ -999,3 +2117,426 @@ def test_a_valid_entry_point_profile_still_lands(profile_scan):
     )
     assert load_profiles()["acme"].env_fault_patterns == ("API Error.*Connection refused",)
     assert profile_mod.external_profile_errors() == {}
+
+
+# ------------------------------------------------ [workspace_trust] (DW-390)
+
+
+def _write_trust_profile(tmp_path: Path, table: str) -> Path:
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE + table, encoding="utf-8")
+    return tmp_path
+
+
+def test_packaged_antigravity_declares_workspace_trust():
+    from bmad_loop.adapters.profile import WorkspaceTrustSpec
+
+    profiles = load_profiles()
+    assert profiles["antigravity"].workspace_trust == WorkspaceTrustSpec(
+        settings_path="~/.gemini/antigravity-cli/settings.json", key="trustedWorkspaces"
+    )
+    # every other shipped profile leaves home untouched
+    for name in sorted(set(profiles) - {"antigravity"}):
+        assert profiles[name].workspace_trust is None, name
+
+
+def test_workspace_trust_parses_from_an_overlay(tmp_path):
+    project = _write_trust_profile(
+        tmp_path, '\n[workspace_trust]\nsettings_path = "~/.mycli/settings.json"\nkey = "trusted"\n'
+    )
+    spec = load_profiles(project)["mycli"].workspace_trust
+    assert spec is not None
+    assert (spec.settings_path, spec.key) == ("~/.mycli/settings.json", "trusted")
+
+
+def test_workspace_trust_absent_is_none(tmp_path):
+    assert load_profiles(_write_trust_profile(tmp_path, ""))["mycli"].workspace_trust is None
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        'workspace_trust = "~/.x.json"\n',
+        '\n[workspace_trust]\nsettings_path = ["~/.x.json"]\nkey = "k"\n',
+        '\n[workspace_trust]\nsettings_path = "~/.x.json"\nkey = 3\n',
+        '\n[workspace_trust]\nkey = "k"\n',
+        '\n[workspace_trust]\nsettings_path = "~/.x.json"\nkey = "k"\nextra = 1\n',
+    ],
+    ids=["not-a-table", "path-not-str", "key-not-str", "path-missing", "unknown-key"],
+)
+def test_workspace_trust_shape_rejections(tmp_path, table):
+    # a bare `workspace_trust = ...` must sit above [hooks] to be top-level
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    text = table + MINIMAL_PROFILE if not table.startswith("\n") else MINIMAL_PROFILE + table
+    (profiles_dir / "mycli.toml").write_text(text, encoding="utf-8")
+    with pytest.raises(ProfileError, match="workspace_trust"):
+        load_profiles(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("settings_path", "key"),
+    [
+        (".gemini/settings.json", "k"),  # not ~/-prefixed
+        ("/etc/settings.json", "k"),
+        ("~settings.json", "k"),
+        ("~/../other-user/settings.json", "k"),
+        ("~/.gemini/../../x.json", "k"),
+        ("~//etc/passwd", "k"),  # joins to an absolute path
+        ("~/", "k"),  # names home itself
+        ("~/.", "k"),
+        ("~/C:/x.json", "k"),
+        ("~/NUL/settings.json", "k"),
+        ("~/.gemini/settings.json. ", "k"),
+        ("~/.gemini/settings.json", ""),
+        ("~/.gemini/settings.json", "   "),
+        ("~/.gemini/settings.json", " trustedWorkspaces"),
+    ],
+)
+def test_workspace_trust_value_rejections_on_both_routes(tmp_path, settings_path, key):
+    """Value rules live in `_validate_profile`, so the TOML route and the
+    entry-point (constructed dataclass) route refuse the same set."""
+    from dataclasses import replace
+
+    from bmad_loop.adapters.profile import WorkspaceTrustSpec
+
+    project = _write_trust_profile(
+        tmp_path,
+        f"\n[workspace_trust]\nsettings_path = {settings_path!r}\nkey = {key!r}\n".replace(
+            "'", '"'
+        ),
+    )
+    with pytest.raises(ProfileError, match="workspace_trust"):
+        load_profiles(project)
+
+    constructed = replace(
+        get_profile("claude"),
+        workspace_trust=WorkspaceTrustSpec(settings_path=settings_path, key=key),
+    )
+    with pytest.raises(ProfileError, match="workspace_trust"):
+        profile_mod._validate_profile(constructed, "entry point test")
+
+
+# ------------------------------------- [user_skills] + extra_skill_trees (#770)
+
+
+def _toml_str(value: str) -> str:
+    # a TOML basic string; json.dumps escapes exactly what TOML needs here
+    return json.dumps(value)
+
+
+def _user_skills_table(spec: UserSkillsSpec) -> str:
+    roots = ", ".join(
+        "{ path = %s, disabled_by = [%s] }"
+        % (_toml_str(r.path), ", ".join(_toml_str(v) for v in r.disabled_by))
+        for r in spec.roots
+    )
+    return f"\n[user_skills]\nprecedence = {_toml_str(spec.precedence)}\nroots = [{roots}]\n"
+
+
+def _write_mycli(tmp_path: Path, text: str) -> Path:
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    (profiles_dir / "mycli.toml").write_text(text, encoding="utf-8")
+    return tmp_path
+
+
+def _assert_entry_point_refused(profile_scan, match: str, **over) -> None:
+    profile_scan(_FakeEntryPoint("acme", lambda: [_plugin_profile(**over)]))
+    profiles = load_profiles()
+    assert "acme" not in profiles, "an invalid profile must never reach the map"
+    assert match in profile_mod.external_profile_errors()["acme"]
+
+
+def test_default_profile_declares_no_extra_trees_and_no_user_skills(tmp_path):
+    """Off by default on every route that does not opt in: a constructed profile
+    (entry point) and a TOML overlay that omits both keys."""
+    constructed = CLIProfile(name="x", binary="x", hooks=HookSpec("none", "", {}))
+    assert constructed.extra_skill_trees == ()
+    assert constructed.user_skills is None
+    overlay = load_profiles(_write_mycli(tmp_path, MINIMAL_PROFILE))["mycli"]
+    assert overlay.extra_skill_trees == ()
+    assert overlay.user_skills is None
+
+
+_PACKAGED_USER_SKILLS = {
+    "claude": UserSkillsSpec("user", (UserSkillRoot("~/.claude/skills", ("CLAUDE_CONFIG_DIR",)),)),
+    "codex": UserSkillsSpec(
+        "unordered",
+        (UserSkillRoot("~/.agents/skills"), UserSkillRoot("~/.codex/skills", ("CODEX_HOME",))),
+    ),
+    "gemini": UserSkillsSpec(
+        "project",
+        (
+            UserSkillRoot("~/.agents/skills", ("GEMINI_CLI_HOME",)),
+            UserSkillRoot("~/.gemini/skills", ("GEMINI_CLI_HOME",)),
+        ),
+    ),
+    "antigravity": UserSkillsSpec("unordered", (UserSkillRoot("~/.gemini/config/skills"),)),
+    # cursor declares none: its user-level skill roots and precedence are unmeasured
+    "cursor": None,
+    "copilot": UserSkillsSpec(
+        "project",
+        (
+            UserSkillRoot("~/.copilot/skills", ("COPILOT_HOME",)),
+            UserSkillRoot("~/.agents/skills", ("COPILOT_HOME",)),
+        ),
+    ),
+    "opencode-http": UserSkillsSpec(
+        "project",
+        (
+            UserSkillRoot("~/.config/opencode/skills", ("XDG_CONFIG_HOME",)),
+            UserSkillRoot("~/.agents/skills"),
+            UserSkillRoot("~/.claude/skills"),
+        ),
+    ),
+}
+
+
+def test_packaged_profiles_declare_their_user_skill_roots():
+    """Every shipped profile parses to exactly its documented `[user_skills]`
+    spec — order matters (it is the CLI's read order) — and only opencode-http
+    declares an extra project skill tree (`.agents/skills`, where the skills
+    CLI installs opencode's project skills)."""
+    packaged = {
+        tomllib.loads(entry.read_text(encoding="utf-8"))["name"]
+        for entry in resources.files("bmad_loop.data").joinpath("profiles").iterdir()
+        if entry.name.endswith(".toml")
+    }
+    # the map covers every shipped profile, so a new one must state its roots here
+    assert packaged == set(_PACKAGED_USER_SKILLS)
+    profiles = load_profiles()
+    assert {name: profiles[name].user_skills for name in packaged} == _PACKAGED_USER_SKILLS
+    extra = {"opencode-http": (".agents/skills",)}
+    for name in packaged:
+        assert profiles[name].extra_skill_trees == extra.get(name, ()), name
+
+
+def test_user_skills_parses_string_and_table_roots(tmp_path):
+    table = (
+        "\n[user_skills]\n"
+        'precedence = "unordered"\n'
+        'roots = ["~/.mycli/skills", { path = "~/.agents/skills", disabled_by = ["MYCLI_HOME"] }]\n'
+    )
+    spec = load_profiles(_write_mycli(tmp_path, MINIMAL_PROFILE + table))["mycli"].user_skills
+    assert spec == UserSkillsSpec(
+        "unordered",
+        (UserSkillRoot("~/.mycli/skills"), UserSkillRoot("~/.agents/skills", ("MYCLI_HOME",))),
+    )
+
+
+def test_user_skills_empty_table_takes_the_defaults(tmp_path):
+    spec = load_profiles(_write_mycli(tmp_path, MINIMAL_PROFILE + "\n[user_skills]\n"))[
+        "mycli"
+    ].user_skills
+    assert spec == UserSkillsSpec(precedence="project", roots=())
+
+
+@pytest.mark.parametrize("precedence", sorted({"project", "user", "unordered"}))
+def test_user_skills_accepts_every_precedence_on_both_routes(tmp_path, profile_scan, precedence):
+    spec = UserSkillsSpec(precedence, (UserSkillRoot("~/.mycli/skills", ("MYCLI_HOME",)),))
+    project = _write_mycli(tmp_path, MINIMAL_PROFILE + _user_skills_table(spec))
+    assert load_profiles(project)["mycli"].user_skills == spec
+    profile_scan(_FakeEntryPoint("acme", lambda: [_plugin_profile(user_skills=spec)]))
+    assert load_profiles()["acme"].user_skills == spec
+    assert profile_mod.external_profile_errors() == {}
+
+
+@pytest.mark.parametrize(
+    ("table", "match"),
+    [
+        pytest.param('user_skills = "~/.x"\n', "user_skills must be a table", id="not-a-table"),
+        pytest.param(
+            '\n[user_skills]\norder = "user"\n',
+            "user_skills has unknown keys: ['order']",
+            id="unknown-key",
+        ),
+        pytest.param(
+            "\n[user_skills]\nprecedence = 1\n",
+            "user_skills.precedence must be a string",
+            id="precedence-not-str",
+        ),
+        pytest.param(
+            '\n[user_skills]\nroots = "~/.x"\n',
+            "user_skills.roots must be a list",
+            id="roots-not-list",
+        ),
+        pytest.param(
+            "\n[user_skills]\nroots = [3]\n",
+            "user_skills.roots entries must be",
+            id="root-not-str-or-table",
+        ),
+        pytest.param(
+            '\n[user_skills]\nroots = [["~/.x"]]\n',
+            "user_skills.roots entries must be",
+            id="root-is-a-list",
+        ),
+        pytest.param(
+            '\n[user_skills]\nroots = [{ path = "~/.x", disable = ["A"] }]\n',
+            "user_skills.roots entry has unknown keys: ['disable']",
+            id="root-unknown-key",
+        ),
+        pytest.param(
+            "\n[user_skills]\nroots = [{ path = 3 }]\n",
+            "user_skills.roots entry path must be a string",
+            id="root-path-not-str",
+        ),
+        pytest.param(
+            '\n[user_skills]\nroots = [{ disabled_by = ["A"] }]\n',
+            "user_skills.roots entry path must be a string",
+            id="root-path-missing",
+        ),
+        pytest.param(
+            '\n[user_skills]\nroots = [{ path = "~/.x", disabled_by = "A" }]\n',
+            "user_skills.roots entry disabled_by must be a list of strings",
+            id="disabled-by-not-list",
+        ),
+        pytest.param(
+            '\n[user_skills]\nroots = [{ path = "~/.x", disabled_by = [1] }]\n',
+            "user_skills.roots entry disabled_by must be a list of strings",
+            id="disabled-by-entry-not-str",
+        ),
+    ],
+)
+def test_user_skills_shape_rejections(tmp_path, table, match):
+    """Shape is the TOML parser's job only — a constructed `UserSkillsSpec` has
+    no shape left to parse — so these rows have no entry-point twin."""
+    # a bare `user_skills = ...` must sit above [hooks] to be top-level
+    text = table + MINIMAL_PROFILE if not table.startswith("\n") else MINIMAL_PROFILE + table
+    with pytest.raises(ProfileError, match=re.escape(match)):
+        load_profiles(_write_mycli(tmp_path, text))
+
+
+_PRECEDENCE_ERR = "user_skills.precedence must be one of"
+_ROOT_ERR = "user_skills root path must be a '~/'-prefixed path inside the home directory"
+_ROOT_ALIAS_ERR = "user_skills root path must not name a Windows device"
+_VAR_ERR = "user_skills root disabled_by entries must be environment variable names"
+_DUP_ERR = "user_skills has duplicate roots"
+
+
+@pytest.mark.parametrize(
+    ("precedence", "roots", "match"),
+    [
+        pytest.param("first", (), _PRECEDENCE_ERR, id="precedence-unknown"),
+        pytest.param("User", (), _PRECEDENCE_ERR, id="precedence-case"),
+        pytest.param("", (), _PRECEDENCE_ERR, id="precedence-empty"),
+        pytest.param("project", (UserSkillRoot(".claude/skills"),), _ROOT_ERR, id="not-home"),
+        pytest.param("project", (UserSkillRoot("/etc/skills"),), _ROOT_ERR, id="absolute"),
+        pytest.param("project", (UserSkillRoot("~skills"),), _ROOT_ERR, id="tilde-no-slash"),
+        pytest.param("project", (UserSkillRoot("~"),), _ROOT_ERR, id="tilde-alone"),
+        pytest.param("project", (UserSkillRoot("~/"),), _ROOT_ERR, id="home-itself"),
+        pytest.param("project", (UserSkillRoot("~/."),), _ROOT_ERR, id="home-dot"),
+        pytest.param("project", (UserSkillRoot("~//etc"),), _ROOT_ERR, id="smuggled-abs"),
+        pytest.param("project", (UserSkillRoot("~/C:/x"),), _ROOT_ERR, id="smuggled-drive"),
+        pytest.param("project", (UserSkillRoot("~/../x"),), _ROOT_ERR, id="parent-climb"),
+        pytest.param(
+            "project", (UserSkillRoot("~/.claude/../../x"),), _ROOT_ERR, id="nested-climb"
+        ),
+        pytest.param(
+            "project", (UserSkillRoot("~\\.claude\\skills"),), _ROOT_ERR, id="backslash-prefix"
+        ),
+        pytest.param(
+            "project", (UserSkillRoot("~/NUL/skills"),), _ROOT_ALIAS_ERR, id="win32-device"
+        ),
+        pytest.param(
+            "project", (UserSkillRoot("~/.claude/skills."),), _ROOT_ALIAS_ERR, id="win32-trim"
+        ),
+        pytest.param(
+            "project", (UserSkillRoot("~/.x", ("1X",)),), _VAR_ERR, id="var-leading-digit"
+        ),
+        pytest.param("project", (UserSkillRoot("~/.x", ("A-B",)),), _VAR_ERR, id="var-dash"),
+        pytest.param("project", (UserSkillRoot("~/.x", ("",)),), _VAR_ERR, id="var-empty"),
+        pytest.param("project", (UserSkillRoot("~/.x", ("$HOME",)),), _VAR_ERR, id="var-sigil"),
+        pytest.param(
+            "project", (UserSkillRoot("~/.x", ("OK", "A B")),), _VAR_ERR, id="var-space-second"
+        ),
+        pytest.param(
+            "project",
+            (UserSkillRoot("~/a/b"), UserSkillRoot("~/a/b")),
+            _DUP_ERR,
+            id="dup-exact",
+        ),
+        pytest.param(
+            "project",
+            (UserSkillRoot("~/a/b"), UserSkillRoot("~/a//b/")),
+            _DUP_ERR,
+            id="dup-spelling",
+        ),
+        pytest.param(
+            "project",
+            (UserSkillRoot("~/a/b", ("X",)), UserSkillRoot("~/./a/b", ("Y",))),
+            _DUP_ERR,
+            id="dup-other-disabler",
+        ),
+    ],
+)
+def test_user_skills_value_rejections_on_both_routes(
+    tmp_path, profile_scan, precedence, roots, match
+):
+    """Value rules live in `_validate_profile`, so the TOML route and the
+    entry-point (constructed dataclass) route refuse the same set.
+
+    ABLATION (run when written): deleting the precedence, the disabled_by name or
+    the duplicate-root guard in `_validate_profile` reddens every one of its rows
+    (the TOML half trips first; the entry-point half shares the same guard)."""
+    spec = UserSkillsSpec(precedence=precedence, roots=roots)
+    with pytest.raises(ProfileError, match=re.escape(match)):
+        load_profiles(_write_mycli(tmp_path, MINIMAL_PROFILE + _user_skills_table(spec)))
+    _assert_entry_point_refused(profile_scan, match, user_skills=spec)
+
+
+def test_extra_skill_trees_parse_on_both_routes(tmp_path, profile_scan):
+    text = MINIMAL_PROFILE.replace("[hooks]", 'extra_skill_trees = [".agents/skills"]\n[hooks]')
+    assert load_profiles(_write_mycli(tmp_path, text))["mycli"].extra_skill_trees == (
+        ".agents/skills",
+    )
+    profile_scan(
+        _FakeEntryPoint("acme", lambda: [_plugin_profile(extra_skill_trees=(".agents/skills",))])
+    )
+    assert load_profiles()["acme"].extra_skill_trees == (".agents/skills",)
+    assert profile_mod.external_profile_errors() == {}
+
+
+def test_extra_skill_trees_must_be_a_list_of_strings(tmp_path):
+    for value in ('".agents/skills"', "[1]"):
+        text = MINIMAL_PROFILE.replace("[hooks]", f"extra_skill_trees = {value}\n[hooks]")
+        with pytest.raises(ProfileError, match="extra_skill_trees must be a list of strings"):
+            load_profiles(_write_mycli(tmp_path, text))
+
+
+_EXTRA_REL_ERR = "extra_skill_trees entries must be project-relative paths"
+_EXTRA_HOME_ERR = "extra_skill_trees entries must not start with '~': a leading '~' is not expanded"
+_EXTRA_ALIAS_ERR = "extra_skill_trees entries must not name a Windows device"
+_EXTRA_SAME_ERR = "extra_skill_trees entries must differ from skill_tree"
+_EXTRA_DASH_ERR = "extra_skill_trees entries must not start with '-'"
+_EXTRA_DUP_ERR = "extra_skill_trees has duplicate entries"
+
+
+@pytest.mark.parametrize(
+    ("entries", "match"),
+    [
+        pytest.param(("~/x",), _EXTRA_HOME_ERR, id="tilde-slash"),
+        pytest.param(("~",), _EXTRA_HOME_ERR, id="tilde-alone"),
+        pytest.param(("~user/skills",), _EXTRA_HOME_ERR, id="tilde-user"),
+        pytest.param(("/abs",), _EXTRA_REL_ERR, id="absolute"),
+        pytest.param(("C:/x",), _EXTRA_REL_ERR, id="drive"),
+        pytest.param(("../x",), _EXTRA_REL_ERR, id="parent"),
+        pytest.param(("",), _EXTRA_REL_ERR, id="empty"),
+        pytest.param((".",), _EXTRA_REL_ERR, id="dot"),
+        pytest.param(("CON",), _EXTRA_ALIAS_ERR, id="win32-device"),
+        pytest.param((".agents/skills.",), _EXTRA_ALIAS_ERR, id="win32-trim"),
+        pytest.param(("-cprint(1)#",), _EXTRA_DASH_ERR, id="leading-dash"),
+        # MINIMAL_PROFILE and _plugin_profile both keep the default skill_tree
+        pytest.param((".claude/skills",), _EXTRA_SAME_ERR, id="same-as-skill-tree"),
+        pytest.param(("./.claude//skills/",), _EXTRA_SAME_ERR, id="same-as-skill-tree-spelling"),
+        pytest.param((".agents/skills", ".agents/skills"), _EXTRA_DUP_ERR, id="dup-exact"),
+        pytest.param((".agents/skills", ".agents//skills/"), _EXTRA_DUP_ERR, id="dup-spelling"),
+    ],
+)
+def test_extra_skill_trees_value_rejections_on_both_routes(tmp_path, profile_scan, entries, match):
+    listed = ", ".join(_toml_str(e) for e in entries)
+    text = MINIMAL_PROFILE.replace("[hooks]", f"extra_skill_trees = [{listed}]\n[hooks]")
+    with pytest.raises(ProfileError, match=re.escape(match)):
+        load_profiles(_write_mycli(tmp_path, text))
+    _assert_entry_point_refused(profile_scan, match, extra_skill_trees=entries)

@@ -1,369 +1,250 @@
 # Authoring CLI adapters & profiles
 
-bmad-loop drives any coding CLI that fits the **tmux-injection + hook-signal**
-transport through one generic adapter (`adapters/generic.py`); everything
+bmad-loop drives any coding CLI that fits the **multiplexer-injection + hook-signal**
+transport through one generic adapter (`adapters/generic.py`). Everything
 CLI-specific lives in a declarative **TOML profile** (`adapters/profile.py`). This
-guide is the canonical home for the profile schema and the two ways to teach
-bmad-loop a new CLI:
+guide covers the profile schema and the two ways to teach bmad-loop a new CLI:
 
-- **The common case — a TOML profile.** If the CLI fits tmux + hook-signal, you
-  write no Python. The [Profile field reference](#profile-field-reference) is the
-  complete `CLIProfile` / `HookSpec` schema; the
-  [walkthrough below](#walkthrough-finalizing-a-profile) shows how `probe-adapter`
-  finalizes one against a real run.
-- **The advanced case — a new adapter class.** If the CLI does _not_ fit that
-  transport (e.g. an HTTP/SSE service), see
-  [Writing a new adapter class](#writing-a-new-adapter-class) for the
-  `CodingCLIAdapter` ABC — and
-  [Shipping a new adapter class out-of-tree](#shipping-a-new-adapter-class-out-of-tree)
-  to register it (and the profile that selects it) from a co-installed package
-  with **zero core edits**, the same way a transport backend ships out-of-tree.
+- **The common case: a TOML profile.** If the CLI runs in a terminal pane and fires
+  lifecycle hooks, you write no Python. The [Profile field reference](#profile-field-reference)
+  is the complete schema; the [walkthrough](#walkthrough-finalizing-a-profile) shows how
+  `probe-adapter` finalizes a profile against a real run.
+- **The advanced case: a new adapter class.** If the CLI does _not_ fit that transport
+  (an HTTP/SSE service, say), see [Writing a new adapter class](#writing-a-new-adapter-class)
+  and [Shipping a new adapter class out-of-tree](#shipping-a-new-adapter-class-out-of-tree).
 
 ## Two axes: CLI vs transport
 
-These are independent and abstracted separately:
+The two axes are independent:
 
-- **CLI axis** — `CodingCLIAdapter` (`adapters/base.py`): _which_ binary to launch,
-  how the prompt is rendered, the hook dialect, where the transcript lives. The
-  generic adapter + a TOML profile cover the common case; a CLI needing its own
-  adapter class registers one via `register_adapter(...)` (`adapters/registry.py`),
-  selected by the profile's `adapter` field and shippable out-of-tree just like a
-  transport backend. Most of this guide is about this axis.
-- **Transport axis** — `TerminalMultiplexer` (`adapters/multiplexer.py`): how
-  sessions, windows, and panes are created, observed, and torn down. The generic
-  adapter never shells out itself — it goes through `self.mux`, obtained from
-  `get_multiplexer()`. The bundled family is tmux-shaped: argv construction and
-  the single spawn primitive live in `BaseTmuxBackend` (`adapters/tmux_base.py`),
-  with the thin POSIX leaf `TmuxMultiplexer` (`adapters/tmux_backend.py`) and the
-  native-Windows leaf `PsmuxMultiplexer` (`adapters/psmux_backend.py`), which
-  points the same spawn seam at psmux's own binary via the `_BINARY` class
-  attribute; the base and its POSIX leaf are the **only** files allowed to invoke
-  `tmux` (and the only place POSIX-shell trailers live). Any other backend
-  registers itself via `register_multiplexer(...)` and slots in behind
-  `get_multiplexer()` with no change to the adapters. A backend author reads
-  `multiplexer.py` for the contract and `tmux_backend.py` / `tmux_base.py` for the
-  reference implementation. Transport is one of **four OS seams** — the others
-  (process lifecycle, hook interpreter, validate preflight) are mapped in
-  [Porting bmad-loop to a new OS](porting-to-a-new-os.md).
+- **CLI axis:** `CodingCLIAdapter` (`adapters/base.py`) decides which binary to launch, how
+  the prompt is rendered, the hook dialect, and where the transcript lives. The generic
+  adapter plus a TOML profile covers the common case. A CLI that needs its own class
+  registers one with `register_adapter(...)` (`adapters/registry.py`), selected by the
+  profile's `adapter` field. Most of this guide is about this axis.
+- **Transport axis:** `TerminalMultiplexer` (`adapters/multiplexer.py`) creates, observes
+  and tears down sessions, windows and panes. Adapters never shell out themselves; they go
+  through `self.mux`, obtained from `get_multiplexer()`. Only `adapters/tmux_base.py`
+  (`BaseTmuxBackend`) and its POSIX leaf `adapters/tmux_backend.py` (`TmuxMultiplexer`)
+  invoke `tmux`. The native-Windows leaf `adapters/psmux_backend.py` drives the `psmux`
+  binary through the same base. Transport is one of four OS seams; registration, the two
+  build paths and the other seams are in [Porting bmad-loop to a new OS](porting-to-a-new-os.md).
+  Operators choosing a backend read [Terminal multiplexer backends](multiplexer-backends.md).
 
-### The transport contract (for a backend author)
+### The transport contract for a backend author
 
-Every part of the codebase that touches sessions, windows, or clients now goes
-through `get_multiplexer()` — not just the generic adapter but also `runs.py`
-(session listing/tagging, kill, attach argv), `tui/launch.py` (the control
-session and its parked orchestrator windows), `probe.py` (the throwaway probe
-session), and `tui/data.py` (legacy-run liveness). A grep for `"tmux"` outside the
-tmux backend (`adapters/tmux_base.py` + `adapters/tmux_backend.py`) should turn up
-only `shutil.which("tmux")` presence checks, never an invocation.
+A backend subclasses `TerminalMultiplexer` and registers with
+`register_multiplexer(name, matches, factory)`. How to register, ship out-of-tree, and
+choose between extending `BaseTmuxBackend` and implementing fresh is in the
+[porting guide](porting-to-a-new-os.md#shipping-out-of-tree-the-bmad_loopmux_backends-entry-point);
+same-platform backends need
+[discriminating `available()` probes](porting-to-a-new-os.md#availability-discriminators-same-platform-backends).
+`tmux_base.py` is the reference implementation.
 
-To add a backend, build a `TerminalMultiplexer` (`adapters/multiplexer.py`) and
-**register** it — `register_multiplexer(name, matches, factory)`, where
-`matches(sys.platform)` decides automatic selection and `name` is the key both
-the `BMAD_LOOP_MUX_BACKEND` env var and the persisted `[mux] backend` policy key
-force. `get_multiplexer()` resolves by precedence: env var → `[mux] backend`
-(set with `bmad-loop mux set <name>`, machine-scoped — policy.toml is
-gitignored) → the platform default when registered and `available()` → the
-first available platform match → the historical tmux fallback. `bmad-loop mux`
-lists every registered backend and the selection; same-platform backends need
-discriminating `available()` probes (see the
-[porting guide](porting-to-a-new-os.md#availability-discriminators-same-platform-backends)).
-An out-of-tree backend package makes its registration run by advertising the
-module under the `bmad_loop.mux_backends` entry-point group — core imports it
-before every selection, so co-installing the package is the whole setup (see
-[the porting guide](porting-to-a-new-os.md#shipping-out-of-tree-the-bmad_loopmux_backends-entry-point);
-a broken package degrades to a `bmad-loop mux` warning, never a selection failure). There are two build paths: extend `BaseTmuxBackend` (`adapters/tmux_base.py`)
-for a tmux-family backend — overriding only its single spawn primitive `_run()`
-plus the shell-dialect hooks (`_shell_wrap`, `_join_argv`, `_parked_trailer`,
-`_source_prefix`, `_window_launch` and the `_EXIT_CAPTURE`/`_ECHO`/`_PARK`
-fragments) — or implement
-`TerminalMultiplexer` fresh for a host with no tmux-shaped CLI. The non-transport
-seams of a full OS port are in
-[Porting bmad-loop to a new OS](porting-to-a-new-os.md). The contract groups into:
+Rules that span methods:
 
-- **Sessions** — `has_session`, `new_session` (geometry is
-  optional: agent sessions pin a fixed pane size because they are observed
-  while detached; the control session omits it),
-  `kill_session`, `list_sessions`, `session_options` (read a user option
-  across all sessions), `set_session_option`.
+- **Failures.** Raise a `MultiplexerError` subclass, so call sites catch the seam type
+  without importing the backend. Each method below states whether it raises, tolerates, or
+  answers a sentinel.
+- **Targets.** Target-taking methods receive either the seam token `=session[:window]`,
+  built by `target()`, or a native id your backend minted. `parse_target()` decodes a token
+  to `(session, window)` and answers `None` for a native id, which you use as-is. Core never
+  builds the grammar by hand.
+- **Qualified ids.** If a minting method returns anything other than a bare native id,
+  every method whose output core compares that id against must emit the identical form, and
+  every verb the id is replayed through must accept it. The pairings: `new_window` ↔
+  `list_window_ids`; `new_parked_window` ↔ the `list_windows` `window_id` column; that column
+  ↔ `list_window_ids` ↔ `current_window_id`. A verb that cannot take the form translates
+  inside itself.
+- **Client verbs report effect, not dispatch.** `detach_client` and `switch_client` answer
+  what actually happened to the client. A vacuous `True` is never allowed.
 
-  One session method carries a default the seam cannot verify for your
-  transport: `session_name_key(name)`, the canonical comparison key — two
-  names denote the same live session exactly when their keys are equal. The
-  default is identity (exact comparison — correct for tmux, whose session
-  names are case-sensitive). **If your transport resolves session names
-  case-insensitively — or folds them any other way — you MUST override**
-  (psmux does: its NTFS port-file store opens names case-insensitively).
-  With the inherited identity key, a case-variant of the control session's
-  name is not discounted by the removal guard, so the documented recovery
-  `bmad-loop delete ctl` wedges behind a false live-session refusal on a
-  persisted `CTL` run.
+**Sessions**
 
-- **Windows** — `new_window` (run a command in a fresh window), `new_parked_window`
-  (run a command, then _park_ on a keypress so the exit
-  status stays inspectable, then return any attached client to its origin — the
-  POSIX `sh -c` recipe is composed from the base's overridable shell-dialect
-  hooks, so a non-POSIX backend swaps the dialect fragments, not the method
-  body), `list_window_ids`
-  (which MUST emit the same id form your `new_window` returns — `window_alive` is
-  a membership test over it, so qualifying one side and not the other reads every
-  live window as dead), `list_windows` (selected fields per window),
-  `window_alive`, `kill_window`, `select_window`, `set_window_option`,
-  `unset_window_option`, `show_window_option`, `pipe_pane` (tee a pane to a log),
-  `send_text`.
-- **Client / attach** — `attach_target_argv` (argv that reaches a target, nesting-
-  aware), `current_pane_id` / `current_window_id` / `current_session`,
-  `current_return_target` (the value an interactive attach records for the
-  parked-window return hop, replayed opaquely by `switch_client` and the parked
-  trailer; concrete default = the native pane id, so most backends inherit it —
-  override only when your ids do not resolve from another session's context,
-  as psmux does to emit `=session:%N`), `detach_client` / `switch_client` (with
-  an optional last-client fallback — see the rule below),
-  `available` (is this backend usable on the current host), `version` (the
-  binary's version string or `None` — **one bounded line**, folded with
-  `fold_version()`; see [the porting guide](porting-to-a-new-os.md)).
-- **Registry namespace** (optional; all three default to "no namespace", so a
-  transport without one writes nothing) — `has_registry_namespace` (a property
-  of the transport: does it namespace sessions by registry at all? Answer
-  `True` on every instance if it does, even when no root is currently in
-  force: cleanup uses it to tell "no namespace exists" from "running on the
-  transport's shared default registry", and only the first lets an untagged
-  session be claimed on run-directory evidence — a namespaced backend that
-  leaves this at the inherited `False` keeps the pre-namespace historical
-  reach, which on a shared registry can kill another project's session),
-  `registry_root` (the root your verbs
-  currently resolve targets through, for `bmad-loop mux` to disclose; `None`
-  from a namespaced backend means "no root in force" — the shared default —
-  not "no namespace") and
-  `legacy_registries` (instances bound to roots your sessions may predate, for
-  the cleanup sweep). Only for a transport that addresses sessions through a
-  directory of per-session files, as psmux does through `PSMUX_DATA_DIR`; the
-  rules are in [the porting
-  guide](porting-to-a-new-os.md#registry-namespaces-only-if-your-transport-has-one).
+- `has_session(name)`: true iff the session exists. A failed lookup answers `False`; a transport failure raises.
+- `new_session(name, cwd, cols=None, lines=None)`: create a detached session with one shell window; pin the geometry when given.
+- `kill_session(name)`: tolerate the session already being gone.
+- `list_sessions()`: names of all live sessions. On a failed listing, raise, or answer `[]` and override `list_sessions_reporting`.
+- `list_sessions_reporting(*, on_fault=None)` (default: `list_sessions()`): a backend that folds a failed listing to `[]` hands a one-line fault to `on_fault`.
+- `session_name_key(name)` (default: identity): the comparison key. Override it if the transport folds names, for example case-insensitively.
+- `session_options(option)`: map of session name to that option's value.
+- `set_session_option(name, option, value)`: raises on a transport failure. A value the transport cannot carry verbatim may be refused with a warning.
 
-  **Both client verbs report effect, not dispatch.** They answer what the
-  parked-window return path trusts — a bool from `detach_client`, a tri-state
-  from `switch_client` (see below) — so a backend with no real detach (herdr —
-  only a manual chord releases its client) answers `False`. If your CLI's exit
-  code already means "a client moved" you are done (tmux: `detach-client` fails
-  with _no current client_); if it does not, **measure** what the verb is meant
-  to change — psmux counts the session's attached clients across `detach_client`
-  and the last-client fallback, and answers on the drop — and record what the
-  measure cannot see in your degradation ledger. Where no measure is available,
-  answer `False` from `detach_client` and `None` from `switch_client`, and
-  record that gap in the ledger too — per _call_, though, never as the wiring: a
-  `switch_client` hard-coded to `None` pins the return path to `UNREACHABLE`, and
-  an attended sweep then stops prompting for good. Use the exit code wherever it
-  carries the effect. Check the ledger against every verb before you
-  trust one measure for all of them: psmux's drop is blind
-  to a `switch_client` whose target sits in the same session, which is the common
-  case for the return path, so that verb gates on the client count read _before_
-  the call and takes the exit code as the verdict instead (#659). A fallback verb
-  belongs to the same audit — hang it on the primary verb's failure, never on
-  "the primary could not be vouched for", or a hand-back that worked gets undone
-  by its own fallback and the undo is read as the success.
-  `tui.launch.return_attached_client` reads a `False` from `switch_client` as
-  `ATTENDED` — the client never left this window, so an attended sweep keeps
-  prompting — and a `False` from `detach_client` as `UNREACHABLE`, which is evidence
-  of nothing, so the sweep goes unattended and defers this cycle's decisions to
-  `bmad-loop decisions`. That makes `switch_client`'s `False` a **joint claim**:
-  no switch happened _and_ the client is still here. A move you cannot _vouch_
-  for is only its first half — a timed-out verb, an unreadable count, nothing
-  attached to move — so answer `None`, which routes to `UNREACHABLE`: the return
-  option survives and the sweep still stops prompting a window the client may
-  already have left. Do not reach for that surviving option as the recovery. The
-  parked trailer sits behind a blocking read, so it never runs while a `--repeat`
-  cycle is stuck on `input()` in the same window — which is exactly what an
-  `ATTENDED` the client has walked away from produces. A vacuous `True` remains
-  the one answer no backend may give: it announces a hand-back that never
-  happened and sends the sweep unattended with the human still sitting there
-  (#227).
+**Windows**
 
-**Window targets.** The target-taking methods (`kill_window`, `select_window`,
-the window-option trio, `attach_target_argv`, `switch_client`) receive one of two
-families: the **seam-canonical target token** `=session[:window]` — formatted by
-the concrete `TerminalMultiplexer.target(session, window=None)`, decoded by the
-module-level `parse_target()` — or the backend's own **native id** (whatever your
-`new_window` returned). Core never hand-assembles the grammar; it calls
-`target()`. (Two values are composed by the backend itself rather than by
-`target()`, precisely so the seam grammar never has to carry a pane or window
-id: the parked-window return target — `current_return_target`, above — and the
-native window id, which psmux qualifies to `session:@N` because its ids are
-per-server (falling back to the bare id where that grammar would not survive).
-Both are replayed opaquely; neither is parsed by core. psmux applies the same
-qualification to `new_parked_window`, the `window_id` columns of `list_windows`
-and `current_window_id`. To preserve unambiguous lookup, `new_parked_window` must
-agree with the `list_windows` column; a backend that qualifies one side only
-remains usable but falls back to resolving parked windows by name, which is
-ambiguous whenever several kinds share a run id (#482). tmux consumes the token
-natively (it coincides with tmux exact-match syntax), so `BaseTmuxBackend` passes
-it straight through. A native-id backend calls `parse_target()` first — `None`
-means "already a native id, use as-is", otherwise resolve `(session, window)`
-yourself; the herdr adapter's
-`_parse_target`
-([backend.py](https://github.com/pbean/bmad-loop-adapter-herdr/blob/main/src/bmad_loop_adapter_herdr/backend.py))
-is the worked example (workspace-by-label → tab-by-name → root pane, resolved
-lazily at use time). You MAY override `target()` to emit native ids, but the token must
-stay a stable _by-name_ reference: core formats targets ahead of use (a parked
-window's return target, for one), so eager resolution to a live id goes stale —
-inheriting the default and resolving lazily is almost always right.
+- `new_window(session, name, cwd, env, command)`: run `command` with `env` layered on; return the native window id.
+- `new_parked_window(session, name, cwd, argv, return_opt)`: run `argv`, print `PARKED_BANNER`, park on a key, then return any attached client via `return_opt`.
+- `list_window_ids(session)`: same id form as `new_window`. Answer `[]` only for an empty listing or a proved-gone session; otherwise raise. A tmux-family leaf whose client can exit 0 with nothing for a live session sets `_EMPTY_LISTING_IS_AN_ANSWER = False`, so that empty listing raises too (psmux does).
+- `list_windows(session, fields)`: one tuple per window in field order; best-effort `[]` on failure.
+- `window_alive(session, window_id)`: `True` while the window is listed AND its pane is alive; a window the multiplexer keeps listed after its pane exited (`remain-on-exit on`) is not alive. Membership alone is `list_window_ids`. Raise when liveness cannot be known; never answer `False` for that.
+- `kill_window(target)`: tolerate the window already being gone; no-op on a transport failure.
+- `select_window(target)`: make the window current; best-effort.
+- `rename_window(target, name)` (default: raises `MultiplexerError`): rename the window so a by-name lookup finds it under `name`, which must stick against any automatic rename. Checked: raise `MultiplexerError` when the rename did not land.
+- `set_window_option(target, option, value)` / `unset_window_option(target, option)`: best-effort. An unset option must read back as unset, not empty.
+- `show_window_option(target, option)`: the value, or `''` when unset or on failure.
+- `pipe_pane(window_id, log_file)`: tee the pane to `log_file`; tolerate a dead window.
+- `send_text(window_id, text)`: send `text` literally, then Enter. Raise `MultiplexerError` instead of typing when the pane is in a mode that would swallow the keys.
+- `send_keys(target, *keys)` (default: raises `MultiplexerError`): press each named key in order, each one of `ALLOWED_KEYS` (`Enter`, `Escape`), with no literal text and no implicit Enter. Raise `MultiplexerError` for any other key or a pane in a mode, as `send_text` does. Override it to enable the TUI's parked-prompt answer keys.
+- `capture_pane(window_id)` (default: raises `MultiplexerError`): the visible screen as text. Override it to enable `parked_prompt_patterns`.
+- `pane_target(window_id)` (default: the window id): a target that keeps naming the launched pane after a split makes another pane active. The generic adapter resolves it right after `new_window` and hands it to `pipe_pane`, `send_text` and `capture_pane` in place of the window id, so all three must accept it. Raise `MultiplexerError` when the pane cannot be resolved.
 
-**The qualified-id obligation.** The psmux qualifications above are instances of
-one rule, and it is the rule — not the instances — a native-id backend needs:
-**if an id-minting seam returns anything other than a bare native id, every seam
-whose output core compares that id against must emit the identical form, and
-every verb the id is replayed through must accept it.** Where a verb cannot take
-that form — or cannot take a window scope at all — the backend translates inside
-that verb rather than exempting the id from qualification: psmux has no
-per-window _user_ options to write to (#310), so its option trio runs the
-qualified target through `_option_scope` and writes a session-scoped key carrying
-the window's id, refusing a bare id rather than guessing a server (the built-ins
-pass straight through to the base). It carried a second such translation on
-`select_window` until its 3.3.8 floor made the server resolve a scoped id itself
-(psmux/psmux#497). Where the composed grammar cannot carry the value at all, the
-backend degrades uniformly across every seam that mints or lists the id, so the
-pairings still line up under the fallback — but the fallback is lossy, not a free
-escape hatch: a bare psmux id routes by the _caller's_ server, so the degrade
-condition must stay the narrow one the grammar forces (#221), never a
-convenience. Those pairings are not a closed set: a new one appears whenever a
-caller compares two id-producing seams to each other, so treat the rule as the
-contract and each documented pairing as an instance of it. Every way of getting
-the _form_ wrong is quiet — these are id-shape faults, never transport faults,
-which `list_window_ids` must still raise: a mint/list split reads every live
-window as instantly dead; a `list_windows`/`current_window_id` split makes the
-ctl-window prune kill the window it is running in (#291); a
-`list_windows`/`list_window_ids` split reports every kill candidate as verifiably
-gone, survivors included (#435). And a verb handed a form it rejects fails or
-silently no-ops — the seam is best-effort or its caller swallows the raise, so no
-error reaches core either way.
+**Client and attach**
 
-Operations that can race a window dying (`pipe_pane`) or a session already being
-gone (`kill_session`) must tolerate it rather than raise; everything else raises a
-`MultiplexerError` subclass on failure, which call sites catch at the seam (e.g.
-`tui/launch.start_detached` turns it into a `LaunchError`) without importing the
-backend. `window_alive` uses `list-windows` membership, not `display-message`, because
-`display-message -t <dead-window>` exits 0 on tmux.
+- `attach_target_argv(target)`: argv that attaches the caller's terminal to a target, nesting-aware.
+- `current_pane_id()` / `current_window_id()` / `current_session()`: this process's pane, window and session, or `None` outside the multiplexer.
+- `current_return_target()` (default: `current_pane_id()`): what an attach records for the parked-window return hop. Override when native ids do not resolve from another session.
+- `detach_client()`: `True` only when a client was actually detached. A failure, or a backend with no real detach, answers `False`.
+- `switch_client(target, last_fallback=False)`: `True` = switched; `False` = nothing switched and the client is still here; `None` = cannot vouch (timeout, unreadable effect, no client).
 
-`tmux_backend.py` is the reference implementation; reading it alongside the ABC is
-the fastest way to see exactly what a `new_parked_window` or `session_options` must
-produce.
+**Probes**
 
-For the **implement-fresh** path, the external herdr adapter
-([pbean/bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr),
-`src/bmad_loop_adapter_herdr/backend.py`) is the reference worked example — a
-backend over [herdr](https://herdr.dev), a cross-platform, agent-aware workspace
-manager whose CLI is a different binary family from tmux. Its
-mapping: a bmad-loop **session** is a herdr **workspace** (label == session name), a
-**window** is a **tab** (one shell pane, whose `root_pane.pane_id` is the native
-window id handed back), and the launched command runs via a typed `exec <argv>`
-(`pane run` = type + Enter) so process-exit == pane-close == tab-close ==
-tmux-identical window death. Where herdr has no analogue, the backend degrades
-honestly rather than faking it: session/window **options** (which herdr lacks
-entirely) live in a cross-process JSON **sidecar** (atomic swaps for readers, an OS
-advisory lock around each read-modify-write so concurrent writers never lose
-updates), and `pipe_pane` — herdr has no
-tee — runs a per-window **poller** thread that snapshots `pane read` into the log
-whenever the content changes, which is exactly enough to drive the two log consumers
-a tmux tee would (`generic._log_activity_key`'s stall re-arm and `probe`'s marker
-discovery). Its module docstring is a **degradation ledger** of every such
-divergence (sidecar options, poller `pipe_pane`, the no-op `detach_client` —
-which #317's widening requires to answer `False`, not `None`, so the
-parked-return path reads it as `UNREACHABLE` and an attended sweep stops
-prompting into a window whose client only a manual chord can release; that is a
-different widening from `switch_client`'s tri-state above, and `detach_client`
-is the verb that stays a bool — the attach
-argv, the advisory geometry, the protocol-version policy) — the reference for what
-"implement fresh" costs when the host has no tmux-shaped CLI. The operator-facing
-view — what a herdr _user_ notices and does — is
-[the adapter's operator guide](https://github.com/pbean/bmad-loop-adapter-herdr/blob/main/docs/adapter-multiplexer-herdr.md).
+- `available()`: can this backend run on this host. Keep it cheap and side-effect-free; a raise reads as unavailable.
+- `version()` (default: `None`): one bounded line built with `fold_version()`, identifying version first.
+- `version_error()` (default: `None`): why the last `version()` answered `None` although the binary exists. Must not raise.
 
-The hard part of a new profile isn't the TOML — it's the **facts that live in no
-doc**: the CLI's exact hook payload shape (field names and casing, whether
-`session_id` / `transcript_path` / `cwd` are present), where it writes its session
-transcript and in what format, and the token-usage schema a `usage_parser` has to
-read. Historically the only way to get these was to hand a volunteer a manual
-recipe and ask them to sanitize the output by hand — error-prone and PII-risky.
+**Registry namespace** (all default to "no namespace"; rules in the
+[porting guide](porting-to-a-new-os.md#registry-namespaces-only-if-your-transport-has-one))
 
-**`bmad-loop probe-adapter`** (alias `collect-adapter-data`) pulls all of that and
-runs it through an audited sanitizer, so a user of any coding CLI can run one
-command and paste back a clean, content-free report.
+- `has_registry_namespace()` (default: `False`): `True` on every instance if the transport namespaces sessions by registry.
+- `registry_root()` (default: `None`): the root the verbs currently resolve through. Must not raise.
+- `legacy_registries()` (default: `[]`): independent instances bound to older registries, for the cleanup sweep.
+
+**Other defaults**
+
+- `target(session, window=None)` (default: `=session[:window]`): override only to emit another stable by-name reference, never an eagerly resolved live id.
+- `inherited_env(session, name, *, on_fault=None)` (default: `None`): the value a new pane would inherit, `UNSET` when confirmed absent, `None` when unknown. Must not raise.
+- `window_pane_pids(target)` (default: `[]`): best-effort pids of the pane's root processes. Must not raise.
+
+The external herdr backend ([pbean/bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr))
+is a worked example of a native-id backend: its `_parse_target` resolves the seam token
+lazily at use time, and its module docstring lists every place it degrades.
+
+## Collecting CLI facts with `probe-adapter`
+
+The hard part of a new profile is the facts no doc records: the CLI's hook payload shape
+(field names and casing; whether `session_id`, `transcript_path` and `cwd` are present),
+where it writes its transcript and in what format, and the token-usage schema a
+`usage_parser` has to read. `session_id` matters: it is how the generic adapter tells the
+launched session's events from a nested CLI's (see
+[Session identity and nested CLIs](#session-identity-and-nested-clis)).
+
+`bmad-loop probe-adapter` (alias `collect-adapter-data`) gathers these and runs them
+through an audited sanitizer, so anyone can run one command and paste back a clean,
+content-free report.
 
 ```bash
 bmad-loop probe-adapter <cli> --project .          # default: zero-launch scan
 bmad-loop probe-adapter <cli> --probe --project .  # opt-in live capture
 ```
 
----
+### Two modes
 
-## Two modes
+Both modes emit the same sanitized finding: markdown on stdout, or a file with `--out`;
+`--json` emits a machine-readable JSON document instead.
 
-Both modes emit the **same single sanitized finding** (markdown to stdout, or to a
-file with `--out`; `--json` emits it as a machine-readable JSON document instead).
+#### SCAN (default, no process launch)
 
-### SCAN (default — no process launch)
+Runs `<binary> --version` and `--help`, finds the newest existing session transcript by
+convention, reads the declared hook config, and infers the token schema from the
+transcript. The hook check reads only the project hook config (the profile's
+`config_path`), not user- or local-scope settings, managed policy or plugin hooks, so a
+relay registered only there reports as unregistered; `bmad-loop init --cli <profile>`
+registers it in the project config. A broken project config (invalid JSON, unreadable,
+not a JSON object, or malformed handlers for a declared event) is reported as a config
+fault, with a warning and its own next step to fix that file. Use it first for any CLI
+that already has a profile or that you have run by hand.
 
-Runs `<binary> --version` / `--help`, locates the newest **already-existing**
-session transcript by convention, reads the declared hook config, and infers the
-token schema from the transcript. Works whenever you've used the CLI before, with
-zero execution risk. This is the right first step for any CLI that already has a
-profile (claude/codex/gemini/copilot/antigravity) or that you've run by hand.
+#### PROBE (`--probe`, opt-in live capture)
 
-### PROBE (`--probe` — opt-in live capture)
+In an ephemeral `mkdtemp` workspace (Codex: the stable workspace described below), `probe`
+registers a full-payload capture hook for every native event in the profile, launches
+**one trivial content-free turn** (`Reply with exactly: OK`) in a window of the selected
+multiplexer, captures each hook event's payload, finds the transcript, and tears
+everything down. Use it to confirm the exact hook payload shape and that the CLI accepts
+the hook dialect your profile declares.
 
-In an ephemeral `mkdtemp` workspace, `probe` registers a full-payload capture hook
-for every native event in the profile, launches **one trivial content-free turn**
-(`Reply with exactly: OK`) in a tmux window, captures each hook event's complete
-payload, locates the transcript, then tears everything down. Use it to confirm the
-**exact hook payload shape** and that the CLI actually **accepts the hook dialect**
-your profile declares — facts scan can't see without running the CLI.
+Codex (`codex-hooks-json`) keys hook trust by the config's path and hash, so a fresh temp
+dir would never be trusted. For Codex the hook script and config go into a stable per-user
+workspace instead, `<state root>/probe-workspaces/<profile>` (see
+[state root](reference/run-state.md#state-root)). The directory is owner-only. Each run
+empties it and writes the same bytes, and Codex launches there. The first `--probe` reports the hook trust
+as untrusted and exits 1 before any turn, with a next step naming the workspace: open Codex
+there once (under the profile's `[env]`), accept its folder trust and hooks trust
+prompts, and re-run from the project checkout.
 
-`--probe` needs a known profile (it uses the profile's hook dialect and event map).
-If `tmux` or the binary is missing, probe degrades gracefully to a scan.
+Trust holds until the config bytes or the workspace path change: a different hook interpreter, a moved
+bmad-loop install, a Codex version that changes the registered events, or a different state
+root (`BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME`) needs that one-time step again. If the state
+root cannot be resolved or the workspace cannot be reset, hook trust reads `unverifiable`
+and nothing launches.
 
----
+`--probe` needs a known profile. If the multiplexer backend is unavailable or the binary is
+missing, it falls back to a scan with a warning.
 
-## PII safety model
+### PII safety model
 
-The report is built to be **safe to paste into an issue or PR**. A single audited
-sanitizer (`src/bmad_loop/sanitize.py`) is the only chokepoint:
+The report is built to be safe to paste into an issue or PR. One audited sanitizer
+(`src/bmad_loop/sanitize.py`) is the only chokepoint:
 
-- **captured hook payloads ship as a schema, never as values** — per event you
-  get the field names and the dotted key paths with leaf _types_
-  (`tool_input.command:str`); no payload value of any kind reaches the report,
-  and a dynamic or credential-shaped key collapses to `<key>`;
-- **numbers, booleans, and `null` pass through** elsewhere — token _counts_ are
-  not PII;
-- **transcript locations are redacted per component** — home → `~`, anything
-  that isn't a plain machine identifier (or that embeds your username) →
-  `<redacted>`, and your project directory name → a salted alias
-  (`project-3f2a9c…`), the same pseudonymization `diagnose` uses;
-- `--help` / `--version` text and log tails have the home dir and any emails
-  redacted, with a line cap;
-- **the rendered report re-scans itself before emitting** — the same
-  `sanitize.guard` egress backstop as `diagnose`. A stray occurrence of the
-  aliased project name is repaired and disclosed; an email / secret / home path /
-  username in the final bytes makes the command **refuse to emit** (message on
-  stderr, empty stdout, exit ≠ 0, no `--out` file) rather than ship it.
+- **Hook payloads ship as a schema, never as values.** Per event you get the field names
+  and dotted key paths with leaf types (`tool_input.command:str`). A dynamic or
+  credential-shaped key collapses to `<key>`.
+- **Numbers, booleans and `null` pass through** elsewhere; token counts are not PII.
+- **Transcript locations are redacted per component.** Home becomes `~`; anything that is
+  not a plain machine identifier, or that embeds your username, becomes `<redacted>`; your
+  project directory name becomes a salted alias (`project-3f2a9c…`), as in `diagnose`.
+- **`--help` / `--version` text and log tails** have the home dir and emails redacted, with
+  a line cap.
+- **The rendered report re-scans itself before emitting** (the same `sanitize.guard` egress
+  check as `diagnose`). A stray project name is repaired and disclosed. An email, secret,
+  home path or username in the final bytes makes the command refuse to emit: a message on
+  stderr, empty stdout, nonzero exit, no `--out` file.
 
-In PROBE mode the raw capture exists **only transiently** inside the temp dir,
-which is `rmtree`'d in a `finally` (even on exception or Ctrl-C). The CLI's own
-transcript stays in its home dir — the command reads its _structure_, never copies
-it. A hidden `--keep-temp` flag retains the raw temp dir for debugging and prints a
-loud **"raw retained — do not share"** warning; never paste a `--keep-temp` run.
+In PROBE mode the raw capture and the launch log exist only inside the temp dir, which is
+removed in a `finally` (even on an exception or Ctrl-C). The Codex probe workspace holds
+only the hook script and its config, never captured data, and stays in place for the trust
+step. The CLI's own transcript stays in its home dir; the command reads its structure and
+never copies it. The hidden `--keep-temp` flag keeps the raw temp dir for debugging and
+adds a `RAW probe data retained at … — DO NOT SHARE` warning to the report. Never paste a
+`--keep-temp` run.
 
----
+### Flags reference
+
+| Flag                | Purpose                                                                                                     |
+| ------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `--probe`           | Opt-in live capture (default is scan). Needs a known profile.                                               |
+| `--transcript PATH` | Inspect this exact transcript file, bypassing convention discovery.                                         |
+| `--session-dir DIR` | Glob this dir (`**/*.jsonl`, then `**/*.json`; newest wins) — for custom/unknown CLIs.                      |
+| `--binary NAME`     | Binary to probe for a CLI that has no profile yet (enables a reduced report).                               |
+| `--model NAME`      | Model passed to the probe turn (PROBE mode).                                                                |
+| `--workspace PATH`  | Also report (read-only) whether PATH is in the profile's `[workspace_trust]` list; exit `1` unless trusted. |
+| `--timeout SECONDS` | Probe turn timeout (default 90).                                                                            |
+| `--out FILE`        | Write the output to a file instead of stdout (the only file the command writes).                            |
+| `--json`            | Emit a machine-readable JSON document _instead of_ the report (honours `--out`).                            |
+| `--keep-temp`       | (hidden, debug) keep the raw probe temp dir — prints a "do not share" warning.                              |
+
+Exit codes mirror `validate`: `0` whenever a report is produced (warnings are fine), `1`
+only when nothing could be produced. An unknown CLI with `--binary` still yields a reduced
+report (version/help and discovery, no hook events); an unknown CLI without `--binary`
+fails and lists the available profiles.
+
+The two trust verdicts are exceptions, because their exit code carries the answer:
+
+- A Codex `hook_trust` other than `trusted` exits `1`.
+- `--workspace PATH` exits `0` only when PATH is listed (`workspace trust: trusted`), and
+  `1` when it is `untrusted` (file, key or entry missing) or `unverifiable` (malformed
+  settings file), each with a warning and a next step. A profile without
+  `[workspace_trust]` fails with `FAIL:` on stderr. The path is never rendered. `--json`
+  carries the verdict as the `workspace_trust` key (`null` without `--workspace`).
 
 ## Walkthrough: finalizing a profile
 
 ### 1. Draft a profile
 
-Drop a TOML file in `<project>/.bmad-loop/profiles/<name>.toml` with the fields
-from the [Profile field reference](#profile-field-reference) below. The minimum is
-a `binary`, a `prompt_template`, bypass flags, a `[hooks]` block picking one of the
-config dialects (`claude-settings-json` / `codex-hooks-json` /
-`gemini-settings-json` / `copilot-settings-json` / `cursor-hooks-json` /
-`antigravity-hooks-json`) and
-a native→canonical event map, and a `usage_parser` (start with `"none"` until
-you've written one).
+Drop a TOML file in `<project>/.bmad-loop/profiles/<name>.toml` with the fields from the
+[Profile field reference](#profile-field-reference). The minimum is a `binary`, a
+`prompt_template`, bypass flags, a `[hooks]` block with a dialect and a native→canonical
+event map, and a `usage_parser` (start with `"none"`).
 
 ### 2. Scan
 
@@ -373,156 +254,607 @@ bmad-loop probe-adapter <cli> --project .
 
 Read three sections of the report:
 
-- **CLI flags** — your profile's launch/bypass flags plus the scrubbed
-  `--version` / `--help`, so you can confirm the flags you chose exist.
-- **Transcript** — the redacted location, format, size, line count, and modified
-  date of the newest transcript the convention glob found.
-- **Token usage schema** — the structural key paths (types only, never values) and
-  the **token-field candidates** (int leaves whose names look token-ish). When a
-  real parser is already declared, its parsed counts are shown as a self-check.
+- **CLI flags:** the scrubbed `--version` / `--help` output, so you can confirm the flags
+  your profile declares exist.
+- **Transcript:** the redacted location, format, size, line count and modified date of the
+  newest transcript the convention glob found.
+- **Token usage schema:** structural key paths (types only) and the **token-field
+  candidates** (int leaves whose names look token-ish). When a real parser is declared, its
+  parsed counts appear as a self-check.
 
-### 3. Probe (confirm the live payload + dialect)
+### 3. Probe (confirm the live payload and dialect)
 
 ```bash
 bmad-loop probe-adapter <cli> --probe --project /tmp/scratch
 ```
 
-The **Hook payload shape** section now shows, per captured event, the native→
-canonical pairing, the payload keys, and the payload **schema** (key paths + leaf
-types, never values) — so you can confirm `session_id` / `transcript_path` casing
-and that the CLI accepted the hook config for your dialect. If the CLI rejects the config or never fires a hook, the report
-says so (with a scrubbed log tail) instead of silently producing nothing.
+The **Hook payload shape** section shows, per captured event, the native→canonical
+pairing, the payload keys and the payload schema, so you can confirm `session_id` /
+`transcript_path` casing and that the CLI accepted the hook config. If the CLI rejects the
+config or never fires a hook, the report says so, with a scrubbed log tail.
 
 ### 4. Write the `usage_parser`
 
 Turn the report's `token_field_candidates` into a parser in
-[`src/bmad_loop/tokens.py`](../src/bmad_loop/tokens.py), following the existing
-ones (`tally` for claude, `tally_codex_rollout`, `tally_gemini_chat`) and
-registering it in `read_usage`. The report flags **per-call vs cumulative** as a
-human call — a `token_count`-style event that carries running totals (codex) is
-read differently from per-message blocks that are summed (claude/gemini). Re-run
-scan after wiring the parser: the **parsed counts** self-check should now appear.
+[`src/bmad_loop/tokens.py`](../src/bmad_loop/tokens.py), following the existing ones
+(`tally` for claude, `tally_codex_rollout`, `tally_gemini_chat`, `tally_copilot_events`,
+`tally_antigravity_transcript`), and register it in `read_usage`. Decide **per-call vs
+cumulative** yourself: a `token_count`-style event that carries running totals (codex) is
+read differently from per-message blocks that are summed (claude, gemini, antigravity).
+Re-run the scan; the **parsed counts** self-check should now appear.
+At run time the parser reads the file named by the hook payload's `transcript_path`. For
+`codex-rollout`, a missing or unusable hook path is resolved from the session id under
+`$CODEX_HOME/sessions`. A CLI whose subagents write their own transcripts needs the parser
+to fold them in: `claude-jsonl`, `codex-rollout` and `antigravity-transcript` each do.
 
-**`none` is a legitimate final answer, not only a placeholder.** If the report
-comes back with no `token_field_candidates`, the CLI may simply not expose usage
-anywhere a parser can reach — `antigravity` is the worked example: it counts
-tokens (its TUI displays them) but writes them only into an internal SQLite
-protobuf blob, never into the transcript. Leave `usage_parser = "none"`, and
-record _why_ in the profile so nobody re-litigates it. Do not reach outside the
-`(transcript_path) -> TokenUsage | None` contract to scrape a vendor's internal
-store: it is undocumented, unversioned, and will break.
+**`none` is a legitimate final answer.** If the report has no `token_field_candidates`, the
+CLI may not expose usage anywhere a parser can reach, for example when it keeps token counts
+only in an internal database. Leave `usage_parser = "none"`, record why and the version you
+checked in the profile, and re-check on a newer release. Do not scrape a vendor's internal
+store outside the `(transcript_path) -> TokenUsage | None` contract.
 
-**Trust the payload over the docs.** A CLI that reports its own transcript path
-in the hook payload is telling you the truth; a path in its documentation may be
-illustrative. agy's `hooks.md` shows a workspace-relative
-`<workspace>/.gemini/antigravity/transcript.jsonl`, but the live payload's
-`transcriptPath` is home-rooted under `brain/<conversationId>/` — and named
-`transcript_full.jsonl`. `--probe` prefers the captured path for exactly this
-reason; the convention glob is the fallback.
-
----
-
-## Flags reference
-
-| Flag                | Purpose                                                                          |
-| ------------------- | -------------------------------------------------------------------------------- |
-| `--probe`           | Opt-in live capture (default is scan). Needs a known profile.                    |
-| `--transcript PATH` | Inspect this exact transcript file, bypassing convention discovery.              |
-| `--session-dir DIR` | Glob this dir (`**/*.jsonl` then `*.json`, newest) — for custom/unknown CLIs.    |
-| `--binary NAME`     | Binary to probe for a CLI that has no profile yet (enables a reduced report).    |
-| `--model NAME`      | Model passed to the probe turn (PROBE mode).                                     |
-| `--timeout SECONDS` | Probe turn timeout (default 90).                                                 |
-| `--out FILE`        | Write the output to a file instead of stdout (the only file the command writes). |
-| `--json`            | Emit a machine-readable JSON document _instead of_ the report (honours `--out`). |
-| `--keep-temp`       | (hidden, debug) keep the raw probe temp dir — prints a "do not share" warning.   |
-
-Exit codes mirror `validate`: `0` whenever a report is produced (warnings are
-fine), `1` only when nothing could be produced. An **unknown CLI with `--binary`**
-still yields a _reduced_ report (version/help + discovery, no hook events); an
-unknown CLI without `--binary` fails and lists the available profiles.
-
----
+**Trust the payload over the docs.** A CLI that reports its transcript path in the hook
+payload is telling the truth; a path in its documentation may be illustrative. `--probe`
+prefers the captured path; the convention glob is the fallback.
 
 ## Worked example: copilot
 
-The `copilot` profile was finalized from a real probe run — a good illustration of
-why `probe-adapter` exists, because the as-drafted profile was wrong in ways no doc
-would reveal:
+The `copilot` profile was finalized from a real probe run:
 
 ```bash
 bmad-loop probe-adapter copilot --probe --project /tmp/scratch
 ```
 
-On Copilot CLI 1.0.63 this surfaced three corrections:
+It surfaced three corrections to the draft:
 
-- **Turn-end event.** The draft registered PascalCase `Stop`, which never fires —
-  the turn-end hook is `agentStop` (camelCase). Without this, every session reads
-  as a timeout. The profile now maps `agentStop = "Stop"` (and `sessionStart` /
-  `sessionEnd`; there is no `PreCompact` equivalent).
-- **Payload casing.** Keys are camelCase (`sessionId`, `transcriptPath`), not
-  snake_case — so the shared relay (`bmad_loop_hook.py`) reads both casings.
-- **Token schema.** The probe located `~/.copilot/session-state/*/events.jsonl` and
-  inferred its token fields (`data.modelMetrics.<model>.usage.*`), which became the
-  `copilot-events` parser in `tokens.py`; the profile's `usage_parser` is now wired
-  to it instead of `"none"`.
+- **Turn-end event.** PascalCase `Stop` never fires; the turn-end hook is `agentStop`.
+  Without the mapping every session reads as a timeout. The profile maps
+  `agentStop = "Stop"`, plus `sessionStart` and `sessionEnd` (there is no `PreCompact`
+  equivalent).
+- **Payload casing.** Keys are camelCase (`sessionId`, `transcriptPath`), so the shared
+  relay (`bmad_loop_hook.py`) reads both casings.
+- **Token schema.** The probe found `~/.copilot/session-state/*/events.jsonl` and its token
+  fields (`data.modelMetrics.<model>.usage.*`), which became the `copilot-events` parser in
+  `tokens.py`. A later capture on 1.0.105 (now the fixture in `tests/fixtures/copilot-1.0.105/`)
+  showed two more things. Each turn's `session.usage_checkpoint` carries the same totals
+  under `data.accountingSnapshot`. And `inputTokens` includes the cache reads (the Copilot
+  SDK docs add cache writes, and count `reasoningTokens` inside `outputTokens`).
 
-Confirm the `mkdtemp` dir is gone afterward.
-
----
+Confirm the `mkdtemp` dir is gone afterward (for Codex, the stable probe workspace stays and
+holds only the hook script and config).
 
 ## Profile field reference
 
 A profile is the `CLIProfile` dataclass in
-[`src/bmad_loop/adapters/profile.py`](../src/bmad_loop/adapters/profile.py),
-loaded from TOML. **Built-ins** ship as packaged TOML
-(`bmad_loop/data/profiles/*.toml`); **project overrides** in
-`<project>/.bmad-loop/profiles/*.toml` overlay them — same `name` overrides a
-built-in, a new `name` extends the set. The legacy alias `claude-code-tmux`
-resolves to `claude`.
+[`src/bmad_loop/adapters/profile.py`](../src/bmad_loop/adapters/profile.py), loaded from
+TOML. Built-ins ship as packaged TOML (`bmad_loop/data/profiles/*.toml`). Project overrides
+in `<project>/.bmad-loop/profiles/*.toml` overlay them: the same `name` replaces a built-in,
+a new `name` extends the set. The aliases `claude-code-tmux` and `opencode` resolve to
+`claude` and `opencode-http`. Unknown top-level keys are ignored.
 
 ### `CLIProfile`
 
-| Field                              | Required | Default            | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ---------------------------------- | -------- | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`                             | ✅       | —                  | Profile id, also the `--cli` value and override key.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `binary`                           | ✅       | —                  | Executable to launch (resolved on `PATH`). `bmad-loop validate` also probes it — a name that resolves but fails `--version` (typically a dead WSL/npm shim) is reported as `adapter.binary-unrunnable` at warning severity, #294. Only a **packaged** profile's binary is probed. A project overlay (or an entry-point package's) profile is resolved and reported found but never launched, whatever its `binary` is called — profile fields arrive with a clone, so a project's own config cannot choose which binary this diagnostic launches. The boundary is provenance rather than the spelling of `binary`, because a bare name still resolves into the checkout whenever a checkout-local directory is on `PATH`. Note what it bounds: **which name** is probed, not what that name resolves to. Resolution runs through your `PATH`, so validate launches whatever `PATH` says the CLI is — the same file the session launch itself would run.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `[hooks]`                          | ✅       | —                  | The `HookSpec` table (see below).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `adapter`                          |          | `generic`          | Which adapter **class** drives this CLI — a key resolved against the [adapter registry](#shipping-a-new-adapter-class-out-of-tree), not a fixed enum. `generic` = the bundled tmux + hook-signal adapter; `opencode-http` = the bundled HTTP/SSE adapter; an out-of-tree package registers its own. Membership is checked against the **live** registry (at run start, and by `bmad-loop validate`'s `adapter.kind`), never at parse time — so an unknown kind is a clear config error rather than a schema change. Orthogonal to `hooks.dialect = "none"` — hooklessness is about the transport, this is about the driving class — with two qualifications. A back-compat carve-out for files written before this field existed: when the key is **absent** and the dialect is `none`, the kind is `opencode-http` (what hooklessness used to select), not `generic`. And one refused pairing: an explicit `generic` beside `dialect = "none"` is rejected at load — that adapter completes on a `Stop` hook a hookless profile never registers, so the session could only wait out `session_timeout_min`. Hookless on any **other** kind stays legal, which is the decoupling this field exists for; a provider shipping a hookless profile must therefore set `adapter` rather than leave it at the default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `skill_tree`                       |          | `.claude/skills`   | Project-relative tree this CLI reads skills from (`.agents/skills` for codex/gemini); `bmad-loop init` installs the `bmad-loop-*` skills here. Must be relative.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `prompt_template`                  |          | `{prompt}`         | How the canonical `/skill args` prompt is rendered. Placeholders: `{prompt}` (whole string), `{skill}` (leading slash-command name, no `/`), `{args}` (the remainder).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `launch_args`                      |          | `()`               | Extra argv passed at launch, e.g. `["-i"]` to stay interactive (gemini/copilot).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `bypass_args`                      |          | `()`               | Flags that bypass permission/approval prompts for unattended runs (e.g. `--allow-all-tools`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `model_flag`                       |          | `--model`          | Flag used to pass the model name when one is configured.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `env`                              |          | `{}`               | Extra environment variables for the session.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `usage_parser`                     |          | `none`             | Which transcript token parser to use — one of `claude-jsonl`, `codex-rollout`, `gemini-chat`, `copilot-events`, `none`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `usage_grace_s`                    |          | `0.0`              | Seconds to keep polling the transcript for token totals after the session ends. `0` = read once. Raise it for CLIs that flush totals only on shutdown (copilot writes `modelMetrics` ~1s after the turn-end hook). Must be ≥ 0.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `stop_without_result_nudges`       |          | unset (use global) | Per-adapter floor for Stop-without-result nudges. Leave unset to inherit `limits.stop_without_result_nudges`. Raise it for CLIs that fire a turn-end hook _per response turn_ (copilot's `agentStop`), where the global default of 1 declares them stalled too early. Must be ≥ 0 if set.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `subagent_stop_without_transcript` |          | `false`            | Set `true` for CLIs that fire the turn-end hook for _subagent_ turns too, with an empty `transcriptPath` and a tool-use session id (copilot's `agentStop`). A `Stop` carrying no transcript is then treated as a subagent stop and ignored, so the main session's real turn-end drives completion. Leave `false` and every `Stop` is the main turn-end.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `first_run_note`                   |          | `""`               | Human note printed by `init` about a manual first-run/auth step this CLI needs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `seed_files`                       |          | `()`               | Project-relative gitignored configs (MCP/CLI settings) a `git worktree add` checkout omits; `provision_worktree` copies them into isolated dev/review worktrees. Must be relative.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `env_fault_patterns`               |          | `()`               | Regex patterns matched line-by-line against the ANSI-stripped tail of a **non-completed** (`timeout`/`stalled`/`crashed`) session's log to classify a transport/API **environment fault** (#194); a match stamps `env_fault` / `env_fault_evidence` on the `SessionResult`. **Which log is per-adapter**, named by `EnvFaultMixin.ENV_FAULT_LOG_SUFFIX`: the tmux adapters scan the pane capture `logs/<task-id>.log`, `opencode-http` scans `logs/<task-id>.server.out` (the `opencode serve` process's own stdout) and never its `.log` conversation transcript. A pattern is only **sound** if the model cannot write to the log it is matched against — a pane capture carries the model's own output, so a story that merely _implements_ rate limiting prints `429`/`quota` in ordinary healthy work. So for a pane-capture profile a pattern must reproduce one of the CLI's **complete error sentences**, taken from captured output. An error-shaped token **plus** a cause on the same line is _not_ sufficient — that is exactly the shape a story writing about the error produces, and it is why the previous doctrine had to be withdrawn (#507). A shipped pattern must also not match **its own line in the profile file**, or a session that prints or diffs its profile reads its own configuration as an outage; the seeded patterns carry single-character classes (`t[o]`, `respons[e]`) for that, changing nothing about what they match and everything about what their source line matches. `test_shipped_patterns_do_not_match_their_own_profile_line` pins the self-match rule and `test_pane_capture_patterns_do_not_match_this_repo` extends the same scan to every tracked file, so a doc bullet or profile comment written in the forbidden shape fails the suite. No quota patterns are seeded for the pane-capture profiles: no captured line exists, and that vocabulary is what a rate-limiting story prints all day. Must be a **list of strings**; compiled and validated at parse time (an invalid regex is a profile error). Matched with the `regex` module under a per-pattern timeout (`ENV_FAULT_MATCH_TIMEOUT_S`), so a pathological pattern can't hang a session teardown. Seeded for `claude` (three patterns over its captured error sentences — connection loss and the two captured provider 5xx refusals, whose statuses are enumerated rather than ranged so an uncaptured `503` stays prose, #507) and `opencode` (provider quota/rate-limit + connection, #323); empty = inert. |
+| Field                              | Required | Default                                                                        | Meaning                                                                                                                                                                                                                                                                                                    |
+| ---------------------------------- | -------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                             | ✅       | —                                                                              | Profile id: the `--cli` value, the policy `[adapter] name`, and the override key.                                                                                                                                                                                                                          |
+| `binary`                           | ✅       | —                                                                              | Executable resolved on `PATH`. `validate` runs `--version` only on binary names a packaged profile declares (`adapter.binary-unrunnable`).                                                                                                                                                                 |
+| `[hooks]`                          | ✅       | —                                                                              | The [`HookSpec`](#hookspec-the-hooks-table) table.                                                                                                                                                                                                                                                         |
+| `adapter`                          |          | `generic` (`opencode-http` if `dialect=none`)                                  | Adapter kind, resolved against the live [registry](#shipping-a-new-adapter-class-out-of-tree) at run start and by `validate` (`adapter.kind`). `generic` with `dialect = "none"` is refused.                                                                                                               |
+| `skill_tree`                       |          | `.claude/skills`                                                               | Project-relative tree the CLI reads skills from; `init` installs the `bmad-loop-*` skills here. Must stay inside the project; a leading `~` is refused (it is not expanded).                                                                                                                               |
+| `extra_skill_trees`                |          | `[]`                                                                           | Further project-relative trees the CLI also reads skills from (opencode-http: `[".agents/skills"]`). Each entry gets the `skill_tree` checks and must differ from it. Read by validate, the run and worktree seeding; `init` installs only into `skill_tree`.                                              |
+| `[user_skills]`                    |          | unset                                                                          | The user-level folders the CLI loads skills from on its own, used only under `[skills] user_roots = true`. See [User-level skill roots](#user-level-skill-roots). Unset: no user root is resolved, hinted or shadow-checked.                                                                               |
+| `prompt_template`                  |          | `{prompt}`                                                                     | Renders the canonical `/skill args` prompt. Placeholders: `{prompt}` (whole string), `{skill}` (command name, no `/`), `{args}` (the rest), `{skill_dir}` (the skill's folder: `<skill_tree>/<skill>`, or the absolute path when it resolved from a user root).                                            |
+| `launch_args`                      |          | `[]`                                                                           | Argv after `binary` (`["-i"]` keeps gemini/copilot interactive). Under `opencode-http` it precedes `serve`; `validate` warns on unservable shapes.                                                                                                                                                         |
+| `bypass_args`                      |          | `[]`                                                                           | Permission-bypass flags for unattended runs, launched under `permission_mode = "bypass"`. A policy `extra_args` replaces them; `validate` warns (`policy.bypass-dropped`) when one is dropped.                                                                                                             |
+| `model_flag`                       |          | `--model`                                                                      | Flag passed with the model name when one is configured.                                                                                                                                                                                                                                                    |
+| `env`                              |          | `{}`                                                                           | `[env]` table of extra session environment variables. It cannot override the run's state-root pin.                                                                                                                                                                                                         |
+| `usage_parser`                     |          | `none`                                                                         | Transcript token parser: `claude-jsonl`, `codex-rollout`, `gemini-chat`, `copilot-events`, `antigravity-transcript` or `none`.                                                                                                                                                                             |
+| `usage_grace_s`                    |          | `0.0`                                                                          | Seconds to keep polling the transcript for token totals after the session ends; `0` reads once. Must be ≥ 0.                                                                                                                                                                                               |
+| `stop_without_result_nudges`       |          | unset                                                                          | Per-profile default for Stop-without-result nudges. An `[adapter]` / `[adapter.<stage>]` value overrides it; unset inherits `[limits] stop_without_result_nudges`. Must be ≥ 0.                                                                                                                            |
+| `subagent_stop_without_transcript` |          | `false`                                                                        | When `true`, a `Stop` with no transcript path is a subagent turn-end and is ignored.                                                                                                                                                                                                                       |
+| `subagent_spawn_marker`            |          | unset                                                                          | File a parent conversation writes when it spawns a child, relative to a conversation folder, with `{session_id}` as the child's id. A `Stop` whose id has this marker in a sibling folder is ignored; the children a parent's own folder lists this way have their writes counted as idle-notice activity. |
+| `first_run_note`                   |          | `""`                                                                           | Note `init` prints about a manual first-run or auth step.                                                                                                                                                                                                                                                  |
+| `seed_files`                       |          | `[]`                                                                           | Project-relative gitignored files copied into each provisioned worktree. Must stay inside the project.                                                                                                                                                                                                     |
+| `env_fault_patterns`               |          | `[]`                                                                           | Regexes that classify a non-completed session as an environment fault. See [Environment-fault patterns](#environment-fault-patterns).                                                                                                                                                                      |
+| `parked_prompt_patterns`           |          | `[]`                                                                           | Regexes matched against the visible pane at each stall-grace expiry and at the timeout. See [Parked-session signals](#parked-session-signals).                                                                                                                                                             |
+| `usage_limit_patterns`             |          | `[]`                                                                           | Regexes for a usage-limit line the CLI stays blocked behind until an operator acts. See [Usage-limit signals](#usage-limit-signals).                                                                                                                                                                       |
+| `usage_wait_patterns`              |          | `[]`                                                                           | Regexes for a usage-limit line the CLI waits out and continues from by itself. Disjoint from `usage_limit_patterns`. See [Usage-limit signals](#usage-limit-signals).                                                                                                                                      |
+| `auto_deny_patterns`               |          | `[]`                                                                           | Regexes for the CLI's auto-deny countdown on a permission prompt, with named groups `min` and `sec`. See [Parked-session signals](#parked-session-signals).                                                                                                                                                |
+| `[workspace_trust]`                |          | unset                                                                          | The [`WorkspaceTrustSpec`](#workspacetrustspec-the-workspace_trust-table) table. Unset: nothing under `~` is read or written.                                                                                                                                                                              |
+| `[parked_answers]`                 |          | unset                                                                          | The [`[parked_answers]`](#answer-keys-the-parked_answers-table) table. Unset: the TUI offers no answer keys.                                                                                                                                                                                               |
+| `[permission_modes.<mode>]`        |          | unset                                                                          | Launch args for a non-bypass `[adapter] permission_mode`. See [Permission modes](#permission-modes). Unset: the profile refuses that mode.                                                                                                                                                                 |
+| `session_id_flag`                  |          | `""`                                                                           | Launch flag for a caller-chosen session id (claude: `--session-id`). The generic adapter appends `[flag, uuid4]` and pins attribution to that id.                                                                                                                                                          |
+| `subagent_transcript_dir`          |          | derived from `usage_parser` (`{stem}/subagents` for `claude-jsonl`, else `""`) | Subagent transcript tree beside the transcript, walked recursively and stat-only; its writes count as idle-notice activity and re-arm the dev stall grace. Must contain `{stem}` (the transcript's filename stem) and stay relative; `""` = off.                                                           |
+
+`session_id_flag` must be one `-`-prefixed token with no whitespace or `=`, and is refused
+on hookless profiles. Set it only when the CLI's `SessionStart` payload reports the id you
+passed.
+
+An overlay that changes `usage_parser` away from `claude-jsonl` must set
+`subagent_transcript_dir` itself; it is refused on hookless profiles.
+
+`subagent_spawn_marker` applies to a `Stop` whose transcript sits under a folder named by its
+session id; that folder's parent holds the conversation folders searched for the marker. A
+`Stop` it cannot judge (no id, no transcript path, no such folder) or a marker it cannot read
+is admitted and journaled once (`subagent-marker-unjudged`, `subagent-marker-unreadable`); a
+dropped child is journaled once per id (`subagent-stop-ignored`). The `Stop` check skips a
+store folder whose mtime predates the session's launch (less a 300 s slack): it stats each such
+folder once per session, then never again. Like `subagent_transcript_dir`, the marker must
+contain its placeholder (here `{session_id}`), stay relative with no `..`, and is refused on
+hookless profiles.
+
+The idle notice also walks each child the parent's folder lists (`<store root>/<childId>/`, its
+`*.jsonl` files only, stat-only), and each child those children list in turn, as it walks
+`subagent_transcript_dir`; when the parent's folder cannot be judged it watches no children, and
+a listing fault joins `subagent-scan-failed`. A listed descendant's writes also re-arm the dev
+stall grace, as pane growth does.
 
 ### `HookSpec` (the `[hooks]` table)
 
-| Field         | Required | Meaning                                                                                                                                                                                                                                   |
-| ------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `dialect`     | ✅       | The CLI's hook-config format — one of `claude-settings-json`, `codex-hooks-json`, `gemini-settings-json`, `copilot-settings-json`, `cursor-hooks-json`, `antigravity-hooks-json`.                                                         |
-| `config_path` | ✅       | Project-relative path the hook config is written to (e.g. `.claude/settings.json`). Absolute paths are rejected.                                                                                                                          |
-| `events`      | ✅       | Map of **native** event name → **canonical** event name. The canonical side must be one of `SessionStart`, `Stop`, `SessionEnd`, `PreCompact`; the native side is whatever the CLI emits (e.g. `agentStop = "Stop"`). At least one entry. |
+| Field                | Required                     | Default | Meaning                                                                                                                                                                               |
+| -------------------- | ---------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dialect`            | ✅                           | —       | Hook-config format: `claude-settings-json`, `codex-hooks-json`, `gemini-settings-json`, `copilot-settings-json`, `cursor-hooks-json`, `antigravity-hooks-json`, or `none` (hookless). |
+| `config_path`        | ✅ unless `dialect = "none"` | `""`    | Project-relative path the hook config is written to. Must stay inside the project; empty when hookless.                                                                               |
+| `events`             | ✅ unless `dialect = "none"` | `{}`    | Native event → canonical event (`SessionStart`, `Stop`, `SessionEnd`, `PreCompact`, `Notification`, `StopFailure`, or a parked kind). Empty when hookless.                            |
+| `notification_types` |                              | `{}`    | `[hooks.notification_types]`: notification subtype → parked kind. Unmapped subtypes are ignored. Needs an event mapped to `Notification`.                                             |
+| `stop_failure_types` |                              | `{}`    | `[hooks.stop_failure_types]`: `StopFailure` error value → `transient`, `rate_limit`, `account`, `account-fatal` or `ignore`. Needs an event mapped to `StopFailure`.                  |
+| `event_min_versions` |                              | `{}`    | `[hooks.event_min_versions]`: native event → minimum CLI version (`X.Y.Z`). Registration leaves the event out below it. Keys must be mapped; never a Stop carrier.                    |
+
+### Session identity and nested CLIs
+
+The relay stamps every hook event with the session's task id from the inherited
+environment, so a coding CLI launched from _inside_ a session writes its events into the
+parent's stream. The generic adapter tells them apart by `session_id`
+(`SessionAttribution` in `signals.py`):
+
+- **`SessionStart`'s `session_id` binds the session.** Without `session_id_flag`, the first
+  `SessionStart` is the launched session's; with it, the id is pinned at launch. A later one with a new id marks that id foreign and drops its
+  events, unless the payload's `source` is `clear` or `compact`, which rebinds. Map
+  `SessionStart` whenever the CLI has one, and check that its payload carries the id.
+- **`Stop` and `SessionEnd` should carry the same id.** Attribution fails toward
+  acceptance: an id-less event, or an id that never announced a `SessionStart`, is
+  admitted. Two exceptions: under `session_id_flag` an identified `SessionStart` or
+  `SessionEnd` from any other id is foreign, and once relay lineage is calibrated trusted a `mismatch`-tagged
+  event is dropped, id-less or not.
+- **Subagent turn-ends stay with `subagent_stop_without_transcript`.** Subagent ids never
+  announce a `SessionStart`, so attribution admits them and the transcript filter decides.
+- **Stop-only profiles get no nested-CLI protection.** With no `SessionStart` mapped,
+  every event is admitted (`antigravity`).
+
+`probe-adapter --probe` shows the payload's field names; confirm the `session_id` and
+`source` casing before relying on them.
+
+The engine passes its `BMAD_LOOP_*` contract on the session window's environment, so only
+processes descended from the launched CLI inherit it. A CLI that runs tool shells or hooks
+in a long-lived server process it shares across sessions gives them the server's
+environment instead: hooks relay nothing and skills cannot tell they run under bmad-loop.
+Host that server per session. The `codex` profile passes `--no-daemon` in `launch_args`,
+and the [opencode adapter](#worked-example-the-opencode-adapter) spawns one
+`opencode serve` per session.
+
+### `WorkspaceTrustSpec` (the `[workspace_trust]` table)
+
+Some CLIs refuse to start in a workspace that is not listed in a home-level settings file,
+and block on a trust dialog a spawned session cannot answer. Declaring the file lets
+provisioning append each unit worktree to that list before any session launches.
+
+| Field           | Required | Meaning                                                                                                    |
+| --------------- | -------- | ---------------------------------------------------------------------------------------------------------- |
+| `settings_path` | ✅       | `~/`-prefixed path of a JSON settings file inside the home directory. No `..` and no Windows device names. |
+| `key`           | ✅       | One **top-level** key of that file holding a list of path strings.                                         |
+
+Any other key in the table is refused. The seeder (`bmad_loop/workspace_trust.py`) adds a
+worktree **only when the main checkout root is already in the list**. It touches only the
+declared key, writes atomically, and keeps the file's permission bits. Outcomes are
+journaled as `worktree-trust-seeded` or `worktree-trust-unseeded`; a malformed file or a
+write fault escalates the unit. Entries are never removed on teardown. The shipped
+`antigravity` profile declares:
+
+```toml
+[workspace_trust]
+settings_path = "~/.gemini/antigravity-cli/settings.json"
+key = "trustedWorkspaces"
+```
+
+### User-level skill roots
+
+The `[user_skills]` table declares the folders in the user's home that the CLI loads skills
+from by itself. bmad-loop resolves a skill from them only when the project sets
+`[skills] user_roots = true`; with the switch off they serve the `skills.base-missing` hint
+and the `skills.user-shadow` warning.
+
+```toml
+[user_skills]
+precedence = "project"
+roots = [
+  { path = "~/.copilot/skills", disabled_by = ["COPILOT_HOME"] },
+  "~/.agents/skills",
+]
+```
+
+| Key           | Default     | Meaning                                                                                                                                                                                                                                                                          |
+| ------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `precedence`  | `"project"` | Which copy the CLI runs when the project and a user root both hold one: `project` (the project's), `user` (the user root's; validate and the run check that copy) or `unordered` (both load in no documented order; bmad-loop checks the project copy and warns).                |
+| `roots`       | `[]`        | The user roots, in the order the CLI reads them. Each is a `"~/..."` string or a `{ path = "~/...", disabled_by = [...] }` table. A path must start with `~/` and stay inside the home folder; duplicate roots are refused.                                                      |
+| `disabled_by` | `[]`        | Environment variables that make the CLI skip this root when set (even to an empty value), such as a variable that moves the CLI's config home. Read from bmad-loop's environment plus the profile's `[env]`; at session dispatch, also the env a `pre_session` plugin hook sets. |
+
+Declare only folders the CLI loads natively, as its own docs describe them. `validate` passes
+a skill found in a declared root, so a root the CLI does not read gives a green `validate`
+and a session that cannot find its skill. Recheck the list when the CLI changes how it
+discovers skills.
+
+### Environment-fault patterns
+
+`env_fault_patterns` are matched line by line against the ANSI-stripped log tail of a
+session that ended `timeout`, `stalled` or `crashed`. A match stamps `env_fault` /
+`env_fault_evidence` on the `SessionResult`, unless the session tracked nonzero token
+usage, which records the match in `env_fault_overruled` instead. What the engine does next
+is in [Environment faults](escalations-guide.md#environment-faults).
+
+- **Which log** is per adapter, named by `EnvFaultMixin.ENV_FAULT_LOG_SUFFIX` (one file) or
+  `ENV_FAULT_LOG_SUFFIXES` (several, scanned in order; the last match across them wins,
+  and a missing file is a read fault). The tmux adapters scan the pane capture
+  `logs/<task-id>.log`; `opencode-http` scans `logs/<task-id>.server.out` plus
+  `logs/<task-id>.provider-errors.log`, the one adapter-written line per provider-error
+  event.
+- **A pane capture carries the model's own output**, so a pattern must reproduce the whole
+  first sentence of one of the CLI's error messages, taken from captured output. An
+  error-shaped token plus a cause is not enough; that is what a story writing about the
+  error prints.
+- **A pattern must not match its own line in the profile file.** The shipped patterns use
+  single-character classes (`t[o]`) for this. `test_shipped_patterns_do_not_match_their_own_profile_line`
+  and `test_pane_capture_patterns_do_not_match_this_repo` enforce it across every tracked
+  file.
+- Patterns are a list of strings, compiled at load (an invalid regex is a profile error),
+  and matched with the `regex` module under a per-pattern timeout.
+- Seeded for `claude` (connection loss, a mid-response cut in both its older and its
+  current Claude Code wording, and two captured provider 5xx errors; the current lines
+  are pinned against `tests/fixtures/claude-stopfailure/`) and
+  `opencode` (provider quota/rate-limit and connection on 1.x; `provider.rate-limit`,
+  `provider.transport`, `provider.internal`, `provider.auth` and `provider.no-route` events
+  on 2.x, whose `provider.quota` is a usage limit instead).
+  Empty means inert.
+- The tail scan also covers `usage_limit_patterns` and `usage_wait_patterns` as ordinary
+  pattern families, under the same token-usage overrule: a session that got past a limit
+  and later failed for another reason is charged. Only a live sighting of a usage line
+  (on the visible pane, or an opencode 2.x provider-error line written while the session
+  runs) exempts a session from the overrule; see [Usage-limit signals](#usage-limit-signals).
+
+### Parked-session signals
+
+A CLI parked on a permission, idle or quota prompt looks like a stalled one, and the stall
+wake nudge's trailing Enter can answer that prompt. Two opt-in profile signals let the
+generic adapter tell them apart:
+
+- **Hook-reported.** Map a native event directly to a parked kind (`PermissionPrompt`,
+  `IdlePrompt`, `QuotaPrompt`), or map the CLI's notification event to `Notification` and
+  its subtypes in `[hooks.notification_types]`. The shipped `claude` profile parks
+  `permission_prompt`, `idle_prompt`, `quota_auto_resume_stale`,
+  `quota_auto_resume_disabled`, `elicitation_dialog` and `elicitation_url_dialog`; every
+  other subtype is ignored. The adapter latches the signal, and a `Stop` clears it; a
+  `PermissionPrompt` latch also clears once the transcript is written after it.
+- **Pane-matched.** `parked_prompt_patterns` are matched against the visible pane
+  (`mux.capture_pane`) at every stall-grace expiry with no latch set, including the final
+  one. A backend that cannot capture, a capture failure, or a regex timeout reads as no
+  match. Seed only lines captured off the CLI's own screen, with single-character classes
+  as for env-fault patterns.
+
+Pane patterns (parked, usage-limit and usage-wait alike) are tried one row at a time, then
+across two or three consecutive rows, so a line that a narrow window wraps still matches.
+Each row boundary is joined both with and without a space, to cover a word split mid-word
+and a wrap at a space. A pattern therefore must not match its own profile line wrapped at
+any width either: keep a single-character class inside the distinctive word
+(`reques[t]`, `procee[d]`), not at a word edge. `test_profile.py` checks the shipped
+patterns against their own lines wrapped at widths 10 to 60.
+
+Neither signal acts on arrival. At the stall-grace expiry, a parked signal suppresses the
+nudge and ends the session `stalled` with `SessionResult.parked` / `parked_evidence` set (a
+window already dead still ends `crashed`), except a `PermissionPrompt` latch the transcript
+has moved past, which gets the nudge. At the timeout, a latched signal or a
+pane-matched prompt marks the `timeout` result parked, but only while the window is alive
+and the transcript is idle. The engine and sweep then pause for a human; an `env_fault`
+outranks it. Re-arm restores the attempt without charging it.
+
+While a `PermissionPrompt` latch is set, the adapter journals `session-parked`, and
+`session-unparked` once the session moves on (`how` is `stop`, `activity` or `ended`). The
+TUI reads them to show a live parked prompt. `auto_deny_patterns` name the CLI's
+auto-deny countdown on the visible pane; each pattern needs the named groups `min` and
+`sec`, and a match records the deadline as `auto_deny_at`. The shipped `claude` profile
+seeds the countdown line Claude Code paints on an unattended session.
+
+Claude sends `idle_prompt` about 60 s after every finished turn, so a session that ends a
+turn without a result and sits idle pauses as parked instead of being nudged. A project
+overlay (`.bmad-loop/profiles/claude.toml`) that drops `idle_prompt` from
+`[hooks.notification_types]` restores the wake nudge.
+
+### StopFailure signals
+
+When an API error ends a turn, Claude Code (2.1.78 and newer) fires `StopFailure`
+instead of `Stop`. Map the native event to the canonical `StopFailure` and name its
+`error` values in `[hooks.stop_failure_types]`. The relay forwards the payload's `error`,
+`error_details` and `last_assistant_message` (the rendered API error, not the model's
+prose). A missing `error` reads as `unknown`. `StopFailure` is never a completion: it
+never marks the turn ended, never reads a result, and never restores a nudge budget.
+The generic adapter acts on it when it arrives, by action:
+
+- **`transient`**: the stop nudge goes out at once, from the same budget and with the
+  same quota-wait guard as a result-less `Stop` (`stop-nudge-withheld` carries
+  `hook_event="StopFailure"`). A session with no stop nudge (a dev session: its skill
+  writes no result file) gets the stall wake nudge at once instead, from the stall
+  budget and attempt cap, and the stall grace restarts; a parked latch withholds it
+  (`stop-nudge-withheld`, `reason="parked"`). A turn that never recovers stalls as
+  before and is charged; with both budgets spent, the adapter leaves
+  `stop-failure-nudge-exhausted`.
+- **`account`**: the session ends `stalled` + `parked` with the evidence
+  `StopFailure(<error>): <message, else details, else "no message">`. The log-tail
+  env-fault scan is skipped, so the run pauses with a `parked:` reason naming the error,
+  and the attempt is not charged.
+- **`account-fatal`**: the adapter treats it exactly like `account` (the same parked exit
+  and evidence, and a dead window after it is relabeled `parked` with
+  `crash-relabeled` `kind="account"`), and `stop_failure_action` reads `account-fatal`.
+  The difference is downstream: usage-relaunch mode relaunches an `account` error but
+  never an `account-fatal` one, so map an error here when no relaunch or account switch
+  can fix it.
+- **`rate_limit`**: an ordinary 429 and a subscription limit share this value, so the
+  message is matched against the profile's usage lists (see
+  [Usage-limit signals](#usage-limit-signals)). A `usage_limit_patterns` match ends the
+  session usage-limited, the same pause as a pane match. A `usage_wait_patterns` match
+  (`stop-failure-quota-wait-pending`) becomes the quota wait's evidence when the pane
+  offers none, so a backend that cannot capture its pane can still admit the wait. No
+  match leaves `stop-failure-rate-limit-unmatched` and the usual stall timing. A match
+  that blows the per-pattern timeout leaves `stop-failure-probe-failed` and counts as no
+  match. In usage-relaunch mode (see below) a wait match and an unmatched value end the
+  session at once instead.
+- **`ignore`**: nothing beyond the crumb.
+
+Every event leaves a `stop-failure` lifecycle crumb (error, action, details, a message
+excerpt); an unmapped value also leaves `stop-failure-unmapped` and keeps the usual stall
+timing. A later `Stop` clears the latch. `SessionResult.stop_failure` carries the last
+uncleared error, as does the heartbeat and the `session-end` journal entry, and
+`SessionResult.stop_failure_action` its mapped action.
+
+**A window that dies after the event.** An operator's own `StopFailure` hook may kill the
+window, for example to switch accounts. The session then ends `crashed`, but an `account`
+or `account-fatal` error, or a `rate_limit` that matched a usage list, keeps its
+classification: the result is labeled `parked` (account) or `usage_limited` (blocked or
+wait class), and the run gets the same uncharged pause as the live exit. The adapter leaves a `crash-relabeled`
+lifecycle crumb (`kind`, `error`). A `Stop` clears the classification, and so does a
+transcript write after the event, since the CLI recovered by itself. A crash whose result
+file exists is completed as before and never relabeled. An unmatched `rate_limit` stays an
+unlabeled, charged crash outside usage-relaunch mode.
+
+**Usage-relaunch mode.** With `[limits] usage_limit_action = "relaunch"`, primary dev and
+review sessions are launched with two flags on `SessionSpec`: `usage_relaunch_mode`, and
+`usage_relaunch_left` while the story has relaunches left under
+`limits.max_usage_relaunches`. Then:
+
+- a `rate_limit` that matches neither usage list counts as a wait-class usage limit. The
+  session ends `stalled` + `parked` + `usage_limited` at once, with the evidence
+  `StopFailure(<error>): <message, else "no message">` and no reset. The
+  `stop-failure-rate-limit-unmatched` crumb carries `relaunch_mode=True`. A window that
+  dies after it is relabeled `usage_limited` the same way (`crash-relabeled`,
+  `kind="unmatched"`). This holds at the cap too, where the engine pauses uncharged at
+  once instead of after a stall grace.
+- with relaunches left, a `rate_limit` that matched `usage_wait_patterns` ends the session
+  at the event instead of waiting for the quota wait (`quota-wait-skipped`,
+  `reason="usage-relaunch"`).
+
+The engine relaunches such a session without charging an attempt (see
+[Usage-limit pauses](escalations-guide.md#usage-limit-pauses)).
+
+The shipped `claude` profile maps the documented values: `overloaded`, `server_error`,
+`unknown`, `max_output_tokens` and `invalid_request` (a context-shape failure that a fresh
+session fixes) are `transient`; `rate_limit` is `rate_limit`; `billing_error`,
+`authentication_failed`, `oauth_org_not_allowed`, `account_on_hold` and
+`verification_required` are `account`; `cloud_credential_error` and `model_not_found` are
+`account-fatal`, since a relaunch on another account still hits the same wrong model or
+broken cloud credential.
+
+**Version gate.** Claude Code before 2.1.78 skips its whole settings file over an
+unknown hook event key, `Stop` relay included, so claude's
+`[hooks.event_min_versions]` floors `StopFailure` at `2.1.78`. Registration (`init`,
+worktree provisioning, `probe-adapter`) reads `<binary> --version` and leaves a floored
+event out below its floor or when the version cannot be read. `init` prints
+`warning: StopFailure hook not registered (claude): …` and strips a relay it gated out;
+provisioning journals `worktree-hook-gated`. A project initialized before the event was
+mapped gets it by re-running `bmad-loop init`, and `bmad-loop validate` warns
+(`hooks.events-incomplete`) until then. `validate` reads the version only for a packaged
+profile; for an overlay or entry-point profile it names the floor without running the
+binary. Downgrading the CLI after `init` keeps the entry
+until `init` runs again.
+
+### Answer keys (the `[parked_answers]` table)
+
+The TUI's `Y` and `N` keys answer a live permission prompt by pressing keys in the
+session's pane. The same keys answer other dialogs differently: Enter on Claude Code's
+bypass startup dialog chooses "No, exit". So each choice carries guard patterns that must
+all match a fresh capture of the visible pane before anything is sent.
+
+| Field           | Meaning                                                                |
+| --------------- | ---------------------------------------------------------------------- |
+| `approve`       | Named keys pressed in order to approve; each one of `Enter`, `Escape`. |
+| `deny`          | Named keys pressed in order to deny; same key set.                     |
+| `approve_guard` | Non-empty regexes that must all match the pane before approving.       |
+| `deny_guard`    | Non-empty regexes that must all match the pane before denying.         |
+
+All four are required, and any other key is refused. Guards are matched like pane
+patterns, across wrapped rows; a regex timeout refuses. The shipped `claude` profile
+guards both choices on the prompt's own question, so neither fires on another dialog, and
+approve also on the focus marker on option 1:
+
+```toml
+[parked_answers]
+approve = ["Enter"]
+deny = ["Escape"]
+approve_guard = ['Do you want to procee[d]\?', '❯ 1[.] Yes']
+deny_guard = ['Do you want to procee[d]\?']
+```
+
+### Permission modes
+
+`[adapter] permission_mode` selects the args a session launches with. `bypass` (the
+default) launches `bypass_args`. Any other mode launches the args of the profile's
+`[permission_modes.<mode>]` table in their place:
+
+| Field                  | Required | Meaning                                                                                                                                    |
+| ---------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `args`                 | ✅       | Launch args that stand in for `bypass_args`. A policy `extra_args` still replaces them.                                                    |
+| `platforms`            |          | `sys.platform` values the mapping works on (`linux`, `darwin`, `win32`). Empty or unset: every platform.                                   |
+| `linked_worktree_args` |          | Args appended after `args` when the session runs in a linked worktree, with `{gitdir}` and `{common_dir}` filled in. Empty or unset: none. |
+
+`linked_worktree_args` is for a sandbox that must be granted a linked worktree's git
+directories explicitly. When the session's cwd is in a linked worktree (as under
+`scm.isolation = "worktree"`), the generic adapter asks git for that worktree's gitdir
+(`<main>/.git/worktrees/<name>`) and the common dir (`<main>/.git`), resolves both, and
+appends the list after the mode's `args` with each `{gitdir}` / `{common_dir}` replaced by
+that path written as a TOML basic string, quotes included. In a main checkout nothing is
+appended. Under `bypass`, or when a policy `extra_args` replaces the mode's args, nothing is
+appended and git is not asked.
+
+If git cannot answer, or a path cannot be written as TOML, the session refuses to launch
+rather than start without the grant. Each entry must be a non-empty string, and at least one
+entry must use a placeholder: an arg with no path in it belongs in `args`. The config digest
+hashes the unfilled list, so a resumed run's digest does not depend on the worktree path.
+
+A profile without the table, or on an excluded platform, refuses the mode at run start and
+in `validate` (`adapter.permission-mode-unsupported`). `opencode-http` never launches
+`bypass_args` and refuses `sandboxed`. `bmad-loop resolve` sessions always launch
+`bypass_args`, because a human is present to answer prompts.
+
+A `sandboxed` mapping must never block on a prompt: an action outside the sandbox has to
+return to the agent as an error. The shipped mappings, both for `linux` and `darwin`:
+
+- **claude:** `--permission-mode dontAsk`, `--allowedTools Edit(/**)` (project edits and
+  writes), `--disallowedTools AskUserQuestion`, and `--settings` turning on the Bash
+  sandbox with no unsandboxed retry. Sandboxed Bash can run git and write `.git`; network is
+  denied. On Linux the Bash sandbox needs bubblewrap and socat installed, or the session
+  refuses to start.
+- **codex:** a `-c` permission profile `bmad_loop` extending `:workspace` with a `.git`
+  write grant, plus `--ask-for-approval never`. Network is off. Its `linked_worktree_args`
+  define a child profile `bmad_loop_worktree` that extends `bmad_loop` with write grants
+  for the linked worktree's gitdir and the common dir, and select it with a later
+  `default_permissions`, so git add and commit work in a worktree checkout. `validate`
+  warns about sandboxed Codex under `scm.isolation = "worktree"` only when that grant
+  cannot ride: an `extra_args` override, or a profile whose mode declares no
+  `linked_worktree_args` or a grant that names only one of `{gitdir}` and `{common_dir}`
+  (Codex needs both to commit).
+
+The sandbox confines the session, not what bmad-loop later runs from the checkout. Both
+mappings leave `.git` writable, hooks and config included, and the orchestrator runs
+`[verify] commands` and its own git commits there unsandboxed. In a linked worktree,
+Codex's common-dir grant opens the main repo's `.git` (hooks, config, the main index and
+refs) to the session, the same exposure a sandboxed session in the main checkout already
+has through the `.git` grant.
+
+Both CLIs show a one-time workspace-trust dialog in a directory they have not seen.
+`validate` reports each role's posture as `adapter.permission-mode`.
+
+### Usage-limit signals
+
+A CLI stopped by a subscription or credit limit either stays blocked until someone acts
+(credit exhaustion) or waits for the limit's reset and continues by itself (a
+session-window limit under Claude Code's auto-continue). Two opt-in profile lists name
+those lines. The tmux adapters match both line by line against the ANSI-stripped visible
+pane; `opencode-http` has no pane and matches them against its provider-error lines (see
+below):
+
+- **`usage_limit_patterns`**: the CLI is blocked and will not continue on its own.
+- **`usage_wait_patterns`**: the CLI is blocked and waiting for a reset it continues from.
+
+A Claude Code `StopFailure` with `error` `rate_limit` is matched against the same two lists
+(see [StopFailure signals](#stopfailure-signals)).
+
+The lists are disjoint by contract; "usage-limited" means either one matched. They follow
+the env-fault evidentiary bar: reproduce the captured sentence prefix (never a bare
+`session limit`, `resets` or `usage credits`), use single-character classes so a pattern
+cannot match its own profile line, and seed only lines captured live from the CLI: off its
+screen, or from the adapter's record of its own events (opencode's provider-error lines). The
+shipped `claude` profile seeds one line in each list, and `opencode` seeds
+`usage_limit_patterns` with its 2.x `provider.quota` line; every other profile leaves both
+empty, which keeps them inert.
+
+**opencode-http's sighting.** On OpenCode 2.x the adapter matches each provider-error line
+it writes to `<task-id>.provider-errors.log` against `usage_limit_patterns`, then
+`usage_wait_patterns`, as the frame arrives for this session. The first match is the
+session's sighting: when the session ends `timeout`, `stalled` or `crashed`, the result
+carries it as `usage_limited` with its class, and no `usage_limit_resets`, since the frame
+names no reset time; a completed, aborted or over-budget result carries none. A frame of
+this session seen while it ran is live evidence, so the sighting is exempt from the
+token-usage overrule like a pane sighting. The shipped pattern matches
+`type=provider.quota`, a blocking limit: OpenCode builds that type from billing and
+credit-exhaustion codes and never retries it. `provider.rate-limit` and
+`provider.transport`, which OpenCode retries, stay `env_fault_patterns`. A match that blows
+the per-pattern timeout counts as no match and leaves a `usage-limit-match-failed`
+lifecycle crumb. OpenCode 1.x writes no provider-error lines and has no sighting.
+
+**At stall-grace expiry** the pane is captured once and checked against the parked
+patterns and both usage lists. A usage match withholds the nudge (even when a hook latch
+such as `idle_prompt` is set, since an idle CLI behind a limit latches exactly that) and
+ends the session `stalled` + `parked` with `SessionResult.usage_limited` holding the
+matched evidence. **When the session timeout fires**, one capture against both lists sets
+`usage_limited` on the `timeout` result. Neither gate takes a usage match from a session
+that is visibly working: a transcript written within the last 90 s (as of the last
+heartbeat) or an unanswered tool call means the line is left over from a limit it
+recovered from, and the stall or timeout is an ordinary one. A dead window is
+usage-limited only when it died during a quota wait or after a usage `StopFailure` (see
+[StopFailure signals](#stopfailure-signals)).
+
+A `usage_limited` result is classified as an environment fault with no token-usage
+overrule and no tail scan, and pauses with a `usage limit:` reason (see
+[Environment faults](escalations-guide.md#environment-faults)). When the matched line
+carries a `resets <time>` clause, the time is parsed (`H[:MM]am|pm`, optionally preceded by
+a weekday or `<Mon> <D> at` and followed by a ` (<Area/City>)` zone) into
+`usage_limit_resets`: ISO-8601 when it resolves, otherwise the raw clause, with a
+`usage-reset-unparsed` lifecycle crumb (`reason` is `unparsed`, or `zone-unavailable` when
+the host has no tz data for the named zone).
+
+**The quota wait.** With `[limits] quota_wait_max_min` above 0 (default 300) and
+`usage_wait_patterns` non-empty, the generic adapter admits a wait at a heartbeat when all
+of these hold: the transcript has been idle for at least 90 s, no tool call is open, the
+visible pane matches `usage_wait_patterns`, no `QuotaPrompt` or `PermissionPrompt` latch is
+set, and the session's cumulative wait is under the cap. While waiting:
+
+- the session timeout is frozen on every tick, at no less than 120 s remaining;
+- a stall-grace expiry re-arms the grace with no nudge (a `QuotaPrompt` or
+  `PermissionPrompt` latch still parks; an `IdlePrompt` latch never ends a wait);
+- a `Stop` without a result withholds the stop nudge (`stop-nudge-withheld`,
+  `reason="quota-wait"`); a `Stop` with a result completes normally;
+- the token-budget grace keeps counting, because a crossed budget is real spend.
+
+The wait ends when the transcript moves again (the timeout resumes from where it was
+frozen) or when a `QuotaPrompt`/`PermissionPrompt` latch arrives. The pane no longer
+matching does not end it, since the line can scroll away. A line the CLI continued from is
+spent: if it stays on screen, no live usage gate (admission, stall-grace expiry or the
+timeout look) takes it as evidence again, and a later limit has to print a new line. At
+the cap, measured on both the monotonic and the wall clock so a host suspend cannot
+stretch it, the session ends `stalled` + `parked` + `usage_limited` (`quota-wait-cap`). A
+line whose parsed reset lies beyond the remaining cap is not waited on: the session ends
+the same way at once (`quota-wait-skipped`, `reason="reset-beyond-cap"`). An unresolved
+reset is admitted, and the cap bounds it.
+
+A window that dies during the wait ends
+`crashed` with the wait's evidence and reset as a wait-class `usage_limited`
+(`crash-relabeled`, `kind="quota-wait"`).
+
+In usage-relaunch mode with relaunches left (`SessionSpec.usage_relaunch_left`), no wait
+is admitted: where it would open, the session ends `stalled` + `parked` + `usage_limited`
+at once (`quota-wait-skipped`, `reason="usage-relaunch"`), so the engine can relaunch the
+story uncharged. At the cap the wait admits as usual.
+
+The `opencode-http` adapter runs its own wait loop with no pane, so neither the usage gate
+nor the quota wait applies there.
 
 ### Worked TOML — copilot
 
-The shipped `copilot` profile exercises the non-default tuning knobs
-(`usage_grace_s`, `stop_without_result_nudges`, `subagent_stop_without_transcript`)
-and a camelCase event map — all discovered by the
-[copilot probe walkthrough](#worked-example-copilot) above:
+The shipped `copilot` profile uses the non-default tuning knobs and a camelCase event map,
+all found by the [copilot probe walkthrough](#worked-example-copilot):
 
 ```toml
 name = "copilot"
 binary = "copilot"
 skill_tree = ".agents/skills"
 launch_args = ["-i"]
-bypass_args = ["--allow-all-tools", "--allow-all-paths"]
+bypass_args = ["--allow-all-tools", "--allow-all-paths", "--allow-all-urls"]
 usage_parser = "copilot-events"
 usage_grace_s = 8.0        # token totals land ~1s after agentStop, on session.shutdown
 stop_without_result_nudges = 5   # agentStop fires per response turn
@@ -535,52 +867,45 @@ config_path = ".github/copilot/settings.json"
 events = { agentStop = "Stop", sessionStart = "SessionStart", sessionEnd = "SessionEnd" }
 ```
 
-(The shipped profile under `bmad_loop/data/profiles/copilot.toml` also carries a
-`prompt_template` and `first_run_note`, trimmed here for focus — read it for the
-exact shipped values.)
-
----
+The shipped file (`bmad_loop/data/profiles/copilot.toml`) also sets `prompt_template`,
+`model_flag` and `first_run_note`.
 
 ## Writing a new adapter class
 
-Reach for this **only** when a CLI does not fit the tmux-injection + hook-signal
-transport — for example an HTTP/SSE service with no terminal. A CLI that _does_
-fit (a binary you launch in a pane that fires lifecycle hooks) needs no Python:
-reuse `generic.py` with a [profile](#profile-field-reference) instead of
-subclassing.
+Reach for this only when a CLI does not fit the pane-injection + hook-signal transport, for
+example an HTTP/SSE service with no terminal. A CLI that does fit needs no Python: reuse
+`generic.py` with a [profile](#profile-field-reference).
 
 The contract is the `CodingCLIAdapter` ABC in
 [`src/bmad_loop/adapters/base.py`](../src/bmad_loop/adapters/base.py).
 
 ### Declare the three capability axes
 
-Set these class attributes so the engine can reason about transport quality
-instead of treating every CLI as a dumb terminal:
+Set these class attributes so the engine can reason about transport quality:
 
-- `injection` — how a prompt reaches the CLI: `tmux-initial-prompt` | `launch-flag` | `http`.
-- `observation` — how completion is detected: `hook-signal` | `sse` | `transcript-poll`.
-- `state` — where session state is readable: `local-jsonl` | `local-json-tree` | `remote`.
+- `injection`: how a prompt reaches the CLI: `tmux-initial-prompt` | `launch-flag` | `http`.
+- `observation`: how completion is detected: `hook-signal` | `sse` | `transcript-poll`.
+- `state`: where session state is readable: `local-jsonl` | `local-json-tree` | `remote`.
+
+Also set `name`. The engine attaches `journal`; gate every adapter-side journal write on it
+being non-`None`.
 
 ### The data contracts
 
-Three frozen dataclasses cross the seam:
+Frozen dataclasses cross the seam; read their docstrings in `base.py` for every field:
 
-- **`SessionSpec`** (engine → adapter) — `task_id`, `role` (`"dev"` / `"review"` /
-  `"retro"`), `prompt`, `cwd`, `env`, `model` (empty = CLI default),
-  `timeout_s`, and `effort` (empty = provider default; a free-form reasoning-effort
-  name resolved per stage from `[adapter] effort`). Only `opencode-http` carries
-  `effort` — as the per-prompt `variant` — and the generic tmux adapter ignores it,
-  because no profile key maps it onto a CLI flag; `bmad-loop validate` warns when a
-  stage on that family sets it. An out-of-tree adapter class may read it or not.
-- **`SessionHandle`** (returned by `start_session`) — `task_id`, `native_id` (tmux
-  window id, HTTP session id, …), `launched_ns` (wall-clock ns just before launch;
-  the floor for hook events).
-- **`SessionResult`** (returned by `wait_for_completion`) — `status` (one of
-  `completed`, `stalled`, `timeout`, `crashed`, `over_budget`, `aborted`), `result_json`,
-  `session_id`, `transcript_path`, and the optional post-mortem forensics
-  `env_fault` / `env_fault_evidence` (set by `_classify_env_fault` when a
-  non-completed session is matched as a transport/API **environment fault** —
-  see the `env_fault_patterns` profile key).
+- **`SessionSpec`** (engine → adapter): `task_id`, `role` (`"dev"` / `"review"` /
+  `"retro"`), `prompt`, `cwd`, `env`, `model` (empty = CLI default), `timeout_s`, the
+  stall-nudge and token-budget settings, the `spec_snapshot` / `expected_spec` pair, and
+  `effort` (empty = provider default). Only `opencode-http` uses `effort`; `validate` warns
+  when a stage on the generic family sets it.
+- **`SessionHandle`** (returned by `start_session`): `task_id`, `native_id` (window id,
+  HTTP session id, …), `launched_ns` (wall-clock ns just before launch, the floor for hook
+  events), and `pinned_session_id`.
+- **`SessionResult`** (returned by `wait_for_completion`): `status` (`completed`,
+  `stalled`, `timeout`, `crashed`, `over_budget` or `aborted`), `result_json`,
+  `session_id`, `transcript_path`, and post-mortem fields including `env_fault` /
+  `env_fault_evidence` / `env_fault_overruled` and `parked` / `parked_evidence`.
 
 ### Methods
 
@@ -597,141 +922,108 @@ Required (abstract):
   readers. Adapter-private breadcrumbs such as `heartbeat.json`,
   `resultless-stops.jsonl`, `session-lifecycle.jsonl`, and `messages.json` remain
   outside the shared cleanup contract and are managed by their owning adapter.
-- `wait_for_completion(handle, spec) -> SessionResult` — block until the session
-  ends (or stalls/times out), then report status. Poll
-  `runs.read_stop_request_mode(run_dir) == "hard"` on both sides of the loop's
-  own blocking wait and return `SessionResult(status="aborted")` when it is true
-  (#319): that is what makes `bmad-loop stop` land mid-session where a signal to
-  the engine cannot be delivered. Return the verdict — never raise, never unlink
-  the file (the engine consumes it and attributes the stop). Keep that wait
-  short — both bundled adapters cap theirs at 5s and inherit the poll from
-  `_ResultFileMixin` — but do not read it as a bound on the stop: a dispatch leg
-  that waits out an artifact grace or blocks on a transport call outlasts
-  `stop_run`'s 10s grace window on its own, and the force-kill backstop is what
-  catches that. Skipping it is
-  not fatal: the engine still honors the request at the next item boundary, which
-  is where an adapter without the poll leaves the operator waiting.
+- `wait_for_completion(handle, spec) -> SessionResult` — block until the session ends,
+  stalls or times out, then report status. On both sides of the loop's own blocking wait,
+  check for a hard stop (`_ResultFileMixin._hard_stop_requested()` reads this run's and the
+  owning run's `stop-request.json`) and return `SessionResult(status="aborted")` when one
+  is lodged. Never raise and never unlink the request; the engine consumes it. Keep the
+  wait short: the bundled adapters cap theirs at 5 s. An adapter without the poll is
+  stopped at the next item boundary instead.
 
-The base class provides `run(spec)`, the template that chains
-`start_session` → `wait_for_completion` → `kill` (the kill runs in a `finally`).
-You normally don't override it.
+The base class provides `run(spec)`, the template you normally leave alone: `start_session`
+→ `wait_for_completion` → `kill` (in a `finally`), then three post-processing hooks over
+the result:
 
-`run(spec)` then chains two post-processing template hooks over the returned
-`SessionResult` (both identity no-ops on the base class, so an adapter that needs
-neither leaves them alone):
+- `_post_kill_reconcile(handle, spec, result)`: identity by default. A session that
+  finished but lost its final `Stop` can be rescued to `completed` here, once window death
+  has settled liveness (see `GenericDevAdapter`).
+- `_classify_env_fault(handle, spec, result)`: identity by default; runs only for a
+  non-`completed` result with `result_json is None`. Mix in `EnvFaultMixin` for the
+  profile-driven implementation, and set its `ENV_FAULT_LOG_SUFFIX` (or
+  `ENV_FAULT_LOG_SUFFIXES`) if your diagnostics do not land in `logs/<task-id>.log`.
+- `_classify_zero_token_timeout(result)`: stamps `env_fault` on a `timeout` whose tracked
+  usage is zero, unless an env fault or `env_fault_overruled` is already set.
 
-- `_post_kill_reconcile(handle, spec, result)` — runs right after the
-  `finally`-kill. A session that finished but lost its final `Stop` can be
-  rescued to `completed` here, once window death has settled the liveness the
-  live-window verdict had to leave open (see `GenericDevAdapter`).
-- `_classify_env_fault(handle, spec, result)` — runs **last**, and only for a
-  non-`completed` result with `result_json is None`. An adapter may re-inspect
-  its post-mortem log tail and stamp `env_fault` / `env_fault_evidence` on the
-  result (see the `env_fault_patterns` profile key). Because it runs after the
-  reconcile, a rescue-to-`completed` is never re-classified. Mixing in
-  `EnvFaultMixin` supplies the profile-driven implementation for free; set its
-  `ENV_FAULT_LOG_SUFFIX` if your adapter's diagnostics do not land in
-  `logs/<task-id>.log`, since the file scanned is part of the patterns' safety
-  contract.
+Optional capabilities (each has a default):
 
-Optional capabilities (default to "unsupported" / no-op):
-
-- `send_text(handle, text)` — nudge a running session. Raises `NotImplementedError`
-  by default (an HTTP adapter that can't inject mid-turn leaves it).
-- `interactive_argv(spec)` / `interactive_env(spec)` — argv + env that launch the
-  CLI **attached** to the caller's terminal, seeded with the prompt, for the
-  interactive escalation-resolution flow. HTTP adapters have no terminal and leave
-  `interactive_argv` raising.
-- `kill(handle)` — tear down the session (no-op default).
-- `read_usage(result) -> TokenUsage | None` — parse token usage from the result
-  (returns `None` by default).
+- `send_text(handle, text)`: nudge a running session. Raises `NotImplementedError` by
+  default.
+- `interactive_argv(spec)` / `interactive_env(spec)`: argv and env that launch the CLI
+  attached to the caller's terminal, seeded with the prompt, for interactive escalation
+  resolution. `interactive_argv` raises by default; `interactive_env` returns `spec.env`.
+- `kill(handle)`: tear down the session (no-op default). Must be safe in `run()`'s
+  `finally`.
+- `read_usage(result) -> TokenUsage | None`: token usage (default `None`, untracked).
+- `_observe_tick(handle, spec)`: heartbeat-cadence observation hook (no-op default). It
+  must not mutate session state.
 
 ### Worked example: the opencode adapter
 
-[`adapters/opencode_http.py`](../src/bmad_loop/adapters/opencode_http.py) is the
-shipped non-tmux adapter: it drives [OpenCode](https://opencode.ai) entirely over
-`opencode serve`'s HTTP API + SSE event stream (`injection = "http"`,
-`observation = "sse"`, `state = "remote"`). Every API fact it relies on was
-pinned live against a real 1.18.2 binary and is recorded in the module's
-API-contract docstring — start there when the upstream API drifts. The design
-decisions worth stealing:
+[`adapters/opencode_http.py`](../src/bmad_loop/adapters/opencode_http.py) is the shipped
+non-tmux adapter. It drives [OpenCode](https://opencode.ai) over `opencode serve`'s HTTP API
+and SSE stream (`injection = "http"`, `observation = "sse"`, `state = "remote"`). Patterns
+worth reusing:
 
-- **One server per session.** The API has no per-session env, but the engine's
-  `BMAD_LOOP_*` contract must reach tool subprocesses — so each session gets its
-  own `opencode serve` spawned with `cwd = spec.cwd` and `env ⊇ spec.env`.
-  Permissions, the model, and a hermetic skills path are injected via the
-  `OPENCODE_CONFIG_CONTENT` env var (zero worktree pollution), and each server
-  gets its own `OPENCODE_SERVER_PASSWORD` so a foreign process on a recycled
-  port can never impersonate it. Reasoning effort (`SessionSpec.effort`) is the
-  one knob that does NOT go through the config: it is a per-call `variant` on
-  every `prompt_async` body instead, because the config has no top-level
-  `variant` and its `agent.<name>.variant` is inert unless that agent pins a model.
-- **Map the transport onto the hook-signal semantics** instead of inventing new
-  ones: the SSE `session.idle` event ≙ the Stop hook, server-process death ≙
-  window death (`crashed`, landed artifact honored), and a poll fallback
-  (`GET /session/status` + message `time.completed` proof-of-work) covers SSE
-  loss. Completion evidence is gated by a forward-advancing floor so an idle
-  event without proof of new work never completes a session — the same
-  artifact-distrust invariant the tmux adapters enforce.
-- **A transport with no pane still owes the operator a transcript.** The tmux
-  adapters get `logs/<task-id>.log` for free by replaying the pane; over HTTP that
-  file would hold nothing but `opencode serve`'s own INFO stdout, leaving finished
-  runs unreadable. So the transcript is _curated_ off the SSE stream the adapter
-  already consumes for control — a second consumer on the same
-  `sessionID`-filtered dispatch, costing one `write()` per interesting frame.
-  Three sinks, one per audience: `<task-id>.log` is the readable transcript
-  (role-prefixed prose plus `[bmad]`-marked `tool:` / `cmd:` / `file:` /
-  `perm ask:` / `perm reply:` / `error:` lines), `<task-id>.server.out` takes the
-  server's own stdout so it cannot drown that transcript, and
-  `<task-id>.sse.jsonl` keeps the raw frames for post-hoc debugging (behind the
-  `sse_trace` module knob, per-token deltas excluded). That split is also a
-  safety boundary: env-fault classification points `ENV_FAULT_LOG_SUFFIX` at
-  `<task-id>.server.out` and never at the curated transcript, whose lines are the
-  model's own words. The catch of curating:
-  what you render is only as good as the event names you pinned — check every
-  branch against the running binary, not against the names that read plausibly.
-- **Hookless profile.** The profile sets `[hooks] dialect = "none"`: no hook
-  registration, no hook-config merge into worktrees; `init`, `validate` and
-  worktree provisioning all understand `profile.hookless`. Skills still install
-  and copy normally — opencode discovers `.claude/skills/<name>/SKILL.md`
-  natively.
-- **Reuse the synthesis mixins, never fork them.** `_ResultFileMixin`
-  (`result.json` read-back) and `_DevSynthesisMixin` (the whole bmad-build-auto
-  dev/review synthesis machinery) live in
+- **Split the wire codec from the transport.** OpenCode 1.x and 2.x serve different HTTP
+  APIs from the same binary name. The transport (server process, port, password, teardown,
+  the stall/budget/timeout loop) is shared; each major's routes, frame envelope, turn-end
+  events, usage read and transcript renderer live in a protocol class in
+  [`adapters/opencode_protocol.py`](../src/bmad_loop/adapters/opencode_protocol.py), whose
+  module docstring records each API contract as pinned live. The adapter picks one from
+  `opencode --version` before spawning, refuses a major it has no codec for, and
+  cross-checks the choice at health time: each major answers the other's routes with the
+  web UI's HTML.
+- **One server per session.** Each session gets its own `opencode serve`, spawned with
+  `cwd = spec.cwd` and `spec.env`, so the engine's `BMAD_LOOP_*` contract reaches tool
+  subprocesses. The argv is
+  `[binary, *launch_args, "serve", "--port", <free port>, "--hostname", "127.0.0.1", "--print-logs", *extra_args]`.
+  Permissions, the model and a hermetic skills path go in `OPENCODE_CONFIG_CONTENT`, with a
+  per-server `OPENCODE_SERVER_PASSWORD`. Reasoning effort is the model `variant`: in each
+  1.x `prompt_async` body, and on the 2.x session's model ref at create.
+- **Map the transport onto hook-signal semantics.** The SSE turn end (1.x `session.idle`,
+  2.x `session.execution.*`) ≙ the Stop hook; server-process death ≙ window death
+  (`crashed`); on SSE loss, a poll of the busy map (1.x `GET /session/status`, 2.x
+  `GET /api/session/active`) plus proof of a completed assistant message takes over. An idle
+  event without proof of new work never completes a session.
+- **Log sinks, one per audience.** `<task-id>.log` is a readable transcript curated off
+  the SSE stream; `<task-id>.server.out` takes the server's own stdout;
+  `<task-id>.provider-errors.log` gets one adapter-written line per provider-error event
+  (2.x logs no per-retry error to stdout). Env-fault classification scans those last two,
+  never the model-written transcript. `<task-id>.sse.jsonl` keeps raw frames behind the
+  `sse_trace` knob.
+- **Hookless profile.** `[hooks] dialect = "none"`: no hook registration and no hook-config
+  merge into worktrees. Skills still install; opencode discovers `.claude/skills/<name>/SKILL.md`.
+- **Reuse the synthesis mixins.** `_ResultFileMixin` (`result.json` read-back) and
+  `_DevSynthesisMixin` (dev/review result synthesis) live in
   [`adapters/generic.py`](../src/bmad_loop/adapters/generic.py).
-  `OpencodeDevAdapter(_DevSynthesisMixin, OpencodeHttpAdapter)` plugs into two
-  seams: `_probe_alive(handle) -> bool | None` (post-kill liveness; `None` =
-  unknown ⇒ the verdict stands) and `_configure_dev_knobs()` (stall-nudge
-  budgets). A new adapter class that should run dev/review sessions composes
-  the same way.
-- **Usage before teardown, kill in `finally`.** Token usage only exists inside
-  the server (`state = "remote"`), so it is captured over HTTP before every
-  return path; `kill()` is idempotent, sweeps via `atexit`, and force-kills the
-  process tree first on Windows (the npm shim is a `.cmd` wrapper — a polite
-  kill orphans the real server).
+  `OpencodeDevAdapter(_DevSynthesisMixin, OpencodeHttpAdapter)` overrides
+  `_probe_alive(handle) -> bool | None` (post-kill liveness; `None` = unknown, the verdict
+  stands) and `_evict_task_state(task_id)`, and calls `_configure_dev_knobs()` from
+  `__init__`.
+- **Usage before teardown, kill in `finally`.** Usage is read over HTTP before every return
+  path. `kill()` is idempotent, an `atexit` sweep backs it up, and on Windows the process
+  tree is force-killed first.
 
-The test story mirrors the transport split:
-[`tests/test_opencode_http.py`](../tests/test_opencode_http.py) runs the full
-adapter against a scripted stdlib FakeOpencode (no binary, no network beyond
-127.0.0.1), and [`tests/test_opencode_live.py`](../tests/test_opencode_live.py)
-smoke-checks the pinned HTTP contract against a real local binary — skipped
-when absent, zero tokens spent.
+[`tests/test_opencode_http.py`](../tests/test_opencode_http.py) runs the adapter against a
+scripted stdlib fake server with a mode per major;
+[`tests/test_opencode_live.py`](../tests/test_opencode_live.py) smoke-checks the detected
+major's HTTP contract against a real local binary without ever prompting, and
+[`tests/test_opencode_live_turn.py`](../tests/test_opencode_live_turn.py) runs one full 2.x
+turn whose every LLM request goes to an in-process fake provider. Both skip when no binary
+is on PATH and spend zero tokens.
 
 ### Shipping a new adapter class out-of-tree
 
-How does a new adapter class ever get _selected_ when it lives in its own package?
-Which class drives a CLI is data — the profile's `adapter` field, resolved against
-the adapter registry
-([`adapters/registry.py`](../src/bmad_loop/adapters/registry.py)) — so a
-co-installed package registers its own kind with no edit to any core `.py`, exactly
-as a transport backend ships via `bmad_loop.mux_backends`
+Which class drives a CLI is data: the profile's `adapter` field, resolved against the
+adapter registry ([`adapters/registry.py`](../src/bmad_loop/adapters/registry.py)). A
+co-installed package registers its own kind with no core edit, as a transport backend does
 ([the transport contract](#the-transport-contract-for-a-backend-author)).
 
 Advertise **two entry points** in the package's `pyproject.toml`:
 
-- **`bmad_loop.adapters`** → a module whose import registers the kind. Core scans
-  the group and imports each advertised module (after the builtins, so a bundled
-  name always keeps first registration) before it resolves any adapter:
+- **`bmad_loop.adapters`** → a module whose import registers the kind. Core imports each
+  advertised module before it resolves any adapter. A bundled kind name always wins, because
+  the builtins are seeded first and the first registration wins:
 
   ```python
   # acme_adapter/__init__.py
@@ -754,10 +1046,9 @@ Advertise **two entry points** in the package's `pyproject.toml`:
   acme = "acme_adapter"
   ```
 
-- **`bmad_loop.profiles`** → a callable returning `CLIProfile`s (or an iterable of
-  them), so the profile that _selects_ your kind ships with it — no project TOML
-  required. Precedence is packaged < entry-point < project, so a project TOML can
-  still override it:
+- **`bmad_loop.profiles`** → a callable returning `CLIProfile`s (or an iterable of them),
+  so the profile that selects your kind ships with it. Precedence is packaged < entry-point
+  < project, so a project TOML can still override it:
 
   ```python
   # acme_adapter/__init__.py  (same package)
@@ -773,71 +1064,44 @@ Advertise **two entry points** in the package's `pyproject.toml`:
   acme = "acme_adapter:profiles"
   ```
 
-The two entry-point **values** differ on purpose: the adapter group's is a bare
-module path (core only imports it — registration is the import's side effect, and
-the entry-point name is just a diagnostic label), while the profile group's names a
-provider object core actually calls. Installing the package into bmad-loop's
-environment is the entire setup — e.g.
-`uv tool install bmad-loop --with <your-adapter>` — with no core edit and no config
-step.
+The adapter group's value is a bare module path (registration is the import's side
+effect); the profile group's value names a callable. Installing the package into
+bmad-loop's environment is the whole setup, for example
+`uv tool install bmad-loop --with <your-adapter>`.
 
-Once co-installed, `bmad-loop adapters` lists the kind and the profiles that select
-it, `bmad-loop validate` checks the reference (an `adapter.kind` finding, resolved
-against the live registry — never a hardcoded set), and a run whose policy
-`[adapter] name` points at a profile carrying `adapter = "acme"` selects it. Note
-those are two different keys: policy's `[adapter] name` picks the **profile**; the
-profile's own `adapter` field picks the **kind**.
+Once installed, `bmad-loop adapters` lists the kind and the profiles that select it,
+`bmad-loop validate` checks the reference (`adapter.kind`, against the live registry), and
+a run whose policy `[adapter] name` points at a profile with `adapter = "acme"` selects it.
+Policy's `[adapter] name` picks the **profile**; the profile's `adapter` field picks the
+**kind**.
 
-A broken package can never break selection: the failure is recorded and reported by
-`bmad-loop adapters` (a `warning: external adapter '<name>' failed to load: <reason>`
-line, and the same for a failed profile provider) and by the `validate` preflight,
-and selection proceeds without it. There is no out-of-tree adapter-**class** package
-to copy yet; the packaging pattern is identical to the transport axis's
-[bmad-loop-adapter-herdr](https://github.com/pbean/bmad-loop-adapter-herdr), which
-registers a `TerminalMultiplexer` rather than an adapter class.
+A broken package never breaks selection. `bmad-loop adapters` prints
+`warning: external adapter '<name>' failed to load: <reason>` (and the same for a failed
+profile provider), `validate` reports it, and selection proceeds without it. An
+entry-point profile is validated like a TOML profile on arrival, so an invalid one is
+reported rather than half-installed.
 
-Two seam facts worth internalizing:
+Seam facts for the class itself:
 
-- **`needs_mux`** gates whether the run bootstrap resolves and usability-checks the
-  shared terminal multiplexer for your family. A tmux/hook family sets it `True`; a
-  self-hosted HTTP/SSE family (like opencode) sets it `False` and is never handed a
-  `mux`.
-- **The `dev` / `plain` split is a pipeline concept, not a per-family branch.** When
-  a dev/review session runs the dev primitive (which writes no `result.json`), the
-  bootstrap builds the `dev` variant — the `_DevSynthesisMixin`-composed class — and
-  threads the project `paths` into it so it can synthesize the result from the spec
-  on disk; every other role builds `plain`. Both variants of a family share the
-  `(*args, paths, **kwargs)` dev `__init__` contract, so honoring it is all an
-  out-of-tree class must do to slot into that machinery.
-- **The bootstrap's keyword set grows.** Accept `**kwargs` in both variants.
-  `runsetup.make_adapters` builds every class with `cls(**build_kwargs)`, and that
-  dict is a _description of the run_ — `run_dir`, `policy`, `profile`, the usage and
-  nudge settings, `events_dir` (the run's hook-event channel), plus `mux` for a
-  `needs_mux=True` kind and `paths` for the `dev` variant. Core adds to it as the run
-  gains things worth describing; `events_dir` arrived that way (#494). A class with a
-  closed signature raises `TypeError` on the first keyword it has not heard of,
-  before the session starts.
-
-  The bundled families carry closed signatures instead, which is not a second
-  pattern to copy: they are edited in the same commit that adds the keyword, and an
-  out-of-tree class cannot be. What they do model is the other half of the
-  obligation — accept what you have no use for rather than refusing it.
-  `opencode_http` takes `events_dir` and immediately `del`s it, because that family
-  observes over SSE and fires no hooks, so there is no channel for it to point at.
-
-An entry-point profile is held to the same invariants a TOML profile is (hook
-dialect, path containment, `env_fault_patterns` compilation, …): it is validated on
-arrival, so a provider that ships an invalid profile is reported rather than
-half-installed.
+- **`needs_mux`** decides whether the run bootstrap resolves and usability-checks the
+  terminal multiplexer for your kind. A pane/hook family sets it `True`; a self-hosted
+  HTTP/SSE family sets it `False` and is never handed a `mux`.
+- **`dev` vs `plain`.** When a dev or review session runs the dev skill (policy
+  `dev.skill = "bmad-dev-auto"`), which writes no `result.json`, the bootstrap builds the `dev` variant and passes it `paths`
+  so it can synthesize the result from the spec on disk. Every other role builds `plain`,
+  without `paths`.
+- **Accept `**kwargs`in both variants.**`runsetup.make_adapters`builds every class with`cls(\*\*build_kwargs)`: `run_dir`, `policy`, `profile`, `extra_args`, `usage_grace_s`,
+`stop_without_result_nudges`and`events_dir`, plus `mux`for a`needs_mux=True`kind and`paths`for the`dev`variant. Core adds keys as the run gains things worth describing.
+A class that rejects a keyword aborts the run with`error: profile '<name>': adapter kind '<kind>' rejected this run's adapter keywords: …`.
+Accept what you do not use: `opencode_http`takes`events_dir` and discards it.
 
 ### References
 
 - [`adapters/registry.py`](../src/bmad_loop/adapters/registry.py) — the adapter-kind
-  registry and the two entry-point scans described above.
-- [`adapters/opencode_http.py`](../src/bmad_loop/adapters/opencode_http.py) — the
-  worked example above: a real non-tmux (HTTP/SSE) transport.
+  registry and the two entry-point scans.
+- [`adapters/opencode_http.py`](../src/bmad_loop/adapters/opencode_http.py) — a non-tmux
+  (HTTP/SSE) adapter.
 - [`adapters/mock.py`](../src/bmad_loop/adapters/mock.py) — the test-only reference
   implementation.
-- [`adapters/generic.py`](../src/bmad_loop/adapters/generic.py) — the tmux +
-  hook-signal adapter to reuse with a profile rather than subclass; also home of
-  the `_ResultFileMixin` / `_DevSynthesisMixin` seams.
+- [`adapters/generic.py`](../src/bmad_loop/adapters/generic.py) — the pane + hook-signal
+  adapter to reuse with a profile; home of `_ResultFileMixin` and `_DevSynthesisMixin`.

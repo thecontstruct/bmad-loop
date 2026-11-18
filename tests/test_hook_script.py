@@ -15,8 +15,8 @@ SCRIPT = Path(__file__).parent.parent / "src" / "bmad_loop" / "data" / "bmad_loo
 
 def _relay_module():
     """Import the relay by path. It ships as package DATA, not an importable
-    module (init copies it into the workspace), so the behavioral tests below
-    drive it as a subprocess — but the reparse-tag branch of `_is_link_like` is
+    module (init registers the console entry point's `relay` subcommand, not a
+    workspace copy), so the behavioral tests below drive it as a subprocess — but the reparse-tag branch of `_is_link_like` is
     reachable only on Windows, and shipping it unexercised is how a capability
     check silently becomes dead code."""
     spec = importlib.util.spec_from_file_location("_bmad_loop_hook_under_test", SCRIPT)
@@ -25,7 +25,9 @@ def _relay_module():
     return module
 
 
-def run_hook(event: str, env: dict, payload) -> subprocess.CompletedProcess:
+def run_hook(
+    event: str, env: dict, payload, cwd: Path | None = None
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(SCRIPT), event],
         input=json.dumps(payload) if payload is not None else "",
@@ -33,11 +35,13 @@ def run_hook(event: str, env: dict, payload) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=10,
+        cwd=cwd,
     )
 
 
 def test_noop_without_env(tmp_path):
-    proc = run_hook("Stop", {}, {"session_id": "s1"})
+    # run from tmp_path, so a no-env write relative to the cwd would land there
+    proc = run_hook("Stop", {}, {"session_id": "s1"}, cwd=tmp_path)
     assert proc.returncode == 0
     assert list(tmp_path.iterdir()) == []
 
@@ -60,7 +64,60 @@ def test_writes_event_file(tmp_path):
     assert event["task_id"] == "1-1-a-dev-1"
     assert event["session_id"] == "abc-123"
     assert event["transcript_path"].endswith("abc-123.jsonl")
+    assert "fully_idle" not in event  # DW-548: absent unless the CLI sends one
     assert not list((tmp_path / "events").glob("*.tmp"))
+
+
+def test_notification_payload_carries_its_subtype(tmp_path):
+    """DW-348: a claude Notification's `notification_type` rides the event file,
+    so the adapter can tell a permission prompt from an auth success."""
+    env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}
+    proc = run_hook(
+        "Notification",
+        env,
+        {"session_id": "s1", "notification_type": "permission_prompt", "message": "Allow?"},
+    )
+    assert proc.returncode == 0
+    event = json.loads(next((tmp_path / "events").glob("*.json")).read_text())
+    assert event["event"] == "Notification"
+    assert event["notification_type"] == "permission_prompt"
+    # every other event carries the key as null
+    assert run_hook("Stop", env, {"session_id": "s1"}).returncode == 0
+    stop = next(f for f in (tmp_path / "events").glob("*-Stop.json"))
+    assert json.loads(stop.read_text())["notification_type"] is None
+
+
+# Claude Code's mid-response-cut StopFailure wording, built by concatenation so this file
+# carries no line the claude env-fault patterns match (the repo-wide pane scan).
+_LOST_MESSAGE = "API Error: Connection lost " + "mid-response"
+
+
+def test_stop_failure_payload_carries_its_api_error(tmp_path):
+    """#865: a claude StopFailure's `error` and `last_assistant_message` ride the
+    event file as `stop_error` / `stop_message`, so the adapter can tell a
+    transient API error from an account one; a Stop carries neither key."""
+    env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}
+    proc = run_hook(
+        "StopFailure",
+        env,
+        {
+            "session_id": "s1",
+            "hook_event_name": "StopFailure",
+            "error": "server_error",
+            "last_assistant_message": _LOST_MESSAGE,
+        },
+    )
+    assert proc.returncode == 0
+    event = json.loads(
+        next((tmp_path / "events").glob("*-StopFailure.json")).read_text(encoding="utf-8")
+    )
+    assert event["event"] == "StopFailure"
+    assert event["stop_error"] == "server_error"
+    assert event["stop_message"] == _LOST_MESSAGE
+    assert "stop_error_details" not in event  # optional, and absent here
+    assert run_hook("Stop", env, {"session_id": "s1"}).returncode == 0
+    stop = json.loads(next((tmp_path / "events").glob("*-Stop.json")).read_text(encoding="utf-8"))
+    assert not {"stop_error", "stop_error_details", "stop_message"} & set(stop)
 
 
 def test_conversation_id_fallback(tmp_path):
@@ -81,6 +138,7 @@ def test_antigravity_payload(tmp_path):
         "workspacePaths": ["/ws"],
         "terminationReason": "model_stop",
         "fullyIdle": True,
+        "modelName": "gemini-4-argon-medium",
     }
     proc = run_hook("Stop", env, payload)
     assert proc.returncode == 0
@@ -88,6 +146,8 @@ def test_antigravity_payload(tmp_path):
     assert event["session_id"] == "agy-3"
     assert event["transcript_path"].endswith("transcript.jsonl")
     assert event["cwd"] == "/ws"
+    assert event["fully_idle"] is True  # DW-548: forwarded as a boolean
+    assert event["model"] == "gemini-4-argon-medium"  # DW-634: `modelName` aliased
 
 
 def test_workspace_paths_ignored_when_unusable(tmp_path):

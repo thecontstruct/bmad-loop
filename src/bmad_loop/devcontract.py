@@ -33,6 +33,7 @@ verify.py against actual on-disk state.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
@@ -42,7 +43,8 @@ from typing import Any
 from . import deferredwork
 from .fences import fenced as _fenced
 from .frontmatter import _edit_frontmatter_block, auto_dev_baseline_of, status_of
-from .platform_util import atomic_write_bytes, atomic_write_bytes_confined
+from .model import ENV_FAULT_CLAIM_LIMIT
+from .platform_util import atomic_write_bytes, atomic_write_bytes_confined, require_root_pinned
 from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 
 # The section the skill appends on EVERY terminal path (success and blocked),
@@ -100,6 +102,36 @@ def _artifact_only_asserted(detail: str) -> bool:
     return any(not _fenced(detail, m.start()) for m in ARTIFACT_ONLY_LINE_RE.finditer(detail))
 
 
+# The session's environment-fault claim (DW-523): an `Environment fault: <text>`
+# line (`environment_fault` / `Environment-fault` spell it too) in the last
+# `## Auto Run Result`, with the same bulleted/bolded label shapes and the same
+# one-line rule as `ARTIFACT_ONLY_LINE_RE` — the text is captured up to the end
+# of the line and never borrowed from the next one (`text` excludes every
+# `splitlines` boundary). A claim decides nothing: the engine only treats it as
+# a reason to run the operator's own `[environment] probes`, whose answer alone
+# can pause. Read through `_env_fault_claim_of`, which skips fenced matches and
+# blank text.
+ENV_FAULT_LINE_RE = re.compile(
+    rf"^{_HORIZONTAL_WS_RE}*(?:[-*]{_HORIZONTAL_WS_RE}*)?"
+    rf"(?:\*\*)?environment[ _-]+fault(?:\*\*)?{_HORIZONTAL_WS_RE}*:"
+    r"(?P<text>[^\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]*)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _env_fault_claim_of(detail: str) -> str | None:
+    """The first genuine (non-fenced, non-blank) environment-fault claim in the
+    marker body, bold markers and surrounding whitespace stripped, bounded to
+    `ENV_FAULT_CLAIM_LIMIT` characters; ``None`` when the body carries none."""
+    for m in ENV_FAULT_LINE_RE.finditer(detail):
+        if _fenced(detail, m.start()):
+            continue
+        text = m.group("text").strip().strip("*").strip()
+        if text:
+            return text[:ENV_FAULT_CLAIM_LIMIT]
+    return None
+
+
 # Terminal frontmatter statuses the skill can leave behind.
 DONE = "done"
 BLOCKED = "blocked"
@@ -111,6 +143,16 @@ BLOCKED = "blocked"
 # here would collapse that distinction into the pause channel — exactly the
 # failure the state exists to avoid.
 AWAITING_OPERATOR = "awaiting-operator"
+
+# BMAD v7 ticket-plan terminals. A v7 build session finishes a ticket at
+# `built`: `done` belongs to the orchestrator, which marks it after its own
+# verification. `dropped` is bmad-agent-po's, a human withdrawing the ticket, so a
+# session that ends on it has nothing to land. Neither is terminal unless the
+# caller opts in through ``success_statuses`` (see `terminal_statuses`): the v6
+# vocabulary has no such tokens, and a sprint or stories spec reading either one
+# keeps today's not-terminal answer.
+BUILT = "built"
+DROPPED = "dropped"
 
 # The status a plan-halt dispatch leaves behind: under folder+id dispatch a
 # `Halt after planning.` directive makes the skill HALT right after the
@@ -157,6 +199,30 @@ _FM_STATUS_RE = re.compile(
 # upstream upgrade, or a project mid-migration), so this must never be keyed on the
 # skill name resolved on disk today.
 FALLBACK_RESULT_PREFIXES = ("bmad-build-auto-result-", "bmad-dev-auto-result-")
+
+# The terminal frontmatter set every v6 caller has always used; the default of the
+# `terminal=` parameters below.
+DEFAULT_TERMINAL = frozenset({DONE, BLOCKED, AWAITING_OPERATOR})
+
+
+def terminal_statuses(
+    success_statuses: tuple[str, ...] = (DONE,), *, plan_halt: bool = False
+) -> frozenset[str]:
+    """The frontmatter statuses that end a session whose successful exits are
+    ``success_statuses``: those, plus ``blocked`` and ``awaiting-operator``, plus
+    ``ready-for-dev`` on a plan-halt leg.
+
+    The ticket contract (``BUILT`` among the successes) adds ``dropped``: a plan
+    a human withdrew mid-session is over, and `synthesize_result` renders it as a
+    CRITICAL escalation. The default arguments return exactly
+    ``DEFAULT_TERMINAL`` (plus ``ready-for-dev`` under ``plan_halt``), so a v6
+    caller that passes nothing gets today's set."""
+    out = set(success_statuses) | {BLOCKED, AWAITING_OPERATOR}
+    if plan_halt:
+        out.add(PLAN_HALT_STATUS)
+    if BUILT in success_statuses:
+        out.add(DROPPED)
+    return frozenset(out)
 
 
 @dataclass(frozen=True)
@@ -244,6 +310,7 @@ DEFERRED_FIELD = "deferred"
 _SUMMARY_LIMIT = 200
 _EVIDENCE_LIMIT = 1000
 _LOCATION_LIMIT = 200
+_SEVERITY_LIMIT = 80
 
 
 @dataclass(frozen=True)
@@ -255,6 +322,9 @@ class DeferredFinding:
     location: str
     severity: str
     fingerprint: str
+    # The dev session's flattened severity text, kept only when it said more
+    # than a bare alias (a qualifier, or an unrecognized word); "" otherwise.
+    declared_severity: str = ""
 
 
 def harvest_fingerprint(*parts: str) -> str:
@@ -315,6 +385,13 @@ def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], 
     scalars (numeric and boolean scalars are string-normalized), never
     collections or embedded NULs. This observation path never raises for the
     YAML shapes it accepts.
+
+    ``severity`` is read by its leading word (``deferredwork.leading_severity``),
+    so a qualified value ("high (unverified)") keeps its level. Whenever the
+    text says more than a bare alias -- a qualifier, or a leading word that is
+    no alias at all ("P1") -- it is kept as ``declared_severity`` so the ledger
+    entry can record it; an unrecognized one leaves ``severity`` empty but the
+    finding stays well-formed.
     """
     raw = fm.get(DEFERRED_FIELD)
     if raw is None:
@@ -335,7 +412,11 @@ def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], 
             )
             continue
         bad_optional = next(
-            (field for field in ("evidence", "location") if not _is_yaml_scalar(item.get(field))),
+            (
+                field
+                for field in ("evidence", "location", "severity")
+                if not _is_yaml_scalar(item.get(field))
+            ),
             None,
         )
         if bad_optional is not None:
@@ -348,6 +429,7 @@ def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], 
             "summary": summary_raw,
             "evidence": item.get("evidence"),
             "location": item.get("location"),
+            "severity": item.get("severity"),
         }
         bad_nul = next(
             (field for field, value in raw_text_values.items() if _contains_nul(value)), None
@@ -361,15 +443,17 @@ def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], 
             continue
         evidence = _flatten(item.get("evidence"), _EVIDENCE_LIMIT)
         location = _flatten(item.get("location"), _LOCATION_LIMIT)
+        declared = _flatten(item.get("severity"), _SEVERITY_LIMIT)
+        severity = deferredwork.leading_severity(declared) or ""
+        bare_alias = bool(severity) and declared.lower() in deferredwork.SEVERITY_ALIASES
         findings.append(
             DeferredFinding(
                 summary=summary,
                 evidence=evidence,
                 location=location,
-                severity=deferredwork.SEVERITY_ALIASES.get(
-                    str(item.get("severity", "")).strip().lower(), ""
-                ),
+                severity=severity,
                 fingerprint=harvest_fingerprint(summary, location),
+                declared_severity="" if bare_alias else declared,
             )
         )
     return findings, malformed
@@ -411,6 +495,7 @@ def synthesize_result(
     dw_ids: list[str] | None = None,
     plan_halt: bool = False,
     park_marker_session_authored: bool = False,
+    success_statuses: tuple[str, ...] = (DONE,),
 ) -> SynthResult:
     """Build the legacy result dict from the generic skill's on-disk spec.
 
@@ -444,6 +529,13 @@ def synthesize_result(
     DW-273). Both are attempt-ownership claims about the same marker, so one
     authorship proof is the right number — a second flag could only disagree
     with the first.
+
+    ``success_statuses`` names the session's successful exits; the default
+    ``(done,)`` is the v6 contract. A v7 ticket session passes ``(built,)`` (dev)
+    or ``(built, done)`` (review), which makes those statuses terminal (see
+    `terminal_statuses`), carries ``followup_review_recommended`` on them, and
+    renders a ``dropped`` plan as a CRITICAL escalation of type ``dropped``.
+    Under the default, ``built`` and ``dropped`` stay non-terminal tokens.
     """
     try:
         fm = read_frontmatter(spec_path)
@@ -466,11 +558,7 @@ def synthesize_result(
     fm_status = status_of(fm)
     arr = parse_auto_run_result(_read_text_or_empty(spec_path))
 
-    terminal = (
-        (DONE, BLOCKED, AWAITING_OPERATOR, PLAN_HALT_STATUS)
-        if plan_halt
-        else (DONE, BLOCKED, AWAITING_OPERATOR)
-    )
+    terminal = terminal_statuses(success_statuses, plan_halt=plan_halt)
     # Not terminal yet: no result section AND frontmatter not at a terminal state.
     if not arr.present and fm_status not in terminal:
         return SynthResult(result_json=None, status_consistent=True)
@@ -492,6 +580,18 @@ def synthesize_result(
                 "type": "blocked",
                 "severity": "CRITICAL",
                 "detail": detail,
+                "spec_file": str(spec_path),
+            }
+        )
+    elif DROPPED in terminal and (status == DROPPED or arr.status == DROPPED):
+        # Ticket contract only (`terminal_statuses` adds DROPPED beside BUILT): a
+        # plan withdrawn while its session ran has nothing to land, and only a
+        # human can say what happens to the work — the same PAUSE a block takes.
+        escalations.append(
+            {
+                "type": DROPPED,
+                "severity": "CRITICAL",
+                "detail": arr.detail or "the ticket plan was dropped while its session ran",
                 "spec_file": str(spec_path),
             }
         )
@@ -527,11 +627,22 @@ def synthesize_result(
     }
     if dw_ids:
         result["dw_ids"] = list(dw_ids)
+    # The session's environment-fault claim (DW-523), carried only when the last
+    # genuine marker states one — never from a repaired marker or frontmatter.
+    # Unlike the two mints above it needs no authorship proof: the claim decides
+    # nothing, it only makes the engine run its own probes.
+    if arr.present and ORCHESTRATOR_SYNTH_NOTE not in arr.detail:
+        claim = _env_fault_claim_of(arr.detail)
+        if claim is not None:
+            result["env_fault_claim"] = claim
     # bmad-build-auto (BMAD-METHOD PR #2505) self-reviews inline and, on a `done`
     # exit, sets `followup_review_recommended: true` when its review-driven
     # changes warrant an independent second-opinion pass. The skill never sets it
-    # on a blocked exit, so only carry it through on `done`.
-    if status == DONE:
+    # on a blocked exit, so only carry it through on a successful exit (`done`, or
+    # the caller's `success_statuses`: `built` for a v7 ticket) or a park. A park
+    # never routes into the review loop, but its record keeps the recommendation
+    # so the operator can run that skipped pass after confirming.
+    if status in success_statuses or status == AWAITING_OPERATOR:
         result["followup_review_recommended"] = bool(fm.get("followup_review_recommended", False))
     # A park's obligations travel with its result so the engine never has to
     # re-read the spec to learn them. Folded on the awaiting-operator status
@@ -610,7 +721,35 @@ def is_result_artifact(path: Path, *, since_ns: int) -> bool:
     return bool(_section_headings(text))
 
 
-def find_frontmatter_candidates(impl_artifacts: Path, *, since_ns: int) -> list[Path]:
+def find_fallback_result_artifact(directory: Path, *, since_ns: int) -> Path | None:
+    """The newest no-spec fallback result (`FALLBACK_RESULT_PREFIXES`) directly
+    under ``directory`` modified at/after ``since_ns``, or None.
+
+    Names only: unlike `find_result_artifact` a marker-carrying spec here never
+    qualifies. The caller probes a directory it did not hand the session as its
+    plan (a v7 initiative folder, where a session that could not resolve its
+    ticket writes the fallback), and every other spec in it belongs to someone
+    else (#261). Unreadable entries are skipped, as the scans above skip them."""
+    if not directory.is_dir():
+        return None
+    best: tuple[int, Path] | None = None
+    for path in directory.glob("*.md"):
+        if not path.name.startswith(FALLBACK_RESULT_PREFIXES):
+            continue
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            continue
+        if mtime_ns < since_ns:
+            continue
+        if best is None or mtime_ns > best[0]:
+            best = (mtime_ns, path)
+    return best[1] if best else None
+
+
+def find_frontmatter_candidates(
+    impl_artifacts: Path, *, since_ns: int, terminal: frozenset[str] = DEFAULT_TERMINAL
+) -> list[Path]:
     """Missing-marker fallback scan (#224): specs this session finalized to a
     terminal frontmatter ``status:`` WITHOUT appending the ``## Auto Run Result``
     marker `find_result_artifact` keys on. The skill's HALT instructions make the
@@ -625,6 +764,7 @@ def find_frontmatter_candidates(impl_artifacts: Path, *, since_ns: int) -> list[
     ``awaiting-operator``). Returns ALL matches, most-recent first — the caller refuses to guess between several
     and must apply its own stability fingerprint before synthesizing, because a
     terminal frontmatter under a live window is weaker evidence than the marker.
+    ``terminal`` is the status set that qualifies, as for `is_frontmatter_candidate`.
     """
     if not impl_artifacts.is_dir():
         return []
@@ -634,14 +774,89 @@ def find_frontmatter_candidates(impl_artifacts: Path, *, since_ns: int) -> list[
             mtime_ns = path.stat().st_mtime_ns
         except OSError:
             continue
-        if not is_frontmatter_candidate(path, since_ns=since_ns):
+        if not is_frontmatter_candidate(path, since_ns=since_ns, terminal=terminal):
             continue
         found.append((mtime_ns, path))
     found.sort(key=lambda t: t[0], reverse=True)
     return [p for _, p in found]
 
 
-def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
+def find_nested_result_hints(
+    impl_artifacts: Path, *, since_ns: int, limit: int = 3
+) -> tuple[list[Path], str | None]:
+    """Diagnosis only (#780): specs ONE level below `impl_artifacts` that would
+    have qualified had they sat directly in it — so a `no-artifact` breadcrumb
+    can name the nested file instead of leaving the operator to guess why a
+    `stories/` layout rode to timeout. Nothing returned here is ever harvested:
+    the result scans stay flat (widening them would widen the #261 shared-dir
+    hazard), and a nested hit is named, never read back.
+
+    Probes each immediate, non-symlinked subdirectory in sorted order with the
+    existing finders — `find_result_artifact` then `find_frontmatter_candidates`
+    — so it adds no qualification logic of its own. Returns at most `limit`
+    distinct paths, plus a fault string when listing the directory or one of its
+    subdirectories failed, probing a subdirectory raised, or a nested `*.md`
+    at/after the launch floor could not be read: the fault is reported, never folded into an empty
+    "nothing nested" answer, and a fault in one subdirectory keeps the hits
+    already found in others. (The finders degrade an unreadable file to "no
+    match" by contract, so a non-hit is probed once more here, purely to tell
+    "not a spec" from "could not look".) A missing `impl_artifacts` is not a
+    fault — the flat scan already says so.
+    """
+    if not impl_artifacts.is_dir():
+        return [], None
+    hits: list[Path] = []
+    faults: list[str] = []
+    try:
+        children = sorted(impl_artifacts.iterdir())
+    except OSError as e:
+        return [], f"{type(e).__name__}: {e}"
+    for child in children:
+        try:
+            # 3.11 floor: Path.is_dir has no follow_symlinks=, so test the link first.
+            if child.is_symlink() or not child.is_dir():
+                continue
+            # `Path.glob` (the finders' and ours below) swallows a listing fault
+            # and yields nothing, so an unlistable subdir would read as empty:
+            # list it explicitly first so the fault reaches the handler below.
+            os.listdir(child)
+            marker = find_result_artifact(child, since_ns=since_ns)
+            found = [marker] if marker is not None else []
+            found += find_frontmatter_candidates(child, since_ns=since_ns)
+            for path in found:
+                if path not in hits:
+                    hits.append(path)
+                if len(hits) >= limit:
+                    return hits, "; ".join(faults) or None
+            for path in sorted(child.glob("*.md")):
+                if path not in found and (fault := _unreadable(path, since_ns=since_ns)):
+                    faults.append(fault)
+        except OSError as e:
+            faults.append(f"could not probe {child}: {type(e).__name__}: {e}")
+    return hits, "; ".join(faults) or None
+
+
+def _unreadable(path: Path, *, since_ns: int) -> str | None:
+    """A read fault on ONE nested `*.md` the finders passed over, or None when it
+    is readable, older than the launch floor, or gone (a file deleted between the
+    glob and the probe is not a fault)."""
+    try:
+        if path.stat().st_mtime_ns < since_ns:
+            return None
+        # Read, not just open: the finders fail on the read too (EIO after a
+        # successful open), and a decode error is "not a spec", not a fault.
+        with path.open("rb") as f:
+            f.read()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f"could not read {path}: {type(e).__name__}: {e}"
+    return None
+
+
+def is_frontmatter_candidate(
+    path: Path, *, since_ns: int, terminal: frozenset[str] = DEFAULT_TERMINAL
+) -> bool:
     """Whether ONE file qualifies for the missing-marker fallback — the per-path
     predicate `find_frontmatter_candidates` applies to each glob hit, factored out
     for the same reason as `is_result_artifact`: a caller holding the spec path the
@@ -652,7 +867,8 @@ def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
     fallback (already matched by name on the marker path), carries ZERO real
     (non-fenced) marker headings — one would put it in `find_result_artifact`'s
     territory — and has a terminal frontmatter ``status:`` (``done``,
-    ``blocked``, or ``awaiting-operator``). Any
+    ``blocked``, or ``awaiting-operator`` by default; ``terminal`` widens it, e.g.
+    to a ticket session's `terminal_statuses`). Any
     unreadable/undecodable read degrades to False, never an exception."""
     if path.name.startswith(FALLBACK_RESULT_PREFIXES):
         return False
@@ -671,10 +887,16 @@ def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
         fm = read_frontmatter(path)
     except OSError:
         return False
-    return status_of(fm) in (DONE, BLOCKED, AWAITING_OPERATOR)
+    return status_of(fm) in terminal
 
 
-def _atomic_write_spec(spec_path: Path, text: str, *, confine_root: Path) -> None:
+def _atomic_write_spec(
+    spec_path: Path,
+    text: str,
+    *,
+    confine_root: Path,
+    root_identity: os.stat_result | None = None,
+) -> None:
     """Rewrite ``spec_path`` with ``text`` via a same-directory temp file + atomic
     rename, so an interrupted / short / disk-full write can never truncate the
     canonical spec — a failed repair must lose no work (fault injection on the old
@@ -708,13 +930,30 @@ def _atomic_write_spec(spec_path: Path, text: str, *, confine_root: Path) -> Non
     belongs to is a pyright error rather than an unconfined write. The two
     `frontmatter`-side writers of these same files land on the identical pair of
     calls (#379); this wrapper stays for its callers' ``str``-in signature and
-    this docstring."""
+    this docstring.
+
+    ``root_identity`` pins ``confine_root`` on the terms
+    `frontmatter.set_frontmatter_status` states — forwarded on the confined arm
+    (DW-423), pre-checked on the external arm (DW-445); ``None`` is the unpinned
+    write on both. Threaded through the writers a mount-rooted caller reaches
+    (`reset_spec_status`, `strip_auto_run_result`, `reset_spec_for_replan`,
+    `append_auto_run_result`): the ``live_spec_root`` re-arm/replan writers pin
+    via `runs.live_spec_root_identity` (DW-423), and the engine's writers — which
+    confine to ``workspace.paths.project``, under worktree isolation the mount —
+    pin via `runs.mount_root_identity` when their workspace is a unit mount
+    (DW-445). `append_operator_confirmation` is project-rooted (``bmad-loop
+    confirm``) and stays unpinned."""
     payload = text.encode("utf-8")
     if spec_path.is_relative_to(confine_root):
         atomic_write_bytes_confined(
-            spec_path, payload, confine_root=confine_root, require_writable_target=True
+            spec_path,
+            payload,
+            confine_root=confine_root,
+            require_writable_target=True,
+            root_identity=root_identity,
         )
     else:
+        require_root_pinned(confine_root, root_identity)
         atomic_write_bytes(spec_path, payload, follow_symlinks=False, require_writable_target=True)
 
 
@@ -742,7 +981,13 @@ def _render_status_line(line: str, m: re.Match[str], value: str) -> str:
     return f"{pre}{q}{value}{q}{rest}" + ("\n" if line.endswith("\n") else "")
 
 
-def reset_spec_status(spec_path: Path, new_status: str, *, confine_root: Path) -> bool:
+def reset_spec_status(
+    spec_path: Path,
+    new_status: str,
+    *,
+    confine_root: Path,
+    root_identity: os.stat_result | None = None,
+) -> bool:
     """Rewrite the frontmatter ``status:`` value of a spec in place.
 
     Used by the generic-skill repair path: bmad-build-auto self-finalizes a spec to
@@ -799,12 +1044,17 @@ def reset_spec_status(spec_path: Path, new_status: str, *, confine_root: Path) -
     if new_body is None:
         return False
     _atomic_write_spec(
-        spec_path, head + new_body + tail + text[fm.end() :], confine_root=confine_root
+        spec_path,
+        head + new_body + tail + text[fm.end() :],
+        confine_root=confine_root,
+        root_identity=root_identity,
     )
     return True
 
 
-def strip_auto_run_result(spec_path: Path, *, confine_root: Path) -> bool:
+def strip_auto_run_result(
+    spec_path: Path, *, confine_root: Path, root_identity: os.stat_result | None = None
+) -> bool:
     """Remove every ``## Auto Run Result`` section from a spec, in place.
 
     Companion to `reset_spec_status` on the re-drive path: re-opening a spec by
@@ -843,11 +1093,15 @@ def strip_auto_run_result(spec_path: Path, *, confine_root: Path) -> bool:
         kept.append(text[pos : m.start()])
         pos = _next_heading_start(text, m.end())
     kept.append(text[pos:])
-    _atomic_write_spec(spec_path, "".join(kept), confine_root=confine_root)
+    _atomic_write_spec(
+        spec_path, "".join(kept), confine_root=confine_root, root_identity=root_identity
+    )
     return True
 
 
-def reset_spec_for_replan(spec_path: Path, *, confine_root: Path) -> bool:
+def reset_spec_for_replan(
+    spec_path: Path, *, confine_root: Path, root_identity: os.stat_result | None = None
+) -> bool:
     """Reset a spec to ``draft`` and strip its stale result transactionally.
 
     The TUI exposes those two writes as one operator action. Capture the exact
@@ -860,15 +1114,23 @@ def reset_spec_for_replan(spec_path: Path, *, confine_root: Path) -> bool:
     two writes cannot leave a partial replan. A fault that leaves the preimage
     untouched does not rewrite it. If the restore itself fails, that failure
     escapes; otherwise the original stage failure is re-raised.
+
+    ``root_identity`` pins ``confine_root`` for all three writes — reset, strip
+    and the restore — so a worktree mount swapped for a link refuses the replan
+    rather than landing it outside the repository (DW-423).
     """
     original = spec_path.read_bytes()
     try:
-        reset = reset_spec_status(spec_path, "draft", confine_root=confine_root)
+        reset = reset_spec_status(
+            spec_path, "draft", confine_root=confine_root, root_identity=root_identity
+        )
         if not reset:
             if not spec_path.is_file():
                 raise FileNotFoundError(f"replan spec vanished during status reset: {spec_path}")
             return False
-        stripped = strip_auto_run_result(spec_path, confine_root=confine_root)
+        stripped = strip_auto_run_result(
+            spec_path, confine_root=confine_root, root_identity=root_identity
+        )
         if not stripped and not spec_path.is_file():
             raise FileNotFoundError(f"replan spec vanished during result strip: {spec_path}")
     except BaseException:
@@ -877,7 +1139,12 @@ def reset_spec_for_replan(spec_path: Path, *, confine_root: Path) -> bool:
         except OSError:
             unchanged = False
         if not unchanged:
-            _atomic_write_spec(spec_path, original.decode("utf-8"), confine_root=confine_root)
+            _atomic_write_spec(
+                spec_path,
+                original.decode("utf-8"),
+                confine_root=confine_root,
+                root_identity=root_identity,
+            )
         raise
     return True
 
@@ -915,7 +1182,12 @@ OPERATOR_CONFIRM_NOTE = (
 
 
 def append_auto_run_result(
-    spec_path: Path, status: str, *, confine_root: Path, detail: str = ""
+    spec_path: Path,
+    status: str,
+    *,
+    confine_root: Path,
+    detail: str = "",
+    root_identity: os.stat_result | None = None,
 ) -> bool:
     """Append a synthesized ``## Auto Run Result`` marker section — the inverse of
     `strip_auto_run_result`.
@@ -949,7 +1221,11 @@ def append_auto_run_result(
     blank / ``Status: <status>`` / blank / the provenance note (plus an optional
     detail paragraph). ``status`` is normalized lowercase and MUST be the spec's
     own frontmatter ``status`` — the caller passes exactly that — so
-    `synthesize_result`'s ``consistent`` cross-check holds on every later re-read."""
+    `synthesize_result`'s ``consistent`` cross-check holds on every later re-read.
+
+    ``root_identity`` pins ``confine_root`` as `_atomic_write_spec` states: the
+    engine's marker repair passes `runs.mount_root_identity` of its unit mount
+    (DW-445), ``None`` otherwise."""
     if not spec_path.is_file():
         return False
     # Raw read (not read_text): preserve the file's exact line endings, and let an
@@ -974,7 +1250,9 @@ def append_auto_run_result(
     section = f"## Auto Run Result{nl}{nl}Status: {status}{nl}{nl}{ORCHESTRATOR_SYNTH_NOTE}{nl}"
     if detail:
         section += f"{nl}{detail.strip()}{nl}"
-    _atomic_write_spec(spec_path, text + section, confine_root=confine_root)
+    _atomic_write_spec(
+        spec_path, text + section, confine_root=confine_root, root_identity=root_identity
+    )
     return True
 
 

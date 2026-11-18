@@ -1,10 +1,12 @@
 """Run-directory helper tests."""
 
 import contextlib
+import dataclasses
 import errno
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -16,20 +18,25 @@ from unittest import mock
 
 import pytest
 from conftest import (
+    _REVERIFY_KEY,
+    _REVERIFY_SPEC_BYTES,
+    _REVERIFY_SPEC_REL,
+    _reverify_run,
     assert_run_state_lock_held,
     escalated_run,
     git,
+    nested_repo_root_paths,
     patch_publish_rename,
     real_publish_rename,
     refuse_to_resolve,
 )
 
-from bmad_loop import envvars, platform_util, runs, verify
+from bmad_loop import bmadconfig, deferredwork, envvars, platform_util, runs, ticketstore, verify
 from bmad_loop.adapters import tmux_base
-from bmad_loop.adapters.multiplexer import MultiplexerError
+from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
-from bmad_loop.journal import load_state, save_state
-from bmad_loop.model import RunState
+from bmad_loop.journal import Journal, load_state, save_state
+from bmad_loop.model import Phase, RunState, StoryTask
 from bmad_loop.process_host import ProcessHost
 
 
@@ -43,6 +50,10 @@ def _make_run(project, run_id, with_state=True):
 
 def _make_state_run(project, run_id, **state_kwargs):
     run_dir = project / ".bmad-loop" / "runs" / run_id
+    # A minted run carries its run dir's identity, so the CLI/runs writers' pinned
+    # journals append without a `journal-unpinned` notice.
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state_kwargs.setdefault("run_dir_identity", platform_util.root_identity_record(run_dir))
     save_state(
         run_dir,
         RunState(
@@ -120,17 +131,123 @@ class _FakeHost(ProcessHost):
         return "python3"
 
 
+def _discover(project):
+    """`discover_runs` over a readable runs dir: the infos, fault asserted None."""
+    infos, fault = runs.discover_runs(project)
+    assert fault is None
+    return infos
+
+
 def test_list_run_dirs_sorted_and_filtered(tmp_path):
     _make_run(tmp_path, "20260611-120000-bbbb")
     _make_run(tmp_path, "20260610-090000-aaaa")
     _make_run(tmp_path, "20260612-080000-cccc", with_state=False)  # no state.json
-    listed = runs.list_run_dirs(tmp_path)
+    listed, fault = runs.list_run_dirs(tmp_path)
     assert [d.name for d in listed] == ["20260610-090000-aaaa", "20260611-120000-bbbb"]
+    assert fault is None
 
 
 def test_list_run_dirs_missing(tmp_path):
-    assert runs.list_run_dirs(tmp_path) == []
-    assert runs.latest_run_dir(tmp_path) is None
+    assert runs.list_run_dirs(tmp_path) == ([], None)
+    assert runs.latest_run_dir(tmp_path) == (None, None)
+    assert runs.discover_runs(tmp_path) == ([], None)
+
+
+def test_list_run_dirs_non_directory_runs_path_is_silent_absence(tmp_path):
+    """A file where the runs dir belongs holds no runs: the same silent answer
+    `is_dir()` gave, not a fault."""
+    (tmp_path / runs.RUNS_DIR).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / runs.RUNS_DIR).write_text("not a directory", encoding="utf-8")
+    assert runs.list_run_dirs(tmp_path) == ([], None)
+
+
+def _deny_stat_under(monkeypatch, root: Path) -> None:
+    """Every `stat()` of `root` or below raises EACCES — what an unreadable dir
+    does to its subtree, and what 3.14's `is_dir`/`is_file` fold into False."""
+    real = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self == root or root in self.parents:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_list_run_dirs_names_an_unreadable_runs_dir(tmp_path, monkeypatch):
+    """DW-468: an unreadable runs dir is not "no runs". Ablate the non-absence
+    `except OSError` arm (fold it into the absent answer) and this fails."""
+    _make_run(tmp_path, "20260610-090000-aaaa")
+    root = tmp_path / runs.RUNS_DIR
+    _deny_stat_under(monkeypatch, root)
+    dirs, fault = runs.list_run_dirs(tmp_path)
+    assert dirs == []
+    assert fault is not None and str(root) in fault and "PermissionError" in fault
+    assert runs.latest_run_dir(tmp_path) == (None, fault)
+    assert runs.discover_runs(tmp_path) == ([], fault)
+
+
+def test_list_run_dirs_names_an_unlistable_runs_dir(tmp_path, monkeypatch):
+    _make_run(tmp_path, "20260610-090000-aaaa")
+    root = tmp_path / runs.RUNS_DIR
+    real = Path.iterdir
+
+    def iterdir(self):
+        if self == root:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    dirs, fault = runs.list_run_dirs(tmp_path)
+    assert dirs == []
+    assert fault is not None and "cannot list" in fault
+
+
+def test_list_run_dirs_keeps_readable_runs_and_names_an_unreadable_one(tmp_path, monkeypatch):
+    """One run dir whose state cannot be stat'd leaves the listing standing and is
+    named — not silently dropped (3.14) and not a raise that loses the rest
+    (3.11-3.13). Ablate the per-entry `unreadable.append` and this fails."""
+    good = _make_run(tmp_path, "20260610-090000-aaaa")
+    bad = _make_run(tmp_path, "20260611-120000-bbbb")
+    _deny_stat_under(monkeypatch, bad)
+    dirs, fault = runs.list_run_dirs(tmp_path)
+    assert dirs == [good]
+    assert fault is not None and "20260611-120000-bbbb" in fault
+    # "newest" over an incomplete listing is only the newest readable run, and says so
+    assert runs.latest_run_dir(tmp_path) == (good, fault)
+
+
+def test_resolve_run_dir_names_an_unreadable_runs_dir_instead_of_no_such_run(tmp_path, monkeypatch):
+    """DW-468: the user-facing "no such run" over an unreadable runs dir names the
+    fault instead — for a partial ref and for the exact id alike (whose `is_file`
+    probe raises on 3.11-3.13 and folds on 3.14). Ablate the fault arm and this
+    fails with "no such run"."""
+    _make_run(tmp_path, "20260610-090000-aaaa")
+    _deny_stat_under(monkeypatch, tmp_path / runs.RUNS_DIR)
+    for ref in ("aaaa", "20260610-090000-aaaa"):
+        with pytest.raises(runs.RunRefError) as exc:
+            runs.resolve_run_dir(tmp_path, ref)
+        assert "no such run" not in str(exc.value)
+        assert "PermissionError" in str(exc.value)
+
+
+def test_resolve_run_dir_refuses_when_an_unreadable_run_could_be_the_one_meant(
+    tmp_path, monkeypatch
+):
+    """A unique readable match is not proven unique while an unreadable run dir's
+    name matches the ref too — resolving past it could act on the wrong run."""
+    _make_run(tmp_path, "20260610-090000-aaaa")
+    bad = _make_run(tmp_path, "20260611-120000-xaaaa")
+    _deny_stat_under(monkeypatch, bad)
+    with pytest.raises(runs.RunRefError, match="incomplete"):
+        runs.resolve_run_dir(tmp_path, "aaaa")
+
+
+def test_resolve_run_dir_resolves_past_an_unreadable_run_no_ref_could_mean(tmp_path, monkeypatch):
+    good = _make_run(tmp_path, "20260610-090000-aaaa")
+    bad = _make_run(tmp_path, "20260611-120000-bbbb")
+    _deny_stat_under(monkeypatch, bad)
+    assert runs.resolve_run_dir(tmp_path, "aaaa") == good
 
 
 def test_all_run_dirs_includes_state_json_less_dirs(tmp_path):
@@ -163,7 +280,7 @@ def test_all_run_dirs_distinguishes_missing_from_unreadable(tmp_path):
 def test_latest_run_dir(tmp_path):
     _make_run(tmp_path, "20260610-090000-aaaa")
     newest = _make_run(tmp_path, "20260611-120000-bbbb")
-    assert runs.latest_run_dir(tmp_path) == newest
+    assert runs.latest_run_dir(tmp_path) == (newest, None)
 
 
 def test_new_run_id_format():
@@ -343,6 +460,86 @@ def test_resolve_run_dir_exact_wins_over_ambiguity(tmp_path):
     assert runs.resolve_run_dir(tmp_path, "20260620-143025-a1b2") == exact
 
 
+def _case_insensitive(path):
+    return (path.parent / path.name.upper()).exists()
+
+
+def test_resolve_run_dir_returns_the_listed_spelling_of_a_miscased_ref(tmp_path):
+    """A case-insensitive filesystem answers the exact stat for a miscased ref, and
+    the typed spelling used to leak into `run_dir.name` — and from there into the
+    multiplexer session names a case-exact backend then never finds. Ablation:
+    return the exact hit unconditionally and the name check reddens."""
+    target = _make_run(tmp_path, "20260620-143025-a1b2")
+    if not _case_insensitive(target):
+        pytest.skip("needs a case-insensitive filesystem")
+    got = runs.resolve_run_dir(tmp_path, "20260620-143025-A1B2")
+    assert got.name == "20260620-143025-a1b2"
+
+
+def test_resolve_run_dir_refuses_a_miscased_ref_on_a_case_sensitive_fs(tmp_path):
+    target = _make_run(tmp_path, "20260620-143025-a1b2")
+    if _case_insensitive(target):
+        pytest.skip("needs a case-sensitive filesystem")
+    with pytest.raises(runs.RunRefError, match="no such run"):
+        runs.resolve_run_dir(tmp_path, "20260620-143025-A1B2")
+
+
+def test_resolve_run_dir_maps_an_unlisted_alias_to_the_listed_run(tmp_path, monkeypatch):
+    """The miscased hit simulated portably: a symlink alias the listing does not
+    show stands in for the case-folded spelling, so the samefile mapping runs on
+    any filesystem that can make the link."""
+    target = _make_run(tmp_path, "20260620-143025-a1b2")
+    alias = target.parent / "20260620-143025-alias"
+    try:
+        alias.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("cannot create a directory symlink here")
+    scan = runs._scan_run_dirs
+
+    def hide_alias(project):
+        listed, unreadable, fault = scan(project)
+        return [d for d in listed if d.name != alias.name], unreadable, fault
+
+    monkeypatch.setattr(runs, "_scan_run_dirs", hide_alias)
+    assert runs.resolve_run_dir(tmp_path, alias.name).name == target.name
+
+
+def test_resolve_run_dir_refuses_an_exact_hit_no_listed_entry_is(tmp_path, monkeypatch):
+    """The stat answers but no listed run dir is that dir: refuse, naming the ref,
+    rather than hand back a spelling the listing cannot vouch for."""
+    _make_run(tmp_path, "20260620-143025-a1b2")
+    monkeypatch.setattr(runs, "_scan_run_dirs", lambda _project: ([], [], None))
+    with pytest.raises(runs.RunRefError, match="'20260620-143025-a1b2'.*no listed run dir"):
+        runs.resolve_run_dir(tmp_path, "20260620-143025-a1b2")
+
+
+def test_resolve_run_dir_refuses_an_exact_hit_several_listed_entries_are(tmp_path, monkeypatch):
+    """Two listed aliases of the hit leave its spelling unproven: refuse rather than
+    pick one, whose name could miss the minted session. Ablation: accept any
+    non-empty match set and this reddens."""
+    target = _make_run(tmp_path, "20260620-143025-a1b2")
+    aliases = [target.parent / "alias-1", target.parent / "alias-2"]
+    monkeypatch.setattr(runs, "_scan_run_dirs", lambda _project: (aliases, [], None))
+    monkeypatch.setattr(runs.os.path, "samefile", lambda _a, _b: True)
+    with pytest.raises(runs.RunRefError, match="2 listed run dirs are it"):
+        runs.resolve_run_dir(tmp_path, target.name)
+
+
+def test_resolve_run_dir_names_a_fault_while_matching_the_exact_hit(tmp_path, monkeypatch):
+    """A listed entry that cannot be stat'd mid-match is a RunRefError naming the
+    ref and the fault — the error every CLI caller catches — never a raw OSError."""
+    target = _make_run(tmp_path, "20260620-143025-a1b2")
+    listed = [target.parent / "20260619-101010-c3d4"]
+    monkeypatch.setattr(runs, "_scan_run_dirs", lambda _project: (listed, [], None))
+
+    def fault(_a, _b):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(runs.os.path, "samefile", fault)
+    with pytest.raises(runs.RunRefError, match="'20260620-143025-a1b2'.*PermissionError"):
+        runs.resolve_run_dir(tmp_path, target.name)
+
+
 @pytest.mark.parametrize("ref", ["", ".", "...", ".. ", " .."], ids=repr)
 def test_resolve_run_dir_refuses_the_root_naming_refs(tmp_path, ref):
     """#480: `_is_path_escape` was the one member of the guard family omitting
@@ -418,6 +615,133 @@ def test_read_pid_identity_forms(tmp_path):
     assert runs.read_pid_identity(run_dir) == (None, None)
 
 
+def test_read_pid_identity_tells_an_unreadable_file_from_a_missing_one(tmp_path):
+    """DW-465. A pid file that exists but cannot be read used to answer
+    `(None, None)`, exactly like no file, so a possibly-live engine read as dead.
+    The pid stays `None` (callers that only ask "is there a pid to act on" keep
+    their answer) and the identity carries the fault. A directory at the name is
+    the portable unreadable file: IsADirectoryError on POSIX, PermissionError on
+    Windows — neither is absence.
+
+    Absence stays absence: a missing file, and a path whose parent is a FILE
+    (NotADirectoryError on POSIX), both hold no pid file.
+
+    ABLATION: fold the generic `OSError` arm back into `(None, None)` and the
+    unreadable row fails; drop `NotADirectoryError` from the absence arm and the
+    stray-file row fails."""
+    run_dir = _make_run(tmp_path, "r1")
+    (run_dir / "engine.pid").mkdir()
+    assert runs.read_pid_identity(run_dir) == (None, runs._PID_FILE_UNREADABLE)
+    assert runs.read_pid(run_dir) is None
+
+    stray = tmp_path / "stray"
+    stray.write_text("not a run dir")
+    assert runs.read_named_pid_identity(stray / "engine.pid") == (None, None)
+    assert runs.read_named_pid_identity(tmp_path / "absent" / "engine.pid") == (None, None)
+
+
+def test_read_pid_identity_reads_undecodable_bytes_as_unreadable(tmp_path, monkeypatch):
+    """DW-465, the decode half. A pid file of non-UTF-8 bytes (a torn write, a
+    planted file) raised `UnicodeDecodeError` out of the reader, which aborted
+    every command that iterates runs — `clean`, `delete`, `status`, the TUI. The
+    file exists and cannot be read as text, so it is a read fault other than
+    absence: the unreadable sentinel, and liveness `'unknown'`, never a raise.
+
+    No host is consulted: there is no pid to hand it.
+
+    ABLATION: drop the `UnicodeDecodeError` arm and this raises instead."""
+    run_dir = _make_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_bytes(b"\xff\xfe 1.0")
+
+    def _no_host():
+        raise AssertionError("an undecodable pid file has no pid to probe")
+
+    monkeypatch.setattr(runs, "get_process_host", _no_host)
+    assert runs.read_pid_identity(run_dir) == (None, runs._PID_FILE_UNREADABLE)
+    assert runs.read_pid(run_dir) is None
+    assert runs.engine_liveness(run_dir) == "unknown"
+    assert runs.engine_alive(run_dir) is False
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+def test_engine_liveness_reads_a_fifo_pid_file_as_unknown_without_blocking(tmp_path, monkeypatch):
+    """#868: a FIFO at ``engine.pid`` blocked the reader's open until a writer
+    appeared, hanging `cleanup` and the TUI cleanup worker. It is a read fault,
+    reported as ``'unknown'``, and answered at once.
+
+    ABLATION: drop ``O_NONBLOCK`` and the call never returns (the thread is still
+    blocked when the join times out); drop the ``S_ISREG`` check and the empty
+    FIFO reads as no pid, so liveness says ``'dead'``."""
+    run_dir = _make_run(tmp_path, "r1")
+    pidfile = run_dir / "engine.pid"
+    os.mkfifo(pidfile)
+
+    def _no_host():
+        raise AssertionError("a FIFO pid file has no pid to probe")
+
+    monkeypatch.setattr(runs, "get_process_host", _no_host)
+    outcome: list[object] = []
+    worker = threading.Thread(
+        target=lambda: outcome.append(
+            (runs.read_pid_identity(run_dir), runs.engine_liveness(run_dir))
+        ),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=10)
+    if worker.is_alive():
+        with open(pidfile, "wb"):  # release the blocked open so the thread can end
+            pass
+        pytest.fail("the pid reader blocked on a FIFO")
+    assert outcome == [((None, runs._PID_FILE_UNREADABLE), "unknown")]
+
+
+def test_read_pid_identity_refuses_an_oversized_record_and_closes_its_fd(tmp_path, monkeypatch):
+    """#868: the reader takes one bounded read. A record past the cap is a read
+    fault, never a parsed prefix: truncation would drop the identity token and turn
+    an identity-checked record into a legacy pid-only one that skips the reuse
+    guard. Every opened descriptor is closed, and a failed close is a read fault.
+
+    ABLATION: drop the oversize check and the padded row reads ``(4242, None)``;
+    drop the ``finally`` close and the fd bookkeeping fails; move the close out of
+    the guarded block and the failing close raises."""
+    run_dir = _make_run(tmp_path, "r1")
+    pidfile = run_dir / "engine.pid"
+    opened: list[int] = []
+    closed: list[int] = []
+    real_open, real_close = os.open, os.close
+
+    def spy_open(*args, **kwargs):
+        opened.append(real_open(*args, **kwargs))
+        return opened[-1]
+
+    def spy_close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(runs.os, "open", spy_open)
+    monkeypatch.setattr(runs.os, "close", spy_close)
+
+    pidfile.write_bytes(b"4242" + b" " * runs._MAX_PID_FILE_BYTES + b"999.0")
+    assert runs.read_pid_identity(run_dir) == (None, runs._PID_FILE_UNREADABLE)
+    pidfile.write_bytes(b"4242" + b" " * 4 + b"999.0")
+    assert runs.read_pid_identity(run_dir) == (4242, 999.0)
+    pidfile.unlink()
+    pidfile.mkdir()  # non-regular: refused after open on POSIX, at open on win32
+    assert runs.read_pid_identity(run_dir) == (None, runs._PID_FILE_UNREADABLE)
+    assert opened == closed
+
+    pidfile.rmdir()
+    pidfile.write_text("4242 999.0")
+
+    def failing_close(fd):
+        real_close(fd)
+        raise OSError(errno.EIO, "close failed")
+
+    monkeypatch.setattr(runs.os, "close", failing_close)
+    assert runs.read_pid_identity(run_dir) == (None, runs._PID_FILE_UNREADABLE)
+
+
 def test_engine_liveness(tmp_path, monkeypatch):
     run_dir = _make_run(tmp_path, "r1")
     assert runs.engine_liveness(run_dir) == "dead"  # no pid file → nothing to gate on
@@ -454,6 +778,31 @@ def test_engine_liveness(tmp_path, monkeypatch):
     monkeypatch.setattr(runs, "get_process_host", _boom_host)
     with pytest.raises(ProcessHostError):
         runs.engine_liveness(run_dir)
+
+
+def test_engine_liveness_reads_an_unreadable_pid_file_as_unknown(tmp_path, monkeypatch):
+    """DW-465: the pid in a file that cannot be read cannot be probed, which is the
+    tri-state's 'unknown' — never 'dead', which licensed every removal path to
+    proceed without the unverifiable-pid warning. `engine_alive` keeps answering
+    False (unknown must not block stop/delete); the frontends report liveness
+    through `engine_liveness`, where the fault is now distinguishable.
+
+    No host is consulted: there is no pid to hand it.
+
+    ABLATION: map the unreadable sentinel back to 'dead' in `engine_liveness` and
+    this fails."""
+    run_dir = _make_run(tmp_path, "r1")
+    (run_dir / "engine.pid").mkdir()
+
+    def _no_host():
+        raise AssertionError("an unreadable pid file has no pid to probe")
+
+    monkeypatch.setattr(runs, "get_process_host", _no_host)
+    assert runs.engine_liveness(run_dir) == "unknown"
+    assert runs.engine_alive(run_dir) is False
+    # the absent file stays 'dead' — the control that makes 'unknown' an answer
+    (run_dir / "engine.pid").rmdir()
+    assert runs.engine_liveness(run_dir) == "dead"
 
 
 @pytest.mark.parametrize("identity_token", ["garbage", "nan", "inf", "-inf"])
@@ -497,14 +846,35 @@ def test_stop_run_already_finished(tmp_path, monkeypatch):
 
 
 def test_stop_run_no_pid_falls_back_to_mark(tmp_path, monkeypatch):
+    """On the mark-stopped fallback nothing is left alive to consume the request, so
+    stop_run discards what it lodged. A file outliving the run it asked to stop is a
+    trap: the next resume would find it and stop again at the first item."""
     killed = []
     monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
     run_dir = _make_state_run(tmp_path, "r1")  # no engine.pid -> legacy/dead
     assert runs.stop_run(run_dir) is True
     assert load_state(run_dir).stopped is True
+    assert runs.read_stop_request_mode(run_dir) is None
     assert killed == ["r1"]
     journal = (run_dir / "journal.jsonl").read_text()
     assert "run-stop" in journal and '"fallback": true' in journal
+
+
+def test_stop_of_a_legacy_run_writes_one_unpinned_notice(tmp_path, monkeypatch):
+    """A run whose state.json predates the recorded run-dir identity (never resumed
+    since) is stopped through a journal pinned to that state: the append degrades to
+    a confined-but-unpinned write and says so ONCE, ahead of the `run-stop` row.
+
+    Ablation: drop `pin=state` from the `run-stop` row and the notice is missing."""
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    run_dir = _make_state_run(tmp_path, "r1", run_dir_identity=None)
+
+    assert runs.stop_run(run_dir) is True
+
+    entries = Journal(run_dir).entries()
+    assert [e["kind"] for e in entries] == ["journal-unpinned", "run-stop"]
+    assert entries[0]["reason"] == "no-record"
+    assert entries[1]["fallback"] is True
 
 
 def test_stop_run_dead_pid_falls_back(tmp_path, monkeypatch):
@@ -785,18 +1155,6 @@ def test_stop_run_stops_sigterm_immune_child_via_stop_request_file(tmp_path, mon
             proc.wait(timeout=10)
 
 
-def test_stop_run_fallback_clears_hard_request(tmp_path, monkeypatch):
-    """On the mark-stopped fallback nothing is left alive to consume the request, so
-    stop_run discards what it lodged. A file outliving the run it asked to stop is a
-    trap: the next resume would find it and stop again at the first item."""
-    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
-    run_dir = _make_state_run(tmp_path, "r1")  # no engine.pid -> straight to fallback
-    assert runs.stop_run(run_dir) is True
-    assert load_state(run_dir).stopped is True
-    assert runs.read_stop_request_mode(run_dir) is None
-    assert '"fallback": true' in (run_dir / "journal.jsonl").read_text()
-
-
 def test_stop_run_takes_state_lock_only_after_signal_and_wait(tmp_path, monkeypatch):
     """Ablation: move stop_run's state_lock above terminate and this reddens on order;
     the engine would be unable to save its own stopped state while stop waits."""
@@ -972,7 +1330,11 @@ def test_stop_run_refusal_leaves_hard_request_lodged(tmp_path, monkeypatch):
     force-kill a pid whose identity we can no longer verify — but if it *is* still
     our engine, the file is now the only channel that can stop it. Clearing it here
     would retract the operator's request while simultaneously declining to enforce
-    it, leaving a live run nobody asked to keep running."""
+    it, leaving a live run nobody asked to keep running.
+
+    The refusal itself: the pid is still alive but its identity changed during the
+    grace window (possible pid reuse), so stop_run raises StopRunError rather than
+    force-kill it."""
     monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
     monkeypatch.setattr(runs, "_STOP_WAIT_S", 0.05)
     monkeypatch.setattr(runs, "_STOP_POLL_S", 0.01)
@@ -1199,25 +1561,6 @@ def test_stop_run_force_kills_wedged_legacy_engine(tmp_path, monkeypatch):
     assert runs.stop_run(run_dir) is True
     assert host.force_killed == [4242]
     assert load_state(run_dir).stopped is True
-
-
-def test_stop_run_refuses_force_kill_on_identity_mismatch(tmp_path, monkeypatch):
-    """If the pid is still 'alive' but its identity changed during the grace window
-    (possible pid reuse), refuse to force-kill and raise StopRunError instead."""
-    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
-    monkeypatch.setattr(runs, "_STOP_WAIT_S", 0.05)
-    monkeypatch.setattr(runs, "_STOP_POLL_S", 0.01)
-    run_dir = _make_state_run(tmp_path, "r1")
-    (run_dir / "engine.pid").write_text("4242 123.0")  # persisted identity at run start
-
-    # matches the persisted identity at stop entry, then changes before the
-    # post-grace force-kill check (pid reused mid-grace).
-    identities = iter([123.0, 999.0])
-    host = _FakeHost(alive=True, identity=lambda: next(identities))
-    monkeypatch.setattr(runs, "get_process_host", lambda: host)
-    with pytest.raises(runs.StopRunError):
-        runs.stop_run(run_dir)
-    assert host.force_killed == []
 
 
 def test_stop_run_refuses_force_kill_without_identity(tmp_path, monkeypatch):
@@ -1750,6 +2093,9 @@ def test_prunable_sessions_partitions(tmp_path, monkeypatch):
         "bmad-loop-untag-fin",  # pre-upgrade session, no tag
         "bmad-loop-untag-orphan",  # pre-upgrade, no tag, no run dir here
         "bmad-loop-ctl",  # control session: never a candidate
+        # a control session an earlier release minted per registry, still
+        # running after the upgrade: tagged ours, and still never a candidate
+        "bmad-loop-ctl-0123456789abcdef",
         "unrelated",  # not ours
     ]
     monkeypatch.setattr(runs, "mux_sessions", lambda: sessions)
@@ -1761,6 +2107,7 @@ def test_prunable_sessions_partitions(tmp_path, monkeypatch):
             "bmad-loop-fin-1": mine,
             "bmad-loop-orphan-1": mine,
             "bmad-loop-other-1": "/some/other/project",
+            "bmad-loop-ctl-0123456789abcdef": mine,
             # untag-* and unrelated intentionally absent (no tag)
         },
     )
@@ -1813,34 +2160,6 @@ def _fake_home(monkeypatch, home) -> None:
     monkeypatch.setenv("USERPROFILE", str(home))
 
 
-def test_state_root_precedence_override_then_xdg_then_home(tmp_path, monkeypatch):
-    """Three answers, ranked, and the ranking is what each assertion removes.
-
-    The override outranks a *set* XDG_STATE_HOME and not merely an unset one —
-    graded by leaving XDG set throughout — because it is the operator's stated
-    answer and the suite's own isolation depends on it winning against whatever a
-    host exports.
-
-    The asymmetry in the middle is deliberate and pinned here rather than left to
-    the reader: `XDG_STATE_HOME` is a *base* to build under, so `bmad-loop` is
-    appended to it, while `BMAD_LOOP_STATE_DIR` names our root itself and is used
-    as spelled. Appending to the override would silently move every path a
-    phase-3 hook computes from that same variable."""
-    monkeypatch.setattr(runs.sys, "platform", "linux")
-    home = tmp_path / "home"
-    _fake_home(monkeypatch, home)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
-    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "override"))
-
-    assert runs.state_root() == tmp_path / "override"  # verbatim: no "bmad-loop" tail
-
-    monkeypatch.delenv(envvars.STATE_DIR)
-    assert runs.state_root() == tmp_path / "xdg" / "bmad-loop"
-
-    monkeypatch.delenv("XDG_STATE_HOME")
-    assert runs.state_root() == home / ".local" / "state" / "bmad-loop"
-
-
 @pytest.mark.parametrize("value", ["state", "./state", "~/state"], ids=repr)
 def test_state_root_refuses_a_relative_override(tmp_path, monkeypatch, value):
     """`BMAD_LOOP_STATE_DIR` is honoured as spelled, but a relative spelling is
@@ -1860,8 +2179,9 @@ def test_state_root_refuses_a_relative_override(tmp_path, monkeypatch, value):
 
     `~/state` is here for the same reason it is in the XDG rows: nothing expands
     it, so it stays relative. The empty string is deliberately NOT a row — empty
-    reads as *unset* and falls through to the cascade, which
-    `test_state_root_precedence_override_then_xdg_then_home` already grades.
+    reads as *unset* and falls through to the cascade, which the
+    `posix-empty-override` row of
+    `test_resolve_state_root_matches_state_root_on_every_cascade_arm` grades.
 
     Ablation target: drop the `os.path.isabs` guard from the override arm and all
     three rows fail — each returning a cwd-relative root instead of raising."""
@@ -1968,6 +2288,180 @@ def test_state_root_refuses_a_home_that_cannot_root_a_control_plane(monkeypatch,
 
     with pytest.raises(runs.StateRootError, match=envvars.STATE_DIR):
         runs.state_root()
+
+
+_CASCADE_ARMS = [
+    # (platform, env spec, expected root under tmp_path or None for a refusal)
+    pytest.param(
+        "linux", {"override": "o", "XDG_STATE_HOME": "x", "HOME": "h"}, "o", id="posix-override"
+    ),
+    pytest.param("linux", {"XDG_STATE_HOME": "x", "HOME": "h"}, "x/bmad-loop", id="posix-xdg"),
+    pytest.param(
+        "linux",
+        {"XDG_STATE_HOME": "rel", "HOME": "h"},
+        "h/.local/state/bmad-loop",
+        id="posix-relative-xdg",
+    ),
+    pytest.param("linux", {"HOME": "h"}, "h/.local/state/bmad-loop", id="posix-home"),
+    pytest.param(
+        "linux", {"HOME": "h/"}, "h/.local/state/bmad-loop", id="posix-home-trailing-slash"
+    ),
+    pytest.param("linux", {"HOME": "rel"}, None, id="posix-relative-home"),
+    pytest.param("linux", {"override": "rel", "HOME": "h"}, None, id="posix-relative-override"),
+    pytest.param(
+        "linux",
+        {"override": "empty", "XDG_STATE_HOME": "x", "HOME": "h"},
+        "x/bmad-loop",
+        id="posix-empty-override",
+    ),
+    pytest.param(
+        "win32",
+        {"override": "o", "LOCALAPPDATA": "l", "USERPROFILE": "p"},
+        "o",
+        id="win-override",
+    ),
+    pytest.param(
+        "win32", {"LOCALAPPDATA": "l", "USERPROFILE": "p"}, "l/bmad-loop/state", id="win-local"
+    ),
+    pytest.param(
+        "win32",
+        {"USERPROFILE": "p", "XDG_STATE_HOME": "x"},
+        "p/AppData/Local/bmad-loop/state",
+        id="win-profile",
+    ),
+    pytest.param("win32", {"XDG_STATE_HOME": "x", "HOME": "h"}, None, id="win-none"),
+    pytest.param(
+        "win32",
+        {"override": "empty", "LOCALAPPDATA": "l", "USERPROFILE": "p"},
+        "l/bmad-loop/state",
+        id="win-empty-override",
+    ),
+]
+
+
+@pytest.mark.parametrize(("platform", "spec", "expected"), _CASCADE_ARMS)
+def test_resolve_state_root_matches_state_root_on_every_cascade_arm(
+    tmp_path, monkeypatch, platform, spec, expected
+):
+    """`state_root()` is `resolve_state_root` over this process's environment
+    (#731), so on every cascade arm both must give the same, literal answer —
+    the root or the refusal. A spec value `rel` is written relative, and `empty`
+    as `""` (an empty override reads as unset); every other one is an absolute
+    path under `tmp_path` (a trailing `/` kept as spelled).
+
+    `USERPROFILE` mirrors `HOME` on the POSIX rows, as `_fake_home` does, so a
+    faked-POSIX row means the same thing on a Windows host. HOME stays set on
+    every POSIX row, so the passwd lookup never runs and `passwd_home=None` is
+    the faithful argument.
+
+    The override outranks a *set* `XDG_STATE_HOME` (`posix-override` keeps XDG
+    set): it is the operator's stated answer, and the suite's own isolation
+    depends on it winning against whatever a host exports. The asymmetry is
+    deliberate: `XDG_STATE_HOME` is a *base* to build under, so `bmad-loop` is
+    appended to it, while `BMAD_LOOP_STATE_DIR` names our root itself and is used
+    as spelled. Appending to the override would silently move every path a
+    phase-3 hook computes from that same variable."""
+    monkeypatch.setattr(runs.sys, "platform", platform)
+    for name in (envvars.STATE_DIR, "XDG_STATE_HOME", "LOCALAPPDATA", "USERPROFILE", "HOME"):
+        monkeypatch.delenv(name, raising=False)
+    env: dict[str, str] = {}
+    for key, value in spec.items():
+        name = envvars.STATE_DIR if key == "override" else key
+        if value == "rel":
+            env[name] = value
+        elif value == "empty":
+            env[name] = ""
+        else:
+            env[name] = str(tmp_path / value.rstrip("/")) + ("/" if value.endswith("/") else "")
+    if platform == "linux":
+        env["USERPROFILE"] = env["HOME"]
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    if expected is None:
+        with pytest.raises(runs.StateRootError, match=envvars.STATE_DIR):
+            runs.state_root()
+        with pytest.raises(runs.StateRootError, match=envvars.STATE_DIR):
+            runs.resolve_state_root(env, None)
+    else:
+        assert runs.state_root() == tmp_path / expected
+        assert runs.resolve_state_root(env, None) == tmp_path / expected
+
+
+def test_resolve_state_root_reads_the_passwd_home_only_when_home_is_absent(tmp_path, monkeypatch):
+    """The one cascade input that is not an environment variable: with `HOME`
+    absent, `expanduser("~")` falls back to the passwd entry, so the resolver
+    takes that home as an explicit argument (#731) and uses it on that arm only.
+
+    - absent HOME + a passwd home: that home's root
+    - absent HOME + no passwd entry (`None`): refused, which is what
+      `state_root()` does today when `expanduser` hands back `"~"`
+    - `HOME=""` with a passwd home given: still refused — a present HOME is used
+      as given, and an empty one folds to `/`
+
+    Ablation target: use `passwd_home` whenever HOME is falsy (`env.get("HOME")
+    or passwd_home`) and the `HOME=""` row fails, resolving the passwd root."""
+    monkeypatch.setattr(runs.sys, "platform", "linux")
+    passwd = str(tmp_path / "pw")
+    unusable = {"XDG_STATE_HOME": "relative"}
+
+    assert runs.resolve_state_root(unusable, passwd) == (
+        tmp_path / "pw" / ".local" / "state" / "bmad-loop"
+    )
+    with pytest.raises(runs.StateRootError, match=envvars.STATE_DIR):
+        runs.resolve_state_root(unusable, None)
+    with pytest.raises(runs.StateRootError, match=envvars.STATE_DIR):
+        runs.resolve_state_root({**unusable, "HOME": ""}, passwd)
+
+
+@pytest.mark.parametrize("answering", ["override", "xdg"])
+def test_state_root_skips_the_passwd_lookup_when_an_earlier_arm_answers(
+    tmp_path, monkeypatch, answering
+):
+    """With HOME absent, `expanduser` would consult passwd only once the cascade
+    reached the HOME arm; an override or a usable XDG_STATE_HOME answers first,
+    and the lookup (an NSS query, possibly a network directory) never runs.
+
+    Ablation: pass `passwd_home()` whenever HOME is absent, without
+    `needs_passwd_home`, and both rows fail on the raising stub."""
+    monkeypatch.setattr(runs.sys, "platform", "linux")
+    _fake_home(monkeypatch, tmp_path / "unused")
+    monkeypatch.delenv("HOME")
+    if answering == "override":
+        monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "o"))
+        expected = tmp_path / "o"
+    else:
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "x"))
+        expected = tmp_path / "x" / "bmad-loop"
+
+    def no_lookup() -> str:
+        raise AssertionError("passwd consulted although an earlier arm answers")
+
+    monkeypatch.setattr(runs, "passwd_home", no_lookup)
+    assert runs.state_root() == expected
+
+
+def test_state_root_without_home_consults_the_passwd_home(tmp_path, monkeypatch):
+    """`state_root()` hands the resolver the passwd home only on the arm that
+    reads it — a POSIX env with no HOME — so the extraction keeps today's
+    `expanduser` fallback. Graded through a faked `passwd_home`, since the real
+    lookup cannot be steered from a test."""
+    monkeypatch.setattr(runs.sys, "platform", "linux")
+    _fake_home(monkeypatch, tmp_path / "unused")
+    monkeypatch.delenv("HOME")
+    asked: list[str] = []
+
+    def fake_passwd_home() -> str:
+        asked.append("passwd")
+        return str(tmp_path / "pw")
+
+    monkeypatch.setattr(runs, "passwd_home", fake_passwd_home)
+    assert runs.state_root() == tmp_path / "pw" / ".local" / "state" / "bmad-loop"
+    assert asked == ["passwd"]
+
+    monkeypatch.setenv("HOME", str(tmp_path / "h"))
+    assert runs.state_root() == tmp_path / "h" / ".local" / "state" / "bmad-loop"
+    assert asked == ["passwd"]  # HOME present: the lookup never runs
 
 
 def test_state_dir_for_is_keyed_on_project_identity_not_spelling(tmp_path, monkeypatch):
@@ -2122,7 +2616,7 @@ def test_config_digest_is_stamped_under_the_state_root_not_in_the_project(tmp_pa
 
     path = runs.config_digest_path_for(project, "r1")
     assert path == runs.state_dir_for(project, "r1") / "config-digest"
-    assert runs.read_trusted_config_digest(project, "r1") == "abc123"
+    assert runs.read_trusted_config_digest(project, "r1") == ("abc123", None)
     assert not any(p.is_file() for p in (project / ".bmad-loop").rglob("*"))
 
 
@@ -2134,15 +2628,20 @@ def test_read_trusted_config_digest_separates_an_absent_file_from_an_empty_one(t
     fallback; collapsing them to `None` would let a session that truncates the
     out-of-tree file fall back into the tree it controls.
 
+    Both are answers, not faults, so neither carries one (DW-467): genuine absence
+    is the one `None` that stays silent.
+
     ABLATION: return `""` instead of `None` from the reader's except arm, or drop
-    the `.strip()`-of-an-empty-file distinction, and one of these two fails."""
+    the `.strip()`-of-an-empty-file distinction, and one of these two fails. Fold
+    `FileNotFoundError` into the generic open-fault arm and the first fails on its
+    fault."""
     project = tmp_path / "proj"
     project.mkdir()
 
-    assert runs.read_trusted_config_digest(project, "r1") is None
+    assert runs.read_trusted_config_digest(project, "r1") == (None, None)
 
     runs.write_trusted_config_digest(project, "r1", "")
-    assert runs.read_trusted_config_digest(project, "r1") == ""
+    assert runs.read_trusted_config_digest(project, "r1") == ("", None)
 
 
 @pytest.mark.parametrize(
@@ -2169,12 +2668,18 @@ def test_trusted_config_digest_read_degrades_where_the_write_raises(
     The `RuntimeError` row is live below 3.13, where `Path.resolve` reports a
     symlink loop that way — same reason `_discard_state_dir` holds it.
 
-    ABLATION: widen the write to swallow these and the second half passes."""
+    The degrade is not silent (DW-467): the read names the fault, which the
+    resume prints, since its fallback is the session-writable copy.
+
+    ABLATION: widen the write to swallow these and the second half passes. Drop
+    the fault from the read's path arm and the first half fails."""
     project = tmp_path / "proj"
     project.mkdir()
     monkeypatch.setattr(runs, attr, _raising(exc))
 
-    assert runs.read_trusted_config_digest(project, "r1") is None
+    digest, fault = runs.read_trusted_config_digest(project, "r1")
+    assert digest is None
+    assert fault is not None and "state root" in fault and str(exc) in fault
     with pytest.raises(type(exc)):
         runs.write_trusted_config_digest(project, "r1", "abc123")
 
@@ -2202,7 +2707,8 @@ def test_read_trusted_config_digest_refuses_a_planted_fifo_instead_of_hanging(tm
     the alarm fires. Dropping the `S_ISREG` check instead fails the assert rather
     than the alarm — with no writer the FIFO reads EOF, so the reader answers `""`
     where it owes `None`. Both are graded; the twin below covers the case where a
-    writer makes those bytes attacker-chosen instead of empty."""
+    writer makes those bytes attacker-chosen instead of empty. The refusal is a
+    fault, not absence, so it is named (DW-467)."""
     import signal
 
     project = tmp_path / "proj"
@@ -2217,7 +2723,10 @@ def test_read_trusted_config_digest_refuses_a_planted_fifo_instead_of_hanging(tm
     previous = signal.signal(signal.SIGALRM, _blew_up)
     signal.alarm(20)
     try:
-        assert runs.read_trusted_config_digest(project, "r1") is None
+        assert runs.read_trusted_config_digest(project, "r1") == (
+            None,
+            f"{path}: not a regular file",
+        )
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous)
@@ -2248,7 +2757,10 @@ def test_read_trusted_config_digest_refuses_a_fed_fifo_instead_of_reading_it(tmp
     holder = os.open(path, os.O_RDWR | os.O_NONBLOCK)
     try:
         os.write(holder, b"ff" * 32 + b"\n")  # a plausible-looking sha256 hex digest
-        assert runs.read_trusted_config_digest(project, "r1") is None
+        assert runs.read_trusted_config_digest(project, "r1") == (
+            None,
+            f"{path}: not a regular file",
+        )
     finally:
         os.close(holder)
 
@@ -2288,8 +2800,9 @@ def test_read_trusted_config_digest_is_bounded(tmp_path):
         return real_read(fd, n)
 
     with mock.patch.object(runs.os, "read", _spy):
-        got = runs.read_trusted_config_digest(project, "r1")
+        got, fault = runs.read_trusted_config_digest(project, "r1")
 
+    assert fault is None
     assert got is not None
     assert len(got) == runs._MAX_DIGEST_BYTES
     # The read never asks for more than the cap, however many calls it makes.
@@ -2304,7 +2817,8 @@ def test_read_trusted_config_digest_does_not_follow_a_planted_symlink(tmp_path):
     "digest" it comes back with is that file's contents.
 
     ABLATION: drop `O_NOFOLLOW` from the flags and the read returns the target's
-    contents instead of `None`."""
+    contents instead of `None`. The refused open is a fault (ELOOP), named with the
+    path (DW-467)."""
     project = tmp_path / "proj"
     project.mkdir()
     secret = tmp_path / "elsewhere.txt"
@@ -2313,7 +2827,56 @@ def test_read_trusted_config_digest_does_not_follow_a_planted_symlink(tmp_path):
     path.parent.mkdir(parents=True)
     path.symlink_to(secret)
 
-    assert runs.read_trusted_config_digest(project, "r1") is None
+    digest, fault = runs.read_trusted_config_digest(project, "r1")
+    assert digest is None
+    assert fault is not None and fault.startswith(f"{path}: cannot open: ")
+
+
+def test_read_trusted_config_digest_names_undecodable_bytes(tmp_path):
+    """Garbage bytes at the out-of-tree path used to read as the legacy no-file
+    case and hand the comparison to `state.json` without a word (DW-467). The
+    answer stays `None`; the fault names the path, never the bytes (they are
+    session-chosen, and headed for an operator's terminal).
+
+    ABLATION: return `(None, None)` from the decode arm and this fails."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = runs.config_digest_path_for(project, "r1")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xff\xfe\x00garbage")
+
+    assert runs.read_trusted_config_digest(project, "r1") == (None, f"{path}: not UTF-8 text")
+
+
+@pytest.mark.parametrize(
+    "target, exc, prefix",
+    [
+        ("open", PermissionError(errno.EACCES, "Permission denied"), "cannot open"),
+        ("open", NotADirectoryError(errno.ENOTDIR, "Not a directory"), "cannot open"),
+        ("read", OSError(errno.EIO, "Input/output error"), "cannot read"),
+    ],
+    ids=["open-eacces", "open-enotdir", "read-eio"],
+)
+def test_read_trusted_config_digest_names_an_os_fault(tmp_path, target, exc, prefix):
+    """Every OS fault on the way to the bytes is named, with the path (DW-467).
+    `NotADirectoryError` is deliberately a fault, not absence: it means a FILE
+    stands where a state-dir component belongs — a tampered path, not a run that
+    was never stamped — so it must not take the legacy fallback silently.
+
+    ABLATION: fold the open arm back into `(None, None)`, or catch
+    `NotADirectoryError` beside `FileNotFoundError`, or drop the read arm's
+    fault, and the matching row fails."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    runs.write_trusted_config_digest(project, "r1", "abc123")
+    path = runs.config_digest_path_for(project, "r1")
+
+    with mock.patch.object(runs.os, target, _raising(exc)):
+        digest, fault = runs.read_trusted_config_digest(project, "r1")
+
+    assert digest is None
+    assert fault is not None
+    assert fault.startswith(f"{path}: {prefix}: {type(exc).__name__}: ")
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -2340,7 +2903,7 @@ def test_write_trusted_config_digest_replaces_a_planted_symlink(tmp_path):
 
     assert target.read_text() == "untouched"
     assert not path.is_symlink()
-    assert runs.read_trusted_config_digest(project, "r1") == "abc123"
+    assert runs.read_trusted_config_digest(project, "r1") == ("abc123", None)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -2423,7 +2986,7 @@ def test_write_trusted_config_digest_lands_under_a_clean_state_root(tmp_path, mo
     runs.write_trusted_config_digest(project, "r1", "abc123")
 
     assert seen == [root]  # the state root itself, not the run dir
-    assert runs.read_trusted_config_digest(project, "r1") == "abc123"
+    assert runs.read_trusted_config_digest(project, "r1") == ("abc123", None)
 
 
 def test_the_state_dir_gc_reclaims_the_config_digest(tmp_path):
@@ -2442,9 +3005,206 @@ def test_the_state_dir_gc_reclaims_the_config_digest(tmp_path):
     digest = runs.config_digest_path_for(tmp_path, "r1")
     assert digest.is_file()
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == [runs.state_dir_for(tmp_path, "r1")]
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == (
+        [runs.state_dir_for(tmp_path, "r1")],
+        None,
+    )
 
     assert not digest.exists()
+
+
+# ------------------------------------------- plugin grant store (#496/#497)
+
+
+def test_plugin_grants_absent_is_silent_and_fault_is_reported(tmp_path, monkeypatch):
+    """Absence is the one silent answer — no grants were ever recorded — and the
+    store lives out of the project tree. Every other unreadable shape carries a
+    fault: a grant store nobody can read must not look like one nobody wrote, or a
+    tampered path would quietly launch with no grants and no word said.
+
+    ABLATION: fold `FileNotFoundError` into the generic open-fault arm and the
+    first assert fails; return `(None, None)` from the path arm and the last
+    fails."""
+    project = tmp_path / "proj"
+    (project / ".bmad-loop").mkdir(parents=True)
+
+    assert runs.read_plugin_grants_text(project) == (None, None)
+
+    runs.write_plugin_grants_text(project, '{"plugins": {}, "version": 1}\n')
+    path = runs.plugin_grants_path(project)
+    assert path == runs.project_state_root(project) / "plugin-grants.json"
+    # byte-exact on every platform: no win32 newline translation (the size cap counts these bytes)
+    assert runs.read_plugin_grants_text(project) == ('{"plugins": {}, "version": 1}\n', None)
+    assert not any(p.is_file() for p in (project / ".bmad-loop").rglob("*"))
+
+    monkeypatch.setattr(runs, "state_root", _raising(runs.StateRootError("no root")))
+    text, fault = runs.read_plugin_grants_text(project)
+    assert text is None
+    assert fault is not None and "state root" in fault and "no root" in fault
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFOs")
+def test_plugin_grants_read_refuses_a_fifo(tmp_path):
+    """A FIFO planted at the store would wedge a foreground launch on an open for
+    reading, and a fed one would hand the launch session-chosen grants. Both are
+    refused on the descriptor's shape. Alarm-guarded: the failure mode is a hang.
+
+    ABLATION: drop `O_NONBLOCK` and the alarm fires; drop the `S_ISREG` check and
+    the fed FIFO's text comes back as the store."""
+    import signal
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = runs.plugin_grants_path(project)
+    path.parent.mkdir(parents=True)
+    os.mkfifo(path)
+
+    def _blew_up(signum, frame):
+        raise AssertionError("the read blocked on the FIFO instead of refusing it")
+
+    previous = signal.signal(signal.SIGALRM, _blew_up)
+    signal.alarm(20)
+    try:
+        assert runs.read_plugin_grants_text(project) == (None, f"{path}: not a regular file")
+        holder = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            os.write(holder, b'{"plugins": {}, "version": 1}\n')
+            assert runs.read_plugin_grants_text(project) == (
+                None,
+                f"{path}: not a regular file",
+            )
+        finally:
+            os.close(holder)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_plugin_grants_read_is_bounded(tmp_path):
+    """A link to an endless source would read until `MemoryError`; the cap removes
+    the condition. Over the cap is refused outright, never truncated — a cut-off
+    JSON document would only fail to decode one layer up. The bound is asserted ON
+    THE READ (the requested counts), not on what comes back.
+
+    ABLATION: slurp the file with no bound and the requested total exceeds the
+    cap; drop the over-cap refusal and the fault assert fails."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = runs.plugin_grants_path(project)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"a" * (runs._MAX_GRANTS_BYTES + 4096))
+
+    requested: list[int] = []
+    real_read = os.read
+
+    def _spy(fd: int, n: int) -> bytes:
+        requested.append(n)
+        return real_read(fd, n)
+
+    with mock.patch.object(runs.os, "read", _spy):
+        text, fault = runs.read_plugin_grants_text(project)
+
+    assert text is None
+    assert fault == f"{path}: larger than {runs._MAX_GRANTS_BYTES} bytes"
+    assert requested, "the spy saw no read at all — the assertion below would be vacuous"
+    assert sum(requested) <= runs._MAX_GRANTS_BYTES + 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_plugin_grants_read_does_not_follow_a_planted_symlink(tmp_path):
+    """`O_NOFOLLOW`: a link at the store's name is a fault, not a redirect to
+    grants a session wrote somewhere else.
+
+    ABLATION: drop `O_NOFOLLOW` and the target's text comes back as the store."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text('{"plugins": {}, "version": 1}\n')
+    path = runs.plugin_grants_path(project)
+    path.parent.mkdir(parents=True)
+    path.symlink_to(elsewhere)
+
+    text, fault = runs.read_plugin_grants_text(project)
+    assert text is None
+    assert fault is not None and fault.startswith(f"{path}: cannot open: ")
+
+
+def test_plugin_grants_read_reports_undecodable_bytes(tmp_path):
+    """Garbage bytes are a named fault, never absence and never the bytes
+    themselves (they are session-chosen, headed for an operator's terminal).
+
+    ABLATION: return `(None, None)` from the decode arm and this fails."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = runs.plugin_grants_path(project)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xff\xfe\x00garbage")
+
+    assert runs.read_plugin_grants_text(project) == (None, f"{path}: not UTF-8 text")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_plugin_grants_writer_replaces_a_planted_symlink(tmp_path):
+    """A link planted at the store's name is replaced, never written through: the
+    store sits beside the state dirs whose paths sessions are handed.
+
+    ABLATION: swap the writer for `atomic_write_text(path, ...)` at its
+    follow-the-link default and the target below is what gets written."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    target = tmp_path / "outside.json"
+    target.write_text("untouched")
+    path = runs.plugin_grants_path(project)
+    path.parent.mkdir(parents=True)
+    path.symlink_to(target)
+
+    runs.write_plugin_grants_text(project, "{}\n")
+
+    assert target.read_text() == "untouched"
+    assert not path.is_symlink()
+    assert runs.read_plugin_grants_text(project) == ("{}\n", None)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_plugin_grants_writer_refuses_a_symlinked_state_component(tmp_path, monkeypatch):
+    """#593 at this site: the `mkdir` accepts a symlinked `<project key>/`, so the
+    write itself must refuse it, or the grants land wherever the link points. The
+    confinement root is the STATE ROOT — rooted at the store's own parent, the walk
+    would check no component a session can reach.
+
+    ABLATION: revert the call to `atomic_write_text(path, text,
+    follow_symlinks=False)`, or root it at `path.parent`, and this fails `DID NOT
+    RAISE` with the store published in `outside/`."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    root = tmp_path / "state"
+    root.mkdir()
+    monkeypatch.setenv(envvars.STATE_DIR, str(root))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / runs.project_tag(project)).symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        runs.write_plugin_grants_text(project, "{}\n")
+
+    assert list(outside.iterdir()) == []
+
+
+def test_plugin_grants_writer_refuses_a_store_its_reader_would_refuse(tmp_path, monkeypatch):
+    """The write and read caps agree: a store the next launch would refuse as
+    oversized is never published, so a grant that reported success is readable.
+
+    ABLATION: drop the writer's size check and the over-cap text is written, then
+    read back as a fault."""
+    monkeypatch.setattr(runs, "_MAX_GRANTS_BYTES", 8)
+    project = tmp_path / "proj"
+    project.mkdir()
+    runs.write_plugin_grants_text(project, "{}\n")
+
+    with pytest.raises(OSError, match="over the 8-byte read cap"):
+        runs.write_plugin_grants_text(project, '{"plugins": {}}\n')
+
+    assert runs.read_plugin_grants_text(project) == ("{}\n", None)
 
 
 def test_prunable_sessions_accepts_legacy_path_tag(tmp_path, monkeypatch):
@@ -2539,6 +3299,24 @@ def test_prunable_sessions_flags_unknown(tmp_path, monkeypatch):
     assert unknown == {"odd-1"}
 
 
+def test_prunable_sessions_flags_an_unreadable_pid_file_as_unknown(tmp_path, monkeypatch):
+    """DW-465 at the prune seam: an unreadable engine.pid takes the existing
+    unverifiable-pid path — prunable, but in the `unknown` set every frontend warns
+    for — rather than reading as a dead engine and pruning without a word.
+
+    ABLATION: fold the unreadable read back into `(None, None)` and `unknown` is
+    empty."""
+    mine = runs.project_tag(tmp_path)
+    odd = _make_state_run(tmp_path, "odd-1")
+    (odd / "engine.pid").mkdir()
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-odd-1"])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {"bmad-loop-odd-1": mine})
+    prunable, live, unknown = runs.prunable_sessions(tmp_path)
+    assert prunable == ["odd-1"]
+    assert live == []
+    assert unknown == {"odd-1"}
+
+
 def test_prune_sessions_dry_run_kills_nothing(tmp_path, monkeypatch):
     finished = _make_state_run(tmp_path, "fin-1")
     (finished / "engine.pid").write_text(str(_dead_pid()))
@@ -2583,12 +3361,6 @@ def _raising(exc: Exception):
         raise exc
 
     return _fail
-
-
-def test_delete_run(tmp_path):
-    run_dir = _make_state_run(tmp_path, "r1")
-    runs.delete_run(tmp_path, run_dir)
-    assert not run_dir.exists()
 
 
 def test_delete_run_refuses_a_live_engine_inside_the_lifecycle_hold(tmp_path, monkeypatch):
@@ -2655,7 +3427,7 @@ def test_failed_composition_pid_bypasses_only_its_own_live_engine(tmp_path, monk
     runs.write_pid(run_dir)
     checked: list[str] = []
 
-    def session_guard(_project, run_id, _action):
+    def session_guard(_project, run_id, _action, **_kw):
         checked.append(run_id)
 
     monkeypatch.setattr(runs, "_refuse_live_session", session_guard)
@@ -2724,6 +3496,112 @@ def test_delete_run_removes_the_out_of_tree_state_counterpart(tmp_path):
 
     assert not run_dir.exists()
     assert not state_dir.exists()
+
+
+@pytest.mark.parametrize("op", ["delete", "archive"])
+def test_run_removal_retries_a_transient_windows_sharing_violation(tmp_path, monkeypatch, op):
+    """DW-519: a concurrent reader's open handle (Python's ``open()`` grants no
+    ``FILE_SHARE_DELETE``) denies one file's delete on Windows. The run-dir removal
+    retries it under the shared backoff instead of failing the whole operation.
+
+    ``sys.platform`` reads ``"win32"`` ONLY between the injected denial and the
+    retried unlink — never across ``state_lock``, whose win32 branch imports
+    ``msvcrt``; the ``rmtree`` wrapper closes the window even if the denial escapes.
+
+    Ablation: revert either call site to a bare ``shutil.rmtree`` and its row
+    raises the injected ``PermissionError``. Verified for both."""
+    run_id = "20260611-100000-aaaa"
+    run_dir = _make_state_run(tmp_path, run_id)
+    (run_dir / "journal.jsonl").write_text('{"kind":"x"}\n')
+    state_dir = _seed_state_dir(tmp_path, run_id)
+    real_platform = sys.platform
+    monkeypatch.setattr(platform_util.sys, "platform", real_platform)  # restore on teardown
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    # ``time.sleep`` is the process-wide one: the session guard's tmux probe waits
+    # under a timeout, and ``Popen.wait`` polls with ``time.sleep`` on a slow host.
+    monkeypatch.setattr(runs, "_refuse_live_session", lambda *_a, **_k: None)
+    real_unlink = os.unlink
+    calls = {"n": 0}
+
+    def held_once(path, *args, **kwargs):
+        if os.path.basename(os.fspath(path)) == "journal.jsonl":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                platform_util.sys.platform = "win32"  # the reader's window opens
+                raise PermissionError(13, "The process cannot access the file")
+            platform_util.sys.platform = real_platform  # ... and closes on the retry
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", held_once)
+    real_rmtree = shutil.rmtree
+
+    def window_closing_rmtree(*args, **kwargs):
+        # Closes the window however the removal ends: should the denial escape
+        # (no retry), it must not reach the state_lock release still reading win32.
+        try:
+            return real_rmtree(*args, **kwargs)
+        finally:
+            platform_util.sys.platform = real_platform
+
+    monkeypatch.setattr(shutil, "rmtree", window_closing_rmtree)
+
+    if op == "delete":
+        runs.delete_run(tmp_path, run_dir)
+    else:
+        dest = runs.archive_run(tmp_path, run_dir)
+        assert dest.is_file()
+
+    assert calls["n"] == 2  # the denial was injected, then retried
+    assert sleeps == []  # the retry's first attempt succeeded
+    assert sys.platform == real_platform
+    assert not run_dir.exists()
+    assert not state_dir.exists()
+
+
+@pytest.mark.parametrize("op", ["delete", "archive"])
+def test_run_removal_final_failure_propagates_and_keeps_the_state_dir(tmp_path, monkeypatch, op):
+    """A run dir that could not be removed keeps its control plane: the error
+    escapes ``delete_run`` / ``archive_run`` and ``_discard_state_dir`` never runs.
+    Off win32 the ``PermissionError`` surfaces after one attempt with no backoff,
+    exactly as the bare ``shutil.rmtree`` raised it; on win32 only after the
+    retries run out."""
+    run_id = "20260611-100000-aaaa"
+    run_dir = _make_state_run(tmp_path, run_id)
+    (run_dir / "journal.jsonl").write_text('{"kind":"x"}\n')
+    state_dir = _seed_state_dir(tmp_path, run_id)
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    # ``time.sleep`` is the process-wide one: the session guard's tmux probe waits
+    # under a timeout, and ``Popen.wait`` polls with ``time.sleep`` on a slow host.
+    monkeypatch.setattr(runs, "_refuse_live_session", lambda *_a, **_k: None)
+    real_unlink = os.unlink
+    calls = {"n": 0}
+    denied = PermissionError(13, "Permission denied")
+
+    def always_denied(path, *args, **kwargs):
+        if os.path.basename(os.fspath(path)) == "journal.jsonl":
+            calls["n"] += 1
+            raise denied
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", always_denied)
+
+    with pytest.raises(PermissionError) as caught:
+        if op == "delete":
+            runs.delete_run(tmp_path, run_dir)
+        else:
+            runs.archive_run(tmp_path, run_dir)
+
+    assert caught.value is denied
+    if sys.platform == "win32":
+        assert calls["n"] == 1 + platform_util._REPLACE_ATTEMPTS
+    else:
+        assert calls["n"] == 1
+        assert sleeps == []
+    assert state_dir.is_dir()
+    assert run_dir.is_dir()
+    assert (run_dir / "journal.jsonl").is_file()
 
 
 @pytest.mark.parametrize(
@@ -2817,19 +3695,141 @@ def test_delete_run_refuses_a_session_tagged_as_ours(tmp_path, monkeypatch):
     assert run_dir.exists()
 
 
-def test_delete_run_proceeds_when_the_session_listing_raises(tmp_path, monkeypatch):
-    """The seam only promises `pipe_pane` and `kill_session` never raise, so an
-    out-of-tree backend answers a failed listing with MultiplexerError where the
-    bundled one answers `[]`. Both must reach the same place, or the guard would
+@pytest.mark.parametrize("helper", ["delete_run", "archive_run"])
+def test_removal_routes_the_unasked_guard_warning_to_one_channel(
+    tmp_path, monkeypatch, capsys, helper
+):
+    """DW-466's warning has one route per caller: stderr by default (the CLI),
+    or the caller's ``warn`` sink instead of stderr (the TUI, whose stderr
+    Textual captures). The sink gets the operator-facing line without the
+    ``warning:`` prefix; stderr stays empty when a sink is given.
+
+    The listing here raises (MultiplexerError, what an out-of-tree backend may
+    answer where the bundled ones answer `[]`), and removal still proceeds: the
+    guard degrades to "no session", as tmux does for a dead server, rather than
     turn a transient transport error into a failed `delete`/`archive`/`clean` —
-    and `clean` has no override. Degrading to "no session" matches what tmux
-    already does for a dead server. (A stronger contract — refuse on the raise —
-    was built on this branch and withdrawn: the guard's degrade is main's
-    documented decision, and the measured cost is filed for its owner.)"""
-    run_dir = _make_state_run(tmp_path, "r1")
+    and `clean` has no override. That degrade is the guard's documented decision.
+
+    Ablation: drop ``warn=warn`` from either helper's `_refuse_live_session`
+    call and its sink row fails (the note goes to stderr instead)."""
+    remove = getattr(runs, helper)
     monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([], unanswerable=True))
-    runs.delete_run(tmp_path, run_dir)
+    note = (
+        "run r1: could not check for a live agent session — the session listing "
+        "raised: simulated transport failure; proceeding as if none is live"
+    )
+
+    run_dir = _make_state_run(tmp_path, "r1")
+    remove(tmp_path, run_dir)
     assert not run_dir.exists()
+    assert capsys.readouterr().err == f"warning: {note}\n"
+
+    run_dir = _make_state_run(tmp_path, "r1")
+    notes: list[str] = []
+    remove(tmp_path, run_dir, warn=notes.append)
+    assert not run_dir.exists()
+    assert notes == [note]
+    assert capsys.readouterr().err == ""
+
+
+def _folding_tmux(stderr: str, *, installed: bool = True) -> TerminalMultiplexer:
+    """A bundled-shaped backend: the real tmux-family `list_sessions` fold, with
+    `list-sessions` exiting 1 on ``stderr``. `_BINARY` names a file that exists
+    on every box (the running interpreter) or one that exists on none, so the
+    fold's `shutil.which` gate is decided without patching PATH lookups for the
+    whole process."""
+
+    class _Folding(tmux_base.BaseTmuxBackend):
+        _BINARY = sys.executable if installed else "bmad-loop-no-such-multiplexer"
+
+        def _run(self, argv, *, check=True, env=None):
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr=stderr)
+
+        def available(self):  # the guard must not consult it
+            raise AssertionError("available() consulted")
+
+    return _Folding()
+
+
+_UNPROVEN_LISTING = "error connecting to /tmp/tmux-1001/default (Permission denied)\n"
+
+
+@pytest.mark.parametrize("helper", ["delete_run", "archive_run"])
+def test_removal_routes_a_folded_listing_fault_to_one_channel(
+    tmp_path, monkeypatch, capsys, helper
+):
+    """The bundled backends never raise from the listing: they fold a failed
+    `list-sessions` into `[]` and warn on stderr (DW-458), which the TUI never
+    shows. So the guard reads the listing through `list_sessions_reporting`:
+    with a ``warn`` sink the fault arrives there, run-scoped like the DW-466
+    raise, and stderr stays empty; without one (the CLI) the backend's own
+    stderr line is the one report, byte-for-byte what DW-458 prints.
+
+    Ablation: pass `on_fault=None` unconditionally from the guard and the sink
+    row fails (the fault goes to stderr instead)."""
+    remove = getattr(runs, helper)
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _folding_tmux(_UNPROVEN_LISTING))
+    detail = "error connecting to /tmp/tmux-1001/default (Permission denied)"
+
+    run_dir = _make_state_run(tmp_path, "r1")
+    remove(tmp_path, run_dir)
+    assert not run_dir.exists()
+    assert capsys.readouterr().err == (
+        f"warning: {sys.executable} list-sessions exited 1 without proving the "
+        f"session gone; reading it as empty: {detail}\n"
+    )
+
+    run_dir = _make_state_run(tmp_path, "r1")
+    notes: list[str] = []
+    remove(tmp_path, run_dir, warn=notes.append)
+    assert not run_dir.exists()
+    assert notes == [
+        "run r1: could not check for a live agent session — the session listing "
+        f"failed: {sys.executable} list-sessions exited 1 without proving the session "
+        f"gone: {detail}; proceeding as if none is live"
+    ]
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    "mux",
+    [
+        lambda: _folding_tmux("no server running on /tmp/tmux-1001/default\n"),
+        lambda: _folding_tmux(_UNPROVEN_LISTING, installed=False),
+    ],
+    ids=["no-server", "no-multiplexer"],
+)
+def test_removal_says_nothing_when_the_listing_answered(tmp_path, monkeypatch, capsys, mux):
+    """A gone server and a missing multiplexer are answers — there is no live
+    session — so neither route hears a word, sink or no sink."""
+    monkeypatch.setattr(runs, "get_multiplexer", mux)
+    run_dir = _make_state_run(tmp_path, "r1")
+    runs.delete_run(tmp_path, run_dir)
+    run_dir = _make_state_run(tmp_path, "r1")
+    notes: list[str] = []
+    runs.delete_run(tmp_path, run_dir, warn=notes.append)
+    assert not run_dir.exists()
+    assert notes == []
+    assert capsys.readouterr().err == ""
+
+
+def test_list_sessions_reporting_default_serves_a_released_backend():
+    """An out-of-tree backend released before the sink existed declares only
+    `list_sessions(self)`. The seam's non-abstract default answers for it —
+    the listing unchanged, nothing reported — so a TUI removal through the
+    guard cannot die of a keyword the override never declared."""
+
+    class _Released:
+        def list_sessions(self):  # no keyword: the released signature
+            return ["bmad-loop-x"]
+
+    faults: list[str] = []
+    listing = TerminalMultiplexer.list_sessions_reporting(
+        _Released(),  # pyright: ignore[reportArgumentType]
+        on_fault=faults.append,
+    )
+    assert listing == ["bmad-loop-x"]
+    assert faults == []
 
 
 def test_delete_run_refuses_when_the_tag_read_raises(tmp_path, monkeypatch):
@@ -2860,18 +3860,6 @@ def test_delete_run_matches_the_session_by_exact_run_id(tmp_path, monkeypatch):
         "get_multiplexer",
         lambda: _LivenessMux(["bmad-loop-r1-2", "bmad-loop-ctl", "r1"]),
     )
-    runs.delete_run(tmp_path, run_dir)
-    assert not run_dir.exists()
-
-
-@pytest.mark.usefixtures("force_tmux_backend")  # the degradation is the seam's, not a stub's
-def test_delete_run_proceeds_when_the_multiplexer_cannot_answer(tmp_path, monkeypatch):
-    """Observation degrades: an absent multiplexer, a dead server, or a failed query
-    all read as "no session" (mux_sessions returns []). A removal the operator asked
-    for must not be blocked by an unanswerable question — the cost is only that the
-    backstop is inert there, which is the pre-#419 behavior."""
-    run_dir = _make_state_run(tmp_path, "r1")
-    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: None)  # no tmux at all
     runs.delete_run(tmp_path, run_dir)
     assert not run_dir.exists()
 
@@ -3024,6 +4012,32 @@ def _escalated_run(tmp_path, spec_text, *, restore_patch_stale=None, git_project
         git_project=git_project,
     )
     return run.run_dir, spec
+
+
+@pytest.mark.parametrize("record", ["legacy", "renumbered"])
+def test_rearm_journal_pins_to_the_reconciled_record(tmp_path, record):
+    """The re-arm's journal is pinned to the state it reconciles, and
+    `reconcile_root_identities` assigns the record BEFORE journaling it, so the
+    `root-identity-*` row and every row after it go through the fresh record: no
+    `journal-unpinned` notice, for a legacy state (no record) and for a record a
+    reboot renumbered (same inode, other `st_dev`) alike.
+
+    Ablation: journal before assigning in `reconcile_root_identities` (the old order)
+    and both rows redden — the legacy row on a `no-record` notice, the renumbered row
+    on a `stale-device` one."""
+    run_dir, _spec = _escalated_run(tmp_path, "---\nstatus: escalated\n---\n")
+    state = load_state(run_dir)
+    dev, ino = platform_util.root_identity_record(run_dir)
+    state.run_dir_identity = None if record == "legacy" else (dev + 1, ino)
+    save_state(run_dir, state)
+
+    runs.rearm_escalation(run_dir, "1-1-a", isolated_redrive=False, resolution_recorded=False)
+
+    kinds = [e["kind"] for e in Journal(run_dir).entries()]
+    expected = "root-identity-recorded" if record == "legacy" else "root-identity-rebound"
+    assert kinds[0] == expected, kinds
+    assert "journal-unpinned" not in kinds
+    assert load_state(run_dir).run_dir_identity == (dev, ino)
 
 
 # --------------------------------------------------- restamp_code_root
@@ -3432,6 +4446,176 @@ def test_rearm_plain_mode_sets_ready_for_dev_and_clears_stale_latch(tmp_path):
     assert "## Auto Run Result" not in text  # stale attempt authority stripped
     entry = [e for e in Journal(run_dir).entries() if e["kind"] == "story-escalation-resolved"][-1]
     assert entry["restore"] is False
+
+
+@pytest.mark.parametrize(
+    "field,seeded,cleared",
+    [
+        ("adopt_pending", True, False),
+        ("env_fault_site", "probe:decision:dev", None),
+        ("reverify_from", "deferred", ""),
+        ("reverify_replayed", "deferred", ""),
+    ],
+    ids=["dw386-adopt-latch", "dw523-env-fault-site", "reverify-latch", "dw527-post-replay-marker"],
+)
+def test_rearm_clears_a_stale_task_latch(tmp_path, field, seeded, cleared):
+    """A plain re-arm re-implements from the baseline, so every per-attempt latch the
+    escalated attempt left on its task is spent; each row seeds one and pins its clear.
+
+    [dw386-adopt-latch] DW-386: an adoption that re-escalated before its latch was
+    spent (e.g. the kept worktree vanished on resume) must not fire an adopt leg on
+    the re-drive. Ablation, performed: drop the `adopt_pending = False` in
+    `_rearm_escalation_locked` and this row reddens.
+
+    [dw523-env-fault-site] DW-523: a re-armed story starts with no environment fault
+    on record. Ablation, performed: drop the `env_fault_site = None` in
+    `_rearm_escalation_locked` and this row reddens.
+
+    [reverify-latch] A verify replay that escalated before its decision (a refused
+    board write) leaves `reverify_from` on the escalated task; left set, the fresh
+    attempt's next DEV_VERIFY pause would resume through the verify-replay arm.
+    Ablation, performed: drop the clear in `_rearm_escalation_locked` and this row
+    reddens on the surviving latch.
+
+    [dw527-post-replay-marker] DW-527: a `--reverify` continuation that escalated in
+    review leaves `reverify_replayed` on the escalated task; left set, a mid-review
+    crash of the re-drive would re-latch a verify replay instead of taking
+    resume-restart. Ablation, performed: drop the clear in `_rearm_escalation_locked`
+    and this row reddens on the surviving marker."""
+    run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    state = load_state(run_dir)
+    setattr(state.tasks["1-1-a"], field, seeded)
+    save_state(run_dir, state)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    task = load_state(run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.PENDING
+    assert getattr(task, field) == cleared
+    if cleared is None or isinstance(cleared, bool):
+        assert getattr(task, field) is cleared
+
+
+def test_adopt_clears_env_fault_site(tmp_path):
+    """DW-523: adopting the escalated branch commits it as-is, so no environment
+    fault stays on record.
+
+    Ablation, performed: drop the `env_fault_site = None` in
+    `adopt_escalated_branch` and this reddens."""
+    from bmad_loop.model import Phase
+
+    run_dir, _wt = _adoptable(tmp_path)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].env_fault_site = "verify:review"
+    save_state(run_dir, state)
+
+    runs.adopt_escalated_branch(run_dir)
+
+    task = load_state(run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.COMMITTING and task.adopt_pending is True
+    assert task.env_fault_site is None
+
+
+def test_adopt_clears_a_post_replay_marker(tmp_path):
+    """DW-527: the adopted branch is finalized as-is, so a `--reverify`
+    continuation's post-replay marker must not survive onto the COMMITTING task.
+
+    Ablation, performed: drop the `reverify_replayed = ""` in
+    `adopt_escalated_branch` and this reddens."""
+    run_dir, _wt = _adoptable(tmp_path)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].reverify_replayed = "escalated"
+    save_state(run_dir, state)
+
+    runs.adopt_escalated_branch(run_dir)
+
+    assert load_state(run_dir).tasks["1-1-a"].reverify_replayed == ""
+
+
+def _adoptable(tmp_path):
+    """An escalation-paused run whose ESCALATED task keeps a worktree + branch + spec."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].worktree_path = str(wt)
+    state.tasks["1-1-a"].branch = "bmad-loop/r1/1-1-a"
+    save_state(run_dir, state)
+    return run_dir, wt
+
+
+def test_adopt_admits_cleared_escalation_pause(tmp_path):
+    """#958: a resume clears the pause before its engine starts, so an engine exit
+    before run end leaves the pause null with the task still ESCALATED. Adoption
+    admits that run and defaults to the unresolved escalation, as at the pause.
+
+    Ablation, performed: restore the stage-only `paused_stage != PAUSE_ESCALATION`
+    gate in `adopt_escalated_branch` and this reddens."""
+    run_dir, _wt = _adoptable(tmp_path)
+    state = load_state(run_dir)
+    state.clear_pause()
+    save_state(run_dir, state)
+
+    assert runs.adopt_escalated_branch(run_dir) == "bmad-loop/r1/1-1-a"
+
+    task = load_state(run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.COMMITTING and task.adopt_pending is True
+
+
+def test_adopt_refuses_a_finished_run_with_its_escalation_still_recorded(tmp_path):
+    """#958: the null-stage admission excludes a finished run, whose ESCALATED task
+    is a closed record (an abandoned replay run keeps one), not an escalation a
+    human still owes: refused as not paused, state untouched.
+
+    Ablation, performed: drop `not state.finished` from `escalation_resolvable`'s
+    null-stage arm and this reddens (the adoption goes through)."""
+    run_dir, _wt = _adoptable(tmp_path)
+    state = load_state(run_dir)
+    state.clear_pause()
+    state.finished = True
+    save_state(run_dir, state)
+    before = (run_dir / "state.json").read_bytes()
+
+    with pytest.raises(runs.RearmError, match=r"not paused at an escalation \(stage: none\)"):
+        runs.adopt_escalated_branch(run_dir)
+
+    assert (run_dir / "state.json").read_bytes() == before
+
+
+def test_adopt_under_lock_refuses_a_task_no_longer_escalated(tmp_path):
+    """DW-386: the locked re-check, not the CLI's lock-free early exit, is what stops
+    a stale adopt gesture from latching a task a rival already moved.
+
+    Ablation, performed: drop the phase check in `adopt_escalated_branch` and this
+    reddens."""
+    from bmad_loop.model import Phase
+
+    run_dir, _wt = _adoptable(tmp_path)
+    state = load_state(run_dir)
+    state.tasks["1-1-a"].phase = Phase.PENDING
+    save_state(run_dir, state)
+    before = (run_dir / "state.json").read_bytes()
+
+    with pytest.raises(runs.RearmError, match="not escalated"):
+        runs.adopt_escalated_branch(run_dir)
+
+    assert (run_dir / "state.json").read_bytes() == before
+
+
+def test_adopt_under_lock_refuses_a_kept_worktree_gone_since_the_early_check(tmp_path):
+    """DW-386: a worktree removed between resolve's lock-free check and the lock is
+    refused under the lock, state untouched.
+
+    Ablation, performed: drop the `adopt_refusal` re-check in
+    `adopt_escalated_branch` and this reddens."""
+    run_dir, wt = _adoptable(tmp_path)
+    wt.rmdir()
+    before = (run_dir / "state.json").read_bytes()
+
+    with pytest.raises(runs.RearmError, match="is gone"):
+        runs.adopt_escalated_branch(run_dir)
+
+    assert (run_dir / "state.json").read_bytes() == before
 
 
 def test_rearm_reloads_state_after_waiting_for_the_run_lock(tmp_path, monkeypatch):
@@ -5286,7 +6470,7 @@ def test_reconcile_orphan_state_dirs_removes_only_what_has_no_run_dir(tmp_path):
     kept = _seed_state_dir(tmp_path, "live-1")
     orphan = _seed_state_dir(tmp_path, "gone-1")
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == [orphan]
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([orphan], None)
 
     assert not orphan.exists()
     assert kept.is_dir()
@@ -5303,7 +6487,7 @@ def test_reconcile_orphan_state_dirs_keeps_a_run_dir_with_no_state_json(tmp_path
     _make_run(tmp_path, "corrupt-1", with_state=False)
     kept = _seed_state_dir(tmp_path, "corrupt-1")
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([], None)
 
     assert kept.is_dir()
 
@@ -5313,7 +6497,7 @@ def test_reconcile_orphan_state_dirs_dry_run_reports_without_removing(tmp_path):
     the disk alone, so the count a caller pre-flights is the count they get."""
     orphan = _seed_state_dir(tmp_path, "gone-1")
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path, dry_run=True) == [orphan]
+    assert runs.reconcile_orphan_state_dirs(tmp_path, dry_run=True) == ([orphan], None)
 
     assert orphan.is_dir()
 
@@ -5327,7 +6511,7 @@ def test_reconcile_orphan_state_dirs_sweeps_a_project_whose_runs_dir_is_gone(tmp
     orphan = _seed_state_dir(tmp_path, "gone-1")
     assert not (tmp_path / ".bmad-loop" / "runs").exists()
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == [orphan]
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([orphan], None)
 
     assert not orphan.exists()
 
@@ -5357,9 +6541,13 @@ def test_reconcile_orphan_state_dirs_sweeps_nothing_when_the_runs_dir_cannot_be_
 
     monkeypatch.setattr(runs.os, "scandir", _refuse_only_the_runs_dir)
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+    handled, fault = runs.reconcile_orphan_state_dirs(tmp_path)
 
+    assert handled == []
     assert kept.is_dir()
+    # DW-470: and says so, rather than reading as "nothing orphaned".
+    assert fault is not None
+    assert "cannot list the runs dir" in fault and "PermissionError" in fault
 
 
 def test_reconcile_orphan_state_dirs_leaves_another_projects_subtree_alone(tmp_path):
@@ -5375,7 +6563,7 @@ def test_reconcile_orphan_state_dirs_leaves_another_projects_subtree_alone(tmp_p
     # my own orphan, so the sweep provably enumerates rather than finding nothing
     orphan = _seed_state_dir(mine, "gone-1")
 
-    assert runs.reconcile_orphan_state_dirs(mine) == [orphan]
+    assert runs.reconcile_orphan_state_dirs(mine) == ([orphan], None)
 
     assert not orphan.exists()
     assert foreign.is_dir()
@@ -5399,7 +6587,7 @@ def test_reconcile_orphan_state_dirs_never_removes_through_a_symlink(tmp_path):
     link = runs.project_state_root(tmp_path) / "ghost-1"
     link.symlink_to(target)
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([], None)
 
     assert link.is_symlink()  # not followed, not removed
     assert target.is_dir()
@@ -5427,7 +6615,12 @@ def test_reconcile_orphan_state_dirs_degrades_when_the_root_cannot_be_named(
     the measured version split."""
     monkeypatch.setattr(runs, attr, _raising(exc))
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+    handled, fault = runs.reconcile_orphan_state_dirs(tmp_path)
+
+    assert handled == []
+    # DW-470: a sweep that could not run is not "swept 0".
+    assert fault is not None
+    assert "cannot name this project's state root" in fault and type(exc).__name__ in fault
 
 
 def test_reconcile_orphan_state_dirs_keeps_a_run_that_starts_mid_sweep(tmp_path, monkeypatch):
@@ -5466,7 +6659,7 @@ def test_reconcile_orphan_state_dirs_keeps_a_run_that_starts_mid_sweep(tmp_path,
 
     monkeypatch.setattr(runs, "_run_dir_names", _names_then_a_new_run)
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == [orphan]
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([orphan], None)
 
     assert not orphan.exists()
     assert racer[0].is_dir(), "swept the control plane of a run that was starting"
@@ -5499,18 +6692,121 @@ def test_reconcile_orphan_state_dirs_skips_an_entry_it_cannot_resolve(tmp_path, 
 
     monkeypatch.setattr(Path, "resolve", _resolve)
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == [good]
+    handled, fault = runs.reconcile_orphan_state_dirs(tmp_path)
+    assert handled == [good]
     assert not good.exists() and bad.is_dir()
+    # DW-470: the skip is named — the rest of the sweep still stands.
+    assert fault is not None and "ghost-loop (cannot resolve: RuntimeError" in fault
+
+
+def test_reconcile_orphan_state_dirs_names_an_unreadable_state_root(tmp_path, monkeypatch):
+    """DW-470: a state root that exists but cannot be listed answers the fault,
+    not `([], None)` — `clean` used to report that as swept 0. Ablate the fault
+    arm (fold it back into the silent return) and this fails."""
+    orphan = _seed_state_dir(tmp_path, "gone-1")
+    root = runs.project_state_root(tmp_path)
+    real_iterdir = Path.iterdir
+
+    def _refuse_the_root(self: Path):
+        if self == root:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", _refuse_the_root)
+
+    handled, fault = runs.reconcile_orphan_state_dirs(tmp_path)
+
+    assert handled == []
+    assert orphan.is_dir()
+    assert fault is not None and "cannot list the state root" in fault
+    assert "PermissionError" in fault
+
+
+def test_reconcile_orphan_state_dirs_is_silent_when_no_state_root_exists(tmp_path):
+    """The healthy twin of the test above: no run ever minted a state dir here,
+    so nothing is orphaned and there is nothing to warn about."""
+    assert not runs.project_state_root(tmp_path).exists()
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([], None)
+
+
+def test_reconcile_orphan_state_dirs_names_an_entry_rmtree_left_behind(tmp_path, monkeypatch):
+    """DW-470: `rmtree(ignore_errors=True)` can leave the tree, and counting it as
+    swept would be false. It is kept out of `handled` and named. Ablate the
+    `lexists` check and `handled` claims the orphan with no fault."""
+    orphan = _seed_state_dir(tmp_path, "gone-1")
+    monkeypatch.setattr(runs.shutil, "rmtree", lambda *a, **k: None)
+
+    handled, fault = runs.reconcile_orphan_state_dirs(tmp_path)
+
+    assert handled == []
+    assert orphan.is_dir()
+    assert fault is not None and "gone-1 (still on disk after removal)" in fault
+
+
+def _sentinel_row(run_dir: Path) -> dict:
+    return next(e for e in Journal(run_dir).entries() if e["kind"] == "sentinel-cleared")
+
+
+def test_clear_sentinel_records_an_unreadable_condition(tmp_path, monkeypatch):
+    """DW-471: a sentinel whose text cannot be read still gets preserved and
+    deleted, but its row says the condition was unreadable. Before this the
+    empty `condition` read exactly like "none recorded". Ablate the flag and
+    this fails."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    spec = tmp_path / "1-1-x-unresolved.md"
+    spec.write_text("## Auto Run Result\n\nintent too vague\n", encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def _refuse_the_spec(self: Path, *args, **kwargs):
+        if self == spec:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _refuse_the_spec)
+
+    runs._clear_sentinel(run_dir, Journal(run_dir), spec, "1-1-x", "unresolved")
+
+    assert not spec.exists()
+    assert (run_dir / "sentinels" / spec.name).is_file()
+    row = _sentinel_row(run_dir)
+    assert row["condition"] == ""
+    assert row["condition_unreadable"] is True
+    assert row["error"].startswith("PermissionError")
+
+
+def test_clear_sentinel_records_an_undecodable_condition(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    spec = tmp_path / "1-1-x-unresolved.md"
+    spec.write_bytes(b"\xff\xfe not utf-8")
+
+    runs._clear_sentinel(run_dir, Journal(run_dir), spec, "1-1-x", "unresolved")
+
+    row = _sentinel_row(run_dir)
+    assert row["condition"] == "" and row["condition_unreadable"] is True
+    assert row["error"].startswith("UnicodeDecodeError")
+
+
+def test_clear_sentinel_readable_row_is_unchanged(tmp_path):
+    """The healthy row keeps its old shape: neither fault key is written."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    spec = tmp_path / "1-1-x-unresolved.md"
+    spec.write_text("# Sentinel\n", encoding="utf-8")
+
+    runs._clear_sentinel(run_dir, Journal(run_dir), spec, "1-1-x", "unresolved")
+
+    row = _sentinel_row(run_dir)
+    assert "condition_unreadable" not in row and "error" not in row
+    assert row["sentinel_kind"] == "unresolved" and row["sentinel"] == spec.name
 
 
 # ---- run inventory (moved from tui/data.py, #650)
 # discover_runs and its status/liveness closure are core now: `bmad-loop list`
 # reads them and must not drag the [tui] extra in. The RunWatcher halves of the
 # split tests stay in test_tui_data.py.
-
-
-def test_discover_runs_missing_dir(tmp_path):
-    assert runs.discover_runs(tmp_path) == []
 
 
 def test_discover_runs_classification(tmp_path):
@@ -5521,7 +6817,7 @@ def test_discover_runs_classification(tmp_path):
     gone_dir = _make_state_run(tmp_path, "20260611-130000-dddd", run_type="sweep")
     (gone_dir / "engine.pid").write_text(str(_dead_pid()))
 
-    infos = runs.discover_runs(tmp_path)
+    infos = _discover(tmp_path)
     assert [i.status for i in infos] == [
         runs.FINISHED,
         runs.PAUSED,
@@ -5531,7 +6827,7 @@ def test_discover_runs_classification(tmp_path):
     assert infos[0].started_at == "2026-06-11T10:00:00"
     assert [i.run_type for i in infos] == ["story", "story", "story", "sweep"]
     # statuses re-classify on a second (cached-header) pass
-    assert [i.status for i in runs.discover_runs(tmp_path)] == [i.status for i in infos]
+    assert [i.status for i in _discover(tmp_path)] == [i.status for i in infos]
 
 
 def test_live_pid_with_unreadable_identity_is_unknown_not_interrupted(tmp_path, monkeypatch):
@@ -5547,7 +6843,7 @@ def test_live_pid_with_unreadable_identity_is_unknown_not_interrupted(tmp_path, 
     # in this module to exercise the full delegation path.
     monkeypatch.setattr(runs, "get_process_host", lambda: Host())
     assert runs.liveness(run_dir) == "unknown"
-    assert runs.discover_runs(tmp_path)[0].status == runs.UNKNOWN
+    assert _discover(tmp_path)[0].status == runs.UNKNOWN
 
 
 def test_process_host_misconfig_degrades_to_unknown(tmp_path, monkeypatch):
@@ -5564,12 +6860,12 @@ def test_process_host_misconfig_degrades_to_unknown(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runs, "get_process_host", boom)
     assert runs.liveness(run_dir) == "unknown"
-    assert runs.discover_runs(tmp_path)[0].status == runs.UNKNOWN
+    assert _discover(tmp_path)[0].status == runs.UNKNOWN
 
 
 def test_finished_beats_stopped(tmp_path):
     _make_state_run(tmp_path, "20260611-100000-aaaa", finished=True, stopped=True)
-    assert runs.discover_runs(tmp_path)[0].status == runs.FINISHED
+    assert _discover(tmp_path)[0].status == runs.FINISHED
 
 
 def test_discover_runs_marks_graceful_stop_pending_while_running(tmp_path):
@@ -5577,9 +6873,9 @@ def test_discover_runs_marks_graceful_stop_pending_while_running(tmp_path):
 
     run_dir = _make_state_run(tmp_path, "20260611-120000-cccc")
     runs.write_pid(run_dir)  # test process pid: alive -> RUNNING
-    assert runs.discover_runs(tmp_path)[0].stopping is False  # no request yet
+    assert _discover(tmp_path)[0].stopping is False  # no request yet
     (run_dir / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
-    info = runs.discover_runs(tmp_path)[0]
+    info = _discover(tmp_path)[0]
     assert info.status == runs.RUNNING
     assert info.stopping is True
 
@@ -5598,16 +6894,17 @@ def test_discover_runs_marks_graceful_stop_pending_while_unknown(tmp_path, monke
             return "unknown"
 
     monkeypatch.setattr(runs, "get_process_host", lambda: Host())
-    assert runs.discover_runs(tmp_path)[0].stopping is False  # no request yet
+    assert _discover(tmp_path)[0].stopping is False  # no request yet
     (run_dir / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
-    info = runs.discover_runs(tmp_path)[0]
+    info = _discover(tmp_path)[0]
     assert info.status == runs.UNKNOWN
     assert info.stopping is True
 
 
 def test_stopping_ignored_on_a_non_running_run(tmp_path):
     # The engine consumes the control file at the stop boundary; a file lingering
-    # on an already-stopped or finished run must not read as still-stopping.
+    # on an already-stopped or finished run must not read as still-stopping. The
+    # stopped run leaves a dead pid and reads STOPPED, not INTERRUPTED.
     from bmad_loop.runs import STOP_REQUEST_FILE
 
     stopped = _make_state_run(tmp_path, "20260611-100000-aaaa", stopped=True)
@@ -5615,7 +6912,7 @@ def test_stopping_ignored_on_a_non_running_run(tmp_path):
     (stopped / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
     finished = _make_state_run(tmp_path, "20260611-110000-bbbb", finished=True)
     (finished / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
-    infos = {i.run_id: i for i in runs.discover_runs(tmp_path)}
+    infos = {i.run_id: i for i in _discover(tmp_path)}
     assert infos["20260611-100000-aaaa"].status == runs.STOPPED
     assert infos["20260611-100000-aaaa"].stopping is False
     assert infos["20260611-110000-bbbb"].status == runs.FINISHED
@@ -5626,7 +6923,7 @@ def test_discover_runs_legacy_no_pid_is_unknown(tmp_path, monkeypatch):
     _make_state_run(tmp_path, "20260611-100000-aaaa")
     # legacy liveness now flows through the multiplexer backend; patch its seam.
     monkeypatch.setattr(tmux_base.shutil, "which", lambda _: None)
-    assert runs.discover_runs(tmp_path)[0].status == runs.UNKNOWN
+    assert _discover(tmp_path)[0].status == runs.UNKNOWN
 
 
 @pytest.mark.usefixtures("force_tmux_backend")  # asserts tmux liveness through the seam
@@ -5644,9 +6941,9 @@ def test_legacy_run_with_live_tmux_session_is_running(tmp_path, monkeypatch):
         return Proc()
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
-    assert runs.discover_runs(tmp_path)[0].status == runs.RUNNING
-    assert calls[0][:3] == ["tmux", "has-session", "-t"]
-    assert calls[0][3] == f"=bmad-loop-{run_dir.name}"
+    assert _discover(tmp_path)[0].status == runs.RUNNING
+    assert calls[0][:4] == ["tmux", "-u", "has-session", "-t"]
+    assert calls[0][4] == f"=bmad-loop-{run_dir.name}"
 
 
 def test_legacy_run_liveness_unknown_when_backend_query_fails(tmp_path, monkeypatch):
@@ -5660,13 +6957,13 @@ def test_legacy_run_liveness_unknown_when_backend_query_fails(tmp_path, monkeypa
         raise tmux_base.subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
 
     monkeypatch.setattr(tmux_base.subprocess, "run", boom)
-    assert runs.discover_runs(tmp_path)[0].status == runs.UNKNOWN
+    assert _discover(tmp_path)[0].status == runs.UNKNOWN
 
 
 def test_discover_runs_corrupt_state_is_unknown_not_crash(tmp_path):
     run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
     (run_dir / "state.json").write_text("{ not json")
-    infos = runs.discover_runs(tmp_path)
+    infos = _discover(tmp_path)
     assert [i.status for i in infos] == [runs.UNKNOWN]
     assert infos[0].run_id == "20260611-100000-aaaa"
 
@@ -5680,7 +6977,7 @@ def test_discover_runs_reports_pause_stage(tmp_path):
         paused_reason="plan checkpoint for 1",
         paused_stage=PAUSE_PLAN_CHECKPOINT,
     )
-    info = runs.discover_runs(tmp_path)[0]
+    info = _discover(tmp_path)[0]
     assert info.status == runs.PAUSED
     assert info.paused_stage == PAUSE_PLAN_CHECKPOINT
 
@@ -5688,7 +6985,7 @@ def test_discover_runs_reports_pause_stage(tmp_path):
 def test_discover_runs_pause_stage_blank_when_not_paused(tmp_path):
     # a finished run keeps its last paused_stage in state; it must not badge.
     _make_state_run(tmp_path, "20260101-000000-aaaa", finished=True, paused_stage="plan-checkpoint")
-    info = runs.discover_runs(tmp_path)[0]
+    info = _discover(tmp_path)[0]
     assert info.status == runs.FINISHED
     assert info.paused_stage == ""
 
@@ -5715,13 +7012,6 @@ def test_stat_sig_includes_inode_for_same_size_rewrite(tmp_path):
     assert before != after  # ...but the inode did
 
 
-def test_stopped_run_classifies_as_stopped_not_interrupted(tmp_path):
-    # a deliberate stop leaves a dead pid; it must read STOPPED, not INTERRUPTED
-    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa", stopped=True)
-    (run_dir / "engine.pid").write_text(str(_dead_pid()))
-    assert runs.discover_runs(tmp_path)[0].status == runs.STOPPED
-
-
 def test_classify_crashed(tmp_path):
     # a recorded crash classifies as CRASHED (distinct from a generic INTERRUPTED),
     # checked before liveness so the dead pid does not override it.
@@ -5738,7 +7028,7 @@ def test_classify_crashed(tmp_path):
     # a state.json carrying crashed=True surfaces through discover_runs
     run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa", crashed=True)
     (run_dir / "engine.pid").write_text(str(_dead_pid()))
-    assert runs.discover_runs(tmp_path)[0].status == runs.CRASHED
+    assert _discover(tmp_path)[0].status == runs.CRASHED
 
 
 def test_classify_legacy_crash_stays_interrupted(tmp_path):
@@ -5749,7 +7039,7 @@ def test_classify_legacy_crash_stays_interrupted(tmp_path):
     doc.pop("crashed", None)
     (run_dir / "state.json").write_text(json.dumps(doc), encoding="utf-8")
     (run_dir / "engine.pid").write_text(str(_dead_pid()))
-    assert runs.discover_runs(tmp_path)[0].status == runs.INTERRUPTED
+    assert _discover(tmp_path)[0].status == runs.INTERRUPTED
 
 
 # ------------------------------- the stop-request channel's confined write (#593)
@@ -5768,6 +7058,13 @@ def test_the_stop_request_refuses_a_symlinked_bmad_loop(tmp_path):
     assertion measures a write that had somewhere to land rather than one that
     failed for want of a parent.
 
+    The positive control for this refusal is
+    `test_write_stop_request_survives_an_interleaved_concurrent_writer`: the same
+    `_write_stop_request(run_dir, "hard")` on a clean `_make_state_run` dir,
+    published through the real rename and read back as `mode == "hard"`. Without
+    it this test passes for a `_write_stop_request` wired to refuse everything,
+    which is every reason a file could be absent from `outside/`.
+
     Ablation: revert `_write_stop_request` to
     `atomic_write_text(..., follow_symlinks=False)` and this fails
     `DID NOT RAISE`, with `stop-request.json` sitting in `outside/runs/r1/`."""
@@ -5782,19 +7079,6 @@ def test_the_stop_request_refuses_a_symlinked_bmad_loop(tmp_path):
         runs._write_stop_request(proj / ".bmad-loop" / "runs" / "r1", "hard")
 
     assert list(landing.iterdir()) == []  # nothing escaped the project
-
-
-def test_the_stop_request_lands_on_a_clean_tree(tmp_path):
-    """The positive control for the refusal above — without it that test passes
-    for a `_write_stop_request` wired to refuse everything, which is every reason
-    a file could be absent from `outside/`."""
-    run_dir = _make_state_run(tmp_path, "r1")
-
-    runs._write_stop_request(run_dir, "hard")
-
-    assert json.loads((run_dir / runs.STOP_REQUEST_FILE).read_text(encoding="utf-8"))["mode"] == (
-        "hard"
-    )
 
 
 def test_stop_run_still_signals_when_the_lodge_is_refused_as_unconfined(tmp_path, monkeypatch):
@@ -6309,10 +7593,12 @@ def test_export_psmux_registry_root_sets_the_derived_root(tmp_path, monkeypatch)
     assert os.environ[runs.PSMUX_DATA_DIR] == expected
 
 
-def test_export_psmux_registry_root_overrides_an_operators_own(tmp_path, monkeypatch):
+@pytest.mark.parametrize("ambient", ["", "relative/root", ".", "/an/absolute/one"])
+def test_export_psmux_registry_root_overrides_any_ambient_spelling(tmp_path, monkeypatch, ambient):
     """The rule, and the absence of an exception to it is the point: the root is
     derived from (project, state root), full stop, so two bmad-loop processes
-    given one project cannot land in different registries.
+    given one project cannot land in different registries — whatever the ambient
+    spelling, including the ones psmux would panic on.
 
     Honouring an ambient value was tried and is the thing that was cut. It makes
     the registry a function of the launch *shell* — a TUI from the Start menu
@@ -6321,21 +7607,13 @@ def test_export_psmux_registry_root_overrides_an_operators_own(tmp_path, monkeyp
     because the process that finds a root in its environment cannot tell one
     typed in this shell alone from one the profile exports into every shell.
 
-    Ablate the unconditional export (restore an if-unset guard) and this fails."""
-    theirs = str(tmp_path / "theirs")
-    derived = str(runs.mux_registry_root(tmp_path))
-    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+    An earlier rule left a relative or empty value untouched so as not to
+    countermand something the operator typed — which, now that nothing ambient is
+    honoured, only preserved a value that makes every verb fail. Replacing it is
+    strictly better: the derived root works.
 
-    assert runs.export_psmux_registry_root(tmp_path) == derived
-    assert os.environ[runs.PSMUX_DATA_DIR] == derived
-
-
-@pytest.mark.parametrize("ambient", ["", "relative/root", ".", "/an/absolute/one"])
-def test_export_psmux_registry_root_overrides_any_ambient_spelling(tmp_path, monkeypatch, ambient):
-    """Including the ones psmux would panic on. An earlier rule left a relative or
-    empty value untouched so as not to countermand something the operator typed —
-    which, now that nothing ambient is honoured, only preserved a value that makes
-    every verb fail. Replacing it is strictly better: the derived root works."""
+    Ablate the unconditional export (restore an if-unset guard) and the rows
+    fail."""
     derived = str(runs.mux_registry_root(tmp_path))
     monkeypatch.setenv(runs.PSMUX_DATA_DIR, ambient)
 
@@ -6401,6 +7679,141 @@ def test_export_psmux_registry_root_converges_a_pane_child_that_moves_the_state_
     assert child == clean == clean_pinned == str(runs.mux_registry_root(tmp_path))
 
 
+# An absolute path that is not a derived root, spelled for the host OS.
+_PIN = os.path.abspath(os.path.join(os.sep, "operator", "pin"))
+
+
+@pytest.mark.parametrize(
+    ("ambient", "honor", "expected"),
+    [
+        (None, False, "derived"),
+        (None, True, "derived"),
+        (_PIN, False, "derived"),
+        (_PIN, True, "ambient"),
+        ("", True, "derived"),
+        ("relative/root", True, "derived"),
+        (".", True, "derived"),
+        (
+            os.path.join(os.path.dirname(_PIN), "0123456789abcdef", runs.MUX_REGISTRY_DIR),
+            True,
+            "derived",
+        ),
+        (os.path.join(os.path.dirname(_PIN), runs.MUX_REGISTRY_DIR), True, "ambient"),
+        ("\\registry", True, "derived"),  # rooted but drive-relative on Windows
+    ],
+)
+def test_resolve_psmux_registry_root(ambient, honor, expected):
+    """The whole decision, as a table. Honoured only on the opt-in AND an
+    absolute value that is not shaped like a derived root
+    (`<16-hex project tag>/_mux`); everything else derives. An operator's own
+    directory merely named `_mux` is still theirs.
+
+    Ablate any one conjunct in `resolve_psmux_registry_root` and a row fails:
+    the flag (row 3), absoluteness (rows 5-7, and on Windows the
+    drive-relative row 10, which `os.path.isabs` accepts below 3.13), the
+    derived-root exclusion (row 8), its tag-shape narrowing (row 9)."""
+    derived = os.path.abspath(os.path.join(os.sep, "state", "proj", runs.MUX_REGISTRY_DIR))
+    got = runs.resolve_psmux_registry_root(derived, ambient, honor_ambient=honor)
+    assert got == (ambient if expected == "ambient" else derived)
+
+
+@pytest.mark.parametrize("honor", [False, True])
+def test_the_policy_flag_closes_the_horn_it_names(tmp_path, monkeypatch, honor):
+    """#729's measured table, one row per process, for both settings of the flag.
+
+    The outer process runs under S1 with the pin R in its environment; the pane
+    child inherits what the outer exported and moves to S2. The flag is the
+    operator saying which kind of pin R is, so it names the clean process the
+    child has to agree with:
+
+    - off — a *transient* pin, typed into one shell: a clean S2 process has no
+      pin and derives D2;
+    - on — a *persistent* pin, exported by the profile: a clean S2 process
+      carries R and honours it.
+
+    Ablate the flag (always derive, or always honour) and one parametrization
+    fails."""
+    pinned = str(tmp_path / "pinned")
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S1"))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, pinned)
+    d1 = str(runs.mux_registry_root(tmp_path))
+    outer = runs.export_psmux_registry_root(tmp_path, honor_ambient=honor)
+
+    # the pane child: carries whatever the outer exported, now under S2
+    monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S2"))
+    child = runs.export_psmux_registry_root(tmp_path, honor_ambient=honor)
+
+    monkeypatch.delenv("TMUX", raising=False)
+    if honor:  # persistent horn: a clean S2 process WITH the profile pin
+        monkeypatch.setenv(runs.PSMUX_DATA_DIR, pinned)
+    else:  # transient horn: a clean S2 process with NO pin
+        monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    clean = runs.export_psmux_registry_root(tmp_path, honor_ambient=honor)
+
+    d2 = str(runs.mux_registry_root(tmp_path))
+    assert outer == (pinned if honor else d1)
+    assert child == clean == (pinned if honor else d2)
+
+
+def test_honouring_never_adopts_an_inherited_derived_root(tmp_path, monkeypatch):
+    """With the flag on and no pin at all, the outer process derives D1 and
+    exports it, so every pane child inherits D1 — which is not the operator's
+    pin and must not be honoured as one. A child moved to S2, or one run for
+    another project, re-derives exactly as a clean process does.
+
+    Ablate the derived-root exclusion in `resolve_psmux_registry_root` and both
+    asserts fail."""
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S1"))
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    d1 = runs.export_psmux_registry_root(tmp_path, honor_ambient=True)
+    assert d1 == str(runs.mux_registry_root(tmp_path))
+
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S2"))
+    assert runs.export_psmux_registry_root(tmp_path, honor_ambient=True) == str(
+        runs.mux_registry_root(tmp_path)
+    )
+
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, d1)
+    assert runs.export_psmux_registry_root(other, honor_ambient=True) == str(
+        runs.mux_registry_root(other)
+    )
+
+
+@pytest.mark.parametrize("ambient", ["", "relative/root", "."])
+def test_honouring_still_overrides_a_value_psmux_would_panic_on(tmp_path, monkeypatch, ambient):
+    """The flag honours a pin, not a typo: a relative or empty value is replaced
+    by the derived root exactly as with the flag off, so `PsmuxMultiplexer._run`'s
+    refusal stays reserved for the degrade arm it was written for.
+
+    Ablate the `os.path.isabs` conjunct in `resolve_psmux_registry_root` and
+    this fails."""
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, ambient)
+    derived = str(runs.mux_registry_root(tmp_path))
+    assert runs.export_psmux_registry_root(tmp_path, honor_ambient=True) == derived
+    assert os.environ[runs.PSMUX_DATA_DIR] == derived
+
+
+def test_honouring_hands_the_derived_root_to_the_sweep(tmp_path, monkeypatch):
+    """Turning the flag on moves the registry from the derived root to the pin,
+    and sessions started before the switch are still in the derived one. It is
+    the displaced root now, so cleanup's tag-scoped legacy pass reaches it.
+
+    Ablate the `displaced = derived` arm in `export_psmux_registry_root` and
+    nothing is recorded."""
+    from bmad_loop.adapters import psmux_backend
+
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    pinned = str(tmp_path / "pinned")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, pinned)
+
+    assert runs.export_psmux_registry_root(tmp_path, honor_ambient=True) == pinned
+    assert os.environ[runs.PSMUX_DATA_DIR] == pinned
+    assert psmux_backend._DISPLACED_ROOT == str(runs.mux_registry_root(tmp_path))
+
+
 def test_pinned_state_env_resolves_rather_than_forwards(tmp_path, monkeypatch):
     """What travels is the answer this process reached, not the override it was
     handed. Forwarding only when the operator set something leaves the common case
@@ -6432,8 +7845,8 @@ def test_pinned_state_env_degrades_on_an_underivable_state_root(monkeypatch):
 
 
 class _NamespaceStub:
-    """Duck-typed mux answering only the namespace question — all
-    ctl_session_for consults."""
+    """Duck-typed mux answering only the namespace question, so an ablation
+    that restores a per-registry name has a namespacing transport to act on."""
 
     def __init__(self, namespaced):
         self._namespaced = namespaced
@@ -6441,81 +7854,37 @@ class _NamespaceStub:
     def has_registry_namespace(self):
         return self._namespaced
 
-
-def test_ctl_session_for_is_fixed_without_a_registry_namespace(tmp_path):
-    """tmux keeps the machine-shared `bmad-loop-ctl` byte-identically — the
-    shared session is correct there and every pinned tmux argv depends on it.
-
-    Ablate the `has_registry_namespace()` arm (suffix always) and this fails."""
-    assert runs.ctl_session_for(tmp_path, _NamespaceStub(False)) == runs.CTL_SESSION
+    def registry_root(self):
+        return os.environ.get(runs.PSMUX_DATA_DIR)
 
 
-def test_ctl_session_for_carries_the_registry_identity(tmp_path, monkeypatch):
-    """On a namespacing transport the name is per REGISTRY, because psmux's
-    duplicate-server mutex is keyed on the session name alone, machine-wide
-    (`Local\\psmux-session-{name}`, source-read at v3.3.8): a fixed name lets
-    only one registry on the machine hold a control session, and the second
-    project's create is rejected as a duplicate server (measured: rc 1). Both
-    axes of the registry key must move the name — a project-only tag would
-    recreate the collision for one project under two state roots.
+@pytest.mark.parametrize("namespaced", [False, True])
+def test_ctl_session_for_is_the_fixed_name_on_every_transport(tmp_path, monkeypatch, namespaced):
+    """psmux keys its one-server-per-name guard on the data root as well as the
+    name (psmux/psmux#599, fixed in 3.4.0), so each project's registry holds a
+    `bmad-loop-ctl` of its own and the per-registry digest earlier releases
+    minted is retired (#733): the name moves with neither the project, the
+    state root nor an honoured registry root. tmux keeps the machine-shared
+    name it always had.
 
-    Ablate the suffix (return the fixed name always) and every assertion but
-    the stability one fails; key the suffix on `project_tag` alone and the
-    state-root case fails."""
-    mux = _NamespaceStub(True)
+    Ablate (restore the digest arm for a namespacing transport) and the
+    namespaced case fails."""
+    mux = _NamespaceStub(namespaced)
     a, b = tmp_path / "proj-a", tmp_path / "proj-b"
     a.mkdir()
     b.mkdir()
-
-    name_a = runs.ctl_session_for(a, mux)
-    name_b = runs.ctl_session_for(b, mux)
-    assert name_a.startswith(runs.CTL_SESSION + "-") and name_b.startswith(runs.CTL_SESSION + "-")
-    assert name_a != name_b  # two projects, two registries, two names
-    assert runs.ctl_session_for(a, mux) == name_a  # stable per registry
-
-    # ...and the OTHER axis of the registry key: same project, moved state root
+    names = {runs.ctl_session_for(a, mux), runs.ctl_session_for(b, mux)}
     monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S2"))
-    assert runs.ctl_session_for(a, mux) != name_a
-
-
-def test_ctl_session_for_converges_across_spellings_of_one_root(tmp_path, monkeypatch):
-    """Two spellings of one state root reach ONE physical registry (the OS
-    resolves both to the same files; psmux keeps the spelling only while
-    constructing those paths — src/paths.rs:79, source-read at v3.3.8), so
-    they must mint ONE control-session name: an as-spelled digest gave the
-    same registry two ctl sessions, each blind to the other's parked windows.
-
-    Ablate the `.resolve()` in ctl_session_for and this fails."""
-    mux = _NamespaceStub(True)
-    project = tmp_path / "proj"
-    project.mkdir()
-    (tmp_path / "state").mkdir()
-    (tmp_path / "alias").mkdir()
-    plain = str(tmp_path / "state")
-    detour = str(tmp_path / "alias" / ".." / "state")
-    assert plain != detour  # the premise: two spellings, not one
-
-    monkeypatch.setenv(envvars.STATE_DIR, plain)
-    name_plain = runs.ctl_session_for(project, mux)
-    monkeypatch.setenv(envvars.STATE_DIR, detour)
-    name_detour = runs.ctl_session_for(project, mux)
-
-    assert name_plain.startswith(runs.CTL_SESSION + "-")
-    assert name_plain == name_detour
-
-
-def test_ctl_session_for_degrades_to_the_fixed_name(tmp_path, monkeypatch):
-    """The underivable arm runs on the transport's shared default registry —
-    the one place psmux is in the tmux-shaped world where a shared session
-    scoped by window tags is correct, and where a pre-#537 legacy ctl session
-    under the fixed name may exist to be reused rather than collided with."""
-    monkeypatch.setenv(envvars.STATE_DIR, "relative-root")
-    assert runs.ctl_session_for(tmp_path, _NamespaceStub(True)) == runs.CTL_SESSION
+    names.add(runs.ctl_session_for(a, mux))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, str(tmp_path / "pinned"))
+    names.add(runs.ctl_session_for(a, mux))
+    assert names == {runs.CTL_SESSION}
 
 
 def test_is_ctl_session_name_shapes():
-    """Exactly the shapes ctl_session_for can mint — the fixed name and a
-    16-hex suffix. An arbitrary suffix is NOT a control session: it is the
+    """Exactly the shapes a release has minted — the fixed name, and the 16-hex
+    suffix earlier releases minted on psmux, which a control session started
+    before the upgrade still carries (#733). An arbitrary suffix is NOT a control session: it is the
     agent session of a run an older release accepted (`--run-id ctl-foo`),
     and reading it as a control session made it unreachable by stop and the
     prune both. Ablate the 16-hex narrowing (back to any `-` suffix) and the
@@ -6597,30 +7966,6 @@ def test_run_id_reservation_stops_at_the_ctl_shape(near_miss):
     assert runs.is_valid_run_id(near_miss)
 
 
-def test_ctl_session_for_folds_case_only_where_the_filesystem_does(tmp_path, monkeypatch):
-    """Two case spellings of a NOT-YET-created state root: `resolve()` can
-    return stored case only for a path that exists, and the registry root
-    usually does not exist at name time — so the digest folds case itself,
-    via `os.path.normcase`. On Windows both spellings land in ONE physical
-    registry (the `.port` files open case-insensitively), so they must mint
-    one name; on POSIX case is significant — two case spellings ARE two
-    registries and must keep two names.
-
-    Ablate the normcase and the win32 arm fails; replace it with an
-    unconditional `str.lower` and the POSIX arm fails."""
-    mux = _NamespaceStub(True)
-    project = tmp_path / "proj"
-    project.mkdir()
-    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "MiXeD-State"))  # never created
-    name_mixed = runs.ctl_session_for(project, mux)
-    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "mixed-state"))  # never created
-    name_lower = runs.ctl_session_for(project, mux)
-    if sys.platform == "win32":
-        assert name_mixed == name_lower
-    else:
-        assert name_mixed != name_lower
-
-
 def test_kill_session_never_addresses_a_control_session_alias():
     """An id that aliases a control session (`ctl`, `ctl-<16 hex>`, folded)
     can only address the control plane, so its kill is skipped — reachable
@@ -6675,6 +8020,10 @@ class _LivenessMux:
             raise MultiplexerError("simulated transport failure")
         return list(self._sessions)
 
+    # The seam's own default: a raising listing reports nothing through the
+    # sink, so the guard hears it as the raise.
+    list_sessions_reporting = TerminalMultiplexer.list_sessions_reporting
+
     def session_options(self, option):
         if self._unanswerable:
             raise MultiplexerError("simulated transport failure")
@@ -6717,31 +8066,95 @@ def test_live_session_may_be_ours_compares_names_the_transports_way(tmp_path, mo
     # psmux shape: the transport folds, so the case-variant IS the control session
     monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux(sessions, fold=True))
     assert not runs.live_session_may_be_ours(tmp_path, "CTL")
-    # this project's derived name is also the control session's
-    monkeypatch.setattr(
-        runs, "ctl_session_for", lambda project, mux=None: "bmad-loop-ctl-aaaabbbbccccdddd"
-    )
-    assert not runs.live_session_may_be_ours(tmp_path, "ctl-aaaabbbbccccdddd")
-    # ...while an OTHER digest in this registry is still not the control session
+    # ...while a digest-shaped name is not THE control session this process
+    # addresses, even where an earlier release's control session holds it
     assert runs.live_session_may_be_ours(tmp_path, "ctl-0123456789abcdef")
 
 
-def test_live_session_may_be_ours_degrades_an_unanswerable_listing_to_absent(tmp_path, monkeypatch):
+def test_live_session_may_be_ours_degrades_an_unanswerable_listing_to_absent(
+    tmp_path, monkeypatch, capsys
+):
     """Observation degrades — the guard's documented contract, restored over
     this branch's withdrawn raise-propagation: a listing that cannot answer
     reads as "no session", the same answer the bundled backend gives for a
     missing multiplexer or a dead server. The control-name discount still
     answers before any probe at all, so the recovery `bmad-loop delete ctl`
-    needs no transport."""
+    needs no transport.
+
+    The degrade is signalled (DW-466): the removal it licenses goes ahead
+    without the multiplexer having answered, so the guard says so on stderr,
+    naming the run and the error. The discount asks no transport, so it is
+    silent. Ablation: drop the warning from the listing arm and the first
+    assert block fails."""
     monkeypatch.setattr(
         runs, "get_multiplexer", lambda: _LivenessMux([], fold=False, unanswerable=True)
     )
     monkeypatch.setattr(runs, "ctl_session_for", lambda project, mux=None: runs.CTL_SESSION)
     assert not runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
+    err = capsys.readouterr().err
+    assert err.startswith(
+        "warning: run 20260826-000000-run1: could not check for a live agent session"
+        " — the session listing raised: simulated transport failure;"
+    )
     assert not runs.live_session_may_be_ours(tmp_path, "ctl")
+    assert capsys.readouterr().err == ""
 
 
-def test_live_session_may_be_ours_degrades_an_unselectable_backend_to_absent(tmp_path, monkeypatch):
+def test_live_session_may_be_ours_reports_a_listing_row_psmux_could_not_read(tmp_path, monkeypatch):
+    """psmux lists a server that did not answer as an empty row at exit 0 (#919).
+    The guard still answers False — the degrade #732 kept — but the row reaches
+    its warn sink as a failed listing instead of reading as silent absence.
+
+    Ablation: make `BaseTmuxBackend._warn_non_session_rows` a no-op and the
+    warning list comes back empty."""
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: "psmux")
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **_k: subprocess.CompletedProcess(argv, 0, stdout="\n", stderr=""),
+    )
+    monkeypatch.setattr(runs, "get_multiplexer", PsmuxMultiplexer)
+    monkeypatch.setattr(runs, "ctl_session_for", lambda project, mux=None: runs.CTL_SESSION)
+    warnings: list[str] = []
+    assert not runs.live_session_may_be_ours(tmp_path, "orphan1", warn=warnings.append)
+    assert warnings == [
+        "run orphan1: could not check for a live agent session — the session listing"
+        " failed: psmux list-sessions printed a row that cannot be a session name"
+        " without proving the session gone: ''; proceeding as if none is live"
+    ]
+
+
+def test_live_session_may_be_ours_keeps_a_session_a_partial_listing_still_names(
+    tmp_path, monkeypatch, capsys
+):
+    """psmux can list one unreadable server beside the run's own session (#919).
+    The session is present, so the guard goes on to its tag check and answers
+    True, and it does not say it is "proceeding as if none is live". The tag
+    read's stderr note says the names that answered were kept, not that the
+    listing was read as empty.
+
+    Ablation: warn every collected fault before the membership test and the
+    warning list is no longer empty."""
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: "psmux")
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **_k: subprocess.CompletedProcess(
+            argv, 0, stdout="ERROR: Invalid session key\nbmad-loop-orphan1\n", stderr=""
+        ),
+    )
+    monkeypatch.setattr(runs, "get_multiplexer", PsmuxMultiplexer)
+    monkeypatch.setattr(runs, "ctl_session_for", lambda project, mux=None: runs.CTL_SESSION)
+    warnings: list[str] = []
+    assert runs.live_session_may_be_ours(tmp_path, "orphan1", warn=warnings.append)
+    assert warnings == []
+    err = capsys.readouterr().err
+    assert "keeping the names that answered" in err and "reading it as empty" not in err
+
+
+def test_live_session_may_be_ours_degrades_an_unselectable_backend_to_absent(
+    tmp_path, monkeypatch, capsys
+):
     """Selection is part of the listing read, so it degrades the listing's way.
 
     `mux_sessions()` selects the backend *inside* the call the guard catches, so
@@ -6752,30 +8165,35 @@ def test_live_session_may_be_ours_degrades_an_unselectable_backend_to_absent(tmp
     `--force`.
 
     Ablation: hoist the selection back above the `try` and this fails with the
-    `MultiplexerError` the misconfiguration raises."""
+    `MultiplexerError` the misconfiguration raises. Drop the selection arm's
+    warning (DW-466) and the stderr asserts fail: the answer is still False, but
+    no longer silently."""
 
     def unselectable():
         raise MultiplexerError("[mux] backend = 'ghost' matches no registered backend")
 
     monkeypatch.setattr(runs, "get_multiplexer", unselectable)
     assert not runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
+    assert capsys.readouterr().err == (
+        "warning: run 20260826-000000-run1: could not check for a live agent session"
+        " — the multiplexer backend could not be selected: [mux] backend = 'ghost'"
+        " matches no registered backend; proceeding as if none is live\n"
+    )
     # ...and the control-name discount needs the transport too, so it degrades alike
     assert not runs.live_session_may_be_ours(tmp_path, "ctl")
+    assert "run ctl: could not check for a live agent session" in capsys.readouterr().err
 
 
 def test_live_session_may_be_ours_reads_a_successful_listing_as_the_whole_truth(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, capsys
 ):
     """The accepted ceiling of #732, pinned so it cannot be closed by accident.
 
     The two tests above cover a listing that *fails*. This one covers the
-    listing that succeeds and is wrong: psmux reaps a live session's registry
-    entry on any `has-session` whose 500 ms connect does not land, and until the
-    server's registry maintenance re-writes it `ls` exits 0 with that session
-    simply missing — no error, no stderr. (That maintenance runs on a nominal
-    5 s check in the server's own loop, so the window has no hard bound; 1.7 s
-    was one measured sample.) The guard therefore cannot tell "absent" from
-    "omitted", and removal proceeds. That is the documented trade, not an
+    listing that answers and is wrong: a process whose PATH lacks the
+    multiplexer binary reads every session as absent, with no error and no
+    stderr. The guard therefore cannot tell "absent" from "omitted", and
+    removal proceeds. That is the documented trade, not an
     oversight; a change that makes an empty or short listing block instead has
     to delete this test and read why.
 
@@ -6789,13 +8207,16 @@ def test_live_session_may_be_ours_reads_a_successful_listing_as_the_whole_truth(
     monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([]))
     assert not runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
 
-    # Non-empty and still omitting it: a reap takes one session's entry, not the
-    # registry, so "the listing came back with rows in it" is no reassurance either.
+    # Non-empty and still omitting it: "the listing came back with rows in it" is
+    # no proof that it names every live session either.
     monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([runs.session_name("other")]))
     assert not runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
 
     monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([name]))
     assert runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
+    # A listing that answered — however wrongly — is not a fault: DW-466's warning
+    # is for the arms where the multiplexer was never asked, and must stay off here.
+    assert capsys.readouterr().err == ""
 
 
 def test_prune_sessions_claims_a_historical_ctl_prefixed_session(tmp_path, monkeypatch):
@@ -6814,15 +8235,14 @@ def test_prune_sessions_claims_a_historical_ctl_prefixed_session(tmp_path, monke
     assert runs.prune_sessions(tmp_path, dry_run=True) == (["ctl-foo"], [], set())
 
 
-def test_no_valid_run_id_can_mint_the_control_session_name(tmp_path):
-    """The reviewer's reproduction, pinned end to end: read the live per-registry
-    control-session name, replay its suffix as a --run-id, and the id is
-    refused before `session_name` can alias the two session types. Covers the
-    fixed name too — `--run-id ctl` minted `bmad-loop-ctl` itself, on every
-    transport."""
-    project = tmp_path / "proj"
-    project.mkdir()
-    ctl = runs.ctl_session_for(project, _NamespaceStub(True))
+def test_no_valid_run_id_can_mint_the_control_session_name():
+    """The reviewer's reproduction, pinned end to end: take a per-registry
+    control-session name an earlier release minted, replay its suffix as a
+    --run-id, and the id is refused before `session_name` can alias the two
+    session types. Covers the fixed name too — `--run-id ctl` minted
+    `bmad-loop-ctl` itself, on every transport; the reservation does not
+    depend on the digest that #733 retired."""
+    ctl = runs.CTL_SESSION + "-0123456789abcdef"
     colliding_id = ctl[len("bmad-loop-") :]
     assert runs.session_name(colliding_id) == ctl  # the alias, were the id valid
     assert not runs.is_valid_run_id(colliding_id)
@@ -6889,7 +8309,7 @@ def test_orphan_state_sweep_never_reaps_the_registry(tmp_path):
     port = registry / "bmad-loop-r1.port"
     port.write_text("54321\n")
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([], None)
     assert port.exists()
 
 
@@ -6900,9 +8320,47 @@ def test_orphan_state_sweep_still_reaps_a_real_orphan_beside_the_registry(tmp_pa
     orphan = runs.state_dir_for(tmp_path, "20260101-000000-dead")
     orphan.mkdir(parents=True)
 
-    assert runs.reconcile_orphan_state_dirs(tmp_path) == [orphan]
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([orphan], None)
     assert not orphan.exists()
     assert runs.mux_registry_root(tmp_path).exists()
+
+
+def test_reconcile_orphan_state_dirs_never_reaps_plugin_snapshots(tmp_path):
+    """Live runs execute plugin hooks and modules from the snapshots root, and its
+    name is never a live run dir's, so without its own arm the sweep reaps it as an
+    orphan — pulling the code out from under a hook the bus is about to spawn. The
+    real orphan beside it is the other half: the arm must not stop the sweep.
+
+    ABLATION: drop the PLUGIN_SNAPSHOTS_DIR arm in `reconcile_orphan_state_dirs`
+    and this fails with the snapshots root among the reaped."""
+    snap = runs.plugin_snapshots_root(tmp_path) / ("ab" * 32)
+    snap.mkdir(parents=True)
+    (snap / "plugin.toml").write_text('[plugin]\nname = "p"\n')
+    orphan = _seed_state_dir(tmp_path, "20260101-000000-dead")
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == ([orphan], None)
+    assert (snap / "plugin.toml").is_file()
+    assert not orphan.exists()
+
+
+def test_plugin_snapshots_dir_can_never_collide_with_a_run(tmp_path):
+    """`--run-id` is caller-supplied, so a run whose id spelled the snapshots dir
+    would key its state dir onto the code live runs execute. The leading
+    underscore makes that unreachable: RUN_ID_RE requires an alphanumeric first
+    character. Ablate it (name the dir `plugin-snapshots`) and this fails."""
+    assert not runs.is_valid_run_id(runs.PLUGIN_SNAPSHOTS_DIR)
+    assert runs.is_valid_run_id(runs.PLUGIN_SNAPSHOTS_DIR.lstrip("_"))
+    assert runs.plugin_snapshots_root(tmp_path) == (
+        runs.project_state_root(tmp_path) / runs.PLUGIN_SNAPSHOTS_DIR
+    )
+
+
+def _healthy_leftovers(project, **kw):
+    """`legacy_registry_leftovers` where every registry answered: the grouped
+    remainder, with the fault list asserted empty (a healthy registry is silent)."""
+    grouped, faults, _superseded = runs.legacy_registry_leftovers(project, **kw)
+    assert faults == []
+    return grouped
 
 
 class _RegistryMux:
@@ -6931,6 +8389,9 @@ class _RegistryMux:
 
     def list_sessions(self):
         return list(self._sessions)
+
+    def list_sessions_reporting(self, *, on_fault=None):
+        return self.list_sessions()
 
     def session_options(self, _option):
         return dict(self._tags)
@@ -7066,15 +8527,32 @@ def test_export_records_nothing_when_it_displaced_nothing(tmp_path, monkeypatch)
     assert psmux_backend._DISPLACED_ROOT is None
 
 
-def test_legacy_registries_degrades_when_no_backend_can_be_selected(monkeypatch):
-    """A cleanup that already swept the primary registry must report that work
-    rather than die on the migration pass."""
+def test_legacy_registries_raises_when_no_backend_can_be_selected(monkeypatch):
+    """ "Could not ask" is not "no legacy registry" (DW-469): the selection fault
+    reaches the callers, which each degrade on their own terms."""
 
     def boom():
         raise MultiplexerError("no backend")
 
     monkeypatch.setattr(runs, "get_multiplexer", boom)
-    assert runs._legacy_registries() == []
+    with pytest.raises(MultiplexerError, match="no backend"):
+        runs._legacy_registries()
+
+
+def test_prune_sessions_skips_the_migration_pass_when_no_backend_can_be_selected(
+    tmp_path, monkeypatch
+):
+    """A cleanup that already swept the primary registry must report that work
+    rather than die on the migration pass; the fault is reported by
+    `legacy_registry_leftovers`, not by widening this tuple."""
+
+    def boom():
+        raise MultiplexerError("no backend")
+
+    monkeypatch.setattr(runs, "prunable_sessions", lambda *_a, **_k: (["r1"], [], set()))
+    monkeypatch.setattr(runs, "_registry_proves_ownership", lambda _p: True)
+    monkeypatch.setattr(runs, "_legacy_registries", boom)
+    assert runs.prune_sessions(tmp_path, dry_run=True) == (["r1"], [], set())
 
 
 # --------------------------------- legacy registry: ownership and remainder
@@ -7102,6 +8580,153 @@ def test_prune_sessions_refuses_an_untagged_legacy_session_claimed_only_by_a_run
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
 
     assert runs.prune_sessions(ours) == ([], [], set())
+    assert legacy.killed == []
+
+
+class _RemovingMux(_RegistryMux):
+    """A registry whose kill lands: the session leaves the listing."""
+
+    def kill_session(self, name):
+        super().kill_session(name)
+        key = self.session_name_key(name)
+        self._sessions = [s for s in self._sessions if self.session_name_key(s) != key]
+
+
+def test_kill_displaced_session_kills_only_this_runs_tag_proven_session(tmp_path, monkeypatch):
+    """A resume must clear a same-named session in a registry this process no
+    longer addresses, or psmux's name mutex (it spans registries) rejects the
+    resumed session's create. Exactly that one session, and only on its tag:
+    another run of ours stays, and a neighbour's same-named session and an
+    untagged one stay too, even though this project holds a dead `r1` run dir
+    the primary pass's untagged fallback would accept as proof.
+
+    Each one left standing is named, because it will still block the resume.
+    Ablate the `kill_session(run_id, legacy)` call and `mine.killed` is empty;
+    ablate the tag check and the other two are killed."""
+    ours = runs.project_tag(tmp_path)
+    (_make_state_run(tmp_path, "r1") / "engine.pid").write_text(str(_dead_pid()))
+    mine = _RemovingMux(
+        ["bmad-loop-r1", "bmad-loop-r2"], {"bmad-loop-r1": ours, "bmad-loop-r2": ours}
+    )
+    neighbour = _RegistryMux(
+        ["bmad-loop-r1"], {"bmad-loop-r1": "0123456789abcdef"}, root=str(tmp_path / "n")
+    )
+    untagged = _RegistryMux(["bmad-loop-r1"], {}, root=str(tmp_path / "u"))
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [mine, neighbour, untagged])
+
+    blockers = runs.kill_displaced_session(tmp_path, "r1")
+    assert mine.killed == ["bmad-loop-r1"]
+    assert neighbour.killed == untagged.killed == []
+    assert len(blockers) == 2
+    assert str(tmp_path / "n") in blockers[0] and str(tmp_path / "u") in blockers[1]
+    assert all("bmad-loop-r1 left standing" in b for b in blockers)
+
+
+def test_kill_displaced_session_kills_even_though_the_resumed_run_reads_alive(
+    tmp_path, monkeypatch
+):
+    """By the time a resume sweeps, it has refused a live engine and published
+    its own pid, so the run reads alive. Reusing the prune partition's liveness
+    arm would spare every stale session — the one case this exists for.
+
+    Ablate by routing the claim back through `prunable_sessions` and this
+    fails."""
+    monkeypatch.setattr(runs, "engine_liveness", lambda _d: "alive")
+    legacy = _RemovingMux(["bmad-loop-r1"], {"bmad-loop-r1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    assert runs.kill_displaced_session(tmp_path, "r1") == []
+    assert legacy.killed == ["bmad-loop-r1"]
+
+
+def test_kill_displaced_session_reports_a_registry_it_could_not_ask(tmp_path, monkeypatch):
+    """Could not ask is not "nothing there". A listing the backend folds into
+    `[]` reaches the sink, one that raises is caught, and a backend that cannot
+    be selected is a line of its own; registries that did answer are still
+    swept.
+
+    Ablate the `on_fault` sink (call `list_sessions()`) and the first line is
+    lost; ablate either `except MultiplexerError` arm and this raises."""
+
+    class _Folding(_RegistryMux):
+        def list_sessions_reporting(self, *, on_fault=None):
+            assert on_fault is not None
+            on_fault("list-sessions failed: rc 1")
+            return []
+
+    class _Raising(_RegistryMux):
+        def list_sessions_reporting(self, *, on_fault=None):
+            raise MultiplexerError("registry unreadable")
+
+    folding = _Folding([], {}, root=str(tmp_path / "fold"))
+    raising = _Raising([], {}, root=str(tmp_path / "raise"))
+    fine = _RemovingMux(["bmad-loop-r1"], {"bmad-loop-r1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [folding, raising, fine])
+
+    blockers = runs.kill_displaced_session(tmp_path, "r1")
+    assert len(blockers) == 2
+    assert str(tmp_path / "fold") in blockers[0] and "rc 1" in blockers[0]
+    assert str(tmp_path / "raise") in blockers[1] and "registry unreadable" in blockers[1]
+    assert fine.killed == ["bmad-loop-r1"]
+
+    def boom():
+        raise MultiplexerError("no backend")
+
+    monkeypatch.setattr(runs, "_legacy_registries", boom)
+    assert [
+        "backend selection failed: no backend" in f
+        for f in runs.kill_displaced_session(tmp_path, "r1")
+    ] == [True]
+
+
+def test_kill_displaced_session_names_a_session_its_kill_did_not_remove(tmp_path, monkeypatch):
+    """The kill is best-effort and silent, and a survivor still holds psmux's
+    name mutex, so it is read back and named rather than reported as cleared.
+
+    Ablate the re-listing and this returns `[]`."""
+    stuck = _RegistryMux(
+        ["bmad-loop-r1"], {"bmad-loop-r1": runs.project_tag(tmp_path)}, root=str(tmp_path / "s")
+    )
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [stuck])
+
+    blockers = runs.kill_displaced_session(tmp_path, "r1")
+    assert stuck.killed == ["bmad-loop-r1"]
+    assert blockers == [f"{tmp_path / 's'}: bmad-loop-r1 still standing after the kill"]
+
+
+def test_kill_displaced_session_matches_through_the_registrys_name_key(tmp_path, monkeypatch):
+    """psmux folds session-name case, so a resume of `r1` must find a stale
+    `bmad-loop-R1` — its mutex blocks `bmad-loop-r1` all the same.
+
+    Ablate the `session_name_key` comparison (match names exactly) and nothing
+    is killed."""
+    tag = runs.project_tag(tmp_path)
+    folding = _RemovingMux(["bmad-loop-R1"], {"bmad-loop-R1": tag}, fold=True)
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [folding])
+
+    assert runs.kill_displaced_session(tmp_path, "r1") == []
+    assert folding.killed == ["bmad-loop-r1"]
+
+
+def test_kill_displaced_session_reports_an_uncomputable_tag(tmp_path, monkeypatch):
+    """Without this project's tag nothing can be proven ours, so nothing is
+    killed — and the resume is told why in a line of its own, which
+    `compose_resume` journals and warns, instead of the fault raising out of it.
+    Same guard `foreign_session_refusal` puts on the same call.
+
+    Ablate the `except (OSError, RuntimeError)` arm and this raises."""
+    legacy = _RemovingMux(["bmad-loop-r1"], {"bmad-loop-r1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    def boom(_project):
+        raise OSError("state dir unreadable")
+
+    monkeypatch.setattr(runs, "accepted_tags", boom)
+
+    blockers = runs.kill_displaced_session(tmp_path, "r1")
+    assert len(blockers) == 1
+    assert "tag could not be computed (state dir unreadable)" in blockers[0]
+    assert "no legacy registry was swept" in blockers[0]
     assert legacy.killed == []
 
 
@@ -7241,17 +8866,6 @@ def test_registry_ownership_demands_a_tag_when_it_cannot_be_asked(tmp_path, monk
     assert runs._registry_proves_ownership(tmp_path) is False
 
 
-def test_legacy_registry_leftovers_names_an_untagged_session(tmp_path, monkeypatch):
-    """A sweep that silently declines to migrate something is the same silence
-    this change exists to remove: cleanup prints a removal count, and a count that
-    excludes what it chose not to claim reads as "everything is clean"."""
-    legacy = _RegistryMux(["bmad-loop-old-1"], {})
-    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert runs.legacy_registry_leftovers(tmp_path) == {
-        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]
-    }
-
-
 def test_legacy_registry_leftovers_keys_each_session_to_its_own_registry(tmp_path, monkeypatch):
     """The grouping is the whole point of the shape: the operator's next action is
     to open the registry and look, and there are two of them now — psmux's own
@@ -7264,15 +8878,20 @@ def test_legacy_registry_leftovers_keys_each_session_to_its_own_registry(tmp_pat
     `registry_root()` answers `None` for psmux's default — the seam deliberately
     never respells its home cascade — so that arm is labelled instead.
 
+    The default registry's session is `CTL_SESSION` on purpose: the prune
+    partition never touches it and the ctl-window sweep runs against the current
+    registry only, so a pre-upgrade control session survives the migration.
+    Naming it is the whole remedy.
+
     Ablate `legacy.registry_root() or DEFAULT_REGISTRY_LABEL` down to the
     constant and both keys collapse into one."""
     theirs = r"D:	heir-own-registry"
-    default_reg = _RegistryMux(["bmad-loop-ctl"], {})
+    default_reg = _RegistryMux([runs.CTL_SESSION], {})
     displaced = _RegistryMux(["bmad-loop-old-1"], {}, root=theirs)
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [default_reg, displaced])
 
-    assert runs.legacy_registry_leftovers(tmp_path) == {
-        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+    assert _healthy_leftovers(tmp_path) == {
+        runs.DEFAULT_REGISTRY_LABEL: [runs.CTL_SESSION],
         theirs: ["bmad-loop-old-1"],
     }
 
@@ -7281,25 +8900,244 @@ def test_legacy_registry_leftovers_merges_two_registries_that_name_one_root(tmp_
     """A displaced root that happens to spell psmux's own default is admitted
     twice, and the rows merge rather than the second overwriting the first.
 
+    Both sessions are untagged, which the legacy pass declines to migrate, so
+    both are named: cleanup prints a removal count, and a count that excludes
+    what it chose not to claim reads as "everything is clean".
+
     Ablate the `grouped.get(label, [])` merge and the first registry's sessions
     vanish from a message that claims to name what is standing."""
     both = _RegistryMux(["bmad-loop-a"], {}), _RegistryMux(["bmad-loop-b"], {})
     monkeypatch.setattr(runs, "_legacy_registries", lambda: list(both))
 
-    assert runs.legacy_registry_leftovers(tmp_path) == {
+    assert _healthy_leftovers(tmp_path) == {
         runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-a", "bmad-loop-b"]
     }
 
 
-def test_legacy_registry_leftovers_names_a_surviving_control_session(tmp_path, monkeypatch):
-    """The prune partition never touches CTL_SESSION and the ctl-window sweep runs
-    against the current registry only, so a pre-upgrade control session survives
-    the migration. Naming it is the whole remedy."""
-    legacy = _RegistryMux([runs.CTL_SESSION], {})
+def test_legacy_leftovers_report_another_projects_derived_registry_in_full(tmp_path, monkeypatch):
+    """#906: whose sessions a derived registry of another project path holds
+    cannot be proven (the tag hashes a path; a renamed project's own old root
+    looks the same), so nothing in it is hidden: its control session and
+    untagged sessions are reported like any displaced registry's, and only the
+    wording says what it is. Another project's *tagged* session is still
+    skipped, as everywhere. Reintroduce a skip for such a root and this fails."""
+    theirs = str(tmp_path / "state" / runs.project_tag(tmp_path / "other") / runs.MUX_REGISTRY_DIR)
+    legacy = _RegistryMux(
+        [runs.CTL_SESSION, "bmad-loop-bare-1", "bmad-loop-b-1"],
+        {"bmad-loop-b-1": runs.project_tag(tmp_path / "other")},
+        root=theirs,
+    )
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert runs.legacy_registry_leftovers(tmp_path) == {
-        runs.DEFAULT_REGISTRY_LABEL: [runs.CTL_SESSION]
-    }
+    assert runs.foreign_registry_root(theirs, tmp_path)
+    assert _healthy_leftovers(tmp_path) == {theirs: ["bmad-loop-bare-1", runs.CTL_SESSION]}
+
+
+def test_foreign_registry_root_is_a_shape_and_tag_check(tmp_path):
+    """True only for `<16-hex tag>/_mux` under a tag that is not this project's.
+    Ablate the tag comparison (or the shape check) and this fails."""
+    other_tag = runs.project_tag(tmp_path / "other")
+    state = tmp_path / "state"
+    assert runs.foreign_registry_root(str(state / other_tag / runs.MUX_REGISTRY_DIR), tmp_path)
+    # Our own tag, under any state root, is not another project path's.
+    mine = state / runs.project_tag(tmp_path) / runs.MUX_REGISTRY_DIR
+    assert not runs.foreign_registry_root(str(mine), tmp_path)
+    # Not the derived shape: wrong leaf, short tag, non-hex tag, empty, None.
+    assert not runs.foreign_registry_root(str(state / other_tag / "mux"), tmp_path)
+    assert not runs.foreign_registry_root(str(state / other_tag[:15] / "_mux"), tmp_path)
+    assert not runs.foreign_registry_root(str(state / ("g" * 16) / "_mux"), tmp_path)
+    assert not runs.foreign_registry_root(r"D:\their-own-registry", tmp_path)
+    assert not runs.foreign_registry_root("", tmp_path)
+    assert not runs.foreign_registry_root(None, tmp_path)
+
+
+def test_foreign_registry_root_never_raises(tmp_path, monkeypatch):
+    """When this project's tag cannot be derived, a derived-shaped root is of
+    unknown ownership, so it answers True (the cautious wording) rather than
+    failing the command that prints the note, or answering False (the plain
+    wording, which invites removal). Ablate the `except` and this raises;
+    answer False there and this fails."""
+
+    def _boom(_p):
+        raise OSError("unresolvable")
+
+    monkeypatch.setattr(runs, "project_tag", _boom)
+    root = str(tmp_path / ("a" * 16) / runs.MUX_REGISTRY_DIR)
+    assert runs.foreign_registry_root(root, tmp_path) is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the registry path folds case on Windows only")
+def test_foreign_registry_root_folds_case_where_the_filesystem_does(tmp_path):
+    """`<TAG>\\_MUX` addresses the same registry as `<tag>\\_mux` on Windows, so
+    a case-varied spelling of this project's own root is not another project
+    path's, and of another's still is. Ablate the `normcase` and this fails."""
+    state = tmp_path / "state"
+    other = runs.project_tag(tmp_path / "other").upper()
+    assert runs.foreign_registry_root(str(state / other / "_MUX"), tmp_path)
+    mine = runs.project_tag(tmp_path).upper()
+    assert not runs.foreign_registry_root(str(state / mine / "_MUX"), tmp_path)
+
+
+_DIGEST_CTL = runs.CTL_SESSION + "-0123456789abcdef"
+
+
+def test_superseded_ctl_sessions_names_the_pre_rename_session_in_our_registry(tmp_path):
+    """#733: the control session the previous release named `bmad-loop-ctl-<hex>`
+    survives the rename in this project's own registry, and nothing addresses
+    it — under the spelling it was listed with, read through the transport's
+    fold (ablate `session_name_key` there and the upper-case one drops out).
+    The current one, under any spelling the transport folds onto it, and a run's
+    agent session are not superseded. Nor is another digest-shaped name: a run
+    id `ctl-<16 hex>` mints exactly that shape for a live agent session (ablate
+    the exact-name match back to `is_ctl_session_name` and this fails)."""
+    own = str(runs.mux_registry_root(tmp_path))
+    old = runs.superseded_ctl_name(tmp_path)
+    assert old != _DIGEST_CTL and runs.is_ctl_session_name(old)
+    mux = _RegistryMux(
+        [
+            runs.CTL_SESSION,
+            runs.CTL_SESSION.upper(),
+            old,
+            old.upper(),
+            _DIGEST_CTL,
+            "bmad-loop-run-1",
+        ],
+        {},
+        root=own,
+        fold=True,
+    )
+    assert runs.superseded_ctl_sessions(tmp_path, mux) == [old.upper(), old]
+
+
+def test_superseded_ctl_name_is_the_previous_releases_mint(tmp_path):
+    """The name the previous release's `ctl_session_for` minted in a project's
+    own derived registry: the digest of that root, resolved and case-folded.
+    Pinned against the formula spelled out here, so a drift in either the root
+    derivation or the hashing fails."""
+    import hashlib
+
+    derived = runs.mux_registry_root(tmp_path)
+    scope = os.path.normcase(str(derived.resolve()))
+    digest = hashlib.sha256(os.fsencode(scope)).hexdigest()[:16]
+    assert runs.superseded_ctl_name(tmp_path) == f"{runs.CTL_SESSION}-{digest}"
+    assert runs.superseded_ctl_name(tmp_path, str(derived)) == f"{runs.CTL_SESSION}-{digest}"
+    # An honoured operator root that is another registry salts the digest.
+    honoured = tmp_path / "operator-reg"
+    salted = scope + "\0" + os.path.normcase(str(honoured.resolve()))
+    salted_digest = hashlib.sha256(os.fsencode(salted)).hexdigest()[:16]
+    assert runs.superseded_ctl_name(tmp_path, str(honoured)) == (
+        f"{runs.CTL_SESSION}-{salted_digest}"
+    )
+
+
+def test_superseded_ctl_sessions_names_the_salted_name_in_an_honoured_root(tmp_path):
+    """With `[mux] honor_ambient_psmux_data_dir` keeping an operator's own root,
+    the previous release minted the control session there under a digest salted
+    with that root. That name, and not the derived registry's, is the one to
+    find there. Ablate the root handed to `superseded_ctl_name` in
+    `superseded_ctl_sessions` and this fails."""
+    honoured = str(tmp_path / "operator-reg")
+    salted = runs.superseded_ctl_name(tmp_path, honoured)
+    unsalted = runs.superseded_ctl_name(tmp_path)
+    assert salted != unsalted
+    mux = _RegistryMux([runs.CTL_SESSION, unsalted, salted, _DIGEST_CTL], {}, root=honoured)
+    assert runs.superseded_ctl_sessions(tmp_path, mux) == [salted]
+
+
+@pytest.mark.parametrize("root", [None, "elsewhere"])
+def test_superseded_ctl_sessions_names_no_other_digest(tmp_path, root):
+    """psmux's shared default registry (`None`) is not read at all, and in any
+    other root only this project's exact name is: a digest-named session that
+    is not it proves nothing about whose it is."""
+    reg = None if root is None else str(tmp_path / root)
+    mux = _RegistryMux([_DIGEST_CTL], {}, root=reg)
+    assert runs.superseded_ctl_sessions(tmp_path, mux) == []
+
+
+def test_superseded_ctl_sessions_follows_an_alias_of_our_own_registry(tmp_path):
+    """An honoured operator root that is a symlink or junction to this project's
+    derived registry is that registry: the old mint resolved both and gave it
+    the derived root's name, unsalted. Compared as spelled, the alias reads as
+    another registry and the name to find goes salted. Ablate the `resolve()`
+    of the registry in `superseded_ctl_name` and this fails."""
+    derived = runs.mux_registry_root(tmp_path)
+    derived.mkdir(parents=True, exist_ok=True)
+    alias = tmp_path / "alias-mux"
+    if sys.platform == "win32":
+        import _winapi  # Windows-only stdlib module; a junction needs no privilege
+
+        _winapi.CreateJunction(str(derived), str(alias))
+    else:
+        alias.symlink_to(derived, target_is_directory=True)
+    old = runs.superseded_ctl_name(tmp_path)
+    mux = _RegistryMux([runs.CTL_SESSION, old], {}, root=str(alias))
+    assert runs.superseded_ctl_sessions(tmp_path, mux) == [old]
+
+
+@pytest.mark.parametrize("fails", ["registry", "derived"])
+def test_superseded_ctl_sessions_reports_a_name_it_could_not_derive(tmp_path, monkeypatch, fails):
+    """The registry in force, or this project's derived root, could not be
+    resolved, so the name cannot be derived. It never raises, and the fault is
+    reported rather than folded into a clean "no such session". Ablate the
+    `on_fault` report in `superseded_ctl_sessions` and this fails."""
+    root = str(tmp_path / "operator-reg")
+    if fails == "derived":
+
+        def _no_root(_p):
+            raise runs.StateRootError("no writable state root")
+
+        monkeypatch.setattr(runs, "mux_registry_root", _no_root)
+        detail = "no writable state root"
+    else:
+        real_resolve = Path.resolve
+
+        def _resolve(self, strict=False):
+            if str(self) == root:
+                raise OSError("symlink loop")
+            return real_resolve(self, strict)
+
+        monkeypatch.setattr(Path, "resolve", _resolve)
+        detail = "symlink loop"
+    faults: list[str] = []
+    mux = _RegistryMux([_DIGEST_CTL], {}, root=root)
+    assert runs.superseded_ctl_sessions(tmp_path, mux, on_fault=faults.append) == []
+    assert faults == [f"could not derive the pre-upgrade control-session name: {detail}"]
+
+
+def test_legacy_leftovers_name_a_pre_rename_control_session_in_our_own_registry_apart(
+    tmp_path, monkeypatch
+):
+    """#733: `cleanup` said "nothing to clean up" while the pre-rename control
+    session held a parked run window, because the reader walked the legacy
+    registries only. #917: it is named in the third element, never in the
+    legacy grouping, since this registry is no legacy one. Ablate the primary
+    pass in `legacy_registry_leftovers`, or merge its result back into
+    `grouped`, and this fails."""
+    own = str(runs.mux_registry_root(tmp_path))
+    old = runs.superseded_ctl_name(tmp_path)
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+    monkeypatch.setattr(
+        runs,
+        "get_multiplexer",
+        lambda: _RegistryMux([runs.CTL_SESSION, old, _DIGEST_CTL], {}, root=own),
+    )
+    assert runs.legacy_registry_leftovers(tmp_path) == ({}, [], [old])
+
+
+def test_legacy_leftovers_report_an_unreadable_own_registry(tmp_path, monkeypatch):
+    """A listing of the project's own registry that failed is "not looked at",
+    never "nothing left" (the DW-469 rule the legacy registries already follow).
+    Ablate the `on_fault` handed to `superseded_ctl_sessions` and this fails."""
+
+    class _Faulting(_RegistryMux):
+        def list_sessions_reporting(self, *, on_fault=None):
+            assert on_fault is not None
+            on_fault("list-sessions failed")
+            return []
+
+    own = str(runs.mux_registry_root(tmp_path))
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _Faulting([], {}, root=own))
+    assert runs.legacy_registry_leftovers(tmp_path) == ({}, [f"{own}: list-sessions failed"], [])
 
 
 def test_legacy_leftovers_names_a_case_variant_ctl_where_the_transport_folds(tmp_path, monkeypatch):
@@ -7314,7 +9152,7 @@ def test_legacy_leftovers_names_a_case_variant_ctl_where_the_transport_folds(tmp
     upper = runs.CTL_SESSION.upper() + "-0123456789ABCDEF"
     legacy = _RegistryMux([upper], {}, fold=True)
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert runs.legacy_registry_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: [upper]}
+    assert _healthy_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: [upper]}
 
 
 def test_legacy_leftovers_leaves_a_case_variant_alone_where_the_transport_is_exact(
@@ -7331,25 +9169,155 @@ def test_legacy_leftovers_leaves_a_case_variant_alone_where_the_transport_is_exa
     upper = runs.CTL_SESSION.upper() + "-0123456789ABCDEF"
     legacy = _RegistryMux([upper], {})  # identity key: the seam default
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert runs.legacy_registry_leftovers(tmp_path) == {}
+    assert _healthy_leftovers(tmp_path) == {}
 
 
 def test_legacy_registry_leftovers_degrades_on_a_transport_fault(tmp_path, monkeypatch):
     """Observation degrades: the sweep's own report still stands, and a migration
     remainder nobody could read is not a reason to fail a cleanup that already
-    killed sessions."""
+    killed sessions. But visibly (DW-469): the registry that raised is named in
+    `faults`, and the one that answered still reports its remainder. Ablate the
+    `faults.append` and this fails — the answer is then indistinguishable from a
+    clean migration."""
 
     class _Broken(_RegistryMux):
         def list_sessions(self):
             raise MultiplexerError("no server")
 
-    monkeypatch.setattr(runs, "_legacy_registries", lambda: [_Broken([], {})])
-    assert runs.legacy_registry_leftovers(tmp_path) == {}
+    healthy = _RegistryMux(["bmad-loop-old-1"], {}, root="/reg/displaced")
+    monkeypatch.setattr(
+        runs, "_legacy_registries", lambda: [_Broken([], {}, root="/reg/broken"), healthy]
+    )
+    grouped, faults, _superseded = runs.legacy_registry_leftovers(tmp_path)
+    assert grouped == {"/reg/displaced": ["bmad-loop-old-1"]}
+    assert len(faults) == 1
+    assert "/reg/broken" in faults[0] and "no server" in faults[0]
+
+
+def test_legacy_registry_leftovers_reports_a_backend_that_cannot_be_selected(tmp_path, monkeypatch):
+    """No backend means no legacy registry could even be named — "could not ask",
+    which `{}` alone used to say exactly like "nothing left" (DW-469). Ablate the
+    `_legacy_registries` raise back to `return []` and this fails."""
+
+    def boom():
+        raise MultiplexerError("no backend")
+
+    monkeypatch.setattr(runs, "get_multiplexer", boom)
+    assert runs.legacy_registry_leftovers(tmp_path) == (
+        {},
+        ["no legacy registry could be checked: backend selection failed: no backend"],
+        [],
+    )
+
+
+def test_legacy_registry_leftovers_still_scans_our_own_registry_when_discovery_fails(
+    tmp_path, monkeypatch
+):
+    """#915: a legacy discovery that raises used to return early, so the scan of
+    the project's own registry for the pre-upgrade control session never ran.
+    Both results are kept: that session named, the discovery fault reported.
+    Ablate the discovery's own `try` back to the early return and this fails."""
+    own = str(runs.mux_registry_root(tmp_path))
+    old = runs.superseded_ctl_name(tmp_path)
+
+    def boom():
+        raise MultiplexerError("legacy discovery failed")
+
+    monkeypatch.setattr(runs, "_legacy_registries", boom)
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _RegistryMux([old], {}, root=own))
+    assert runs.legacy_registry_leftovers(tmp_path) == (
+        {},
+        ["no legacy registry could be checked: legacy discovery failed"],
+        [old],
+    )
+
+
+def test_legacy_registry_leftovers_routes_own_registry_faults_apart(tmp_path, monkeypatch):
+    """#915: the project's own registry is no legacy one, so a fault in its scan
+    for the pre-upgrade control session goes to `on_primary_fault` when given,
+    not into the legacy fault list; without the hook it still lands there, so
+    no caller loses it. Ablate the routing and the first half fails."""
+
+    class _Unlistable(_RegistryMux):
+        def list_sessions_reporting(self, *, on_fault=None):
+            raise MultiplexerError("no server")
+
+    own = str(runs.mux_registry_root(tmp_path))
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _Unlistable([], {}, root=own))
+    routed: list[str] = []
+    assert runs.legacy_registry_leftovers(tmp_path, on_primary_fault=routed.append) == (
+        {},
+        [],
+        [],
+    )
+    assert routed == [f"{own}: could not be listed: no server"]
+    assert runs.legacy_registry_leftovers(tmp_path) == (
+        {},
+        [f"{own}: could not be listed: no server"],
+        [],
+    )
+
+
+def test_superseded_ctl_may_be_run_when_a_run_has_the_id_its_name_spells(tmp_path, monkeypatch):
+    """#915: a run dir whose session the transport resolves to the listed name
+    means that name may be the run's own agent session; none means it cannot
+    be. A case variant counts where the transport folds (ablate the
+    `session_name_key` comparison back to the spelled id and the folding arm
+    fails), and not where it is exact. A runs dir that cannot be listed answers
+    True, the direction that withholds a command, and says so (ablate the
+    `on_fault` report or answer False there and this fails)."""
+    name = runs.superseded_ctl_name(tmp_path)
+    exact = _RegistryMux([], {})
+    folding = _RegistryMux([], {}, fold=True)
+    assert runs.superseded_ctl_may_be_run(tmp_path, name, exact) is False
+    run_id = name[len(runs.session_name("")) :]
+    runs.run_dir_for(tmp_path, run_id.upper()).mkdir(parents=True)
+    assert runs.superseded_ctl_may_be_run(tmp_path, name, folding) is True
+    assert runs.superseded_ctl_may_be_run(tmp_path, name, exact) is False
+    # The exact spelling, in a project of its own: on a case-folding store a
+    # second mkdir here would reuse the upper-case dir.
+    spelled = tmp_path / "spelled"
+    runs.run_dir_for(spelled, run_id).mkdir(parents=True)
+    assert runs.superseded_ctl_may_be_run(spelled, name, exact) is True
+
+    def _denied(self):
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr(Path, "iterdir", _denied)
+    faults: list[str] = []
+    assert runs.superseded_ctl_may_be_run(tmp_path, name, exact, on_fault=faults.append) is True
+    assert len(faults) == 1 and name in faults[0] and "access denied" in faults[0]
+
+
+def test_superseded_ctl_may_be_run_when_the_session_carries_a_project_tag(tmp_path):
+    """#915: in a shared registry a neighbour's run with that id leaves no run
+    dir here, but its session carries a session-level project tag, which no
+    control session ever did (ablate the tag check and the neighbour arm
+    fails). An untagged session stays a control session; a tag listing that
+    faults withholds the command and says so."""
+    name = runs.superseded_ctl_name(tmp_path)
+    neighbour = _RegistryMux([name], {name: "0123456789abcdef"}, fold=True)
+    assert runs.superseded_ctl_may_be_run(tmp_path, name.upper(), neighbour) is True
+    assert runs.superseded_ctl_may_be_run(tmp_path, name, _RegistryMux([name], {name: ""})) is False
+
+    class _Faulting(_RegistryMux):
+        def session_options(self, _option):
+            raise MultiplexerError("server gone")
+
+    faults: list[str] = []
+    assert (
+        runs.superseded_ctl_may_be_run(
+            tmp_path, name, _Faulting([name], {}), on_fault=faults.append
+        )
+        is True
+    )
+    assert len(faults) == 1 and name in faults[0] and "server gone" in faults[0]
 
 
 def test_legacy_registry_leftovers_is_empty_with_no_legacy_registry(tmp_path, monkeypatch):
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
-    assert runs.legacy_registry_leftovers(tmp_path) == {}
+    assert _healthy_leftovers(tmp_path) == {}
 
 
 # ------------------ legacy remainder: our own stranded sessions (#537)
@@ -7368,9 +9336,7 @@ def test_legacy_registry_leftovers_names_our_own_live_session(tmp_path, monkeypa
     assert runs.prune_sessions(tmp_path) == ([], ["live-1"], set())
     assert legacy.killed == []
     # ...and the remainder says so
-    assert runs.legacy_registry_leftovers(tmp_path) == {
-        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-live-1"]
-    }
+    assert _healthy_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-live-1"]}
 
 
 def test_legacy_registry_leftovers_stays_quiet_about_a_dead_session_the_sweep_takes(
@@ -7386,7 +9352,7 @@ def test_legacy_registry_leftovers_stays_quiet_about_a_dead_session_the_sweep_ta
 
     plan = runs.prune_sessions(tmp_path, dry_run=True)
     assert plan == (["fin-1"], [], set())
-    assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == {}
+    assert _healthy_leftovers(tmp_path, announced=plan[0]) == {}
 
 
 def test_legacy_registry_leftovers_still_stays_quiet_about_another_projects_session(
@@ -7400,7 +9366,7 @@ def test_legacy_registry_leftovers_still_stays_quiet_about_another_projects_sess
         {"bmad-loop-theirs-1": "0123456789abcdef"},
     )
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert runs.legacy_registry_leftovers(tmp_path) == {}
+    assert _healthy_leftovers(tmp_path) == {}
 
 
 # ---------------- legacy remainder: presence, not a resampled partition (#537)
@@ -7442,9 +9408,7 @@ def test_legacy_leftovers_names_a_session_whose_engine_exited_mid_sweep(tmp_path
     assert runs.prune_sessions(tmp_path) == ([], ["race-live"], set())
     assert legacy.killed == []
     # ...and the reader names it even though it now looks prunable
-    assert runs.legacy_registry_leftovers(tmp_path) == {
-        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-race-live"]
-    }
+    assert _healthy_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-race-live"]}
 
 
 def test_legacy_leftovers_names_a_session_whose_kill_did_not_land(tmp_path, monkeypatch):
@@ -7462,9 +9426,7 @@ def test_legacy_leftovers_names_a_session_whose_kill_did_not_land(tmp_path, monk
 
     assert runs.prune_sessions(tmp_path) == (["fin-1"], [], set())
     assert legacy.killed == ["bmad-loop-fin-1"]
-    assert runs.legacy_registry_leftovers(tmp_path) == {
-        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-fin-1"]
-    }
+    assert _healthy_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-fin-1"]}
 
 
 def test_legacy_leftovers_is_quiet_once_the_sweep_actually_removed_the_session(
@@ -7484,7 +9446,7 @@ def test_legacy_leftovers_is_quiet_once_the_sweep_actually_removed_the_session(
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
 
     assert runs.prune_sessions(tmp_path) == (["fin-1"], [], set())
-    assert runs.legacy_registry_leftovers(tmp_path) == {}
+    assert _healthy_leftovers(tmp_path) == {}
 
 
 def test_legacy_leftovers_dry_run_excludes_what_the_preview_announced(tmp_path, monkeypatch):
@@ -7502,7 +9464,7 @@ def test_legacy_leftovers_dry_run_excludes_what_the_preview_announced(tmp_path, 
 
     plan = runs.prune_sessions(tmp_path, dry_run=True)
     assert plan == (["fin-1"], ["live-1"], set())
-    assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == {
+    assert _healthy_leftovers(tmp_path, announced=plan[0]) == {
         runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-live-1"]
     }
 
@@ -7532,7 +9494,7 @@ def test_legacy_leftovers_dry_run_never_drops_what_the_preview_did_not_announce(
     plan = runs.prune_sessions(tmp_path, dry_run=True)
     assert plan == ([], ["race-live"], set())  # nothing announced as a would-kill
     assert legacy.killed == []
-    assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == {
+    assert _healthy_leftovers(tmp_path, announced=plan[0]) == {
         runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-race-live"]
     }
 
@@ -7559,15 +9521,2488 @@ def test_legacy_leftovers_dry_run_keeps_what_the_legacy_pass_cannot_claim(tmp_pa
     monkeypatch.setattr(runs, "get_multiplexer", lambda: ours)
     monkeypatch.setattr(runs, "mux_sessions", ours.list_sessions)
     monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    # As `cli._configure_mux` leaves a process: the derived root in force AND
+    # the project it was derived for, which is what lets the kill gate see it.
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
     # untagged over there: the run dir proves nothing in a shared registry
     legacy = _RegistryMux(["bmad-loop-dup"], {})
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
 
     plan = runs.prune_sessions(tmp_path, dry_run=True)
     assert plan == (["dup"], [], set())  # announced by the primary pass alone
-    preview = runs.legacy_registry_leftovers(tmp_path, announced=plan[0])
+    preview = _healthy_leftovers(tmp_path, announced=plan[0])
 
     assert runs.prune_sessions(tmp_path) == (["dup"], [], set())
     assert legacy.killed == []  # the legacy pass declined it, as it must
-    assert preview == runs.legacy_registry_leftovers(tmp_path)
+    assert preview == _healthy_leftovers(tmp_path)
     assert preview == {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-dup"]}
+
+
+# --------------------------------------------- worktree-mount spec-writer pin (DW-423)
+#
+# `live_spec_root_identity` answers the `root_identity` every `live_spec_root` write
+# site passes: None for the project, the mount's `lstat` for an intact mount, and a
+# never-matching identity for a mount that cannot be pinned — so the refusal lands at
+# the write, and a gone mount keeps its no-op.
+
+requires_symlinked_mount_swap = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+
+_PINNED_SPEC = "---\nstatus: blocked\n---\n\nbody\n\n## Auto Run Result\n\nStatus: blocked\n"
+
+
+def _mount(project: Path) -> Path:
+    return project / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+
+
+def _swap_mount_for_link(mount: Path, outside: Path) -> None:
+    """Copy the mount's spec tree to ``outside``, rename the mount aside and plant a
+    link at its name — the walk below the root still finds the same subpath."""
+    import shutil
+
+    shutil.copytree(mount, outside)
+    mount.rename(mount.with_name(mount.name + "-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+
+
+def _never_matches(identity) -> bool:
+    import stat
+
+    return identity is not None and not stat.S_ISDIR(identity.st_mode) and identity.st_ino == 0
+
+
+def _rec(path: Path):
+    """``path``'s mint-time identity record, as `worktree_flow` persists a mount's
+    (DW-446)."""
+    return platform_util.root_identity_record(path)
+
+
+def test_live_spec_root_identity_is_none_for_the_project(tmp_path):
+    """No mount, and a spec the mount cannot confine: both roots are the project,
+    which the operator chose and may keep behind a link — unpinned.
+
+    Ablation: answer `pinned_root_identity(live_spec_root(...))` unconditionally and
+    both rows redden with the project's identity."""
+    no_mount = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md")
+    assert runs.live_spec_root_identity(no_mount.task, no_mount.state, tmp_path) is None
+
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    outside = escalated_run(
+        tmp_path,
+        "r2",
+        spec_file=str(tmp_path / "_bmad-output" / "specs" / "6-4.md"),
+        worktree_path=str(mount),
+    )
+    assert runs.task_spec_root(outside.task, outside.state) == tmp_path  # the premise
+    assert runs.live_spec_root_identity(outside.task, outside.state, tmp_path) is None
+
+
+def test_live_spec_root_identity_pins_an_intact_mount(tmp_path):
+    """An intact mount answers its own `lstat` identity.
+
+    Ablation: return `None` for the mount case and this reddens."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+
+    identity = runs.live_spec_root_identity(run.task, run.state, tmp_path)
+
+    assert identity is not None
+    expected = os.lstat(mount)
+    assert (identity.st_dev, identity.st_ino, identity.st_mode) == (
+        expected.st_dev,
+        expected.st_ino,
+        expected.st_mode,
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_live_spec_root_identity_never_matches_a_linked_mount(tmp_path):
+    """A mount that is a link cannot be pinned, and must not degrade to unpinned:
+    the helper answers an identity no directory matches.
+
+    Ablation: return `pinned_root_identity(...)` raw (None for a link) and this
+    reddens — None is the unpinned write."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    _swap_mount_for_link(mount, tmp_path / "outside")
+
+    assert _never_matches(runs.live_spec_root_identity(run.task, run.state, tmp_path))
+
+
+def test_live_spec_root_identity_never_matches_a_gone_mount_without_raising(tmp_path):
+    """A gone mount answers the never-matching identity rather than raising, so the
+    writers keep their missing-spec `False` no-op (they return before any open).
+
+    Ablation: raise when `pinned_root_identity` answers None and this reddens."""
+    mount = _mount(tmp_path)  # never created
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+
+    identity = runs.live_spec_root_identity(run.task, run.state, tmp_path)
+
+    assert _never_matches(identity)
+    # and the no-op it protects: a missing spec is still "nothing to change"
+    spec = runs.live_spec_path(run.task, run.state, tmp_path)
+    assert (
+        verify.set_frontmatter_status(
+            spec, "ready-for-dev", confine_root=mount, root_identity=identity
+        )
+        is False
+    )
+
+
+def _same_dir(identity, path: Path) -> bool:
+    expected = os.lstat(path)
+    return (identity.st_dev, identity.st_ino, identity.st_mode) == (
+        expected.st_dev,
+        expected.st_ino,
+        expected.st_mode,
+    )
+
+
+def test_mount_root_identity_pins_an_intact_mount(tmp_path):
+    """DW-445's pin primitive answers an intact mount's own `lstat` identity.
+
+    Ablation: return `_UNPINNABLE_MOUNT` unconditionally and this reddens."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+
+    assert _same_dir(runs.mount_root_identity(mount, mount=mount, recorded=_rec(mount)), mount)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_mount_root_identity_never_matches_a_linked_mount(tmp_path):
+    """A mount that is a link answers the never-matching identity, never None (the
+    unpinned write).
+
+    Ablation: return `pinned_root_identity(root)` raw and this reddens."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    record = _rec(mount)
+    _swap_mount_for_link(mount, tmp_path / "outside")
+
+    assert _never_matches(runs.mount_root_identity(mount, mount=mount, recorded=record))
+
+
+def test_mount_root_identity_never_matches_a_gone_or_non_directory_mount(tmp_path):
+    """A gone mount, and a mount name holding a regular file, answer the
+    never-matching identity without raising — the refusal belongs to the write.
+
+    Ablation: return `pinned_root_identity(root)` raw (None) and both rows redden."""
+    gone = _mount(tmp_path)
+    gone.mkdir(parents=True)
+    record = _rec(gone)
+    gone.rmdir()  # recorded at the mint, gone since
+    assert _never_matches(runs.mount_root_identity(gone, mount=gone, recorded=record))
+
+    a_file = tmp_path / "not-a-dir"
+    a_file.mkdir()
+    record = _rec(a_file)
+    a_file.rmdir()
+    a_file.write_text("x", encoding="utf-8")
+    assert _never_matches(runs.mount_root_identity(a_file, mount=a_file, recorded=record))
+
+
+def test_mount_root_identity_pins_an_intact_nested_project(tmp_path):
+    """Under a nested project (DW-379) the pinned root is ``<worktree>/<offset>``,
+    and an intact chain answers THAT directory's identity — not the worktree's.
+
+    Ablation: answer the mount's own identity (`pinned_root_identity(mount)`) and
+    this reddens."""
+    mount = _mount(tmp_path)
+    nested = mount / "apps" / "web"
+    nested.mkdir(parents=True)
+
+    assert _same_dir(runs.mount_root_identity(nested, mount=mount, recorded=_rec(mount)), nested)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("swapped", ["worktree", "intermediate"])
+def test_mount_root_identity_never_matches_a_nested_chain_through_a_link(tmp_path, swapped):
+    """The worktree above a nested project — or any directory between it and the
+    project — swapped for a link to an outside copy answers the never-matching
+    identity, although a fresh `lstat` of ``<worktree>/<offset>`` would follow the
+    link to a real directory.
+
+    Ablation: pin only `root` (`pinned_root_identity(root)`, skipping the
+    components between `mount` and it) and both rows redden."""
+    mount = _mount(tmp_path)
+    nested = mount / "apps" / "web"
+    nested.mkdir(parents=True)
+    record = _rec(mount)
+    link_at = mount if swapped == "worktree" else mount / "apps"
+    _swap_mount_for_link(link_at, tmp_path / "outside")
+    assert nested.is_dir()  # the premise: the spelling still reaches a directory
+
+    assert _never_matches(runs.mount_root_identity(nested, mount=mount, recorded=record))
+
+
+def test_mount_root_identity_never_matches_a_root_outside_the_mount(tmp_path):
+    """A root that is not the mount or lexically under it — a sibling, or a
+    spelling climbing out through ``..`` — cannot be pinned by the mount chain.
+
+    Ablation: drop the `_below_mount` gate (pin `root` whatever `mount` is) and both
+    rows redden with a real directory's identity."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    sibling = tmp_path / "elsewhere"
+    sibling.mkdir()
+
+    record = _rec(mount)
+    assert _never_matches(runs.mount_root_identity(sibling, mount=mount, recorded=record))
+    assert _never_matches(
+        runs.mount_root_identity(mount / ".." / "1", mount=mount, recorded=record)
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_mount_root_identity_accepts_a_root_spelled_through_a_resolved_ancestor(tmp_path):
+    """``ProjectPaths.rebased`` resolves the mount, so a root may be spelled through
+    a resolved ancestor while ``mount`` keeps the link spelling. The mount is then
+    compared under its RESOLVED parent — the ancestor residual, not a refusal —
+    while the worktree itself stays pinned.
+
+    Ablation: drop the resolved-parent retry and this answers never-matching,
+    refusing every legitimate write under a linked `.bmad-loop`."""
+    real = tmp_path / "real-state"
+    (real / "runs" / "r1" / "worktrees" / "1").mkdir(parents=True)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".bmad-loop").symlink_to(real, target_is_directory=True)
+    mount = _mount(project)  # spelled through the linked `.bmad-loop`
+    root = mount.resolve()
+
+    assert _same_dir(runs.mount_root_identity(root, mount=mount, recorded=_rec(mount)), root)
+
+
+# ------------------------------------ mint-time mount identity (DW-446, DW-486)
+
+
+@pytest.fixture(params=["handle", "no-handle"])
+def mount_pin_arm(request, monkeypatch):
+    """Both arms of `mount_root_identity`: the handle-anchored ``O_NOFOLLOW`` walk
+    from the recorded mount, and the no-handle ``lstat`` fallback."""
+    if request.param == "handle" and not platform_util.HANDLE_ANCHORED_WRITES:
+        pytest.skip("no handle-anchored writes on this host")
+    if request.param == "no-handle":
+        monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    return request.param
+
+
+def test_mount_root_identity_refuses_a_missing_record(tmp_path, mount_pin_arm):
+    """DW-446: a mount with no mint-time record (a pre-upgrade state not yet
+    backfilled) answers the never-matching identity — never a fresh `lstat` and
+    never None (the unpinned write), even for an intact mount.
+
+    Ablation: map ``recorded=None`` to the pre-DW-446 per-component `lstat` walk and
+    both arms redden with the mount's real identity."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+
+    assert _never_matches(runs.mount_root_identity(mount, mount=mount, recorded=None))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_mount_root_identity_refuses_a_worktrees_dir_swapped_for_a_link_holding_a_real_unit(
+    tmp_path, mount_pin_arm
+):
+    """DW-446: ``worktrees/`` swapped, after the mint, for a link to a tree holding
+    a REAL ``<unit>/``. The mount path now reaches a real, non-link directory — a
+    fresh `lstat` of it, and of every component below it, accepts the outside tree —
+    but it is not the minted mount, so both arms answer never-matching.
+
+    Ablation: take the identity from `pinned_root_identity(mount)` instead of
+    comparing against ``recorded`` (the pre-DW-446 pin) and both arms redden with
+    the outside unit's identity."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    record = _rec(mount)
+    worktrees = mount.parent
+    outside = tmp_path / "outside"
+    (outside / mount.name).mkdir(parents=True)
+    worktrees.rename(worktrees.with_name("worktrees-aside"))
+    worktrees.symlink_to(outside, target_is_directory=True)
+    assert mount.is_dir() and not mount.is_symlink()  # the premise
+
+    assert _never_matches(runs.mount_root_identity(mount, mount=mount, recorded=record))
+
+
+def test_mount_root_identity_refuses_a_mount_replaced_by_another_directory(tmp_path, mount_pin_arm):
+    """The record is compared, not re-taken: a mount renamed aside and replaced by
+    a fresh real directory of the same name is not the minted mount.
+
+    Ablation: re-record on a mismatch (answer the current identity) and both arms
+    redden."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    record = _rec(mount)
+    mount.rename(mount.with_name("1-aside"))
+    mount.mkdir()
+
+    assert _never_matches(runs.mount_root_identity(mount, mount=mount, recorded=record))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("swapped", ["mount", "worktrees"])
+def test_mount_root_identity_refuses_a_nested_mount_swapped_for_a_link_holding_a_real_offset(
+    tmp_path, mount_pin_arm, swapped
+):
+    """DW-486: under a nested project the pinned root is ``<mount>/<offset>``. A
+    ``<mount>`` swapped for a link to a tree holding a real ``app/`` — or its
+    ``worktrees/`` parent swapped for one holding a real ``<unit>/app/`` — makes
+    ``<mount>/app`` a real directory reached through the link; the recorded mount
+    no longer matches, so the pin refuses.
+
+    Ablation: skip the record compare (open ``mount`` unpinned, the handle arm) and
+    both rows redden with the outside ``app/``'s identity; the pre-DW-446
+    per-component `lstat` walk reddens the ``worktrees`` row.
+
+    Positive control: `test_mount_root_identity_pins_an_intact_nested_project` —
+    a recorded mount and a real ``<mount>/<offset>`` answer the offset's own
+    identity, so the intact writes land."""
+    mount = _mount(tmp_path)
+    (mount / "app").mkdir(parents=True)
+    record = _rec(mount)
+    outside = tmp_path / "outside"
+    link_at = mount if swapped == "mount" else mount.parent
+    real_offset = outside / "app" if swapped == "mount" else outside / mount.name / "app"
+    real_offset.mkdir(parents=True)
+    link_at.rename(link_at.with_name(link_at.name + "-aside"))
+    link_at.symlink_to(outside, target_is_directory=True)
+    assert (mount / "app").is_dir()  # the premise
+
+    assert _never_matches(runs.mount_root_identity(mount / "app", mount=mount, recorded=record))
+
+
+@requires_symlinked_mount_swap
+def test_rearm_flip_refuses_a_worktrees_dir_swapped_for_a_link_holding_a_real_unit(tmp_path):
+    """DW-446 on a re-arm writer: the status flip through a mount whose
+    ``worktrees/`` was swapped for a link to a tree holding a real ``<unit>`` (with
+    the same spec subpath) refuses, and the outside copy keeps its bytes; the
+    unpinned control shows the same swap really lands outside.
+
+    Ablation: answer `pinned_root_identity` per component in `mount_root_identity`
+    (the pre-DW-446 pin) and the pinned flip lands in the outside copy."""
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_PINNED_SPEC, encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    assert run.task.worktree_identity == _rec(mount)  # the premise: recorded at the mint
+    worktrees = mount.parent
+    outside = tmp_path / "outside"
+    import shutil
+
+    shutil.copytree(worktrees, outside)
+    worktrees.rename(worktrees.with_name("worktrees-aside"))
+    worktrees.symlink_to(outside, target_is_directory=True)
+    spec = runs.live_spec_path(run.task, run.state, tmp_path)
+    confine_root = runs.live_spec_root(run.task, run.state, tmp_path)
+    identity = runs.live_spec_root_identity(run.task, run.state, tmp_path)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        verify.set_frontmatter_status(
+            spec, "ready-for-dev", confine_root=confine_root, root_identity=identity
+        )
+    outside_spec = outside / mount.name / "specs" / "6-4.md"
+    assert outside_spec.read_text(encoding="utf-8") == _PINNED_SPEC
+
+    assert verify.set_frontmatter_status(spec, "ready-for-dev", confine_root=confine_root)
+    assert "status: ready-for-dev" in outside_spec.read_text(encoding="utf-8")
+
+
+# ------------------------------------ legacy backfill (DW-446)
+
+
+def _legacy_rows(run_dir: Path) -> list[dict]:
+    return [e for e in Journal(run_dir).entries() if e.get("kind") == "root-identity-recorded"]
+
+
+def test_reconcile_root_identities_backfills_journals_and_never_overwrites(tmp_path):
+    """A pre-DW-446 state records the run dir and each mounted task's identity, one
+    `root-identity-recorded` row per record; a second pass records nothing; an
+    existing record — even a stale one — is never overwritten; an unpinnable
+    (gone) mount records nothing.
+
+    Ablation: re-take a fresh `root_identity_record` for every root regardless of
+    its record (``if record is None:`` → ``if True:`` in `_reconcile_one_root`) and
+    the second pass reports a change and journals two more rows."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    state = load_state(run.run_dir)
+    state.run_dir_identity = None
+    state.tasks["s1"].worktree_identity = None
+    gone = StoryTask(story_key="s2", epic=1, worktree_path=str(tmp_path / "gone"))
+    state.tasks["s2"] = gone
+    journal = Journal(run.run_dir)
+
+    assert runs.reconcile_root_identities(state, run.run_dir, journal, tmp_path)
+
+    assert state.run_dir_identity == _rec(run.run_dir)
+    assert state.tasks["s1"].worktree_identity == _rec(mount)
+    assert gone.worktree_identity is None
+    rows = _legacy_rows(run.run_dir)
+    assert [(r["root"], r.get("story_key")) for r in rows] == [
+        ("run-dir", None),
+        ("worktree", "s1"),
+    ]
+    assert (rows[1]["dev"], rows[1]["ino"]) == _rec(mount)
+    assert rows[1]["path"] == str(mount)
+
+    assert not runs.reconcile_root_identities(state, run.run_dir, journal, tmp_path)
+    assert len(_legacy_rows(run.run_dir)) == 2
+
+    # a stale record (another inode) is never re-recorded, whatever its `st_dev`
+    run_stale = (1, _rec(run.run_dir)[1] + 1)
+    mount_stale = (1, _rec(mount)[1] + 1)
+    state.run_dir_identity = run_stale
+    state.tasks["s1"].worktree_identity = mount_stale
+    assert not runs.reconcile_root_identities(state, run.run_dir, journal, tmp_path)
+    assert state.run_dir_identity == run_stale
+    assert state.tasks["s1"].worktree_identity == mount_stale
+
+
+def test_rearm_backfills_a_legacy_state_before_its_pinned_writes(tmp_path):
+    """A re-arm on a state.json written before DW-446 records the mount's identity
+    before its first pinned write — so the flip lands — journals it, and persists
+    it with the re-arm's own `save_state`.
+
+    Ablation: drop the `reconcile_root_identities` call from
+    `_rearm_escalation_locked` and the flip refuses (the record is missing)."""
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_PINNED_SPEC, encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    raw = json.loads((run.run_dir / "state.json").read_text(encoding="utf-8"))
+    raw.pop("run_dir_identity")
+    for task in raw["tasks"].values():
+        task.pop("worktree_identity")
+    (run.run_dir / "state.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    runs.rearm_escalation(run.run_dir, isolated_redrive=True, resolution_recorded=False)
+
+    assert "status: ready-for-dev" in (mount / "specs" / "6-4.md").read_text(encoding="utf-8")
+    saved = load_state(run.run_dir)
+    assert saved.run_dir_identity == _rec(run.run_dir)
+    assert saved.tasks["s1"].worktree_identity == _rec(mount)
+    assert {r["root"] for r in _legacy_rows(run.run_dir)} == {"run-dir", "worktree"}
+
+
+# ------------------------------------ `st_dev` re-bind at a locked load (DW-446)
+
+
+def _rebound_rows(run_dir: Path) -> list[dict]:
+    return [e for e in Journal(run_dir).entries() if e.get("kind") == "root-identity-rebound"]
+
+
+def _renumbered(path: Path) -> tuple[int, int]:
+    """``path``'s record as a reboot would leave it: the real inode, another `st_dev`."""
+    dev, ino = _rec(path)
+    return (dev + 1, ino)
+
+
+def test_reconcile_rebinds_a_renumbered_st_dev_once(tmp_path):
+    """A record whose root still `lstat`s as a real directory with the SAME inode
+    but another `st_dev` (a reboot on btrfs, an NFS/overlay remount) is re-bound to
+    today's `st_dev`, journaling one `root-identity-rebound` per root with its
+    fields; the pinned mount identity then matches; a second pass journals nothing.
+
+    Ablation: drop the re-bind (return the record untouched) and the rows, the
+    re-bound records and the pinned identity all redden."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    state = load_state(run.run_dir)
+    run_old, mount_old = _renumbered(run.run_dir), _renumbered(mount)
+    state.run_dir_identity = run_old
+    state.tasks["s1"].worktree_identity = mount_old
+    assert _never_matches(runs.mount_root_identity(mount, mount=mount, recorded=mount_old))
+    journal = Journal(run.run_dir)
+
+    assert runs.reconcile_root_identities(state, run.run_dir, journal, tmp_path)
+
+    assert state.run_dir_identity == _rec(run.run_dir)
+    assert state.tasks["s1"].worktree_identity == _rec(mount)
+    rows = _rebound_rows(run.run_dir)
+    assert [
+        (r["root"], r.get("story_key"), r["path"], r["old_dev"], r["dev"], r["ino"]) for r in rows
+    ] == [
+        ("run-dir", None, str(run.run_dir), run_old[0], *_rec(run.run_dir)),
+        ("worktree", "s1", str(mount), mount_old[0], *_rec(mount)),
+    ]
+    assert _legacy_rows(run.run_dir) == []  # a re-bind is not a backfill
+    assert _same_dir(
+        runs.mount_root_identity(mount, mount=mount, recorded=state.tasks["s1"].worktree_identity),
+        mount,
+    )
+
+    assert not runs.reconcile_root_identities(state, run.run_dir, journal, tmp_path)
+    assert len(_rebound_rows(run.run_dir)) == 2
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("change", ["inode", "link"])
+def test_reconcile_never_rebinds_an_inode_mismatch_or_a_link(tmp_path, change):
+    """The re-bind is inode-matched and real-directory-only. A root whose inode
+    differs (renamed aside, replaced by a fresh directory) or that is now a link to
+    the ORIGINAL directory (same inode through the link) is left alone: no row, the
+    record unchanged, and the pinned mount identity keeps refusing.
+
+    Ablation: accept an inode mismatch in `_reconcile_one_root` (drop the
+    ``st_ino != ino`` check) and the ``inode`` row reddens; re-bind from a
+    following ``os.stat`` instead of `pinned_root_identity` and the ``link`` row
+    reddens."""
+    mount = _mount(tmp_path)
+    mount.mkdir(parents=True)
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    state = load_state(run.run_dir)
+    record = _renumbered(mount)
+    state.tasks["s1"].worktree_identity = record
+    if change == "inode":
+        mount.rename(mount.with_name("1-aside"))
+        mount.mkdir()
+    else:
+        aside = mount.with_name("1-aside")
+        mount.rename(aside)
+        mount.symlink_to(aside, target_is_directory=True)
+        assert os.stat(mount).st_ino == record[1]  # the premise: same inode via the link
+    journal = Journal(run.run_dir)
+
+    assert not runs.reconcile_root_identities(state, run.run_dir, journal, tmp_path)
+
+    assert state.tasks["s1"].worktree_identity == record
+    assert _rebound_rows(run.run_dir) == []
+    assert _legacy_rows(run.run_dir) == []
+    assert _never_matches(runs.mount_root_identity(mount, mount=mount, recorded=record))
+
+
+def test_rearm_rebinds_a_renumbered_st_dev_before_its_pinned_writes(tmp_path):
+    """A re-arm over records whose `st_dev` a reboot renumbered re-binds them before
+    its first pinned write — so the status flip lands — journals
+    `root-identity-rebound` per root, and persists the re-bound records.
+
+    Ablation: drop the `reconcile_root_identities` call from
+    `_rearm_escalation_locked` and the flip refuses (the record no longer matches)."""
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_PINNED_SPEC, encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    state = load_state(run.run_dir)
+    state.run_dir_identity = _renumbered(run.run_dir)
+    state.tasks["s1"].worktree_identity = _renumbered(mount)
+    save_state(run.run_dir, state)
+
+    runs.rearm_escalation(run.run_dir, isolated_redrive=True, resolution_recorded=False)
+
+    assert "status: ready-for-dev" in (mount / "specs" / "6-4.md").read_text(encoding="utf-8")
+    saved = load_state(run.run_dir)
+    assert saved.run_dir_identity == _rec(run.run_dir)
+    assert saved.tasks["s1"].worktree_identity == _rec(mount)
+    assert [r["root"] for r in _rebound_rows(run.run_dir)] == ["run-dir", "worktree"]
+
+
+def test_rearm_keeps_refusing_an_inode_mismatch(tmp_path):
+    """A re-arm over a mount record whose inode no longer matches (the mount was
+    replaced while paused) does not re-bind it: the pinned status flip refuses and
+    the record persists unchanged, with no `root-identity-rebound` row.
+
+    Ablation: accept an inode mismatch in `_reconcile_one_root` (drop the
+    ``info.st_ino != ino`` check) and the persisted-record and no-rebound-row
+    assertions redden. The flip still refuses: that re-bind keeps the record's old
+    inode, so the pin never matches either way."""
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_PINNED_SPEC, encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    record = run.task.worktree_identity
+    assert record is not None
+    stale = (record[0] + 1, record[1] + 1)
+    state = load_state(run.run_dir)
+    state.tasks["s1"].worktree_identity = stale
+    save_state(run.run_dir, state)
+
+    with pytest.raises(
+        runs.RearmError, match=r"UnconfinedWriteError: cannot reach .* without a redirect"
+    ):
+        runs.rearm_escalation(run.run_dir, isolated_redrive=True, resolution_recorded=False)
+
+    assert (mount / "specs" / "6-4.md").read_text(encoding="utf-8") == _PINNED_SPEC
+    assert load_state(run.run_dir).tasks["s1"].worktree_identity == stale
+    assert _rebound_rows(run.run_dir) == []
+
+
+def _nested_escalated_run(tmp_path: Path):
+    """An escalated run whose project is nested at ``<repo>/app`` (DW-379), mounted
+    at a unit worktree: `live_spec_root` is ``<worktree>/app``."""
+    repo = tmp_path
+    project = repo / "app"
+    project.mkdir()
+    mount = _mount(project)
+    (mount / "app" / "specs").mkdir(parents=True)
+    run = escalated_run(project, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    run.state.repo_root = str(repo)
+    assert runs.live_spec_root(run.task, run.state, project) == mount / "app"  # the premise
+    return run, project, mount
+
+
+def test_live_spec_root_identity_pins_an_intact_nested_mount_project(tmp_path):
+    """DW-423's pin under nesting: the mount PROJECT ``<worktree>/app`` is pinned.
+
+    Ablation: pass ``mount=live_spec_root(...)`` instead of the worktree and this
+    still passes — the negative row below is the one guarding the chain."""
+    run, project, mount = _nested_escalated_run(tmp_path)
+
+    identity = runs.live_spec_root_identity(run.task, run.state, project)
+
+    assert identity is not None
+    assert _same_dir(identity, mount / "app")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_live_spec_root_identity_never_matches_a_nested_mount_whose_worktree_is_a_link(
+    tmp_path,
+):
+    """The worktree above a nested mount project swapped for a link: the fresh
+    `lstat` of ``<worktree>/app`` follows it to a real directory, and the pin must
+    not accept that directory (DW-445 adopts the chain rule for DW-423's writers).
+
+    Ablation: pass ``mount=live_spec_root(...)`` (pin the project alone) and this
+    reddens with the outside directory's identity."""
+    run, project, mount = _nested_escalated_run(tmp_path)
+    _swap_mount_for_link(mount, tmp_path / "outside")
+
+    assert _never_matches(runs.live_spec_root_identity(run.task, run.state, project))
+
+
+@requires_symlinked_mount_swap
+def test_nested_rearm_flip_refuses_a_swapped_worktree(tmp_path):
+    """End to end on a DW-423 writer: the re-arm's status flip through a nested
+    mount whose worktree was swapped for a link refuses, and the outside copy keeps
+    its bytes; the unpinned control shows the same swap really lands outside.
+
+    Ablation: pass ``mount=live_spec_root(...)`` in `live_spec_root_identity` and the
+    flip lands in the outside copy."""
+    run, project, mount = _nested_escalated_run(tmp_path)
+    spec = mount / "app" / "specs" / "6-4.md"
+    spec.write_text(_PINNED_SPEC, encoding="utf-8")
+    outside = tmp_path / "outside"
+    _swap_mount_for_link(mount, outside)
+    outside_spec = outside / "app" / "specs" / "6-4.md"
+    confine_root = runs.live_spec_root(run.task, run.state, project)
+    identity = runs.live_spec_root_identity(run.task, run.state, project)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        verify.set_frontmatter_status(
+            spec, "ready-for-dev", confine_root=confine_root, root_identity=identity
+        )
+    assert outside_spec.read_text(encoding="utf-8") == _PINNED_SPEC
+
+    assert verify.set_frontmatter_status(spec, "ready-for-dev", confine_root=confine_root)
+    assert "status: ready-for-dev" in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_restore_rearmed_spec_refuses_a_mount_swapped_for_a_link(tmp_path, monkeypatch):
+    """The re-arm's undo is pinned like the three writes it undoes: a mount swapped
+    for a link raises `RearmError` instead of writing the preimage outside. The
+    unpinned control shows the same swap really lands the undo outside.
+
+    Ablation: drop `root_identity=` from `_restore_rearmed_spec`'s confined call and
+    the pinned row writes the preimage into the outside copy."""
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text("flipped\n", encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    spec = runs.live_spec_path(run.task, run.state, tmp_path)
+    outside = tmp_path / "outside"
+    _swap_mount_for_link(mount, outside)
+    outside_spec = outside / "specs" / "6-4.md"
+
+    with pytest.raises(runs.RearmError):
+        runs._restore_rearmed_spec(spec, b"original\n", run.task, run.state, tmp_path)
+    assert outside_spec.read_bytes() == b"flipped\n"
+
+    # Control: unpinned, the undo follows the link out of the repository.
+    monkeypatch.setattr(runs, "live_spec_root_identity", lambda *a: None)
+    assert (
+        runs._restore_rearmed_spec(spec, b"original\n", run.task, run.state, tmp_path) == "restored"
+    )
+    assert outside_spec.read_bytes() == b"original\n"
+
+
+@requires_symlinked_mount_swap
+def test_restore_rearmed_spec_external_arm_refuses_a_swapped_pinned_mount(tmp_path, monkeypatch):
+    """DW-445 keeps the undo's two arms in parity with its forward writers: handed the
+    spec's RESOLVED spelling after a mount swap (outside `live_spec_root`, so the
+    external arm), the undo pre-checks the pin and raises `RearmError` naming the
+    refusal; the outside copy is unchanged. Unpinned, the same call restores it.
+
+    Ablation: drop the `require_root_pinned` pre-check from `_restore_rearmed_spec`'s
+    external arm and the pinned row writes the preimage into the outside copy."""
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text("flipped\n", encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    outside = tmp_path / "outside"
+    _swap_mount_for_link(mount, outside)
+    outside_spec = (outside / "specs" / "6-4.md").resolve()
+
+    with pytest.raises(runs.RearmError, match=_PIN_REFUSAL_RE):
+        runs._restore_rearmed_spec(outside_spec, b"original\n", run.task, run.state, tmp_path)
+    assert outside_spec.read_bytes() == b"flipped\n"
+
+    monkeypatch.setattr(runs, "live_spec_root_identity", lambda *a: None)  # control
+    assert (
+        runs._restore_rearmed_spec(outside_spec, b"original\n", run.task, run.state, tmp_path)
+        == "restored"
+    )
+    assert outside_spec.read_bytes() == b"original\n"
+
+
+_PIN_REFUSAL_RE = "no longer the directory it was pinned to"
+
+
+@requires_symlinked_mount_swap
+def test_rearm_escalation_refuses_an_isolated_mount_swapped_for_a_link(tmp_path, monkeypatch):
+    """Acceptance end-to-end: an isolated run whose mount is replaced by a link. The
+    re-arm aborts with `RearmError` and the link target's spec copy is unchanged;
+    the unpinned control shows the flip would otherwise land there.
+
+    Ablation: drop `root_identity=` from the status flip in `rearm_escalation` (or
+    make `live_spec_root_identity` answer None) and the flip lands in the outside
+    copy."""
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_PINNED_SPEC, encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    outside = tmp_path / "outside"
+    _swap_mount_for_link(mount, outside)
+    outside_spec = outside / "specs" / "6-4.md"
+
+    with pytest.raises(runs.RearmError):
+        runs.rearm_escalation(run.run_dir, "s1", isolated_redrive=True, resolution_recorded=False)
+    assert outside_spec.read_text(encoding="utf-8") == _PINNED_SPEC
+    assert load_state(run.run_dir).tasks["s1"].phase.value == "escalated"
+
+    # Control: unpinned, the same re-arm writes the spec outside the repository.
+    monkeypatch.setattr(runs, "live_spec_root_identity", lambda *a: None)
+    runs.rearm_escalation(run.run_dir, "s1", isolated_redrive=True, resolution_recorded=False)
+    assert "status: ready-for-dev" in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize(
+    ("after_module", "after_name", "outside_changes"),
+    [
+        # the flip lands in the real mount, then the mount is swapped: the STRIP's pin
+        ("verify", "set_frontmatter_status", lambda text: "## Auto Run Result" not in text),
+        # the flip and the strip land, then the mount is swapped: the RE-STAMP's pin
+        ("devcontract", "strip_auto_run_result", lambda text: "baseline_revision:" in text),
+    ],
+    ids=["strip", "restamp"],
+)
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned-control"])
+def test_rearm_escalation_pins_every_later_write_to_the_mount(
+    tmp_path, monkeypatch, after_module, after_name, outside_changes, pinned
+):
+    """The mount swapped for a link MID-re-arm, right after the write before the site
+    under test. Pinned, that site refuses (`RearmError`), the undo refuses too, and
+    the outside copy keeps the bytes it was swapped in with; the unpinned control
+    shows the same site otherwise writes outside the repository.
+
+    Ablation: drop `root_identity=` from the runs strip (`strip` row) or baseline
+    re-stamp (`restamp` row) call and its pinned row reddens — the write lands in the
+    outside copy."""
+    import shutil
+
+    from bmad_loop import devcontract
+
+    mount = _mount(tmp_path)
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_PINNED_SPEC, encoding="utf-8")
+    run = escalated_run(
+        tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount), git_project=True
+    )
+    outside = tmp_path.parent / (tmp_path.name + "-outside")
+    outside_spec = outside / "specs" / "6-4.md"
+    module = {"verify": verify, "devcontract": devcontract}[after_module]
+    real = getattr(module, after_name)
+
+    def then_swap(*args, **kwargs):
+        result = real(*args, **kwargs)
+        shutil.copytree(mount, outside)
+        mount.rename(mount.with_name(mount.name + "-aside"))
+        mount.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(module, after_name, then_swap)
+    if not pinned:
+        monkeypatch.setattr(runs, "live_spec_root_identity", lambda *a: None)
+        runs.rearm_escalation(run.run_dir, "s1", isolated_redrive=True, resolution_recorded=False)
+        assert outside_changes(outside_spec.read_text(encoding="utf-8"))
+        return
+
+    with pytest.raises(runs.RearmError):
+        runs.rearm_escalation(run.run_dir, "s1", isolated_redrive=True, resolution_recorded=False)
+    swapped_in = (mount.with_name(mount.name + "-aside") / "specs" / "6-4.md").read_bytes()
+    assert outside_spec.read_bytes() == swapped_in
+    assert not outside_changes(outside_spec.read_text(encoding="utf-8"))
+
+
+# ------------------------------------------- nested repo_root mounts (DW-379)
+
+
+def _nested_run(tmp_path, *, spec_file, worktree_path):
+    """An escalated run whose project `<repo>/app` is nested in its code root `<repo>`,
+    with the unit's mount recorded at `worktree_path`."""
+    app = tmp_path / "repo" / "app"
+    app.mkdir(parents=True)
+    run = escalated_run(app, "r1", spec_file=spec_file, worktree_path=worktree_path)
+    run.state.repo_root = str(tmp_path / "repo")
+    return run
+
+
+def test_nested_mount_spec_and_stories_roots_are_the_mount_project(tmp_path):
+    """DW-379: a relative spec spelling is project-relative, so under a nested
+    `repo_root` every mount-side resolver answers the MOUNT PROJECT, `<mount>/app`:
+    `task_spec_root` (relative and absolute-inside shapes), `task_spec_path`, and
+    `task_stories_root` (which mirrors `_stories_folder`'s join on
+    `workspace.paths.project`). A spec in the mount but outside its project cannot be
+    confined by it and answers the project.
+
+    Ablation: return the raw `worktree_path` from `task_spec_root` and the first
+    assertions land on `<mount>`, the outer tree."""
+    wt = tmp_path / "wt"
+    (wt / "app").mkdir(parents=True)
+    rel = "_bmad-output/specs/6-4.md"
+
+    run = _nested_run(tmp_path, spec_file=rel, worktree_path=str(wt))
+    assert runs.task_spec_root(run.task, run.state) == wt / "app"
+    assert runs.task_spec_path(run.task, run.state) == wt / "app" / rel
+    assert runs.task_stories_root(run.task, run.state) == wt / "app"
+    # the relative spec is mount-owned, so its writers get a pin (DW-423)
+    live_project = Path(run.state.project)
+    assert runs.live_spec_root_identity(run.task, run.state, live_project) is not None
+
+    inside = wt / "app" / rel
+    run.task.spec_file = str(inside)
+    assert runs.task_spec_root(run.task, run.state) == wt / "app"
+
+    outer = wt / "other" / "6-4.md"
+    run.task.spec_file = str(outer)
+    assert runs.task_spec_root(run.task, run.state) == Path(run.state.project)
+
+
+def test_redrive_spec_status_prefixes_the_nested_offset_onto_the_blob_path(project):
+    """The isolated arm reads the COMMITTED spec from the code root's tree, where the
+    blob path is repo-relative: under a nested `repo_root` the project-relative
+    `spec_file` must carry the `app/` offset or no blob is ever found and the status
+    is always `""` (DW-379).
+
+    Ablation: drop the offset prefix in `_redrive_spec_status` and this reddens on
+    `""`."""
+    paths = nested_repo_root_paths(project)
+    rel = "_bmad-output/implementation-artifacts/spec-1-1-a.md"
+    spec = paths.project / rel
+    spec.write_text("---\nstatus: done\n---\n", encoding="utf-8")
+    git(paths.repo_root, "add", "-A")
+    git(paths.repo_root, "commit", "-q", "-m", "spec")
+    state = RunState(
+        run_id="r1",
+        project=str(paths.project),
+        repo_root=str(paths.repo_root),
+        started_at="now",
+        target_branch="main",
+    )
+    task = StoryTask("1-1-a", 1, spec_file=rel)
+
+    assert runs._redrive_spec_status(state, task, isolated_redrive=True) == "done"
+    # the unprefixed spelling names nothing in the code root's tree: the ablated read
+    flat = RunState(run_id="r2", project=str(paths.repo_root), started_at="now")
+    flat.target_branch = "main"
+    assert runs._redrive_spec_status(flat, task, isolated_redrive=True) == ""
+
+
+def test_moved_default_config_project_keeps_the_pre_dw379_anchors(project, tmp_path):
+    """A DEFAULT-config project moved after launch keeps its launch-time
+    `state.project` while resume re-stamps `repo_root`, so the recorded pair LOOKS
+    disjoint. No mount is ever made for a disjoint layout, so `mount_project` answers
+    the recorded mount itself (the pre-DW-379 anchor) and `_redrive_spec_status` reads
+    the raw spelling — byte-identical to before.
+
+    Ablation: let `mount_project` return `rebased_project(...)` for the disjoint pair
+    (the unmoved main project) and the first assertion reddens; return "" from
+    `_redrive_spec_status` for it and the second does."""
+    repo = project.project  # the live, re-stamped code root (a real checkout)
+    rel = "_bmad-output/implementation-artifacts/spec-1-1-a.md"
+    (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+    (repo / rel).write_text("---\nstatus: done\n---\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "spec")
+    mount = repo / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    state = RunState(
+        run_id="r1",
+        project=str(tmp_path / "old-location" / "proj"),  # launch-time spelling
+        repo_root=str(repo),  # re-stamped by resume
+        started_at="now",
+        target_branch="main",
+    )
+    task = StoryTask("1-1-a", 1, spec_file=rel, worktree_path=str(mount))
+    assert not Path(state.project).is_relative_to(state.code_root), "premise: looks disjoint"
+
+    assert runs.task_spec_root(task, state) == mount
+    assert runs._redrive_spec_status(state, task, isolated_redrive=True) == "done"
+
+
+def test_nested_live_stories_root_follows_a_project_move_to_the_mount_project(tmp_path):
+    """After the whole checkout moved, `live_stories_root` rebases the recorded MOUNT
+    PROJECT (`<mount>/app` under a nested `repo_root`) onto the live project and
+    answers it — not the moved mount's root, the outer tree.
+
+    Ablation: probe `Path(task.worktree_path)` instead of `state.mount_project(task)`
+    in `live_stories_root` and this answers `<live mount>` without `/app`."""
+    old_app = tmp_path / "old" / "repo" / "app"
+    old_app.mkdir(parents=True)
+    recorded_mount = old_app / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    run = escalated_run(
+        old_app, "r1", spec_file="_bmad-output/specs/6-4.md", worktree_path=str(recorded_mount)
+    )
+    run.state.repo_root = str(tmp_path / "old" / "repo")
+    live_app = tmp_path / "new" / "repo" / "app"
+    live_mount_project = live_app / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1" / "app"
+    live_mount_project.mkdir(parents=True)
+
+    assert runs.live_stories_root(run.task, run.state, live_app) == live_mount_project
+
+
+# ----------------------------------------------- rearm_for_reverify (DW-522)
+
+
+def _edit_reverify_state(run_dir, edit):
+    state = load_state(run_dir)
+    edit(state, state.tasks[_REVERIFY_KEY])
+    save_state(run_dir, state)
+
+
+def _reverify_rows(run_dir):
+    return [e for e in Journal(run_dir).entries() if e["kind"] == "story-reverify-armed"]
+
+
+def test_rearm_for_reverify_moves_deferred_to_dev_verify_keeping_baseline(tmp_path):
+    from bmad_loop.model import Phase
+
+    run_dir, spec_path = _reverify_run(tmp_path)
+    project = spec_path.parents[2]
+    head_before = git(project, "rev-parse", "HEAD")
+    before = load_state(run_dir).tasks[_REVERIFY_KEY]
+
+    outcome = runs.rearm_for_reverify(run_dir, project_root=project)
+
+    assert outcome.story_key == _REVERIFY_KEY
+    assert outcome.hold_resume is False
+    state = load_state(run_dir)
+    task = state.tasks[_REVERIFY_KEY]
+    assert task.phase == Phase.DEV_VERIFY
+    assert task.reverify_from == "deferred"
+    assert task.defer_reason is None
+    assert task.generation == before.generation + 1
+    assert task.review_cycle == 0 and task.followup_reviews_spent == 0
+    assert task.salvage_refile_pending is False
+    assert task.adopt_pending is False and task.rearmed is False
+    # the attempt product is the tree: nothing about it moves
+    assert task.baseline_commit == before.baseline_commit
+    assert task.attempt == 2
+    assert [s.task_id for s in task.sessions] == ["1-1-a-dev-2"]
+    assert task.board_advance_intended == "review"
+    assert git(project, "rev-parse", "HEAD") == head_before
+    # the pause is the caller's to clear
+    assert state.paused_stage == "escalation"
+    rows = _reverify_rows(run_dir)
+    assert len(rows) == 1
+    assert rows[0]["story_key"] == _REVERIFY_KEY
+    assert rows[0]["origin"] == "deferred"
+    assert rows[0]["baseline"] == before.baseline_commit
+    assert rows[0]["spec_restored"] is False
+
+
+def test_rearm_for_reverify_accepts_a_verify_env_fault_escalation(tmp_path):
+    from bmad_loop.model import Phase
+
+    run_dir, spec_path = _reverify_run(tmp_path, phase="escalated", env_fault_site="verify:dev")
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    task = load_state(run_dir).tasks[_REVERIFY_KEY]
+    assert task.phase == Phase.DEV_VERIFY
+    assert task.reverify_from == "escalated"
+    assert task.env_fault_site is None
+    assert _reverify_rows(run_dir)[0]["origin"] == "escalated"
+
+
+def test_rearm_for_reverify_clears_a_prior_post_replay_marker(tmp_path):
+    """DW-527: a prior replay's post-PROCEED marker belongs to that continuation;
+    the new re-arm latches `reverify_from` and clears the marker.
+
+    Ablation, performed: drop the `reverify_replayed = ""` in
+    `_rearm_for_reverify_locked` and this reddens."""
+    run_dir, spec_path = _reverify_run(tmp_path)
+
+    def edit(_state, task):
+        task.reverify_replayed = "escalated"
+
+    _edit_reverify_state(run_dir, edit)
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    task = load_state(run_dir).tasks[_REVERIFY_KEY]
+    assert task.reverify_from == "deferred" and task.reverify_replayed == ""
+
+
+def test_rearm_for_reverify_skips_plugin_workflow_sessions(tmp_path):
+    """A plugin workflow declaring `role = "dev"` (a post_dev_phase or
+    pre_commit_gate gate) is recorded under the dev role with no result payload;
+    it is not the attempt, so neither the dev-result lookup nor the latest-session
+    check reads it. Ablation, performed: drop the `not s.label` filter from
+    `latest_completed_dev_record` (or from the `last_dev` lookup) and this refuses."""
+    from bmad_loop.model import Phase, SessionRecord
+
+    run_dir, spec_path = _reverify_run(tmp_path)
+
+    def edit(_state, task):
+        task.sessions.append(
+            SessionRecord(
+                task_id="1-1-a-tea.gate-1",
+                role="dev",
+                status="completed",
+                label="tea.gate",
+            )
+        )
+
+    _edit_reverify_state(run_dir, edit)
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert load_state(run_dir).tasks[_REVERIFY_KEY].phase == Phase.DEV_VERIFY
+
+
+def test_rearm_for_reverify_restores_the_stashed_spec_byte_exact(tmp_path):
+    run_dir, spec_path = _reverify_run(tmp_path, spec="stashed")
+    stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)
+    assert not spec_path.exists()
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert spec_path.read_bytes() == _REVERIFY_SPEC_BYTES  # CRLF and all
+    assert stash.read_bytes() == _REVERIFY_SPEC_BYTES  # the stash is kept
+    row = _reverify_rows(run_dir)[0]
+    assert row["spec_restored"] is True
+    assert row["spec_file"] == str(spec_path)
+
+
+def test_rearm_for_reverify_restores_from_a_staged_copy_whose_landing_failed(tmp_path):
+    """DW-528: `Engine._defer` stages the spec beside its stash target before the
+    rollback and lands it after. When that landing fails after the reset took the live
+    spec, the staged copy is kept as the attempt's only version; the refusal gate
+    accepts it and the re-arm restores the spec from it, byte-exact.
+
+    Ablation, performed: read only the landed stash in `_deferred_stash_source` and
+    the re-arm refuses with "neither at"."""
+    run_dir, spec_path = _reverify_run(tmp_path, spec="stashed")
+    stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)
+    staged = runs.deferred_stash_staged_path(stash)
+    stash.rename(staged)
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert spec_path.read_bytes() == _REVERIFY_SPEC_BYTES
+    assert staged.read_bytes() == _REVERIFY_SPEC_BYTES  # kept, like a landed stash
+    assert _reverify_rows(run_dir)[0]["spec_restored"] is True
+
+
+def test_rearm_for_reverify_prefers_a_failed_landing_over_an_older_stash(tmp_path):
+    """A story that defers twice can hold the first defer's landed stash beside the
+    second defer's staged copy, kept because its landing failed after the reset. The
+    staged copy is the newer attempt, so the re-arm restores from it.
+
+    Ablation, performed: check the landed stash first in `_deferred_stash_source`
+    and the older stash's bytes are restored."""
+    run_dir, spec_path = _reverify_run(tmp_path, spec="stashed")
+    stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)
+    staged = runs.deferred_stash_staged_path(stash)
+    staged.write_bytes(_REVERIFY_SPEC_BYTES)
+    stash.write_bytes(b"---\nstatus: in-review\n---\nthe first defer's copy\n")
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert spec_path.read_bytes() == _REVERIFY_SPEC_BYTES
+    assert _reverify_rows(run_dir)[0]["spec_restored"] is True
+
+
+def test_rearm_for_reverify_keeps_an_operator_restored_spec(tmp_path):
+    """A spec the operator already put back wins over the stash: it may carry their
+    own edits, and the replay verifies what is on the tree."""
+    run_dir, spec_path = _reverify_run(tmp_path)
+    stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)
+    stash.parent.mkdir(parents=True)
+    stash.write_bytes(b"---\nstatus: in-review\n---\nthe older stashed copy\n")
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert spec_path.read_bytes() == _REVERIFY_SPEC_BYTES
+    assert _reverify_rows(run_dir)[0]["spec_restored"] is False
+
+
+def test_rearm_for_reverify_spec_restore_fault_is_a_rearm_error(tmp_path, monkeypatch):
+    """A spec-restore I/O fault (stash unreadable, disk full, an unconfined write)
+    surfaces as an actionable RearmError the CLI reports, not a bare OSError for
+    `main()`'s backstop; nothing is persisted.
+
+    Ablation, performed: drop the `except OSError` wrap in
+    `_rearm_for_reverify_locked` and this reddens on the bare OSError."""
+    from bmad_loop.journal import STATE_FILE
+
+    run_dir, spec_path = _reverify_run(tmp_path, spec="stashed")
+    state_before = (run_dir / STATE_FILE).read_bytes()
+
+    def disk_full(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs, "atomic_write_bytes_confined", disk_full)
+
+    with pytest.raises(runs.RearmError, match="re-run resolve --reverify") as exc:
+        runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert isinstance(exc.value.__cause__, OSError)
+    assert not spec_path.exists()
+    assert (run_dir / STATE_FILE).read_bytes() == state_before
+    assert _reverify_rows(run_dir) == []
+
+
+def test_rearm_for_reverify_rolls_back_the_restored_spec_when_save_fails(tmp_path, monkeypatch):
+    """An interrupt before the commit point leaves the tree as the re-arm found it:
+    the spec copy this call created is removed again, the stash and state untouched.
+
+    Ablation, performed: drop the `retrying_unlink(spec_path)` undo in
+    `_rearm_for_reverify_locked` and this reddens on the leftover spec."""
+    from bmad_loop.journal import STATE_FILE
+
+    run_dir, spec_path = _reverify_run(tmp_path, spec="stashed")
+    stash = runs.deferred_stash_path(run_dir, _REVERIFY_KEY, spec_path.name)
+    state_before = (run_dir / STATE_FILE).read_bytes()
+
+    def interrupted_save(_run_dir, _state):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runs, "save_state", interrupted_save)
+
+    with pytest.raises(KeyboardInterrupt):
+        runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+    assert not spec_path.exists()
+    assert stash.read_bytes() == _REVERIFY_SPEC_BYTES
+    assert (run_dir / STATE_FILE).read_bytes() == state_before
+    assert _reverify_rows(run_dir) == []
+
+
+def _git_reset_to_baseline(run_dir, project):
+    git(project, "reset", "-q", "--hard", load_state(run_dir).tasks[_REVERIFY_KEY].baseline_commit)
+
+
+def _baseline_off_head(run_dir, project):
+    git(project, "commit", "-q", "--allow-empty", "-m", "side")
+    side = git(project, "rev-parse", "HEAD")
+    git(project, "reset", "-q", "--hard", "HEAD~1")
+
+    def edit(_state, task):
+        task.baseline_commit = side
+
+    _edit_reverify_state(run_dir, edit)
+
+
+def _mounted(run_dir, project):
+    mount = project.parent / "wt"
+    mount.mkdir()
+
+    def edit(_state, task):
+        task.worktree_path = str(mount)
+        task.branch = "bmad-loop/r1/1-1-a"
+
+    _edit_reverify_state(run_dir, edit)
+
+
+def _later_story(run_dir, _project):
+    def edit(state, _task):
+        state.tasks["1-2-b"] = StoryTask(story_key="1-2-b", epic=1)
+
+    _edit_reverify_state(run_dir, edit)
+
+
+def _state_edit(fn):
+    return lambda run_dir, _project: _edit_reverify_state(run_dir, fn)
+
+
+def _crashed_fix_after_dev(run_dir, _project):
+    from bmad_loop.model import SessionRecord
+
+    def edit(_state, task):
+        task.sessions.append(SessionRecord(task_id="1-1-a-dev-2", role="dev", status="crashed"))
+
+    _edit_reverify_state(run_dir, edit)
+
+
+def _spec_gone(_run_dir, project):
+    (project / _REVERIFY_SPEC_REL).unlink()
+
+
+# Each row: (id, phase, env_fault_site, arrange, expected refusal fragment). Every row
+# was ablated by deleting its gating check in `runs.reverify_refusal` (the test then
+# re-arms instead of refusing).
+_REVERIFY_REFUSALS = [
+    (
+        "sweep_run",
+        "deferred",
+        None,
+        _state_edit(lambda s, _t: setattr(s, "run_type", "sweep")),
+        "not supported for sweep runs",
+    ),
+    (
+        "pause_names_another_story",
+        "deferred",
+        None,
+        _state_edit(lambda s, _t: setattr(s, "paused_story_key", "9-9-z")),
+        "is not paused on story 1-1-a",
+    ),
+    ("later_story_picked", "deferred", None, _later_story, "a later story was picked"),
+    ("tree_at_baseline", "deferred", None, None, "holds nothing above"),
+    (
+        "no_completed_dev_result",
+        "deferred",
+        None,
+        _state_edit(lambda _s, t: setattr(t.sessions[0], "result_json", None)),
+        "no completed dev session result",
+    ),
+    # a fix session (recorded under the dev role) crashed after the completed dev
+    # pass: the tree holds its partial work, which the earlier result does not describe
+    ("latest_dev_session_failed", "deferred", None, _crashed_fix_after_dev, "ended crashed"),
+    ("missing_spec_no_stash", "deferred", None, _spec_gone, "neither at"),
+    (
+        "escalation_without_reverifiable_site",
+        "escalated",
+        None,
+        None,
+        "a verify replay cannot clear",
+    ),
+    (
+        "dispatch_site_escalation",
+        "escalated",
+        "probe:dispatch:dev",
+        None,
+        "a verify replay cannot clear",
+    ),
+    (
+        "plan_review_owed",
+        "deferred",
+        None,
+        _state_edit(lambda _s, t: setattr(t, "plan_review_owed", True)),
+        "still owes a plan review",
+    ),
+    (
+        "moved_repo_root",
+        "deferred",
+        None,
+        _state_edit(lambda s, _t: setattr(s, "repo_root", str(Path(s.project).parent / "was"))),
+        "code root in the BMAD config has changed",
+    ),
+    ("baseline_not_ancestor_of_head", "deferred", None, _baseline_off_head, "is not an ancestor"),
+    # a mount directory that is not (or no longer) a registered worktree of the code root
+    ("unregistered_mount", "deferred", None, _mounted, "is no longer a worktree of"),
+]
+
+
+@pytest.mark.parametrize(
+    ("phase", "site", "arrange", "fragment"),
+    [pytest.param(*row[1:], id=row[0]) for row in _REVERIFY_REFUSALS],
+)
+def test_rearm_for_reverify_refuses(tmp_path, phase, site, arrange, fragment):
+    """Every refusal is raised before anything is written: state.json byte-identical,
+    no journal row, the spec where it was."""
+    from bmad_loop.journal import STATE_FILE
+
+    run_dir, spec_path = _reverify_run(tmp_path, phase=phase, env_fault_site=site)
+    project = spec_path.parents[2]
+    if arrange is None and fragment == "holds nothing above":
+        arrange = _git_reset_to_baseline
+    if arrange is not None:
+        arrange(run_dir, project)
+    state_before = (run_dir / STATE_FILE).read_bytes()
+
+    # the story is named explicitly, as `--story` would: with no key the call targets
+    # the paused story, so the pause-names-another-story row is reachable only so
+    with pytest.raises(runs.RearmError, match=re.escape(fragment)):
+        runs.rearm_for_reverify(run_dir, _REVERIFY_KEY, project_root=project)
+
+    assert (run_dir / STATE_FILE).read_bytes() == state_before
+    assert _reverify_rows(run_dir) == []
+
+
+def test_rearm_for_reverify_refusal_names_the_preserve_ref(tmp_path):
+    run_dir, spec_path = _reverify_run(tmp_path)
+    project = spec_path.parents[2]
+    _git_reset_to_baseline(run_dir, project)
+    _edit_reverify_state(
+        run_dir, lambda _s, t: setattr(t, "preserve_ref", "refs/bmad-loop/preserve/r1/1-1-a")
+    )
+
+    with pytest.raises(runs.RearmError, match="parked at refs/bmad-loop/preserve/r1/1-1-a"):
+        runs.rearm_for_reverify(run_dir, project_root=project)
+
+
+def test_rearm_for_reverify_locked_body_holds_the_run_lock_through_save(tmp_path, monkeypatch):
+    run_dir, spec_path = _reverify_run(tmp_path)
+    real_save = runs.save_state
+
+    def checked_save(target, state):
+        assert_run_state_lock_held(target)
+        real_save(target, state)
+
+    monkeypatch.setattr(runs, "save_state", checked_save)
+
+    runs.rearm_for_reverify(run_dir, project_root=spec_path.parents[2])
+
+
+# --------------------------- standalone_replay_refusal: finished runs (DW-525)
+
+
+def _finished_mounted_run(tmp_path):
+    """`_reverify_run`'s attempt moved into a kept worktree unit of a FINISHED
+    isolated run: a registered worktree on the unit branch under the run dir, holding
+    a committed change above the baseline and the spec — the shape a deferred unit
+    leaves behind under `scm.keep_failed`. Returns (run_dir, project, worktree)."""
+    run_dir, spec_path = _reverify_run(tmp_path)
+    project = spec_path.parents[2]
+    state = load_state(run_dir)
+    task = state.tasks[_REVERIFY_KEY]
+    branch = f"bmad-loop/r1/{_REVERIFY_KEY}"
+    wt = run_dir / "worktrees" / _REVERIFY_KEY
+    wt.parent.mkdir(parents=True)
+    git(project, "worktree", "add", "-q", "-b", branch, str(wt), task.baseline_commit or "")
+    (wt / "unit.py").write_text("print('unit attempt')\n", encoding="utf-8")
+    git(wt, "add", "unit.py")
+    git(wt, "commit", "-q", "-m", "unit attempt")
+    spec = wt / _REVERIFY_SPEC_REL
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_bytes(_REVERIFY_SPEC_BYTES)
+    _write_board(project, "review")
+    task.worktree_path = str(wt)
+    task.branch = branch
+    state.clear_pause()
+    state.finished = True
+    state.target_branch = "main"
+    save_state(run_dir, state)
+    return run_dir, project, wt
+
+
+def _write_board(project, status):
+    """The main checkout's sprint board, holding `_REVERIFY_KEY` at `status`."""
+    board = project / "_bmad-output" / "implementation-artifacts" / "sprint-status.yaml"
+    board.write_text(
+        f"development_status:\n  epic-1: in-progress\n  {_REVERIFY_KEY}: {status}\n",
+        encoding="utf-8",
+    )
+    return board
+
+
+def _standalone_refusal(run_dir, project):
+    state = load_state(run_dir)
+    return runs.standalone_replay_refusal(
+        state,
+        state.tasks[_REVERIFY_KEY],
+        _REVERIFY_KEY,
+        run_dir=run_dir,
+        project_root=project,
+    )
+
+
+def test_standalone_replay_admits_a_finished_runs_kept_unit(tmp_path):
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    assert _standalone_refusal(run_dir, project) is None
+
+
+def _remove_worktree(run_dir, project):
+    wt = Path(load_state(run_dir).tasks[_REVERIFY_KEY].worktree_path)
+    git(project, "worktree", "remove", "--force", str(wt))
+
+
+def _detach_worktree(run_dir, _project):
+    git(Path(load_state(run_dir).tasks[_REVERIFY_KEY].worktree_path), "checkout", "-q", "--detach")
+
+
+# Each row: (id, arrange, expected refusal fragment). The first six gate the shape
+# only a finished isolated story run can hand over; the rest are the shared
+# `_reverify_task_refusal` / `_mounted_reverify_refusal` arms, reached with the
+# finished-run remedy.
+_STANDALONE_REFUSALS = [
+    ("not_finished", _state_edit(lambda s, _t: setattr(s, "finished", False)), "is not finished"),
+    ("sweep_run", _state_edit(lambda s, _t: setattr(s, "run_type", "sweep")), "sweep run"),
+    ("stories_mode", _state_edit(lambda s, _t: setattr(s, "source", "stories")), "stories-mode"),
+    (
+        "unknown_source",
+        _state_edit(lambda s, _t: setattr(s, "source", "legacy-src")),
+        "legacy-src-mode",
+    ),
+    (
+        "not_deferred",
+        _state_edit(lambda _s, t: setattr(t, "phase", Phase.DONE)),
+        "is not deferred (phase: done)",
+    ),
+    ("in_place", _state_edit(lambda _s, t: setattr(t, "worktree_path", "")), "deferred in place"),
+    (
+        "no_target_branch",
+        _state_edit(lambda s, _t: setattr(s, "target_branch", "")),
+        "no target branch",
+    ),
+    (
+        "no_completed_dev_result",
+        _state_edit(lambda _s, t: setattr(t.sessions[0], "result_json", None)),
+        "no completed dev session result",
+    ),
+    (
+        "plan_review_owed",
+        _state_edit(lambda _s, t: setattr(t, "plan_review_owed", True)),
+        "still owes a plan review",
+    ),
+    ("worktree_gone", _remove_worktree, "is gone"),
+    ("detached", _detach_worktree, "detached HEAD"),
+]
+
+
+@pytest.mark.parametrize(
+    ("arrange", "fragment"),
+    [pytest.param(*row[1:], id=row[0]) for row in _STANDALONE_REFUSALS],
+)
+def test_standalone_replay_refuses(tmp_path, arrange, fragment):
+    """Every refusal row names its reason; none tells the operator to run a bare
+    `bmad-loop resolve <run>` (resolve refuses a finished run) — the remedy points at
+    recovering the work by hand.
+
+    Ablation: delete the `wt.is_dir()` check in `runs._mounted_reverify_refusal` and
+    the worktree-gone row fails (it falls to the registration check's message);
+    delete the `current_branch` check there and the detached row is admitted.
+    Setting the stories source's `replay` trait to True (`worksource.TRAITS`) admits
+    the stories-mode row; narrowing the source allowlist back to a `== "stories"`
+    denylist admits the unknown-source row through the sprint-board read (both
+    performed)."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    arrange(run_dir, project)
+
+    refusal = _standalone_refusal(run_dir, project)
+
+    assert refusal is not None and fragment in refusal
+    assert "`bmad-loop resolve r1`" not in refusal
+
+
+def test_standalone_replay_remedy_names_the_branch_and_saved_patch(tmp_path):
+    """A torn-down unit's refusal points at the branch and the diff the teardown
+    saved, not at a re-arm."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    _remove_worktree(run_dir, project)
+    patch = run_dir / "failed" / _REVERIFY_KEY / "changes.patch"
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff\n", encoding="utf-8")
+
+    refusal = _standalone_refusal(run_dir, project)
+
+    assert refusal is not None
+    assert "recover the work by hand" in refusal
+    assert f"bmad-loop/r1/{_REVERIFY_KEY}" in refusal and str(patch) in refusal
+
+
+def test_standalone_replay_refusal_says_an_unreadable_journal_skipped_the_handoff_check(
+    tmp_path,
+):
+    """An undecodable journal cannot rule out an earlier replay hand-off, so a
+    torn-down-unit refusal says so rather than passing for a plain teardown.
+
+    Ablation: drop the `entries is None` clause in `runs.standalone_replay_refusal`
+    and the refusal no longer mentions the journal."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    _remove_worktree(run_dir, project)
+    with (run_dir / "journal.jsonl").open("ab") as f:
+        f.write(b"\xff\xfe not utf-8\n")
+
+    refusal = _standalone_refusal(run_dir, project)
+
+    assert refusal is not None and "is gone" in refusal
+    assert "journal could not be read" in refusal
+
+
+@pytest.mark.parametrize("status", ["backlog", "in-progress", "review", "awaiting-operator"])
+def test_standalone_replay_admits_a_story_not_done_on_the_board(tmp_path, status):
+    """Only a done row refuses (DW-533); any earlier row leaves the replay admitted."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    _write_board(project, status)
+
+    assert _standalone_refusal(run_dir, project) is None
+
+
+def test_standalone_replay_refuses_a_story_already_done_on_the_board(tmp_path):
+    """A later run re-drove and finished the story, so the kept unit is superseded work
+    a replay must not merge (DW-533).
+
+    Ablation: delete the `board_status == "done"` check in
+    `runs.standalone_replay_refusal` and the replay is admitted."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    _write_board(project, "done")
+
+    refusal = _standalone_refusal(run_dir, project)
+
+    assert refusal is not None
+    assert f"story {_REVERIFY_KEY} is already done on the sprint board" in refusal
+    assert "recover the work by hand" in refusal
+    assert "`bmad-loop resolve r1`" not in refusal
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        pytest.param(lambda board: board.unlink(), id="missing"),
+        pytest.param(lambda board: board.write_bytes(b"\xff\xfe not utf-8\n"), id="undecodable"),
+        pytest.param(lambda board: board.write_text("[1, 2]\n", encoding="utf-8"), id="no-map"),
+    ],
+)
+def test_standalone_replay_refuses_when_the_board_cannot_be_read(tmp_path, corrupt):
+    """A board that cannot be read cannot rule out a done row, so the replay fails
+    closed with a refusal naming the board (DW-533).
+
+    Ablation: make the `except` arm in `runs.standalone_replay_refusal` fall through
+    and the replay is admitted."""
+    run_dir, project, _wt = _finished_mounted_run(tmp_path)
+    board = _write_board(project, "review")
+    corrupt(board)
+
+    refusal = _standalone_refusal(run_dir, project)
+
+    assert refusal is not None
+    assert f"cannot read the sprint board at {board}" in refusal
+    assert "recover the work by hand" in refusal
+
+
+# ------------------------------------- by-name operations in a shared registry (#729)
+
+
+class _SharedRegistryMux:
+    """A namespacing backend whose registry in force is `root` — an operator's
+    honoured root another project may share. Only what the ownership gate and
+    the by-name verbs reach."""
+
+    def __init__(self, root, sessions, tags, *, list_fault=None, namespaced=True):
+        self._root = root
+        self._sessions = list(sessions)
+        self._tags = dict(tags)
+        self._list_fault = list_fault
+        self._namespaced = namespaced
+        self.killed: list[str] = []
+
+    def has_registry_namespace(self):
+        return self._namespaced
+
+    def registry_root(self):
+        return self._root
+
+    def session_name_key(self, name):
+        return name
+
+    def list_sessions_reporting(self, *, on_fault=None):
+        if self._list_fault is not None:
+            assert on_fault is not None
+            on_fault(self._list_fault)
+            return []
+        return list(self._sessions)
+
+    def session_options(self, _option):
+        return dict(self._tags)
+
+    def has_session(self, name):
+        return name in self._sessions
+
+    def kill_session(self, name):
+        self.killed.append(name)
+
+
+def _shared(monkeypatch, project, mux):
+    """Point the module-level seam at `mux` and record `project` as configured,
+    as `cli._configure_mux` does ahead of every command."""
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: mux)
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", project)
+    return mux
+
+
+_FOREIGN_TAG = "0123456789abcdef"
+
+
+def _foreign_r1(tmp_path):
+    return _SharedRegistryMux(
+        str(tmp_path / "shared"), ["bmad-loop-r1"], {"bmad-loop-r1": _FOREIGN_TAG}
+    )
+
+
+def _own_r1(tmp_path):
+    return _SharedRegistryMux(
+        str(tmp_path / "shared"), ["bmad-loop-r1"], {"bmad-loop-r1": runs.project_tag(tmp_path)}
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "refused"),
+    [
+        ("ours", False),
+        ("foreign", True),
+        ("untagged", True),
+        ("absent", False),
+        ("listing-fault", True),
+        ("no-project", True),
+    ],
+)
+def test_foreign_session_refusal_in_a_shared_registry(tmp_path, monkeypatch, case, refused):
+    """In a registry that is not this project's derived root, a same-named
+    session is this project's only on its tag. "Could not ask" and "no project
+    configured" refuse rather than read as absent.
+
+    Ablate the tag comparison and `foreign`/`untagged` stop refusing; ablate the
+    listing-fault arm and `listing-fault` stops refusing; ablate the
+    no-project arm and `no-project` stops refusing."""
+    name = "bmad-loop-r1"
+    tag = {"ours": runs.project_tag(tmp_path), "foreign": _FOREIGN_TAG}.get(case)
+    mux = _SharedRegistryMux(
+        str(tmp_path / "shared"),
+        [] if case == "absent" else [name],
+        {name: tag} if tag else {},
+        list_fault="list-sessions failed: rc 1" if case == "listing-fault" else None,
+    )
+    _shared(monkeypatch, None if case == "no-project" else tmp_path, mux)
+
+    assert (runs.foreign_session_refusal(name) is not None) is refused
+
+
+@pytest.mark.parametrize("where", ["derived", "default", "tmux"])
+def test_foreign_session_refusal_stays_out_of_a_registry_that_proves_ownership(
+    tmp_path, monkeypatch, where
+):
+    """The derived root proves ownership by construction, so no tag is read
+    there; psmux's own default registry (the pre-existing degrade arm) and tmux
+    keep their historical by-name behaviour. A foreign tag on the session makes
+    the point: it is never consulted.
+
+    Ablate the `root == derived` early return and the `derived` row refuses."""
+    name = "bmad-loop-r1"
+    root = {"derived": str(runs.mux_registry_root(tmp_path)), "default": None}.get(where)
+    mux = _SharedRegistryMux(root, [name], {name: _FOREIGN_TAG}, namespaced=where != "tmux")
+    _shared(monkeypatch, tmp_path, mux)
+
+    assert runs.foreign_session_refusal(name) is None
+
+
+def test_kill_session_leaves_another_projects_session_in_a_shared_registry(
+    tmp_path, monkeypatch, capsys
+):
+    """The chokepoint every by-name kill routes through: resume's stale-session
+    drop, stop's backstop, the engine's teardowns. In a shared registry a
+    neighbour's tagged `bmad-loop-r1` stays, and the refusal is said.
+
+    Ablate the gate in `kill_session` and it is killed."""
+    mux = _shared(monkeypatch, tmp_path, _foreign_r1(tmp_path))
+
+    runs.kill_session("r1")
+
+    assert mux.killed == []
+    assert "killing bmad-loop-r1 refused" in capsys.readouterr().err
+
+
+def test_kill_session_still_kills_its_own_session_in_a_shared_registry(tmp_path, monkeypatch):
+    mux = _shared(monkeypatch, tmp_path, _own_r1(tmp_path))
+
+    runs.kill_session("r1")
+
+    assert mux.killed == ["bmad-loop-r1"]
+
+
+def test_stop_run_backstop_leaves_another_projects_session(tmp_path, monkeypatch, capsys):
+    """Stop's backstop kill goes through the gated chokepoint, so stopping this
+    project's `r1` never takes a neighbour's same-named session with it."""
+    mux = _shared(monkeypatch, tmp_path, _foreign_r1(tmp_path))
+    run_dir = _make_state_run(tmp_path, "r1")  # no engine.pid -> legacy/dead
+
+    assert runs.stop_run(run_dir) is True
+    assert mux.killed == []
+    assert "refused" in capsys.readouterr().err
+
+
+def test_session_liveness_does_not_read_another_projects_session_as_alive(
+    tmp_path, monkeypatch, capsys
+):
+    """A same-named session in a shared registry proves nothing about this run:
+    'unknown', not 'alive', which would refuse this run's resume and delete
+    and hide it from cleanup. 'unknown' alone cannot tell a refused probe from an
+    absent session, so the refusal is warned about.
+
+    Ablate the gate in `_session_liveness` and the first assert reads 'alive';
+    ablate the warning and stderr is empty."""
+    monkeypatch.setattr(runs, "mux_usable", lambda _m: True)
+    _shared(monkeypatch, tmp_path, _foreign_r1(tmp_path))
+    assert runs._session_liveness("r1") == "unknown"
+    assert "reading bmad-loop-r1 as this run's refused" in capsys.readouterr().err
+
+    _shared(monkeypatch, tmp_path, _own_r1(tmp_path))
+    assert runs._session_liveness("r1") == "alive"
+
+
+def test_export_records_the_project_it_configured(tmp_path, monkeypatch):
+    """The gate's project comes from the export, recorded even when the
+    derivation fails (the degrade arm still needs a project to prove a tag
+    against).
+
+    Ablate the assignment in `export_psmux_registry_root` and both fail."""
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    runs.export_psmux_registry_root(tmp_path)
+    assert runs._SETTLED_PROJECT == tmp_path
+
+    other = tmp_path / "other"
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", None)
+
+    def boom(_project):
+        raise runs.StateRootError("no state root")
+
+    monkeypatch.setattr(runs, "mux_registry_root", boom)
+    assert runs.export_psmux_registry_root(other) is None
+    assert runs._SETTLED_PROJECT == other
+
+
+def test_foreign_session_refusal_matches_through_the_registrys_name_key(tmp_path, monkeypatch):
+    """psmux folds session-name case, so a foreign-tagged `bmad-loop-R1` IS the
+    session a kill of `bmad-loop-r1` would reach.
+
+    Ablate the `session_name_key` comparisons (match names exactly) and the gate
+    sees no such session and lets the kill through."""
+    mux = _SharedRegistryMux(
+        str(tmp_path / "shared"), ["bmad-loop-R1"], {"bmad-loop-R1": _FOREIGN_TAG}
+    )
+    mux.session_name_key = lambda name: name.lower()
+    _shared(monkeypatch, tmp_path, mux)
+
+    assert runs.foreign_session_refusal("bmad-loop-r1") is not None
+
+
+def test_kill_session_reports_whether_it_sent_the_kill(tmp_path, monkeypatch):
+    """`False` for a refused kill, which is also queued for a frontend that cannot
+    read stderr (the TUI's cleanup worker drains it).
+
+    Ablate the `_REFUSED_KILLS.append` and the drain comes back empty."""
+    _shared(monkeypatch, tmp_path, _foreign_r1(tmp_path))
+    assert runs.kill_session("r1") is False
+    drained = runs.drain_refused_kills()
+    assert len(drained) == 1 and "tagged for another project" in drained[0]
+    assert runs.drain_refused_kills() == []
+
+    _shared(monkeypatch, tmp_path, _own_r1(tmp_path))
+    assert runs.kill_session("r1") is True
+
+
+def test_prune_sessions_does_not_count_a_refused_kill_as_removed(tmp_path, monkeypatch):
+    """The partition judged the session ours, then the ownership gate refused the
+    kill (a listing that faulted in between): cleanup must not report it as
+    removed while it runs on.
+
+    Ablate the `kill_session(run_id) is not False` filter in `prune_sessions` and
+    `r1` is reported killed."""
+    monkeypatch.setattr(runs, "prunable_sessions", lambda _p, *_a, **_k: (["r1"], [], {"r1"}))
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: False)
+
+    assert runs.prune_sessions(tmp_path) == ([], [], set())
+
+
+# ------------------------------------------- session_scan_error (#864)
+
+
+def test_session_scan_error_names_a_live_run_behind_an_unavailable_backend(tmp_path, monkeypatch):
+    # The listing behind the prune reads a missing backend as no sessions; with
+    # a live run of this project that is not a clean answer and must be named.
+    run_dir = _make_run(tmp_path, "live-1")
+    monkeypatch.setattr(runs, "mux_usable", lambda _mux: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda rd: "alive" if rd == run_dir else "dead")
+    err = runs.session_scan_error(tmp_path)
+    assert err is not None
+    assert "unavailable" in err and "live run live-1" in err
+
+
+def test_session_scan_error_names_an_unreadable_run_listing(tmp_path, monkeypatch):
+    # An unreadable listing may hide a live run: reported, not read as clean.
+    monkeypatch.setattr(runs, "mux_usable", lambda _mux: False)
+    monkeypatch.setattr(runs, "_run_dir_names", lambda _p: (None, "runs: cannot list"))
+    err = runs.session_scan_error(tmp_path)
+    assert err is not None and "runs: cannot list" in err
+
+
+def test_session_scan_error_is_silent_without_evidence(tmp_path, monkeypatch):
+    # A host with no multiplexer and nothing of ours running: no report.
+    _make_run(tmp_path, "fin-1")
+    monkeypatch.setattr(runs, "mux_usable", lambda _mux: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    assert runs.session_scan_error(tmp_path) is None
+
+
+def test_session_scan_error_is_silent_for_a_usable_backend(tmp_path, monkeypatch):
+    # A forced backend counts as usable even when its probe fails, so the real
+    # mux_usable answers True here and a live run reports nothing.
+    from bmad_loop.adapters import multiplexer
+
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "tmux")
+    multiplexer.get_multiplexer.cache_clear()
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(multiplexer, "_FORCED_UNUSABLE_WARNED", True)
+    _make_run(tmp_path, "live-1")
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    try:
+        assert runs.session_scan_error(tmp_path) is None
+    finally:
+        multiplexer.get_multiplexer.cache_clear()
+
+
+def test_session_scan_error_names_a_run_whose_liveness_is_unknown(tmp_path, monkeypatch):
+    # An unverifiable pid may be a live engine: evidence, not absence.
+    _make_run(tmp_path, "odd-1")
+    monkeypatch.setattr(runs, "mux_usable", lambda _mux: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
+    err = runs.session_scan_error(tmp_path)
+    assert err is not None and "run odd-1 whose engine may be live" in err
+
+
+def test_session_scan_error_sees_a_live_run_that_lost_its_state_file(tmp_path, monkeypatch):
+    # The listing is ungated: a run whose state.json is gone still holds its pid.
+    run_dir = _make_run(tmp_path, "live-1", with_state=False)
+    monkeypatch.setattr(runs, "mux_usable", lambda _mux: False)
+    monkeypatch.setattr(runs, "engine_liveness", lambda rd: "alive" if rd == run_dir else "dead")
+    err = runs.session_scan_error(tmp_path)
+    assert err is not None and "live run live-1" in err
+
+
+@pytest.mark.parametrize(
+    ("recorded_project", "recorded_root", "live_project", "expected"),
+    [
+        # default config: the code root is the project, so it follows the move
+        ("{gone}/repo", "{gone}/repo", "{tmp}/new/repo", "{tmp}/new/repo"),
+        # monorepo override, whole repository renamed: the recorded offset is kept
+        ("{gone}/repo/app", "{gone}/repo", "{tmp}/new/repo/app", "{tmp}/new/repo"),
+        ("{gone}/repo/a/b", "{gone}/repo", "{tmp}/x/a/b", "{tmp}/x"),
+        # the live project no longer ends in the recorded offset: left as recorded
+        ("{gone}/repo/app", "{gone}/repo", "{tmp}/new/repo/web", "{gone}/repo"),
+        # unmoved
+        ("{gone}/repo/app", "{gone}/repo", "{gone}/repo/app", "{gone}/repo"),
+        # an external root (neither ancestor nor descendant) is never moved
+        ("{gone}/repo/app", "{gone}/elsewhere", "{tmp}/new/repo/app", "{gone}/elsewhere"),
+        # a code root under the project follows it like any project-owned path
+        ("{gone}/proj", "{gone}/proj/code", "{tmp}/moved", "{tmp}/moved/code"),
+    ],
+)
+def test_rebase_recorded_code_root(
+    tmp_path, recorded_project, recorded_root, live_project, expected
+):
+    """A finished run's launch-time code root located on the live project. An ancestor
+    root (`repo_root` above the project) follows a renamed repository by the recorded
+    project offset; anything the live project cannot vouch for stays as recorded.
+
+    Ablation: return `rebase_recorded_project_path(recorded, …)` for every shape and
+    the two renamed-repository rows keep the gone root."""
+    gone = tmp_path / "gone"
+
+    def fill(spelling: str) -> str:
+        return spelling.format(gone=gone, tmp=tmp_path)
+
+    state = RunState(
+        run_id="r",
+        project=fill(recorded_project),
+        repo_root=fill(recorded_root),
+        started_at="now",
+    )
+    assert runs.rebase_recorded_code_root(state, Path(fill(live_project))) == Path(fill(expected))
+
+
+def test_rebase_recorded_code_root_keeps_an_ancestor_root_that_still_exists(tmp_path):
+    """The project moved INSIDE a repository that stayed put (``repo/app`` →
+    ``repo/sub/app``): the live project still ends in the recorded offset, but the
+    recorded root is still a directory, so it is kept rather than re-derived as
+    ``repo/sub``.
+
+    Ablation: drop the `recorded.is_dir()` clause and the answer is ``repo/sub``."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state = RunState(run_id="r", project=str(repo / "app"), repo_root=str(repo), started_at="now")
+    assert runs.rebase_recorded_code_root(state, repo / "sub" / "app") == repo
+
+
+# ------------------------------------------- sweep closes a run still holds (DW-571)
+
+
+def _seam():
+    """The DW-569/571 seam helpers live with the sweep suite that owns them."""
+    import test_sweep
+
+    return test_sweep
+
+
+@pytest.mark.parametrize(
+    ("fixture", "layout"),
+    [("project_v7_store_repo", "T3"), ("project_v7_external_store", "T4")],
+)
+def test_held_sweep_closes_names_an_unresumed_isolated_close(request, fixture, layout):
+    """DW-571, the original gap. An isolated T3/T4 sweep run paused after accepted
+    dev and never resumed leaves DW-1 `done` in the shared ledger. No later sweep
+    re-bundles it, and the discovery reports it."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(request.getfixturevalue(fixture), layout)
+
+    assert not ts.ledger_entries(paths)["DW-1"].open
+    assert "DW-1" not in deferredwork.open_ids(paths.deferred_work.read_text(encoding="utf-8"))
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == ["DW-1"]
+
+
+def test_held_sweep_closes_counts_a_target_branch_as_isolation(project_v7_store_repo):
+    """`state.target_branch` alone marks the run isolated, as `worktree_path` does
+    for one task.
+
+    Ablation: key isolation on `task.worktree_path` alone and this fails."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo, worktree=False)
+    engine.state.target_branch = "main"
+    engine._save()
+
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == ["DW-1"]
+
+
+def _rewrite_state(engine, **changes) -> None:
+    for key, value in changes.items():
+        setattr(engine.state, key, value)
+    engine._save()
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "landed",
+        "landed-parked",
+        "not-isolated",
+        "finished",
+        "story-run",
+        "no-close-intended",
+    ],
+)
+def test_held_sweep_closes_ignores_a_run_that_holds_nothing(project_v7_store_repo, shape):
+    """Each row breaks one condition of "holds": the task landed (DONE or
+    AWAITING_OPERATOR, merged back), the run is not isolated, the run finished,
+    the run is not a sweep, or no close was ever intended. The close stays `done`
+    in every row, so only the condition answers `[]`.
+
+    Ablation: make `_bundle_code_landed` answer False and both "landed" rows fail;
+    delete the isolation predicate and "not-isolated" fails; delete the
+    `state.finished` check and "finished" fails; delete the `run_type` check and
+    "story-run" fails."""
+    ts = _seam()
+    seam = {
+        "landed": {"phase": Phase.DONE},
+        "landed-parked": {"phase": Phase.AWAITING_OPERATOR},
+        "not-isolated": {"worktree": False},
+        "no-close-intended": {"intended": False},
+    }.get(shape, {})
+    engine, paths, *_, task = ts._held_sweep_run(project_v7_store_repo, **seam)
+    if shape.startswith("landed"):
+        task.isolated_ledger_carried = True  # the merge-back's latch
+        engine._save()
+    if shape == "finished":
+        _rewrite_state(engine, finished=True)
+    elif shape == "story-run":
+        _rewrite_state(engine, run_type="story")
+    assert not ts.ledger_entries(paths)["DW-1"].open  # premise: the close stands
+
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == []
+
+
+@pytest.mark.parametrize("phase", [Phase.DONE, Phase.AWAITING_OPERATOR])
+def test_held_sweep_closes_names_a_terminal_unit_not_yet_merged_back(project_v7_store_repo, phase):
+    """An isolated unit saves its terminal phase BEFORE `integrate_unit` merges it
+    back. A host lost between the two leaves a DONE (or AWAITING_OPERATOR) task
+    with `isolated_ledger_carried` False: its code is not on the target, and only
+    a resume replays the merge, so the run still holds its close.
+
+    Ablation: key landing on the phase alone (drop the `isolated_ledger_carried`
+    clause of `_bundle_code_landed`) and this fails."""
+    ts = _seam()
+    engine, paths, *_, task = ts._held_sweep_run(project_v7_store_repo, phase=phase)
+    assert not task.isolated_ledger_carried  # premise: the merge-back never latched
+
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == ["DW-1"]
+
+
+def test_held_sweep_closes_ignores_a_close_already_reopened(project_v7_store_repo):
+    """Once the close is undone (the escalation reopen ran), nothing is held.
+
+    Ablation: return the task's `bundle_closes_intended` instead of
+    `held_reopenable_closes` and this fails."""
+    ts = _seam()
+    engine, paths, _store, _rel, task = ts._held_sweep_run(project_v7_store_repo)
+    reopened = deferredwork.mark_open_many(
+        paths.deferred_work,
+        task.dw_ids,
+        engine._bundle_close_note(task),
+        engine._bundle_close_operation_id(task),
+    )
+    assert reopened == ["DW-1"]  # premise
+
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == []
+
+
+@pytest.mark.parametrize("switched", [False, True])
+def test_held_sweep_closes_ignores_a_ledger_in_the_checkout(project_v7, switched):
+    """T1: the store is tracked in the code checkout, so an isolated bundle's
+    close lives in the unit worktree's copy and dies with it. A close in this
+    checkout's ledger under the run's identity is not held, and that stays true
+    after the active initiative is switched: with no shared store there is
+    nothing a switch could hide.
+
+    Ablation: delete the `in_shared_store` check and the unswitched case fails;
+    delete the `shared_store is None` early return and the switched case fails
+    (the initiative conflict reads as "unknown")."""
+    from conftest import V7_USER_CONFIG_REL
+
+    ts = _seam()
+    paths = ts._v7_paths(project_v7)
+    ts.write_ledger(paths, {"DW-1": "open"})
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == "T1"
+    engine, _ = ts.make_sweep(paths, [], store_topology=topology.to_dict(), run_id=ts.HELD_RUN_ID)
+    assert not engine.paths.in_shared_store(engine.paths.deferred_work)  # premise
+    task = StoryTask(
+        story_key="dw-fix-things",
+        epic=0,
+        dw_ids=["DW-1"],
+        phase=Phase.DEV_VERIFY,
+        worktree_path=str(paths.repo_root.parent / "unit"),
+        bundle_closes_intended=["DW-1"],
+    )
+    engine.state.tasks[task.story_key] = task
+    deferredwork.mark_done_many_reopenable(
+        paths.deferred_work,
+        task.dw_ids,
+        engine._today(),
+        engine._bundle_close_note(task),
+        engine._bundle_close_operation_id(task),
+    )
+    engine.state.initiative = paths.active_initiative  # the pin `compose_sweep` records
+    engine._save()
+    assert not ts.ledger_entries(paths)["DW-1"].open  # premise
+    if switched:
+        (paths.project / V7_USER_CONFIG_REL).write_text(
+            '[core]\nactive_initiative = "another-initiative"\n', encoding="utf-8"
+        )
+
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == []
+
+
+def test_held_sweep_closes_reads_absence_as_nothing_held(project_v7_store_repo):
+    """An absent `state.json` has no record of a close, and an absent ledger holds
+    none: both answer `[]`, never "unknown"."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    paths.deferred_work.unlink()
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == []
+
+    (engine.run_dir / "state.json").unlink()
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == []
+
+
+@pytest.mark.parametrize("fault", ["state", "ledger", "topology"])
+def test_held_sweep_closes_never_folds_a_fault_into_nothing_held(project_v7_store_repo, fault):
+    """A present but unreadable `state.json`, a ledger that does not decode, and a
+    recorded store topology that does not parse each raise
+    `HeldClosesUnknownError`. None of them is "none held".
+
+    Ablation: answer `[]` from any one of the three arms (the state `except
+    Exception`, the `observe_ledger` fault check, the config/topology `except`)
+    and its row fails."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    if fault == "state":
+        (engine.run_dir / "state.json").write_text("{not json", encoding="utf-8")
+    elif fault == "ledger":
+        paths.deferred_work.write_bytes(b"\xff\xfe not utf-8\n")
+    else:
+        _rewrite_state(engine, store_topology={"layout": "T3"})
+
+    with pytest.raises(runs.HeldClosesUnknownError):
+        runs.held_sweep_closes(paths.project, engine.run_dir)
+
+
+def test_prior_sweep_closes_skips_the_new_run_and_live_runs(project_v7_store_repo, monkeypatch):
+    """The sweep-start scan reports a held run, but not the run named by
+    `exclude` (the new sweep), and not a live run whose close is still in
+    flight.
+
+    Ablation: drop the `engine_liveness` skip and the live row fails; drop the
+    `exclude` skip and the excluded row fails."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    project = paths.project
+
+    assert runs.prior_sweep_closes(project, exclude="other") == [
+        runs.PriorSweepCloses(ts.HELD_RUN_ID, ("DW-1",))
+    ]
+    assert runs.prior_sweep_closes(project, exclude=ts.HELD_RUN_ID) == []
+    monkeypatch.setattr(
+        runs, "engine_liveness", lambda rd: "alive" if rd == engine.run_dir else "dead"
+    )
+    assert runs.prior_sweep_closes(project, exclude="other") == []
+
+
+def test_prior_sweep_closes_reports_an_unlistable_runs_dir_as_a_fault(tmp_path, monkeypatch):
+    """A runs dir that cannot be listed gives one fault row with no run id, never
+    an empty answer."""
+    monkeypatch.setattr(runs, "_run_dir_names", lambda _p: (None, "runs: EACCES"))
+
+    assert runs.prior_sweep_closes(tmp_path, exclude="x") == [
+        runs.PriorSweepCloses(None, fault="runs: EACCES")
+    ]
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_delete_run_refuses_a_run_holding_unlanded_sweep_closes(project_v7_store_repo, force):
+    """`delete_run` refuses a run that holds a shared-store close no code landed
+    for: the error names the run, DW-1 and `bmad-loop resume`. The run dir, its
+    state and the ledger are byte-identical afterwards. `force` waives only the
+    session guard, so it does not waive this.
+
+    Ablation: delete the `refuse_held_sweep_closes` call in `delete_run` and both
+    rows fail (the run is removed)."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    state_before = (engine.run_dir / "state.json").read_bytes()
+    ledger_before = paths.deferred_work.read_bytes()
+
+    with pytest.raises(runs.HeldSweepClosesError) as info:
+        runs.delete_run(paths.project, engine.run_dir, force=force)
+
+    assert info.value.run_id == ts.HELD_RUN_ID and info.value.dw_ids == ["DW-1"]
+    assert info.value.reason is None
+    message = str(info.value)
+    assert ts.HELD_RUN_ID in message and "DW-1" in message
+    assert f"bmad-loop resume {ts.HELD_RUN_ID}" in message
+    assert (engine.run_dir / "state.json").read_bytes() == state_before
+    assert paths.deferred_work.read_bytes() == ledger_before
+
+
+def test_delete_run_refuses_a_run_it_cannot_check_for_held_closes(project_v7_store_repo):
+    """A present but unreadable `state.json` might hold closes, so `delete_run`
+    refuses it and names the fault. The garbage state is left in place."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    (engine.run_dir / "state.json").write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(runs.HeldSweepClosesError) as info:
+        runs.delete_run(paths.project, engine.run_dir)
+
+    assert info.value.dw_ids == [] and "could not be read" in (info.value.reason or "")
+    assert f"bmad-loop resume {ts.HELD_RUN_ID}" in str(info.value)
+    assert (engine.run_dir / "state.json").read_text(encoding="utf-8") == "{not json"
+
+
+def test_delete_run_checks_held_closes_under_the_lock_after_the_liveness_guard(
+    project_v7_store_repo, monkeypatch
+):
+    """The held-closes check runs under the run's state lock, and only after the
+    engine-liveness guard: a live run still gets `LiveEngineError`."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    real = runs.held_sweep_closes
+    checked: list[Path] = []
+
+    def held(project, run_dir):
+        assert_run_state_lock_held(run_dir)
+        checked.append(run_dir)
+        return real(project, run_dir)
+
+    monkeypatch.setattr(runs, "held_sweep_closes", held)
+    with pytest.raises(runs.HeldSweepClosesError):
+        runs.delete_run(paths.project, engine.run_dir)
+    assert checked == [engine.run_dir]
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    with pytest.raises(runs.LiveEngineError):
+        runs.delete_run(paths.project, engine.run_dir)
+    assert checked == [engine.run_dir]  # the liveness guard refused first
+    assert engine.run_dir.is_dir()
+
+
+def test_delete_run_removes_a_sweep_run_that_holds_nothing(project_v7_store_repo):
+    """A sweep run whose bundle landed (DONE, merged back) holds no close, so it
+    is deleted as before."""
+    ts = _seam()
+    engine, paths, *_, task = ts._held_sweep_run(project_v7_store_repo, phase=Phase.DONE)
+    task.isolated_ledger_carried = True  # the merge-back's latch
+    engine._save()
+
+    runs.delete_run(paths.project, engine.run_dir, warn=lambda _note: None)
+
+    assert not engine.run_dir.exists()
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_archive_run_refuses_a_run_holding_unlanded_sweep_closes(project_v7_store_repo, force):
+    """DW-572: `archive_run` refuses a held run as `delete_run` does, since nothing
+    restores an archive for `resume` to land or reopen the closes from. The error
+    names the run, DW-1, `archive` and `bmad-loop resume`. No archive dir or
+    tarball is created, and the run dir, its state and the ledger are untouched.
+    `force` waives only the session guard.
+
+    Ablation: delete the `refuse_held_sweep_closes` call in `archive_run` and
+    both rows fail (the run is archived)."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    state_before = (engine.run_dir / "state.json").read_bytes()
+    ledger_before = paths.deferred_work.read_bytes()
+
+    with pytest.raises(runs.HeldSweepClosesError) as info:
+        runs.archive_run(paths.project, engine.run_dir, force=force)
+
+    assert info.value.run_id == ts.HELD_RUN_ID and info.value.dw_ids == ["DW-1"]
+    message = str(info.value)
+    assert "refusing to archive it" in message and "DW-1" in message
+    assert f"bmad-loop resume {ts.HELD_RUN_ID}" in message
+    assert not (paths.project / runs.ARCHIVE_DIR).exists()
+    assert (engine.run_dir / "state.json").read_bytes() == state_before
+    assert paths.deferred_work.read_bytes() == ledger_before
+
+
+def test_archive_run_refuses_a_run_it_cannot_check_for_held_closes(project_v7_store_repo):
+    """Fail safe, as on delete: an unreadable `state.json` might hold closes, so
+    `archive_run` refuses it, names the fault and writes no tarball."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    (engine.run_dir / "state.json").write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(runs.HeldSweepClosesError) as info:
+        runs.archive_run(paths.project, engine.run_dir)
+
+    assert info.value.dw_ids == [] and "could not be read" in (info.value.reason or "")
+    assert not (paths.project / runs.ARCHIVE_DIR).exists()
+    assert (engine.run_dir / "state.json").read_text(encoding="utf-8") == "{not json"
+
+
+def test_archive_run_checks_held_closes_under_the_lock_after_the_liveness_guard(
+    project_v7_store_repo, monkeypatch
+):
+    """The archive gate runs under the run's state lock, after the liveness guard."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    real = runs.held_sweep_closes
+    checked: list[Path] = []
+
+    def held(project, run_dir):
+        assert_run_state_lock_held(run_dir)
+        checked.append(run_dir)
+        return real(project, run_dir)
+
+    monkeypatch.setattr(runs, "held_sweep_closes", held)
+    with pytest.raises(runs.HeldSweepClosesError):
+        runs.archive_run(paths.project, engine.run_dir)
+    assert checked == [engine.run_dir]
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    with pytest.raises(runs.LiveEngineError):
+        runs.archive_run(paths.project, engine.run_dir)
+    assert checked == [engine.run_dir]  # the liveness guard refused first
+    assert engine.run_dir.is_dir()
+
+
+def test_archive_run_archives_a_sweep_run_that_holds_nothing(project_v7_store_repo):
+    """A sweep run whose bundle landed holds no close, so it is archived as before."""
+    ts = _seam()
+    engine, paths, *_, task = ts._held_sweep_run(project_v7_store_repo, phase=Phase.DONE)
+    task.isolated_ledger_carried = True  # the merge-back's latch
+    engine._save()
+
+    dest = runs.archive_run(paths.project, engine.run_dir, warn=lambda _note: None)
+
+    assert dest.is_file() and not engine.run_dir.exists()
+
+
+def test_delete_run_failed_launch_unwind_skips_the_held_closes_check(
+    project_v7_store_repo, monkeypatch
+):
+    """The runsetup failed-launch unwind (`_expected_composer_claim`) removes a run
+    it just composed, which holds nothing, so the check is skipped.
+
+    Ablation: drop the `_expected_composer_claim is None` condition and this fails
+    with `HeldSweepClosesError`."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    claim = engine.run_dir.stat(follow_symlinks=False)
+
+    runs.delete_run(
+        paths.project,
+        engine.run_dir,
+        warn=lambda _note: None,
+        _expected_composer_pid=os.getpid(),
+        _expected_composer_claim=claim,
+    )
+
+    assert not engine.run_dir.exists()
+
+
+def test_held_sweep_closes_refuses_to_judge_under_a_switched_initiative(project_v7_store_repo):
+    """The live paths resolve the ACTIVE initiative's ledger. A sweep pinned to
+    another initiative would be judged against a ledger that holds nothing under
+    its op id, so a switched initiative is "unknown", never "none held": delete
+    refuses (naming the conflict), and the sweep-start scan reports a fault row.
+
+    Ablation: delete the `sweep_initiative_conflict` check in `held_sweep_closes`
+    and this fails (delete removes the holder; the scan reports nothing)."""
+    from conftest import V7_USER_CONFIG_REL
+
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == ["DW-1"]  # premise
+    (paths.project / V7_USER_CONFIG_REL).write_text(
+        '[core]\nactive_initiative = "another-initiative"\n', encoding="utf-8"
+    )
+
+    [row] = runs.prior_sweep_closes(paths.project, exclude="other")
+    assert row.run_id == ts.HELD_RUN_ID and row.fault and "active initiative" in row.fault
+    with pytest.raises(runs.HeldSweepClosesError) as info:
+        runs.delete_run(paths.project, engine.run_dir)
+    assert info.value.reason and "active initiative" in info.value.reason
+    assert engine.run_dir.is_dir()
+
+
+def test_held_sweep_closes_judges_a_v7_sweep_on_a_mixed_install_as_v7(project_v7_store_repo):
+    """A tickets run on a mixed install (v6 keys left beside the v7 marker) spawns
+    its sweep on v7 paths, so the sweep pins the v7 initiative and records a store
+    topology. An auto-detecting `load_paths` resolves that install as v6, where no
+    initiative is active: the sweep would read as switched, and its held close as a
+    fault. The recorded v7 run is judged under v7 paths instead.
+
+    Ablation: drop `want_tickets` from `held_sweep_closes`'s `load_paths` call and
+    this fails with "active initiative" raised."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    assert engine.state.initiative and engine.state.store_topology  # premise: a v7 sweep
+    custom = paths.project / "_bmad" / "custom" / "config.toml"
+    custom.parent.mkdir(parents=True, exist_ok=True)
+    with custom.open("a", encoding="utf-8") as f:
+        f.write(
+            "\n[modules.bmm]\n"
+            'planning_artifacts = "{project-root}/_bmad-output/planning-artifacts"\n'
+            'implementation_artifacts = "{project-root}/_bmad-output/implementation-artifacts"\n'
+        )
+    assert bmadconfig.load_paths(paths.project).era == "v6"  # premise: mixed install
+
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == ["DW-1"]
+
+
+def test_prior_sweep_closes_records_a_liveness_probe_fault_as_a_fault_row(tmp_path, monkeypatch):
+    """A misconfigured process host makes `engine_liveness` raise
+    `ProcessHostError`. The scan records a fault row for that run rather than
+    letting the error abort the new sweep.
+
+    Ablation: drop the `except ProcessHostError` around the liveness probe and
+    this fails with the raise."""
+    from bmad_loop.process_host import ProcessHostError
+
+    (tmp_path / ".bmad-loop" / "runs" / "20260101-000000-aaaa").mkdir(parents=True)
+
+    def broken(_run_dir):
+        raise ProcessHostError("no such process host 'bogus'")
+
+    monkeypatch.setattr(runs, "engine_liveness", broken)
+
+    [row] = runs.prior_sweep_closes(tmp_path, exclude="x")
+    assert row.run_id == "20260101-000000-aaaa" and row.dw_ids == ()
+    assert row.fault and "bogus" in row.fault
+
+
+# ---------------------------------------- a chained run's recorded paths and pin
+
+CHILD = "initiative-child"
+
+
+def _chained(parent: str | None, initiative: str = CHILD) -> RunState:
+    return RunState(
+        run_id="r-chained",
+        project="/p",
+        started_at="now",
+        source="tickets",
+        initiative=initiative,
+        parent_initiative=parent,
+    )
+
+
+def test_paths_for_state_keeps_an_unchained_runs_paths(project_v7):
+    """An ordinary run reopens on the loaded paths themselves."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    assert runs.paths_for_state(paths, _chained(None, project_v7.initiative)) is paths
+
+
+def test_paths_for_state_reroots_a_chained_run_on_its_child(project_v7):
+    """A chained run reopens on its child initiative: the folder is the parent's
+    sibling named for the child, and the ledger, sprint path and both artifact
+    dirs move onto it. Ablation (performed): return `paths` unconditionally and
+    this FAILS."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    child = runs.paths_for_state(paths, _chained(project_v7.initiative))
+    folder = project_v7.initiative_folder.parent / CHILD
+    assert child.active_initiative == CHILD and child.initiative_folder == folder
+    assert child.implementation_artifacts == child.planning_artifacts == folder
+    assert child.deferred_work == folder / "deferred-work.md"
+    assert child.sprint_status == folder / "sprint-status.yaml"
+
+
+def test_paths_for_state_refuses_a_chained_run_whose_parent_moved(project_v7):
+    """A live `active_initiative` that no longer names the run's parent refuses
+    with a config error naming the value to restore — never the loaded (other)
+    initiative's paths, nor a child located from them."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    with pytest.raises(bmadconfig.BmadConfigError, match="set it back to 'initiative-platform'"):
+        runs.paths_for_state(paths, _chained("initiative-platform"))
+
+
+def test_paths_for_state_refuses_a_child_it_cannot_locate(project_v7):
+    """A child slug that is no folder name is a config error, not a ValueError
+    escaping past every `load_paths` caller's handler."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    with pytest.raises(bmadconfig.BmadConfigError, match="cannot locate child initiative"):
+        runs.paths_for_state(paths, _chained(project_v7.initiative, initiative="a/b"))
+
+
+def test_tree_pin_refuses_parent_rooted_paths(project_v7):
+    """`tree_pin` on a chained run handed the parent's own paths (`load_paths`
+    output, not re-rooted) refuses instead of routing the tree through the
+    parent's folder as if it were the child's; so does a folder not named for the
+    child. Ablation (performed): delete the guard and this FAILS."""
+    parent = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    state = _chained(project_v7.initiative)
+    with pytest.raises(ValueError, match="re-root them with paths_for_state"):
+        runs.tree_pin(state, parent)
+    elsewhere = parent.with_initiative(CHILD)
+    misfiled = dataclasses.replace(elsewhere, initiative_folder=parent.initiative_folder)
+    with pytest.raises(ValueError, match="re-root them with paths_for_state"):
+        runs.tree_pin(state, misfiled)
+    assert runs.tree_pin(state, elsewhere) == (project_v7.initiative, elsewhere.initiative_folder)
+
+
+def test_recorded_tree_pin_pins_a_mount_to_the_child(tmp_path, monkeypatch):
+    """A tree built in a worktree mount pins the chained run's child with no
+    folder — the mount's config names it — and reads no config at all."""
+    monkeypatch.setattr(bmadconfig, "load_paths", lambda *a, **k: pytest.fail("read config"))
+    state = _chained("initiative-platform")
+    assert runs.recorded_tree_pin(state, tmp_path, tmp_path / "wt" / "u1") == (CHILD, None)

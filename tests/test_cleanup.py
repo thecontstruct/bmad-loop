@@ -2,7 +2,9 @@
 artifact trim, and the `clean` CLI command."""
 
 import argparse
+import json
 import os
+from pathlib import Path
 
 import pytest
 from conftest import install_bmad_config, machine_json
@@ -12,8 +14,24 @@ from bmad_loop.journal import STATE_FILE, VERIFY_DIR, save_state
 from bmad_loop.model import RunState
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_sessions(monkeypatch):
+    """`clean` reads the live-session listing, and the real one answers from
+    whatever server holds the default socket — here, another xdist worker's. With
+    none running, tmux reports the socket file absent, which the backend warns
+    about by design (DW-458), and every `--json` test's empty-stderr assertion
+    fails on scheduling alone. Pin an empty, fault-free listing; tests about a
+    live session install their own."""
+    from test_runs import _LivenessMux
+
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([]))
+
+
 def _state_run(project, run_id, **kw):
     run_dir = project / ".bmad-loop" / "runs" / run_id
+    # Recorded identity, as `test_runs._make_state_run` does: pinned writers stay silent.
+    run_dir.mkdir(parents=True, exist_ok=True)
+    kw.setdefault("run_dir_identity", platform_util.root_identity_record(run_dir))
     save_state(
         run_dir,
         RunState(run_id=run_id, project=str(project), started_at="2026-06-11T10:00:00", **kw),
@@ -74,9 +92,10 @@ def test_reconcile_orphan_worktrees(project):
     outside = repo / "elsewhere"
     verify.worktree_add(repo, outside, "other", "main")
 
-    handled = runs.reconcile_orphan_worktrees(repo, run_dir)
+    handled, fault = runs.reconcile_orphan_worktrees(repo, run_dir)
 
     assert [p.name for p in handled] == ["unit"]
+    assert fault is None
     assert not wt.exists()
     assert outside.exists()  # a worktree outside the run dir is never touched
     assert repo not in [p for p in verify.worktree_list(repo)[1:]]  # main checkout intact
@@ -89,9 +108,10 @@ def test_reconcile_orphan_worktrees_dry_run(project):
     wt.parent.mkdir(parents=True)
     verify.worktree_add(repo, wt, "feat", "main")
 
-    handled = runs.reconcile_orphan_worktrees(repo, run_dir, dry_run=True)
+    handled, fault = runs.reconcile_orphan_worktrees(repo, run_dir, dry_run=True)
 
     assert [p.name for p in handled] == ["unit"]
+    assert fault is None
     assert wt.exists()  # dry run removes nothing
 
 
@@ -115,8 +135,59 @@ def test_reconcile_orphan_worktrees_spawn_fault_degrades_to_noop(project, monkey
         raise OSError(24, "Too many open files")
 
     monkeypatch.setattr(verify.subprocess, "run", cannot_spawn)
-    assert runs.reconcile_orphan_worktrees(repo, run_dir) == []
+    handled, fault = runs.reconcile_orphan_worktrees(repo, run_dir)
+    assert handled == []
     assert wt.exists()  # nothing was reclaimed, nothing was rmtree'd
+    # DW-470: visibly — the fault is not "nothing orphaned".
+    assert fault is not None and "cannot list git worktrees" in fault
+
+
+def test_reconcile_orphan_worktrees_names_a_worktree_the_fallback_left(project, monkeypatch):
+    """DW-470: `git worktree remove` failed and the `rmtree` fallback left the tree
+    on disk. It is named in the fault and kept out of `handled`, which `clean`
+    prints as "removed worktree" — a claim that would be false.
+
+    Ablation: drop the `lexists` check and `handled` names the worktree again with
+    no fault."""
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    wt = run_dir / "worktrees" / "unit"
+    wt.parent.mkdir(parents=True)
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    def refuse(*_args, **_kwargs):
+        raise verify.GitError("locked")
+
+    monkeypatch.setattr(verify, "worktree_remove", refuse)
+    monkeypatch.setattr(runs.shutil, "rmtree", lambda *a, **k: None)
+
+    handled, fault = runs.reconcile_orphan_worktrees(repo, run_dir)
+
+    assert handled == []
+    assert wt.exists()
+    assert fault is not None and str(wt) in fault and "still on disk" in fault
+
+
+def test_reconcile_stale_worktrees_reports_a_listing_fault_once(project, monkeypatch):
+    """DW-470: a `git worktree list` fault is repo-wide, so every finished run
+    reports the same one; the run-start warning carries it once, not once per run.
+    Ablate the fault return in `reconcile_orphan_worktrees` and `fault` is None."""
+    repo = project.project
+    for name in ("20260101-000000-aaaa", "20260101-000001-bbbb"):
+        save_state(
+            repo / ".bmad-loop" / "runs" / name,
+            RunState(run_id=name, project=str(repo), started_at="x", finished=True),
+        )
+
+    def cannot_list(_repo):
+        raise verify.GitError("git worktree list failed in repo: boom")
+
+    monkeypatch.setattr(verify, "worktree_list", cannot_list)
+
+    handled, fault = runs.reconcile_stale_worktrees(repo, repo)
+
+    assert handled == []
+    assert fault is not None and fault.count("cannot list git worktrees") == 1
 
 
 def test_reconcile_stale_worktrees_finished_only(project):
@@ -132,30 +203,26 @@ def test_reconcile_stale_worktrees_finished_only(project):
     save_state(fin, RunState(run_id="f", project=str(repo), started_at="x", finished=True))
     save_state(stp, RunState(run_id="s", project=str(repo), started_at="x", stopped=True))
 
-    handled = runs.reconcile_stale_worktrees(repo, repo)
+    handled, fault = runs.reconcile_stale_worktrees(repo, repo)
 
     assert not fin_wt.exists()  # finished run's worktree reclaimed
     assert stp_wt.exists()  # stopped run is resumable — left intact
     assert {p.name for p in handled} == {"u"} and len(handled) == 1
+    assert fault is None
 
 
 # ------------------------------------------------------------- retention
 
 
-def test_runs_past_retention_by_count():
-    dirs = [project_dir(f"2026010{i}-000000-aa") for i in range(1, 8)]
-    past = runs.runs_past_retention(dirs, keep_n=3)
-    assert [p.name for p in past] == [d.name for d in dirs[:4]]
-
-
-def test_runs_past_retention_keep_all_within_count():
-    dirs = [project_dir(f"2026010{i}-000000-aa") for i in range(1, 4)]
-    assert runs.runs_past_retention(dirs, keep_n=10) == []
-
-
-def test_runs_past_retention_zero_keeps_none():
-    dirs = [project_dir(f"2026010{i}-000000-aa") for i in range(1, 4)]
-    assert len(runs.runs_past_retention(dirs, keep_n=0)) == 3
+@pytest.mark.parametrize(
+    "count,keep_n,n_past",
+    [(7, 3, 4), (3, 10, 0), (3, 0, 3)],
+    ids=["by-count", "keep-all-within-count", "zero-keeps-none"],
+)
+def test_runs_past_retention_by_count(count, keep_n, n_past):
+    dirs = [project_dir(f"2026010{i}-000000-aa") for i in range(1, count + 1)]
+    past = runs.runs_past_retention(dirs, keep_n=keep_n)
+    assert [p.name for p in past] == [d.name for d in dirs[:n_past]]
 
 
 def test_runs_past_retention_days_boundary():
@@ -190,7 +257,7 @@ def test_trim_run_dir_keeps_run_viewable(tmp_path):
     assert (run_dir / "state.json").is_file()
     assert (run_dir / "journal.jsonl").is_file()
     # the run still discovers + lists in the dashboard
-    infos = runs.discover_runs(tmp_path)
+    infos, _ = runs.discover_runs(tmp_path)
     assert [i.run_id for i in infos] == ["20260101-000000-aaaa"]
 
 
@@ -226,7 +293,7 @@ def test_trim_run_dir_reclaims_the_verifier_stream_store(tmp_path):
     # the TUI-visible core the trim exists to preserve
     assert (run_dir / "state.json").is_file()
     assert (run_dir / "journal.jsonl").is_file()
-    infos = runs.discover_runs(tmp_path)
+    infos, _ = runs.discover_runs(tmp_path)
     assert [i.run_id for i in infos] == ["20260101-000000-aaaa"]
 
 
@@ -304,6 +371,142 @@ def test_cmd_clean_warns_unknown_liveness(project, monkeypatch, capsys):
     assert cli.cmd_clean(_clean_args(repo)) == 0
     err = capsys.readouterr().err
     assert "run 20260101-000000-aaaa: engine may still be live (unverifiable pid)" in err
+
+
+def test_cmd_clean_warns_for_an_unreadable_pid_file(project, capsys):
+    """DW-465, end to end through the real liveness read: an engine.pid that
+    exists but cannot be read (a directory at the name) used to read as a dead
+    engine, so `clean` reclaimed the run without its unverifiable-pid warning.
+
+    ABLATION: fold `read_named_pid_identity`'s read fault back into `(None, None)`
+    and the warning is gone."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+    (run_dir / runs.PID_FILE).mkdir()
+
+    assert cli.cmd_clean(_clean_args(repo)) == 0
+    err = capsys.readouterr().err
+    assert "run 20260101-000000-aaaa: engine may still be live (unverifiable pid)" in err
+
+
+def _deny_stat_under(monkeypatch, root: Path) -> None:
+    """Every `stat()` of `root` or below raises EACCES — an unreadable dir, as
+    3.14's `is_dir`/`is_file` would fold it into False."""
+    real = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self == root or root in self.parents:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_cmd_clean_names_an_unreadable_runs_dir(project, monkeypatch, capsys):
+    """DW-468: "nothing to reclaim" over an unreadable runs dir is not the answer.
+    Text warns on stderr; --json carries `listing_fault` with stderr empty.
+    Ablate the listing fault in `list_run_dirs` and both fail."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+    _deny_stat_under(monkeypatch, run_dir.parent)
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True)) == 0
+    err = capsys.readouterr().err
+    assert "run listing incomplete" in err and "PermissionError" in err
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True, json=True)) == 0
+    captured = capsys.readouterr()
+    assert "PermissionError" in json.loads(captured.out)["listing_fault"]
+    assert captured.err == ""
+
+
+def test_cmd_clean_readable_runs_dir_is_silent(project, capsys):
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True)) == 0
+    assert "run listing incomplete" not in capsys.readouterr().err
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True, json=True)) == 0
+    assert json.loads(capsys.readouterr().out)["listing_fault"] is None
+
+
+def _stopped_run(repo: Path) -> Path:
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+    return run_dir
+
+
+def test_cmd_clean_names_a_worktree_reconcile_git_could_not_list(project, monkeypatch, capsys):
+    """DW-470: a run whose worktrees git would not list is not "no orphaned
+    worktrees". Text warns on stderr and `clean` still finishes; --json carries
+    `worktree_faults` with stderr empty. Ablate the listing fault in
+    `reconcile_orphan_worktrees` and both fail."""
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = _stopped_run(repo)
+
+    def cannot_list(_repo):
+        raise verify.GitError("git worktree list failed in repo: boom")
+
+    monkeypatch.setattr(verify, "worktree_list", cannot_list)
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True)) == 0
+    err = capsys.readouterr().err
+    assert f"warning: run {run_dir.name}: worktree reconcile incomplete" in err
+    assert "boom" in err
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True, json=True)) == 0
+    captured = capsys.readouterr()
+    faults = json.loads(captured.out)["worktree_faults"]
+    assert len(faults) == 1 and faults[0].startswith(f"{run_dir.name}: cannot list git worktrees")
+    assert captured.err == ""
+
+
+def test_cmd_clean_names_a_state_dir_sweep_that_could_not_run(project, monkeypatch, capsys):
+    """DW-470: a state-dir sweep that could not name its root is not "swept 0".
+    Ablate the fault return in `reconcile_orphan_state_dirs` and both fail."""
+    install_bmad_config(project)
+    repo = project.project
+    _stopped_run(repo)
+
+    def no_root(_project):
+        raise runs.StateRootError("no usable base")
+
+    monkeypatch.setattr(runs, "project_state_root", no_root)
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True)) == 0
+    err = capsys.readouterr().err
+    assert "warning: orphaned state-dir sweep incomplete" in err and "StateRootError" in err
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True, json=True)) == 0
+    captured = capsys.readouterr()
+    assert "StateRootError" in json.loads(captured.out)["state_dir_fault"]
+    assert captured.err == ""
+
+
+def test_cmd_clean_healthy_reconcile_reports_no_fault(project, capsys):
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = _stopped_run(repo)
+    wt = run_dir / "worktrees" / "unit"
+    wt.parent.mkdir(parents=True)
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True)) == 0
+    captured = capsys.readouterr()
+    assert "incomplete" not in captured.err
+    assert f"would remove worktree {wt}" in captured.out
+
+    assert cli.cmd_clean(_clean_args(repo, dry_run=True, json=True)) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["worktree_faults"] == [] and doc["state_dir_fault"] is None
+    assert doc["worktrees"] == [str(wt)]
 
 
 def test_cmd_clean_reclaims_and_keeps_protected(project, capsys):
@@ -406,7 +609,7 @@ def test_cmd_clean_survives_a_session_appearing_mid_clean(project, monkeypatch, 
         save_state(d, RunState(run_id=d.name, project=str(repo), started_at="x", finished=True))
     seen: list[str] = []
 
-    def racing(_project, run_id):
+    def racing(_project, run_id, **_kw):
         if run_id != racer.name:
             return False  # only one run races; the other must still be reclaimed
         seen.append(run_id)
@@ -442,7 +645,7 @@ def test_cmd_clean_reports_a_mid_clean_racer_by_what_it_actually_did(project, mo
     save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
     seen: list[str] = []
 
-    def racing(_project, run_id):
+    def racing(_project, run_id, **_kw):
         seen.append(run_id)
         return len(seen) > 1
 
@@ -946,3 +1149,286 @@ def test_cmd_clean_json_carries_the_sweep_count_in_both_modes(project, capsys):
     outcome = _clean_json(repo, capsys)
     assert outcome["state_dirs_swept"] == 1
     assert not orphan.exists()
+
+
+# ---------------------------------------- runs holding unlanded sweep closes (DW-571)
+
+
+def _held_and_plain_stopped_runs(v7):
+    """Two stopped runs past any retention window. One is an isolated sweep run
+    still holding its shared-store close of DW-1, the other a plain run. Returns
+    (held engine, paths, plain run dir)."""
+    import test_sweep as ts
+
+    engine, paths, *_ = ts._held_sweep_run(v7)
+    engine.state.paused_stage = None
+    engine.state.paused_story_key = None
+    engine.state.stopped = True
+    engine._save()
+    plain = paths.project / ".bmad-loop" / "runs" / "20260102-000000-bbbb"
+    save_state(
+        plain, RunState(run_id="p", project=str(paths.project), started_at="x", stopped=True)
+    )
+    assert runs.reclaimable(engine.run_dir) and runs.reclaimable(plain)  # premise
+    return engine, paths, plain
+
+
+def test_cmd_clean_hard_skips_a_run_holding_unlanded_sweep_closes(project_v7_store_repo, capsys):
+    """`clean --hard` checks the delete arm's runs for held sweep closes before it
+    mutates anything. The holder is left whole (state, ledger, no trim) with a
+    stderr line naming DW-1 and `bmad-loop resume`, and its sibling is still
+    deleted.
+
+    Ablation: delete the pre-check in `cmd_clean` and this fails. The sibling
+    still goes, but the holder is trimmed, and the refusal surfaces only from
+    `delete_run` as a mid-clean skip."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    heavy = engine.run_dir / VERIFY_DIR
+    heavy.mkdir()
+    (heavy / "verify.log").write_text("kept\n", encoding="utf-8")
+    assert heavy in runs.heavy_run_entries(engine.run_dir)  # premise: a trim takes it
+    state_before = (engine.run_dir / "state.json").read_bytes()
+    ledger_before = paths.deferred_work.read_bytes()
+
+    assert cli.cmd_clean(_clean_args(paths.project, retain=0, hard=True)) == 0
+
+    err = capsys.readouterr().err
+    assert not plain.exists()
+    assert engine.run_dir.is_dir() and heavy.is_dir()  # untouched, not trimmed
+    assert (engine.run_dir / "state.json").read_bytes() == state_before
+    assert paths.deferred_work.read_bytes() == ledger_before
+    line = next(ln for ln in err.splitlines() if ln.startswith(f"run {engine.run_dir.name}:"))
+    assert "DW-1" in line and f"bmad-loop resume {engine.run_dir.name}" in line
+    assert line.endswith("— not removed")
+
+
+def test_cmd_clean_names_the_fault_when_a_run_could_not_be_checked(project_v7_store_repo, capsys):
+    """A delete-arm run whose ledger cannot be read is skipped with a line naming
+    the fault, never with the held-ids wording and an empty id list. Its sibling
+    is still deleted.
+
+    Ablation: make `_held_closes_reason` always return the held-ids text and this
+    fails (the line reads `holds sweep ledger closes whose code never landed ()`)."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    paths.deferred_work.write_bytes(b"\xff\xfe not utf-8\n")
+
+    assert cli.cmd_clean(_clean_args(paths.project, retain=0, hard=True)) == 0
+
+    err = capsys.readouterr().err
+    assert engine.run_dir.is_dir() and not plain.exists()
+    line = next(ln for ln in err.splitlines() if ln.startswith(f"run {engine.run_dir.name}:"))
+    assert "could not be checked" in line and str(paths.deferred_work) in line
+    assert "holds sweep ledger closes" not in line
+
+
+def test_cmd_clean_json_reports_a_held_closes_run_as_protected(project_v7_store_repo, capsys):
+    """In `--json` mode the holder lands in the existing `protected` list and the
+    sibling in `deleted`.
+
+    Green ablation: deleting the pre-check in `cmd_clean` leaves this green,
+    because with nothing to trim the removal's refusal handler also files the
+    holder as protected. `test_cmd_clean_hard_skips_a_run_holding_unlanded_sweep_closes`
+    pins the pre-check."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+
+    doc = _clean_json(paths.project, capsys, "--hard", "--retain", "0")
+
+    assert doc["protected"] == [engine.run_dir.name]
+    assert doc["deleted"] == [plain.name]
+    assert engine.run_dir.is_dir() and not plain.exists()
+
+
+def test_cmd_clean_reports_a_held_closes_refusal_from_delete_run(
+    project_v7_store_repo, monkeypatch, capsys
+):
+    """A run that passed the pre-check can still be refused by `delete_run`, whose
+    under-lock check is authoritative. `clean` records it beside the other
+    mid-clean refusals and goes on, rather than aborting.
+
+    Ablation: drop `runs.HeldSweepClosesError` from the removal's except tuple and
+    this fails (the refusal escapes `cmd_clean`)."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    real = runs.held_sweep_closes
+    calls: list[Path] = []
+
+    def held(project, run_dir):
+        calls.append(run_dir)
+        if run_dir == engine.run_dir and calls.count(run_dir) == 1:
+            return []  # the pre-check sees nothing held
+        return real(project, run_dir)
+
+    monkeypatch.setattr(runs, "held_sweep_closes", held)
+
+    assert cli.cmd_clean(_clean_args(paths.project, retain=0, hard=True)) == 0
+
+    err = capsys.readouterr().err
+    assert calls.count(engine.run_dir) == 2  # premise: pre-check, then delete_run
+    assert engine.run_dir.is_dir() and not plain.exists()
+    assert f"run {engine.run_dir.name}: holds sweep ledger closes" in err
+
+
+def test_cmd_clean_policy_delete_arm_skips_a_held_closes_run(project_v7_store_repo, capsys):
+    """Without `--hard`, `[cleanup] archive_old = false` also puts past-retention
+    runs on the delete arm, and the holder is skipped there the same way: left
+    whole and untrimmed, while its sibling is deleted.
+
+    Ablation: narrow the pre-check in `cmd_clean` to `args.hard` and this fails
+    (the holder is trimmed)."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    policy = paths.project / ".bmad-loop" / "policy.toml"
+    policy.write_text("[cleanup]\narchive_old = false\n", encoding="utf-8")
+    heavy = engine.run_dir / VERIFY_DIR
+    heavy.mkdir()
+    (heavy / "verify.log").write_text("kept\n", encoding="utf-8")
+    state_before = (engine.run_dir / "state.json").read_bytes()
+    ledger_before = paths.deferred_work.read_bytes()
+
+    assert cli.cmd_clean(_clean_args(paths.project, retain=0)) == 0
+
+    err = capsys.readouterr().err
+    assert not plain.exists()
+    assert not (paths.project / ".bmad-loop" / "archive").exists()  # premise: delete arm
+    assert engine.run_dir.is_dir() and heavy.is_dir()
+    assert (engine.run_dir / "state.json").read_bytes() == state_before
+    assert paths.deferred_work.read_bytes() == ledger_before
+    assert f"run {engine.run_dir.name}: holds sweep ledger closes" in err
+
+
+def test_cmd_clean_dry_run_plans_a_held_closes_run_as_protected(project_v7_store_repo, capsys):
+    """`--dry-run --hard --json` predicts the skip: the holder is in `protected`,
+    not in `deleted`, and nothing is removed.
+
+    Ablation: gate the pre-check in `cmd_clean` on `not dry` and this fails (the
+    plan lists the holder as deleted)."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+
+    doc = _clean_json(paths.project, capsys, "--dry-run", "--hard", "--retain", "0")
+
+    assert engine.run_dir.name in doc["protected"]
+    assert engine.run_dir.name not in doc["deleted"]
+    assert doc["deleted"] == [plain.name]
+    assert engine.run_dir.is_dir() and plain.is_dir()
+
+
+@pytest.mark.parametrize("force", [False, True], ids=["plain", "force"])
+def test_cmd_archive_refuses_a_run_holding_unlanded_sweep_closes(
+    project_v7_store_repo, monkeypatch, capsys, force
+):
+    """DW-572: `archive` on a held run exits FAILURE with the refusal naming DW-1
+    and `bmad-loop resume`, and writes no tarball. Under `--force` a live holder
+    is refused before the live-engine stop, as on `delete`.
+
+    Ablation: delete the `refuse_held_sweep_closes` call in `archive_run` and the
+    plain row fails (the run is archived); delete the `--force` pre-check in
+    `cmd_archive` and the force row fails (the engine is stopped first)."""
+    engine, paths, _plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    stopped: list[Path] = []
+    monkeypatch.setattr(runs, "stop_run", lambda rd, *_a, **_k: stopped.append(rd))
+    if force:
+        monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    args = argparse.Namespace(project=str(paths.project), run_id=engine.run_dir.name, force=force)
+
+    assert cli.cmd_archive(args) == cli.ExitCode.FAILURE
+
+    err = capsys.readouterr().err
+    assert f"run {engine.run_dir.name}: refusing to archive it" in err
+    assert "DW-1" in err and f"bmad-loop resume {engine.run_dir.name}" in err
+    assert engine.run_dir.is_dir() and not (paths.project / runs.ARCHIVE_DIR).exists()
+    assert stopped == []
+
+
+@pytest.mark.parametrize("mode", ["text", "json"])
+def test_cmd_clean_archive_arm_skips_a_held_closes_run(project_v7_store_repo, capsys, mode):
+    """DW-572: the default archive arm leaves a held run whole and untrimmed and
+    reports it protected, while its sibling is archived.
+
+    Ablation: narrow the pre-check in `cmd_clean` back to the delete arm and this
+    fails (the holder is trimmed, then `archive_run` refuses it)."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    heavy = engine.run_dir / VERIFY_DIR
+    heavy.mkdir()
+    (heavy / "verify.log").write_text("kept\n", encoding="utf-8")
+    state_before = (engine.run_dir / "state.json").read_bytes()
+    archive_dir = paths.project / runs.ARCHIVE_DIR
+
+    if mode == "json":
+        doc = _clean_json(paths.project, capsys, "--retain", "0")
+        assert doc["protected"] == [engine.run_dir.name]
+        assert doc["archived"] == [plain.name]
+        assert doc["trimmed"] == []
+    else:
+        assert cli.cmd_clean(_clean_args(paths.project, retain=0)) == 0
+        err = capsys.readouterr().err
+        line = next(ln for ln in err.splitlines() if ln.startswith(f"run {engine.run_dir.name}:"))
+        assert "DW-1" in line and line.endswith("— not removed")
+
+    assert not plain.exists() and (archive_dir / f"{plain.name}.tar.gz").is_file()
+    assert not (archive_dir / f"{engine.run_dir.name}.tar.gz").exists()
+    assert engine.run_dir.is_dir() and heavy.is_dir()
+    assert (engine.run_dir / "state.json").read_bytes() == state_before
+
+
+def _held_run_unit_worktree(engine, paths):
+    """Mount a real git worktree under the held run's `worktrees/` dir, the shape a
+    paused isolated unit leaves, plus a trimmable verifier store. Returns both."""
+    wt = engine.run_dir / "worktrees" / "u"
+    wt.parent.mkdir()
+    verify.worktree_add(paths.repo_root, wt, "held-unit")
+    heavy = engine.run_dir / VERIFY_DIR
+    heavy.mkdir()
+    (heavy / "verify.log").write_text("kept\n", encoding="utf-8")
+    assert {wt.parent, heavy} <= set(runs.heavy_run_entries(engine.run_dir))  # premise
+    return wt, heavy
+
+
+@pytest.mark.parametrize(
+    "trim, extra",
+    [
+        (True, ()),
+        (True, ("--dry-run",)),
+        (False, ()),
+    ],
+    ids=["trim", "trim-dry-run", "reconcile-only"],
+)
+def test_cmd_clean_leaves_a_held_runs_worktree_and_artifacts_alone(
+    project_v7_store_repo, capsys, trim, extra
+):
+    """DW-573: inside retention, `clean` neither force-removes a held run's unit
+    worktree (`reconcile_orphan_worktrees`) nor trims it (`trim_run_dir`), with
+    `[cleanup] trim_artifacts` on or off and under `--dry-run`. The run is
+    reported protected, and its sibling is still trimmed.
+
+    Ablation: narrow the pre-check in `cmd_clean` back to the delete arm and
+    every row fails (the worktree is reconciled and the run listed as such)."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    wt, heavy = _held_run_unit_worktree(engine, paths)
+    (plain / VERIFY_DIR).mkdir()
+    if not trim:
+        policy = paths.project / ".bmad-loop" / "policy.toml"
+        policy.write_text("[cleanup]\ntrim_artifacts = false\n", encoding="utf-8")
+
+    doc = _clean_json(paths.project, capsys, *extra)
+
+    assert doc["protected"] == [engine.run_dir.name]
+    assert doc["worktrees"] == []
+    assert doc["trimmed"] == ([plain.name] if trim else [])
+    assert doc["archived"] == [] and doc["deleted"] == []
+    assert wt.is_dir() and heavy.is_dir()
+    assert wt.resolve() in [p.resolve() for p in verify.worktree_list(paths.repo_root)]
+
+
+def test_cmd_clean_text_reports_a_held_run_inside_retention_as_untouched(
+    project_v7_store_repo, capsys
+):
+    """The text line for a held run kept inside retention names DW-1 and says it
+    was left untouched (nothing of it was due for removal)."""
+    engine, paths, _plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    wt, heavy = _held_run_unit_worktree(engine, paths)
+
+    assert cli.cmd_clean(_clean_args(paths.project)) == 0
+
+    out, err = capsys.readouterr()
+    assert str(wt) not in out
+    line = next(ln for ln in err.splitlines() if ln.startswith(f"run {engine.run_dir.name}:"))
+    assert "DW-1" in line and line.endswith("— left untouched")
+    assert wt.is_dir() and heavy.is_dir()

@@ -1,15 +1,17 @@
 """Deterministic reading and editing of the deferred-work ledger.
 
-The ledger (`{implementation_artifacts}/deferred-work.md`) is append-only
-markdown in the canonical form documented at
+The ledger (`{implementation_artifacts}/deferred-work.md`; on a BMAD v7 project
+that is the active initiative folder, or `output_folder` when none is active) is
+append-only markdown in the canonical form documented at
 bmad-loop-sweep/deferred-work-format.md: `### DW-<seq>: <title>` headings with
 `origin:`/`location:`/`reason:`/`status:` field lines. The one sanctioned
 rewrite is :func:`archive_closed`, which moves closed entries verbatim to a
 sibling archive file and leaves id-preserving stubs. Pre-#2651 dev primitives
-and the attended `bmad-build` append flatter entries here directly, which the
-orchestrator normalizes on sweep; the current unattended primitive records its
-findings in the spec's frontmatter instead and the engine harvests them into
-canonical entries. The
+and the attended `bmad-build` append flatter entries here directly (opened by
+`- source_spec:`, or `- source_plan:` on v7), which the orchestrator normalizes
+on sweep; the current unattended primitive records its findings in the spec's
+(on v7, the plan's) frontmatter instead and the engine harvests them into
+canonical entries, whose `source_spec:` field keeps its name in every era. The
 orchestrator never trusts an LLM to have edited it — status flips and decision
 records happen here, and gates re-read the file from disk.
 
@@ -170,12 +172,13 @@ import re
 import sys
 import threading
 from bisect import bisect_right
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date as calendar_date
 from pathlib import Path
 from stat import S_ISREG
+from typing import Literal
 
 from . import sprintstatus
 from .fences import fenced_spans
@@ -481,7 +484,11 @@ ANY_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?=[ \t]|$)", re.MULTILINE)
 # Keyed on the opening line alone, deliberately: also requiring the block's
 # `summary:`/`evidence:` lines would narrow the boundary below the parser's own
 # recognition, leaving the bug in place for every partial shape it accepts.
-_FLAT_SOURCE_BODY = r"source_spec:[ \t]"
+# Two keys open the block: v6's `source_spec:` and the v7 attended `bmad-build`'s
+# `source_plan:`. Matching only the first absorbed a v7 append into the canonical
+# entry above it, its `status:` and `gate:` lines included. The canonical field
+# stays `source_spec:` in every era; only the flat opener has two spellings.
+_FLAT_SOURCE_BODY = r"source_(?:spec|plan):[ \t]"
 FLAT_ENTRY_RE = re.compile(rf"^[-*][ \t]+{_FLAT_SOURCE_BODY}", re.IGNORECASE | re.MULTILINE)
 STATUS_RE = re.compile(r"^status:[ \t]*(.*)$", re.MULTILINE)
 # The mechanical half of a hard gate. An entry could always *say* it blocked a
@@ -537,6 +544,25 @@ _SPLITTABLE_TOKEN_RE = re.compile(r"^\d+-\d+$")
 # rather than *accepted*, because accepting an indented line would read a fenced
 # example inside an entry as a live gate and refuse a story nobody meant to block.
 _GATE_NEAR_RE = re.compile(r"^[ \t]*gate[ \t]*:", re.IGNORECASE | re.MULTILINE)
+# Which key grammar a `gate:` token is read under. A parameter, not a union of the
+# two: a ticket ref accepted on a sprint project (`gate: 1.2`) would be a "valid"
+# token no story key can ever match — the field's own silent no-op — so each queue
+# admits only the shapes its own keys can take.
+GateGrammar = Literal["story", "ticket"]
+# The three token shapes a dispatched BMAD v7 ticket answers to (`tickets.py`, whose
+# `<ref>` and `after` grammar these mirror). Copied rather than imported for the
+# same reason as `_STORIES_ID_RE`: the project's `tickets.py` is a script, not a
+# module, and the copies are pinned to the vendored upstream by a drift test.
+#
+# `E.M`: an entry of an epic the initiative lists (`CROSS_RE`) — the unit key.
+_TICKET_REF_RE = re.compile(r"^([0-9A-Za-z]+)\.([0-9A-Za-z]+)$")
+# A bare id (`ID_RE`): under a gate, the epic with that id in the initiative table.
+_TICKET_ID_RE = re.compile(r"^[0-9A-Za-z]+$")
+# An epic folder (`EPIC_RE`), `epic-<slug>`: that whole epic.
+_EPIC_FOLDER_RE = re.compile(r"^epic-[^/]+$")
+# Ids `ID_RE` admits but `tickets.py` `_id` refuses: frontmatter reads a bare
+# `true` / `false` as a boolean, so no epic or ticket can carry either id.
+_TICKET_BOOLEAN_IDS = frozenset({"true", "false"})
 # The prose convention `gate:` replaces, matched anywhere on a line rather than
 # at its start: real ledgers hard-wrap their `reason:` prose, so the declaration
 # routinely lands mid-line and a line-anchored pattern misses exactly the entries
@@ -821,7 +847,7 @@ def declares_prose_gate(entry: DWEntry) -> bool:
     return any(not _quoted(entry, m.start()) for m in HARD_GATE_PROSE_RE.finditer(entry.body))
 
 
-def gates(entry: DWEntry) -> EntryGates:
+def gates(entry: DWEntry, *, grammar: GateGrammar = "story") -> EntryGates:
     """Every ``gate:`` token in one entry's canonical span, order-preserving.
 
     Multiple ``gate:`` lines union: an entry blocking three stories may list them
@@ -840,6 +866,10 @@ def gates(entry: DWEntry) -> EntryGates:
     :data:`_GATE_NEAR_RE`). They are counted rather than parsed so the operator is
     told the spelling gated nothing — the same trade the space-separated token
     makes, one level up.
+
+    ``grammar`` decides which tokens are matchable (see :func:`_matchable_token`):
+    the story grammar of the sprint and stories queues, or the ticket grammar of
+    a tickets run. A token the chosen grammar cannot match is ``malformed``.
     """
     tokens: list[str] = []
     malformed: list[str] = []
@@ -859,7 +889,7 @@ def gates(entry: DWEntry) -> EntryGates:
             if not token:
                 continue
             named = True
-            bucket = tokens if _matchable_token(token) else malformed
+            bucket = tokens if _matchable_token(token, grammar) else malformed
             if token not in bucket:
                 bucket.append(token)
         if not named:
@@ -881,16 +911,66 @@ def gates(entry: DWEntry) -> EntryGates:
     )
 
 
-def _matchable_token(token: str) -> bool:
-    """Whether ``token`` could gate any legal story key — the test that decides
-    :attr:`EntryGates.tokens` vs :attr:`EntryGates.malformed`.
+def field_values(entry: DWEntry, field: str) -> tuple[str, ...]:
+    """Every value one entry's canonical span declares for ``field``, order-preserving.
+
+    :func:`field_line_present` answers the appenders' dedupe question ("does the
+    entry hold this key"), while this one answers "which dedupe keys does the
+    entry hold" for ``validate_migration``, which has to hold a rewrite to them.
+    Filtered through :func:`_quoted` like every gate scan here, so an entry
+    quoting a worked example does not have the example's ``origin:`` snapshotted
+    as a key it owns.
+
+    Anchored like ``status:`` — lowercase, column 0 — which is the only spelling
+    :func:`field_line_present` matches, so an indented or capitalised line is no
+    key to either reader. Both readers apply the same fence rule too (DW-408), so
+    a FENCED column-0 line is a key to neither: dropping one is accepted, while a
+    live key moved into a fence is refused — the loss this guards against is of
+    the key an appender wrote, and appenders write it live. Each value drops surrounding
+    whitespace and ONE wrapping backtick pair: :func:`append_entry` writes
+    ``source_spec`` backtick-wrapped and :func:`field_line_present` matches
+    either spelling, so a rewrap between the two is not a changed key.
+    Duplicates collapse — a repeated line is one key, not two.
+    """
+    pattern = re.compile(rf"^{re.escape(field)}:[ \t]*(.*)$", re.MULTILINE)
+    values: list[str] = []
+    for m in pattern.finditer(entry.body):
+        if _quoted(entry, m.start()):
+            continue
+        value = m.group(1).strip(" \t")
+        if len(value) >= 2 and value.startswith("`") and value.endswith("`"):
+            value = value[1:-1]
+        if value not in values:
+            values.append(value)
+    return tuple(values)
+
+
+def _matchable_token(token: str, grammar: GateGrammar = "story") -> bool:
+    """Whether ``token`` could gate any legal key of ``grammar``'s queue — the
+    test that decides :attr:`EntryGates.tokens` vs :attr:`EntryGates.malformed`.
 
     Both halves are required and neither implies the other: ``GATE_TOKEN_RE``
     alone admits ``3.2``, which nothing can match, and the key shapes alone admit
     ``3-2 3-3`` via the sprint slug, which is one token pretending to be two.
+
+    Under ``"ticket"`` the key shapes are the three a dispatched ticket answers
+    to: an ``E.M`` ref, a bare epic id, and an ``epic-<slug>`` folder. Each is a
+    shape :func:`gates_ticket` can match, and nothing else is, so a v6 story key
+    (``3-2``, ``3-2-invite-link``) is ``malformed`` there — no ticket carries one.
+    So is a backlog leaf file name (``story-login.md``): a tickets run never
+    dispatches a backlog row, and one moved into an epic is dispatched by its new
+    ``E.M`` ref, so the file name would gate nothing in silence. So is an id of
+    ``true`` or ``false``, bare or as either half of a ref: ``tickets.py`` reads
+    neither as an id.
     """
     if not GATE_TOKEN_RE.match(token):
         return False
+    if grammar == "ticket":
+        if _EPIC_FOLDER_RE.match(token):
+            return True
+        pair = _TICKET_REF_RE.match(token)
+        ids = pair.groups() if pair else (token,) if _TICKET_ID_RE.match(token) else ()
+        return bool(ids) and not _TICKET_BOOLEAN_IDS.intersection(ids)
     return bool(_STORIES_ID_RE.match(token) or sprintstatus.STORY_RE.match(token))
 
 
@@ -931,6 +1011,90 @@ def gates_story(token: str, story_key: str) -> bool:
         return False
     rest = story_key[len(token) :]
     return len(rest) >= 2 and "a" <= rest[0] <= "z" and rest[1] == "-"
+
+
+def legacy_story_tokens(entry: DWEntry) -> tuple[str, ...]:
+    """``entry``'s v6 story-key tokens as a ticket queue sees them: matchable under
+    the story grammar and ``malformed`` under the ticket one (``3-2``,
+    ``3-2-invite-link``). A migrated ledger keeps its ``gate:`` lines verbatim and
+    no ticket *ref* is a story key — the old key survives only as the ticket's
+    ``v6_key`` — so read under the ticket grammar alone these would gate nothing in
+    silence. Both the tickets run and ``validate`` read them
+    through this one reading: a token one ticket's ``v6_key`` claims gates that
+    ticket (:func:`partition_legacy_tokens`), and any other pauses the run before
+    every ticket and fails ``validate``."""
+    story_tokens = gates(entry).tokens
+    return tuple(t for t in gates(entry, grammar="ticket").malformed if t in story_tokens)
+
+
+def partition_legacy_tokens(
+    tokens: Iterable[str], claims: Iterable[tuple[str, str | None]]
+) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
+    """Split v6 story-key ``tokens`` (:func:`legacy_story_tokens`) by whether one
+    ticket claims them: ``(resolved, unresolved)``, both order-preserving.
+
+    ``claims`` are ``(v6_key, ref)`` pairs, one per ticket-file entry that carries
+    a ``v6_key`` (``tickettree.read_v6_key_claims``); ``ref`` is that entry's
+    ``E.M``, or None when its epic is unlisted. A token is *claimed* by an entry
+    whose ``v6_key`` it would gate as a story key (:func:`gates_story`: the exact
+    key, or its ``N-M`` prefix or split arm), and *resolves* to ``(token, ref)``
+    when exactly one entry claims it and that entry has a ref. Unclaimed, claimed
+    by two or more entries, or claimed only by an entry with no ref, it stays
+    unresolved: no single ticket can be shown to be the one it names.
+
+    The one resolver the engine's gate check and ``validate`` share, so the two
+    cannot disagree about which ticket a v6 token gates.
+    """
+    pairs = tuple(claims)
+    resolved: list[tuple[str, str]] = []
+    unresolved: list[str] = []
+    for token in tokens:
+        refs = [ref for key, ref in pairs if gates_story(token, key)]
+        if len(refs) == 1 and refs[0] is not None:
+            resolved.append((token, refs[0]))
+        else:
+            unresolved.append(token)
+    return tuple(resolved), tuple(unresolved)
+
+
+def _ticket_id_text(text: str) -> str:
+    """An id as ``tickets.py`` compares it: digits alone are the number, so
+    ``06`` and ``6`` are one id; any other id is compared as written."""
+    return str(int(text)) if text.isdigit() else text
+
+
+def gates_ticket(token: str, ref: str, *, epic_id: str, epic_slug: str) -> bool:
+    """Whether ``token`` gates the ticket ``ref`` of epic ``epic_slug`` (its folder,
+    ``epic-<x>``) whose initiative id is ``epic_id`` (``""`` when unlisted).
+
+    Three arms, one per thing a ticket gate can name:
+
+    - **the ticket**: ``token`` is ``ref`` — an ``E.M`` ref compared id by id the
+      way ``tickets.py`` does (``1.06`` is ``1.6``);
+    - **its epic by id**: a bare id that is ``epic_id`` gates every ``E.M`` of it;
+    - **its epic by folder**: ``epic-<slug>`` that is ``epic_slug``.
+
+    No prefix and no split arm, unlike :func:`gates_story`: ticket ids are opaque
+    letters and digits, so ``2.6a`` is its own ticket and not a split of ``2.6``,
+    and ``1.2`` never reaches ``1.20``.
+    """
+    if token == ref:
+        return True
+    pair, ref_pair = _TICKET_REF_RE.match(token), _TICKET_REF_RE.match(ref)
+    if pair is not None:
+        return ref_pair is not None and all(
+            _ticket_id_text(a) == _ticket_id_text(b)
+            for a, b in zip(pair.groups(), ref_pair.groups())
+        )
+    if _TICKET_ID_RE.match(token):
+        # Only an `E.M` ref belongs to a listed epic.
+        return (
+            bool(epic_id)
+            and ref_pair is not None
+            and _ticket_id_text(token) == _ticket_id_text(epic_id)
+            and _ticket_id_text(ref_pair.group(1)) == _ticket_id_text(epic_id)
+        )
+    return bool(epic_slug) and token == epic_slug
 
 
 def parse_declaration(raw: object) -> tuple[tuple[str, ...], str | None]:
@@ -1338,6 +1502,23 @@ def _apply_done_many(
     return text, marked
 
 
+def apply_reopenable_close(
+    text: str, dw_ids: Sequence[str], date: str, note: str, operation_id: str
+) -> str:
+    """The ledger text :func:`mark_done_many_reopenable` would publish over
+    `text`: the same pure fold (:func:`_apply_done_many`) under the same undo
+    owner, with no `Path`, no lock and no I/O. `text` comes back unchanged when
+    no id would flip. `date` and `operation_id` are validated as the writer
+    validates them.
+
+    The projection a caller needs to recognise its own close in a ledger it
+    read earlier — a sweep's verify reuse pins the pre-close ledger and this
+    projection of it, and accepts a gate-time ledger only when it is one of
+    the two."""
+    _require_iso_date(date)
+    return _apply_done_many(text, dw_ids, date, note, None, _operation_digest(operation_id))[0]
+
+
 def _mark_done_many(
     path: Path,
     dw_ids: Sequence[str],
@@ -1565,7 +1746,9 @@ _MARK_DONE_TAIL_RE = re.compile(
 )
 
 
-def _apply_open(text: str, dw_id: str, note: str, undo_owner: str) -> str | None:
+def _apply_open(
+    text: str, dw_id: str, note: str, undo_owner: str, archive: str | None = None
+) -> str | None:
     """Undo one reopenable close *within* `text`. None when the entry is missing,
     already open, or does not carry this operation's adjacent resolution and
     undo-marker lines.
@@ -1582,7 +1765,20 @@ def _apply_open(text: str, dw_id: str, note: str, undo_owner: str) -> str | None
     A live ``archived:`` stamp is demoted to :data:`_ARCHIVED_BODY_FIELD` rather
     than dropped: the reopened entry is no longer archived, but the body its
     close moved out still is, and that line is the only thing a later triage has
-    to find it with."""
+    to find it with.
+
+    `archive` is the archive sidecar's text, or None when the caller did not
+    read it (it was absent, or no id needed it). Given, and the entry is a stub
+    written before severity preservation (:func:`_needs_severity_recovery`), the
+    severity lines of the stamp's archive block (:func:`_archived_severity_lines`)
+    are restored immediately before the first live stamp, so the reopened entry
+    stays selectable by a severity floor (DW-334/DW-394). A modern stub keeps
+    the same lines in body order among its other preserved fields, so the bytes
+    match a reopen of the modern twin only when severity follows `gate:`,
+    `origin:` and `source_spec:` in the archived body — the order
+    :func:`append_entry` writes. Nothing else is rehydrated. The archive arrives as text so
+    this stays pure; reading it, and failing loud when it cannot be, is
+    :func:`mark_open_many`'s job."""
     entry = _find_entry(text, dw_id)
     if entry is None or entry.open:
         return None
@@ -1640,6 +1836,17 @@ def _apply_open(text: str, dw_id: str, note: str, undo_owner: str) -> str | None
     # Cuts are disjoint (an `^archived:` line cannot start inside the status
     # line or its adjacent tail) and applied back-to-front so earlier offsets
     # stay valid.
+    #
+    # A recovered severity rides on the FIRST stamp's replacement rather than
+    # as a zero-width cut of its own at the same offset: one cut per span keeps
+    # the back-to-front order unambiguous.
+    restored = ""
+    if archive is not None and _needs_severity_recovery(entry):
+        archived_stamp = _archived_stamp(entry)
+        assert archived_stamp is not None  # _needs_severity_recovery requires one
+        restored = "".join(
+            f"{line}\n" for line in _archived_severity_lines(archive, entry.id, archived_stamp)
+        )
     cuts = [(start, end, previous_status_line)]
     for cut_start, cut_end in _archived_line_spans(entry):
         # Everything after the field name — value, spacing and the terminating
@@ -1650,16 +1857,21 @@ def _apply_open(text: str, dw_id: str, note: str, undo_owner: str) -> str | None
             (
                 entry.span[0] + cut_start,
                 entry.span[0] + cut_end,
-                f"{_ARCHIVED_BODY_FIELD}{stamp}",
+                f"{restored}{_ARCHIVED_BODY_FIELD}{stamp}",
             )
         )
+        restored = ""
     for cut_start, cut_end, replacement in sorted(cuts, reverse=True):
         text = text[:cut_start] + replacement + text[cut_end:]
     return text
 
 
 def _apply_open_many(
-    text: str, dw_ids: Sequence[str], note: str, undo_owner: str
+    text: str,
+    dw_ids: Sequence[str],
+    note: str,
+    undo_owner: str,
+    archive: str | None = None,
 ) -> tuple[str, list[str]]:
     """Fold every id in `dw_ids` through :func:`_apply_open` *within* `text`,
     returning the new text and the ids actually reopened, in the order given.
@@ -1668,15 +1880,31 @@ def _apply_open_many(
     advisory pre-lock probe and the locked pass, so the two cannot drift. The
     `undo_owner` match is part of the decision: an entry closed by a different
     operation is skipped here, which is what makes "no id was eligible" a
-    question only this fold can answer."""
+    question only this fold can answer.
+
+    `archive` is threaded to every :func:`_apply_open` untouched. It changes
+    which lines a reopen restores, never whether an id reopens, so the ids this
+    returns do not depend on it."""
     reopened: list[str] = []
     for dw_id in dw_ids:
-        updated = _apply_open(text, dw_id, note, undo_owner)
+        updated = _apply_open(text, dw_id, note, undo_owner, archive)
         if updated is None:
             continue
         text = updated
         reopened.append(dw_id)
     return text, reopened
+
+
+def held_reopenable_closes(
+    text: str, dw_ids: Sequence[str], note: str, operation_id: str
+) -> list[str]:
+    """The ids in `dw_ids` whose close in `text` :func:`mark_open_many` would undo
+    under `note` and `operation_id`, in the order given — the closes that
+    operation still holds. Pure and read-only: the same fold the writer decides
+    with (:func:`_apply_open_many`), so "would reopen" and "is held" cannot
+    drift. An entry already reopened, closed by another operation, or missing is
+    not held."""
+    return _apply_open_many(text, dw_ids, note, _operation_digest(operation_id))[1]
 
 
 def mark_open_many(path: Path, dw_ids: Sequence[str], note: str, operation_id: str) -> list[str]:
@@ -1696,7 +1924,21 @@ def mark_open_many(path: Path, dw_ids: Sequence[str], note: str, operation_id: s
     Nothing is written when no id was eligible, and no lock is taken either
     (#736): a replayed rollback over already-reopened entries is answered from
     one advisory read, so it leaves the file untouched rather than rewriting it
-    byte-for-byte, and cannot fail on a lock it had no write to serialize."""
+    byte-for-byte, and cannot fail on a lock it had no write to serialize.
+
+    A reopened stub written before severity preservation gets its severity back
+    from the archive sidecar (DW-334/DW-394; see :func:`_apply_open`). The
+    sidecar is read under the same hold, whenever some id being reopened is an
+    archived stub with no live severity line (:func:`_needs_severity_recovery`)
+    — a modern stub whose body never had a severity looks exactly like a
+    pre-695d4d6e one until the archive is read. Only a batch whose reopened
+    stubs all carry a severity line never reads it. An absent archive restores
+    nothing, but a REFUSED one (:class:`LedgerReadFault`/:class:`LedgerReadError`)
+    raises and publishes nothing for the WHOLE batch — a severity-less reopen
+    over an archive that exists would be the silent degrade this recovery
+    exists to end, the same disposition as :func:`archive_closed`'s read of
+    that file. The advisory
+    probe decides only "would anything reopen" and never reads the archive."""
     undo_owner = _operation_digest(operation_id)
     if not dw_ids:
         # No ids, no lock — see `_mark_done_many`. The `operation_id` above is
@@ -1722,12 +1964,24 @@ def mark_open_many(path: Path, dw_ids: Sequence[str], note: str, operation_id: s
     with ledger_lock(path):
         # REPAIR/WRITE (DW-146): this text is edited and published below. `None`
         # is absence alone; a refusal raises out of the reader (DW-221/255).
-        text = read_for_write(path)
-        if text is None:
+        original = read_for_write(path)
+        if original is None:
             return []
-        text, reopened = _apply_open_many(text, dw_ids, note, undo_owner)
+        text, reopened = _apply_open_many(original, dw_ids, note, undo_owner)
         if not reopened:
             return []
+        # Each reopen edits only its own entry, so the original text answers
+        # "does this stub need recovery" for every id the fold reopened.
+        if any(
+            (entry := _find_entry(original, dw_id)) is not None and _needs_severity_recovery(entry)
+            for dw_id in reopened
+        ):
+            # REPAIR/WRITE (DW-146): what this read returns is written into the
+            # ledger below, so a refusal raises rather than publishing a reopen
+            # that silently lost the severity it was read to restore.
+            archive = read_for_write(path.parent / ARCHIVE_REL)
+            if archive is not None:
+                text, reopened = _apply_open_many(original, dw_ids, note, undo_owner, archive)
         _publish(path, text)
         return reopened
 
@@ -1913,23 +2167,41 @@ def append_decision(path: Path, dw_id: str, date: str, label: str, detail: str) 
 
 
 DW_ID_RE = re.compile(r"\bDW-(\d+)\b")
+# The id a `### DW-<n>` heading line carries, read looser than `HEADING_RE` on
+# purpose: a heading with no colon, a blank title, extra whitespace after the
+# hashes or a few spaces of indent is malformed, but its number is still spoken
+# for. Fences are not masked either — erring toward a burned number, never a
+# reused one.
+_SEQ_HEADING_RE = re.compile(r"^ {0,3}###[ \t]+DW-(\d+)\b", re.MULTILINE)
 
 
 def next_seq(text: str) -> int:
-    """The next free DW sequence number — one past the highest DW-<n> anywhere
-    in the ledger (malformed entries included, so a number is never reused and
-    the sweep numbering check stays satisfied)."""
-    nums = [int(m.group(1)) for m in DW_ID_RE.finditer(text)]
+    """The next free DW sequence number — one past the highest id any
+    ``### DW-<n>`` heading carries (malformed headings included, so a number is
+    never reused and the sweep numbering check stays satisfied).
+
+    Headings only (DW-384): a ``DW-<n>`` mentioned in an entry's body, in
+    surrounding prose, or later in a heading's own title names an entry rather
+    than allocating one, so a note citing a far-higher id no longer burns the
+    id space up to it."""
+    nums = [int(m.group(1)) for m in _SEQ_HEADING_RE.finditer(text)]
     return (max(nums) + 1) if nums else 1
 
 
-def field_line_present(body: str, field: str, value: str) -> bool:
-    """True when `body` has a `field:` line whose value is exactly `value`,
+def field_line_present(entry: DWEntry, field: str, value: str) -> bool:
+    """True when `entry` has a live `field:` line whose value is exactly `value`,
     matching the shapes append_entry writes (plain, or backtick-wrapped as for
     `source_spec:`). Anchored per-line so an incidental substring elsewhere in
-    the body (e.g. inside `reason:`) never counts as a match."""
-    v = re.escape(value)
-    return re.search(rf"(?m)^{re.escape(field)}:[ \t]*`?{v}`?[ \t]*$", body) is not None
+    the body (e.g. inside `reason:`) never counts as a match.
+
+    Fence-aware through :func:`_quoted`, like :func:`field_values` (DW-408): an
+    entry quoting a worked example carries the example's `origin:` and
+    `source_spec:` lines in column 0, right where the anchor looks, and a quoted
+    example is not a key the entry holds. Read over the raw body, it suppressed
+    a legitimate append and a harvest filing whose only "twin" was that
+    example."""
+    pattern = re.compile(rf"^{re.escape(field)}:[ \t]*`?{re.escape(value)}`?[ \t]*$", re.MULTILINE)
+    return any(not _quoted(entry, m.start()) for m in pattern.finditer(entry.body))
 
 
 @dataclass(frozen=True)
@@ -1945,7 +2217,17 @@ class EntrySpec:
     ``origin`` alone. It is opt-in because only producers whose origin is already
     a complete, spec-independent work identity may safely collapse rows from
     different source specs. The scan remains open-only so resolved work can be
-    filed again when it recurs."""
+    filed again when it recurs.
+
+    ``dedupe_any_status`` (DW-388) is the opposite trade: an entry of ANY status —
+    open, done, legacy, or an :func:`archive_closed` stub, which keeps its
+    ``origin:`` line — carrying the same ``origin`` suppresses the append, whatever
+    its ``source_spec``. It is for producers whose origin names ONE immutable
+    commitment (a retro action item's stable id), where recurrence is meaningless
+    and a finished item must never be re-filed. With it set, the advisory pre-lock
+    no-op in :func:`append_entries_published` stays safe: entries are never deleted
+    and stubs keep ``origin:``, so a twin observed before the lock is still there
+    under it — unlike the open-only arms, whose twin can close in between."""
 
     title: str
     origin: str
@@ -1955,6 +2237,7 @@ class EntrySpec:
     status: str = "open"
     severity: str | None = None
     cross_spec_dedupe: bool = False
+    dedupe_any_status: bool = False
 
 
 def _apply_append(text: str, spec: EntrySpec) -> tuple[str, str | None]:
@@ -1980,7 +2263,9 @@ def _apply_append(text: str, spec: EntrySpec) -> tuple[str, str | None]:
     The scan is deliberately open-only for both match arms: a closed entry with
     the same marker does not suppress the append, because the work has come
     back. The origin-only arm is opt-in so non-harvest producers keep the
-    released exact-pair semantics."""
+    released exact-pair semantics. ``dedupe_any_status`` is the one exception,
+    and it is opt-in too: its origin-only match counts entries of every status
+    (see :class:`EntrySpec`)."""
     given_title = bool(spec.title)
     title = _one_line(spec.title)
     origin = _one_line(spec.origin)
@@ -1988,9 +2273,13 @@ def _apply_append(text: str, spec: EntrySpec) -> tuple[str, str | None]:
     reason = _one_line(spec.reason)
     location = _one_line(spec.location)
     for entry in parse_ledger(text):
-        if not entry.open or not field_line_present(entry.body, "origin", origin):
+        if spec.dedupe_any_status:
+            if field_line_present(entry, "origin", origin):
+                return text, None
             continue
-        if spec.cross_spec_dedupe or field_line_present(entry.body, "source_spec", source_spec):
+        if not entry.open or not field_line_present(entry, "origin", origin):
+            continue
+        if spec.cross_spec_dedupe or field_line_present(entry, "source_spec", source_spec):
             return text, None
     dw_id = f"DW-{next_seq(text)}"
     if given_title and not title.strip():
@@ -2043,6 +2332,21 @@ def _apply_appends(text: str, specs: Sequence[EntrySpec]) -> tuple[str, list[str
         text, dw_id = _apply_append(text, spec)
         minted.append(dw_id)
     return text, minted
+
+
+def appended_text(text: str, specs: Sequence[EntrySpec]) -> str:
+    """The text :func:`append_entries` would publish over `text` for `specs`.
+
+    Pure — text in, text out — and the SAME fold the writer runs
+    (:func:`_apply_appends`), so a caller recomputing what a batch append WROTE
+    cannot drift from what it writes. The ids it would mint are dropped: a caller
+    that needs them is a writer and belongs in :func:`append_entries`. Nothing is
+    validated here, because nothing is written: a spec the writer's up-front
+    status/severity checks would refuse may still fold into text the writer would
+    never publish, or raise from the fold itself — a caller comparing against the
+    result must hand it only specs the writer accepts. The engine's harvested-carry
+    ownership proof (DW-355) recomputes its intended ledger through this."""
+    return _apply_appends(text, specs)[0]
 
 
 def append_entries(path: Path, specs: Sequence[EntrySpec]) -> list[str | None]:
@@ -2118,7 +2422,10 @@ def append_entries_published(
     An opted-in cross-spec batch always reaches the lock, even when the advisory
     fold suppresses every spec, because an observed open twin may close before
     the authoritative decision; the locked re-read must then file the recurrence
-    fresh. Deliberately NO missing-ledger guard, unlike its sibling mutators: an
+    fresh. An any-status batch (``dedupe_any_status``, DW-388) keeps the
+    lock-free no-op: its twin cannot vanish between the probe and the lock,
+    because entries are never deleted and archive stubs keep ``origin:``.
+    Deliberately NO missing-ledger guard, unlike its sibling mutators: an
     absent ledger here means CREATE, which is a write, and a write must take the
     lock.
 
@@ -2187,7 +2494,7 @@ def append_entry(
     severity: str | None = None,
 ) -> str | None:
     """Append a new canonical `### DW-<seq>` entry numbered past the highest
-    existing DW id, returning the new id (e.g. "DW-42").
+    `### DW-<n>` heading id (:func:`next_seq`), returning the new id (e.g. "DW-42").
 
     Idempotent: returns None without writing when an open entry already carries
     the same `origin:` marker and `source_spec:` — so re-running the same defer
@@ -2363,6 +2670,56 @@ def _preserved_stub_lines(entry: DWEntry) -> list[str]:
         if tail is not None:
             lines = [tail.group(0).lstrip("\n")] + lines
     return lines
+
+
+# The severity arm of `_PRESERVED_FIELD_RE` on its own: what a stub keeps of an
+# archived body's severity metadata, and so exactly what a reopen of a stub
+# written before that arm existed has to recover (DW-334/DW-394).
+_PRESERVED_SEVERITY_RE = re.compile(rf"^{_PRESERVED_SEVERITY_LINE}$", re.MULTILINE)
+
+
+def _live_severity_lines(entry: DWEntry) -> list[str]:
+    """The entry's unfenced severity/priority lines, verbatim and in body order —
+    the lines :func:`_preserved_stub_lines` copies into a stub for this arm."""
+    return [
+        entry.body[m.start() : m.end()]
+        for m in _PRESERVED_SEVERITY_RE.finditer(entry.body)
+        if not _quoted(entry, m.start())
+    ]
+
+
+def _needs_severity_recovery(entry: DWEntry) -> bool:
+    """Whether reopening `entry` must look in the archive for its severity.
+
+    A stub written before severity preservation (695d4d6e) carries a live
+    ``archived:`` stamp and no live severity/priority line, although its
+    archived body may have had one; reopened as-is it reads severity-less and a
+    ``min_severity`` sweep drops it (DW-334/DW-394). A modern stub whose
+    archived body never had a severity qualifies too: without the archive the
+    two cannot be told apart, so the archive is read for it (and a refused
+    archive refuses its reopen). Only a stub already carrying a severity line
+    never qualifies — the archive is then never read for it."""
+    return _archived_stamp(entry) is not None and not _live_severity_lines(entry)
+
+
+def _archived_severity_lines(archive: str, dw_id: str, stamp: str) -> list[str]:
+    """The live severity/priority lines of the LAST archive block for `dw_id`
+    whose own ``archived:`` stamp is `stamp`, or ``[]`` when no block matches.
+
+    Last because the archive is append-only, so for one id file order is
+    closure order — :func:`_archived_stamp`'s documented tie-break between two
+    closures archived on the same day. Lines are the ones a modern stub would
+    have preserved from that block's body (:func:`_live_severity_lines`), so a
+    recovered reopen always carries the same severity lines as a reopen of the
+    modern twin, and the same bytes when severity follows the other preserved
+    fields (`gate:`/`origin:`/`source_spec:`) in the body — the order
+    :func:`append_entry` writes. Restored lines always land just before the
+    stamp, where a modern stub keeps body order."""
+    block = None
+    for candidate in parse_ledger(archive):
+        if candidate.id == dw_id and _archived_stamp(candidate) == stamp:
+            block = candidate
+    return _live_severity_lines(block) if block is not None else []
 
 
 def _close_date(entry: DWEntry) -> str | None:
@@ -2650,6 +3007,20 @@ def _normalize_severity(value: str) -> str | None:
     return SEVERITY_ALIASES.get(value.lower())
 
 
+# The word must end there: a digit, letter or `_word` suffix ("critical1",
+# "high_priority") is a different token, while a closing `_` emphasis or a
+# hyphenated qualifier ("high-if-true") still reads as the level.
+_LEADING_SEVERITY_RE = re.compile(r"[ \t\r\n*_`]*([A-Za-z]+)(?![^\W_]|_\w)")
+
+
+def leading_severity(text: str) -> str | None:
+    """Normalize a dev session's declared severity by its leading word, so a
+    qualifier ("high (unverified)") keeps its level; harvest-only — the ledger
+    reader's SEVERITY_FIELD_RE is deliberately untouched."""
+    m = _LEADING_SEVERITY_RE.match(text)
+    return _normalize_severity(m.group(1)) if m else None
+
+
 @dataclass(frozen=True)
 class LegacyEntry:
     key: str  # stable content-derived identity, unique within the file
@@ -2685,7 +3056,8 @@ _LEAD_DONE_STRIP_RE = re.compile(
 #   - source_spec: `spec-foo.md`
 #     summary: <one sentence>
 #     evidence: <why this is real>
-# We recognize it so the `summary` becomes the title (not the source_spec path)
+# (on v7 the opener is `- source_plan: <plan>`, the same block otherwise).
+# We recognize it so the `summary` becomes the title (not the source path)
 # and the entry migrates cleanly into the canonical `### DW-<seq>` shape. The
 # opening line comes from the same `_FLAT_SOURCE_BODY` as FLAT_ENTRY_RE, which
 # bounds canonical spans on it — see that constant for why they must not drift.
@@ -2716,7 +3088,8 @@ def _clean_title(s: str) -> str:
 def _item_entry(first: str, body: str, section: str, section_done: bool) -> dict:
     """Interpret one bullet item; returns the pre-key entry fields."""
     if _FLAT_SOURCE_RE.match(first):
-        # flat appender block (legacy/attended era): title is the `summary`
+        # flat appender block (legacy/attended era, `source_spec:` or v7's
+        # `source_plan:` opener): title is the `summary`
         sm = _FLAT_SUMMARY_RE.search(body)
         summary = sm.group(1).strip() if sm else ""
         return {

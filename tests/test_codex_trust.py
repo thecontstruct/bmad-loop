@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from conftest import install_bmad_config, windows_relay_builder, write_script_launcher
 
-from bmad_loop import cli, codex_trust, probe
+from bmad_loop import cli, codex_trust, envvars, probe, runs, sanitize
 from bmad_loop.adapters.profile import ProfileError, get_profile
 from bmad_loop.install import _hook_command, merge_hooks
 
@@ -164,6 +168,29 @@ def test_trust_resolves_codex_cmd_shim_before_spawning(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "error",
+    [OSError("spawn"), ValueError("closed"), TimeoutError("slow"), subprocess.SubprocessError()],
+)
+def test_failed_hooks_list_query_reports_the_exported_query_failure_reason(
+    tmp_path, monkeypatch, error
+):
+    """The worktree gate retries a failed query once by matching this exported
+    constant (DW-341), so the except arm must return exactly it.
+
+    Ablation: return a different string literal from the except arm and this fails
+    (and the gate's retry silently stops firing)."""
+    _config(tmp_path)
+    monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_a, **_k: "/fake/codex")
+
+    def hooks_list(*_a):
+        raise error
+
+    monkeypatch.setattr(codex_trust, "_hooks_list", hooks_list)
+    result = codex_trust.project_hook_trust(tmp_path, get_profile("codex"))
+    assert result == codex_trust.TrustResult("unverifiable", codex_trust.QUERY_FAILED_REASON)
+
+
+@pytest.mark.parametrize(
     ("mutation", "expected"),
     [
         ("start-modified", "untrusted"),
@@ -314,6 +341,76 @@ def test_validate_trust_query_uses_selected_project(project, tmp_path, monkeypat
     assert queried == [project.project]
 
 
+_SANDBOXED_ONLY_POSIX = pytest.mark.skipif(
+    sys.platform == "win32", reason="the packaged codex sandboxed mode maps linux/darwin only"
+)
+
+
+def _codex_validate_project(project, policy_text):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    install_into(project.project, clis=("codex",))
+    (project.project / ".bmad-loop/policy.toml").write_text(policy_text, encoding="utf-8")
+
+
+@_SANDBOXED_ONLY_POSIX
+def test_validate_trust_query_uses_each_roles_permission_mode_launch(project, monkeypatch, capsys):
+    """Validate queries the profile the run launches: under a sandboxed
+    permission_mode that is the mode's args, not the profile's bypass_args.
+
+    Ablation: query `project_hook_trust(project, profile)` with the base profile
+    and the queried bypass_args are the bypass switch, so this fails."""
+    _codex_validate_project(project, '[adapter]\nname = "codex"\npermission_mode = "sandboxed"\n')
+    capsys.readouterr()
+    base = get_profile("codex")
+    sandboxed = base.for_permission_mode("sandboxed")
+    assert sandboxed.bypass_args != base.bypass_args
+    queried = []
+
+    def trust(_path, profile):
+        queried.append(profile.bypass_args)
+        return codex_trust.TrustResult("trusted", "hook trust current")
+
+    monkeypatch.setattr(codex_trust, "project_hook_trust", trust)
+    cli.main(["validate", "--project", str(project.project), "--json"])
+    finding = next(
+        f for f in json.loads(capsys.readouterr().out)["findings"] if f["check"] == "hooks.trust"
+    )
+    assert finding["severity"] == "ok"
+    # every role shares one sandboxed launch: one query, at the mode's args
+    assert queried == [sandboxed.bypass_args]
+
+
+@_SANDBOXED_ONLY_POSIX
+def test_validate_fails_trust_untrusted_for_one_roles_permission_mode_launch(
+    project, monkeypatch, capsys
+):
+    _codex_validate_project(
+        project, '[adapter]\nname = "codex"\n[adapter.review]\npermission_mode = "sandboxed"\n'
+    )
+    capsys.readouterr()
+    base = get_profile("codex")
+    queried = []
+
+    def trust(_path, profile):
+        queried.append(profile.bypass_args)
+        if profile.bypass_args == base.bypass_args:
+            return codex_trust.TrustResult("trusted", "hook trust current")
+        return codex_trust.TrustResult("untrusted", "hook trust stale under sandbox")
+
+    monkeypatch.setattr(codex_trust, "project_hook_trust", trust)
+    cli.main(["validate", "--project", str(project.project), "--json"])
+    doc = json.loads(capsys.readouterr().out)
+    findings = [f for f in doc["findings"] if f["check"] == "hooks.trust"]
+    assert len(findings) == 1 and findings[0]["severity"] == "problem"
+    message = findings[0]["message"]
+    assert "hook trust stale under sandbox" in message and "review (sandboxed)" in message
+    assert "dev (bypass)" not in message
+    assert set(findings[0]["detail"]) >= {"profile", "project", "binary"}
+    assert queried == [base.bypass_args, base.for_permission_mode("sandboxed").bypass_args]
+
+
 def test_validate_does_not_run_project_owned_codex_profile(project, tmp_path, capsys):
     from bmad_loop.install import install_into
 
@@ -396,7 +493,7 @@ def test_scan_and_live_probe_refuse_trust_at_their_own_directories(tmp_path, mon
             pass
 
         def start(self, *_args):
-            pytest.fail("untrusted temporary hook config must stop before launch")
+            pytest.fail("untrusted probe hook config must stop before launch")
 
         def kill(self):
             pass
@@ -408,11 +505,12 @@ def test_scan_and_live_probe_refuse_trust_at_their_own_directories(tmp_path, mon
         cli="codex", profile=profile, project=tmp_path, hints=probe.Hints(binary="chosen")
     )
     assert live.hook_trust == "untrusted"
-    assert calls[-1][0] != tmp_path and calls[-1][1:] == ("chosen", probe.PROBE_HOOK_NAME)
-    assert "temporary probe workspace" in live.warnings[0]
+    assert calls[-1][0] == probe.probe_workspace(profile)
+    assert calls[-1][1:] == ("chosen", probe.PROBE_HOOK_NAME)
+    assert "stable probe workspace" in live.warnings[0]
 
 
-def test_trusted_live_probe_checks_temp_config_then_starts_zero_token_launcher(
+def test_trusted_live_probe_checks_stable_config_then_starts_zero_token_launcher(
     tmp_path, monkeypatch
 ):
     profile = get_profile("codex")
@@ -458,10 +556,314 @@ def test_trusted_live_probe_checks_temp_config_then_starts_zero_token_launcher(
         cli="codex", profile=profile, project=tmp_path, hints=probe.Hints(binary="chosen")
     )
     assert finding.hook_trust == "trusted"
-    assert events[0][0] == "trust" and events[0][1] != tmp_path
+    assert events[0][0] == "trust" and events[0][1] == probe.probe_workspace(profile)
     assert events[0][2:] == ("chosen", probe.PROBE_HOOK_NAME)
     assert events[1] == ("start", events[0][1], "/bin/true")
     assert events[-1] == ("kill",)
+
+
+class _LiveProbeHarness:
+    """Fakes the mux, launcher, watcher and mkdtemp around ``probe.probe`` so a
+    live probe runs with zero tokens and records where it queried trust, where
+    it launched, and which ephemeral raw dirs it made."""
+
+    def __init__(self, monkeypatch, trust_status: str = "untrusted"):
+        self.trust_paths: list[Path] = []
+        self.starts: list[Path] = []
+        self.raw_dirs: list[Path] = []
+        self.launch_envs: list[dict[str, str]] = []
+        self.log_files: list[Path] = []
+        harness = self
+        real_mkdtemp = probe.tempfile.mkdtemp
+
+        def mkdtemp(*args, **kwargs):
+            path = real_mkdtemp(*args, **kwargs)
+            harness.raw_dirs.append(Path(path))
+            return path
+
+        def trust(path, _profile, *, binary=None, marker=None):
+            harness.trust_paths.append(path)
+            return codex_trust.TrustResult(trust_status, f"hook trust {trust_status}")
+
+        class Mux:
+            def available(self):
+                return True
+
+        class Launcher:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self, _argv, env, cwd, log_file):
+                harness.starts.append(Path(cwd))
+                harness.launch_envs.append(dict(env))
+                harness.log_files.append(Path(log_file))
+                return "fake-window"
+
+            def kill(self):
+                pass
+
+        class Watcher:
+            def __init__(self, _capture_dir):
+                pass
+
+            def wait_for(self, *_args, **_kwargs):
+                return object()  # scripted Stop; no model turn
+
+        monkeypatch.setattr(probe.tempfile, "mkdtemp", mkdtemp)
+        monkeypatch.setattr(codex_trust, "project_hook_trust", trust)
+        monkeypatch.setattr(probe, "get_multiplexer", Mux)
+        monkeypatch.setattr(probe, "_ProbeLauncher", Launcher)
+        monkeypatch.setattr(probe, "SignalWatcher", Watcher)
+        monkeypatch.setattr(probe.shutil, "which", lambda _binary, **_kwargs: "/bin/true")
+        monkeypatch.setattr(
+            probe, "run_version_help", lambda binary: probe.FlagFinding(binary, True)
+        )
+        monkeypatch.setattr(probe, "discover_transcript", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(probe.time, "sleep", lambda _seconds: None)
+
+    def run(self, project: Path, cli_name: str = "codex") -> probe.ProfileFinding:
+        return probe.probe(
+            cli=cli_name,
+            profile=get_profile(cli_name),
+            project=project,
+            hints=probe.Hints(binary="chosen"),
+        )
+
+
+def test_untrusted_live_probe_names_stable_workspace_and_keeps_only_hook_and_config(
+    tmp_path, monkeypatch
+):
+    harness = _LiveProbeHarness(monkeypatch)
+    profile = get_profile("codex")
+    workspace = probe.probe_workspace(profile)
+    assert workspace.parent == runs.state_root() / probe.PROBE_WORKSPACES_DIR
+
+    finding = harness.run(tmp_path)
+
+    assert finding.hook_trust == "untrusted" and harness.starts == []
+    assert harness.trust_paths == [workspace]
+    label = probe._workspace_label(workspace)
+    step = finding.next_steps[-1]
+    assert f"`{label}`" in step
+    assert "Open Codex once in the stable probe workspace" in step
+    assert "folder trust and hooks trust prompts" in step
+    assert "bmad-loop probe-adapter codex --probe` from your project checkout" in step
+    assert sorted(p.relative_to(workspace).as_posix() for p in workspace.rglob("*")) == sorted(
+        [
+            probe.PROBE_HOOK_NAME,
+            Path(profile.hooks.config_path).parent.as_posix(),
+            Path(profile.hooks.config_path).as_posix(),
+        ]
+    )
+    assert len(harness.raw_dirs) == 1 and not harness.raw_dirs[0].exists()
+    raw = harness.raw_dirs[0]
+    assert raw != workspace and workspace not in raw.parents and raw not in workspace.parents
+
+    # the rendered report carries the workspace label past the egress guard
+    report = probe.render_markdown(finding)
+    assert label in report
+
+
+def test_unverifiable_live_probe_gets_the_diagnostic_step_not_the_trust_step(tmp_path, monkeypatch):
+    harness = _LiveProbeHarness(monkeypatch, trust_status="unverifiable")
+
+    finding = harness.run(tmp_path)
+
+    assert finding.hook_trust == "unverifiable" and harness.starts == []
+    assert finding.next_steps[-1] == (
+        "Resolve the Codex hook trust diagnostic and re-run "
+        "`bmad-loop probe-adapter codex --probe`"
+    )
+    assert not any("Open Codex once" in step for step in finding.next_steps)
+
+
+def test_live_probe_workspace_reset_drops_strays_and_keeps_config_bytes(tmp_path, monkeypatch):
+    harness = _LiveProbeHarness(monkeypatch)
+    profile = get_profile("codex")
+    workspace = probe.probe_workspace(profile)
+    config = workspace / profile.hooks.config_path
+
+    harness.run(tmp_path)
+    first = config.read_bytes()
+    stray = workspace / "stray.txt"
+    stray.write_text("left behind", encoding="utf-8")
+
+    harness.run(tmp_path)
+
+    assert not stray.exists()
+    assert config.read_bytes() == first
+    assert harness.trust_paths == [workspace, workspace]
+
+
+def test_live_probe_workspace_reset_keeps_the_directory_an_operator_cd_into(tmp_path, monkeypatch):
+    # The untrusted next step sends the operator to cd into the workspace; a
+    # re-run from there must not unlink its own (and its shell's) cwd.
+    harness = _LiveProbeHarness(monkeypatch)
+    workspace = probe.probe_workspace(get_profile("codex"))
+    harness.run(tmp_path)
+    before = os.stat(workspace)
+    (workspace / "stray-dir" / "nested").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("not ours", encoding="utf-8")
+    monkeypatch.chdir(workspace)
+    if sys.platform != "win32":
+        (workspace / "stray-link").symlink_to(outside, target_is_directory=True)
+
+    harness.run(tmp_path)
+
+    assert Path.cwd() == workspace  # cwd still resolves
+    after = os.stat(workspace)
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert not (workspace / "stray-dir").exists()
+    assert not os.path.lexists(workspace / "stray-link")
+    assert (outside / "keep.txt").is_file()  # the link was removed, not followed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_live_probe_workspace_is_owner_only(tmp_path, monkeypatch):
+    harness = _LiveProbeHarness(monkeypatch)
+    workspace = probe.probe_workspace(get_profile("codex"))
+    workspace.mkdir(parents=True)
+    workspace.chmod(0o775)  # an older run under a group-writable umask
+    workspace.parent.chmod(0o775)
+
+    harness.run(tmp_path)
+
+    assert workspace.stat().st_mode & 0o777 == 0o700
+    assert workspace.parent.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink")
+def test_live_probe_refuses_a_linked_probe_workspaces_dir(tmp_path, monkeypatch):
+    harness = _LiveProbeHarness(monkeypatch, trust_status="trusted")
+    workspace = probe.probe_workspace(get_profile("codex"))
+    target = tmp_path / "elsewhere"
+    (target / workspace.name).mkdir(parents=True)
+    keep = target / workspace.name / "keep.txt"
+    keep.write_text("not ours", encoding="utf-8")
+    workspace.parent.parent.mkdir(parents=True, exist_ok=True)
+    workspace.parent.symlink_to(target, target_is_directory=True)
+
+    finding = harness.run(tmp_path)
+
+    assert finding.hook_trust == "unverifiable" and harness.starts == []
+    assert "symlink or junction" in finding.warnings[-1]
+    assert keep.is_file()
+
+
+def test_trusted_live_probe_launches_in_stable_workspace_and_removes_raw_dir(tmp_path, monkeypatch):
+    harness = _LiveProbeHarness(monkeypatch, trust_status="trusted")
+    workspace = probe.probe_workspace(get_profile("codex"))
+
+    finding = harness.run(tmp_path)
+
+    assert finding.hook_trust == "trusted"
+    assert harness.starts == [workspace]
+    assert len(harness.raw_dirs) == 1 and not harness.raw_dirs[0].exists()
+    raw = harness.raw_dirs[0]
+    # captures and the launch log stay in the ephemeral raw dir, never the workspace
+    assert harness.log_files == [raw / "probe.log"]
+    assert harness.launch_envs[0]["BMAD_LOOP_PROBE_CAPTURE_DIR"] == str(raw / "capture")
+    assert harness.launch_envs[0]["BMAD_LOOP_RUN_DIR"] == str(raw)
+    assert (workspace / probe.PROBE_HOOK_NAME).is_file()
+
+
+@pytest.mark.parametrize("fault", ["state-root", "reset"])
+def test_live_probe_workspace_fault_is_unverifiable_without_launch(tmp_path, monkeypatch, fault):
+    harness = _LiveProbeHarness(monkeypatch, trust_status="trusted")
+    if fault == "state-root":
+
+        def no_root():
+            raise runs.StateRootError("cannot locate a state directory")
+
+        monkeypatch.setattr(probe.runs, "state_root", no_root)
+    else:
+        # a plain file where the workspace dir belongs: mkdir refuses it
+        workspace = probe.probe_workspace(get_profile("codex"))
+        workspace.parent.mkdir(parents=True)
+        workspace.write_text("not a dir", encoding="utf-8")
+
+    finding = harness.run(tmp_path)
+
+    assert finding.hook_trust == "unverifiable"
+    assert harness.trust_paths == [] and harness.starts == []
+    assert "could not prepare the stable probe workspace" in finding.warnings[-1]
+    step = finding.next_steps[-1]
+    assert "re-run `bmad-loop probe-adapter codex --probe`" in step
+    if fault == "state-root":
+        assert "BMAD_LOOP_STATE_DIR" in step and "Close any Codex session" not in step
+    else:
+        assert "Close any Codex session running in the probe workspace" in step
+        assert "check its parent directory is writable" in step
+        assert "BMAD_LOOP_STATE_DIR" not in step
+        assert f"`{probe._workspace_label(probe.probe_workspace(get_profile('codex')))}`" in step
+    assert len(harness.raw_dirs) == 1 and not harness.raw_dirs[0].exists()
+    probe.render_markdown(finding)  # passes the egress guard
+
+
+def test_non_codex_live_probe_keeps_the_ephemeral_workspace(tmp_path, monkeypatch):
+    harness = _LiveProbeHarness(monkeypatch)
+
+    finding = harness.run(tmp_path, cli_name="claude")
+
+    assert finding.hook_trust is None
+    assert harness.trust_paths == []
+    assert harness.starts == harness.raw_dirs and len(harness.raw_dirs) == 1
+    assert not harness.raw_dirs[0].exists()
+    assert not (runs.state_root() / probe.PROBE_WORKSPACES_DIR).exists()
+
+
+def _digest(name: str) -> str:
+    return "-" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("codex", "codex"),
+        ("my codex/2", "my_codex_2" + _digest("my codex/2")),
+        ("..", "profile" + _digest("..")),
+        ("", "profile" + _digest("")),
+        ("nul", "_nul" + _digest("nul")),
+        ("CON.x", "_CON.x" + _digest("CON.x")),
+        ("codex.", "codex" + _digest("codex.")),
+    ],
+)
+def test_probe_workspace_name_is_path_safe(name, expected):
+    profile = replace(get_profile("codex"), name=name)
+    assert probe.probe_workspace(profile) == (
+        runs.state_root() / probe.PROBE_WORKSPACES_DIR / expected
+    )
+
+
+def test_probe_workspace_names_that_coerce_alike_stay_distinct():
+    base = get_profile("codex")
+    names = ["my codex/2", "my_codex_2", "my:codex:2"]
+    workspaces = {probe.probe_workspace(replace(base, name=n)) for n in names}
+    assert len(workspaces) == len(names)
+
+
+def test_workspace_label_redacts_an_email_shaped_component_without_the_username():
+    # Off the username branch (a tmp state root embeds the user): only the
+    # egress-guard fallback can catch the email here.
+    path = Path("/mnt/accounts/bob@example.net/state") / probe.PROBE_WORKSPACES_DIR / "codex"
+    assert not sanitize.embeds_current_username(str(path))
+    label = probe._workspace_label(path)
+    assert "bob@example.net" not in label and sanitize.assert_no_leak(label) == []
+    assert label.endswith(f"{probe.PROBE_WORKSPACES_DIR}/codex")
+
+
+def test_workspace_label_redacts_an_email_shaped_state_root(tmp_path, monkeypatch):
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "bob@example.net" / "state"))
+    harness = _LiveProbeHarness(monkeypatch)
+    label = probe._workspace_label(probe.probe_workspace(get_profile("codex")))
+    assert "bob@example.net" not in label and sanitize.assert_no_leak(label) == []
+
+    finding = harness.run(tmp_path)
+
+    assert f"`{label}`" in finding.next_steps[-1]
+    probe.render_markdown(finding)  # passes the egress guard
 
 
 def test_probe_json_exits_nonzero_and_names_hook_trust(tmp_path, monkeypatch, capsys):
@@ -525,3 +927,93 @@ def test_continuous_unrelated_messages_cannot_extend_rpc_deadline(tmp_path, monk
     monkeypatch.setattr(codex_trust, "_TIMEOUT_S", 0.1)
     with pytest.raises(TimeoutError):
         codex_trust._hooks_list(str(script), tmp_path, {})
+
+
+def test_trust_accepts_no_daemon_launch_arg(tmp_path, monkeypatch):
+    """The shipped profile launches with `--no-daemon`, which changes where the
+    app-server is hosted, not which hooks are discovered: it resolves trusted,
+    not unverifiable. Ablation target: drop NO_DAEMON_ARG from the safe set."""
+    data = _config(tmp_path)
+    monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_: "codex-stub")
+    monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: _rpc(tmp_path, data))
+    profile = get_profile("codex")
+    assert profile.launch_args == (codex_trust.NO_DAEMON_ARG,)
+    assert codex_trust.project_hook_trust(tmp_path, profile).status == "trusted"
+
+
+def test_trust_still_refuses_unknown_launch_args(tmp_path, monkeypatch):
+    data = _config(tmp_path)
+    monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_: "codex-stub")
+    monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: _rpc(tmp_path, data))
+    profile = replace(
+        get_profile("codex"), launch_args=(codex_trust.NO_DAEMON_ARG, "--profile", "x")
+    )
+    result = codex_trust.project_hook_trust(tmp_path, profile)
+    assert result.status == "unverifiable"
+    assert "launch arguments" in result.reason
+
+
+def test_hook_discovery_args_safe_accepts_no_daemon():
+    assert codex_trust.hook_discovery_args_safe(None)
+    assert codex_trust.hook_discovery_args_safe(("--no-daemon",))
+    assert codex_trust.hook_discovery_args_safe(
+        ("--no-daemon", "--dangerously-bypass-approvals-and-sandbox")
+    )
+    assert not codex_trust.hook_discovery_args_safe(("--no-daemon", "-c", "x=1"))
+
+
+def test_hook_discovery_args_safe_shipped_sandboxed_mapping_is_safe():
+    from bmad_loop.adapters.profile import get_profile
+
+    sandboxed = get_profile("codex").for_permission_mode("sandboxed", platform="linux")
+    assert codex_trust.hook_discovery_args_safe(sandboxed.bypass_args)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--sandbox", "workspace-write"),
+        ("--ask-for-approval", "never"),
+        ("--sandbox", "workspace-write", "--ask-for-approval", "never", "--no-daemon"),
+        ("-c", 'default_permissions="bmad_loop"'),
+        ("-c", 'permissions.bmad_loop.extends=":workspace"'),
+    ],
+)
+def test_hook_discovery_args_safe_accepts_safe_pairs(args):
+    assert codex_trust.hook_discovery_args_safe(args)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        # a pair value standing alone, or a pair flag with no value
+        ("never",),
+        ("workspace-write",),
+        ("--ask-for-approval",),
+        ("--no-daemon", "--sandbox"),
+        # a known flag with an unlisted value
+        ("--sandbox", "danger-full-access"),
+        ("--ask-for-approval", "on-request"),
+        # a config override outside the permission-profile keys
+        ("-c", "hooks.x=1"),
+        ("-c", "default_permissions_extra=1"),
+        # an unknown flag consuming a safe token as its value
+        ("--profile", "never"),
+    ],
+)
+def test_hook_discovery_args_safe_refuses_unknown_or_split_pairs(args):
+    assert not codex_trust.hook_discovery_args_safe(args)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("codex-cli 0.164.0", (0, 164, 0)),
+        ("0.156.0", (0, 156, 0)),
+        ("codex-cli 0.155.1-alpha.2", (0, 155, 1)),
+        ("codex-cli", None),
+        ("", None),
+    ],
+)
+def test_parse_codex_version(text, expected):
+    assert codex_trust.parse_codex_version(text) == expected

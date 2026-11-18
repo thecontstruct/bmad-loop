@@ -1,8 +1,11 @@
 # GitHub Copilot CLI (GA since 2026-02). `-i "<prompt>"` starts an interactive
 # session and auto-runs the prompt (a bare `-p` prompt runs headless and exits).
-# Copilot has no native skill discovery, so the prompt tells it to read the
-# SKILL.md directly (skills live in .agents/skills/, shared with codex/gemini and
-# matching upstream BMAD-METHOD's github-copilot installer). "use subagents as
+# Copilot CLI discovers skills itself (~/.copilot/skills, ~/.agents/skills and
+# the project's .github/.claude/.agents skill folders; COPILOT_HOME stops it
+# reading ~/.agents/skills), but the prompt still names the SKILL.md to load:
+# {skill_dir} is the folder bmad-loop located — .agents/skills/<skill>, shared
+# with codex/gemini and matching upstream BMAD-METHOD's github-copilot installer,
+# or a user root's absolute folder under `[skills] user_roots`. "use subagents as
 # needed" keeps parallel skill phases (e.g. review layers) actually spawning
 # subagents, same as codex.
 #
@@ -14,20 +17,29 @@
 # camelCase (sessionId, transcriptPath, cwd) regardless of event-name casing, and
 # the `agentStop` payload carries `transcriptPath` + `stopReason: end_turn` — the
 # shared relay reads both camelCase and snake_case, so the usage_parser gets the
-# transcript. CAVEAT: single build/OS (1.0.63, macOS); a future build may alias
-# `Stop`. NOTE: an enterprise policy permissions.disableBypassPermissionsMode =
+# transcript. Re-checked on 1.0.105 (Linux): same events and keys; the
+# `sessionStart` payload carries `sessionId` but no `transcriptPath`, so the
+# events file is known only from `agentStop`. A future build may alias `Stop`. NOTE: an enterprise policy permissions.disableBypassPermissionsMode =
 # 'disable' suppresses the --allow-all-* flags and will block unattended runs.
 name = "copilot"
 binary = "copilot"
-prompt_template = "LOAD the FULL .agents/skills/{skill}/SKILL.md, read its entire contents and follow its directions exactly, using subagents as needed: {args}"
+prompt_template = "LOAD the FULL {skill_dir}/SKILL.md, read its entire contents and follow its directions exactly, using subagents as needed: {args}"
 launch_args = ["-i"]
-bypass_args = ["--allow-all-tools", "--allow-all-paths"]
+# Three separate confirmations, each its own flag
+# (https://docs.github.com/en/copilot/reference/cli-command-reference): tool
+# calls, file path checks, and URL access. Without --allow-all-urls a
+# session that fetches a URL parks on a permission prompt. `--allow-all` (alias
+# `--yolo`) is all three; they are spelled out so the launched argv says what it
+# grants.
+bypass_args = ["--allow-all-tools", "--allow-all-paths", "--allow-all-urls"]
 model_flag = "--model"
 usage_parser = "copilot-events"
-# Copilot writes its token totals (modelMetrics) only in the trailing
-# `session.shutdown` events.jsonl line, ~1s AFTER the agentStop hook fires — so
-# read usage on a short grace poll, not the instant the turn ends, or it samples
-# the transcript before the totals land (reads as 0/None).
+# Copilot writes its token totals (modelMetrics) only AFTER the agentStop hook
+# returns: in the turn's `session.usage_checkpoint` events.jsonl line (1.0.105)
+# and in the trailing `session.shutdown` line (~1s after the hook on 1.0.63) —
+# so read usage on a short grace poll, not the instant the turn ends, or it
+# samples the transcript before the totals land (reads as 0/None). The poll waits
+# for the shutdown line, since an earlier turn's checkpoint already reads non-None.
 usage_grace_s = 8.0
 # agentStop fires PER response turn, so a parallel-subagent review (e.g. the
 # bmad-dev-auto step-04 hunter layers) ends several turns; the global default of
@@ -38,6 +50,8 @@ stop_without_result_nudges = 5
 # turn-end: ignore a Stop with no transcript so a subagent's premature Stop is not
 # read as a (result-less) completion. Without this the dev stage (0 nudges) stalls
 # outright on the first subagent Stop, before bmad-dev-auto writes its terminal spec.
+# Session attribution (#767) runs first, but toolu_ ids never announce a
+# sessionStart, so it admits them and this filter still owns them.
 subagent_stop_without_transcript = true
 first_run_note = "run `copilot` once and authenticate (gh / Copilot subscription); requires Copilot CLI GA (>= 2026-02)"
 skill_tree = ".agents/skills"
@@ -50,3 +64,19 @@ seed_files = [".github/copilot/settings.json"]
 dialect = "copilot-settings-json"
 config_path = ".github/copilot/settings.json"
 events = { agentStop = "Stop", sessionStart = "SessionStart", sessionEnd = "SessionEnd" }
+
+# The home-relative skill folders Copilot CLI loads on its own, read only with
+# `[skills] user_roots = true` (see bmad_loop.skill_locate). Project skills beat
+# personal ones; COPILOT_HOME moves ~/.copilot and stops it reading
+# ~/.agents/skills.
+# Source: https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills (2026-11-15).
+[user_skills]
+precedence = "project"
+roots = [
+  { path = "~/.copilot/skills", disabled_by = [
+    "COPILOT_HOME",
+  ] },
+  { path = "~/.agents/skills", disabled_by = [
+    "COPILOT_HOME",
+  ] },
+]

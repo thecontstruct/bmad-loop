@@ -1,0 +1,257 @@
+# Run state reference
+
+Where bmad-loop keeps the state of runs and sweeps, what each file holds, how multiplexer sessions are named and torn down, and what `stop`, `cleanup`, `clean`, `delete` and `archive` remove. Command options are in the [CLI reference](cli.md).
+
+## Run inventory
+
+- All run state in `.bmad-loop/runs/<run-id>/` (gitignored by `init`): `state.json`, `journal.jsonl`, `engine.pid`, `logs/<task_id>.log`, and `tasks/<task_id>/` per agent session, which holds the session prompt, the heartbeat, adapter-private records, and the shared artifacts: [`result.json`, `escalation.json`]. The hook-event channel and the config digest live outside the tree, under the [state root](#state-root).
+
+A directory under `.bmad-loop/runs/` counts as a run only if it contains a `state.json` file.
+
+`state.json` and `journal.jsonl` are written through a descriptor on the run directory, never by path. The descriptor is held to the identity (device and inode) recorded when the run directory was created, and both files are created owner-only (`0600`). When that identity is recorded, a run directory that is a link, has been replaced, or is missing refuses the write with an error instead of writing elsewhere or recreating it. On a run with no recorded identity, or one whose device number changed (a reboot or remount) while its inode did not, the write still refuses a link at the run directory, and each writer records one `journal-unpinned` row (`reason`: `no-record` or `stale-device`) before its first row. `resume` records or re-binds the identity before its own first row.
+
+Re-reads of `state.json` by a caller that already holds the run's state (the locked re-checks in `resolve` and in the TUI's replan and re-arm, and the TUI state watcher after its first read) go through the same pinned descriptor, and so do the engine's journal reads. A run directory or `runs/` that no longer matches the recorded identity, or a link at the file, refuses with an error instead of reading another tree's record. The first `state.json` read and journal reads with no run state in hand use plain paths. The TUI journal pane reads by path too, and shows a fault when the run directory no longer matches the identity or `journal.jsonl` is a link. The other run-directory files (`engine.pid`, `ATTENTION`, `tasks/<task_id>/heartbeat.json`, adapter `.jsonl` records, `logs/`) use plain paths.
+
+## State root
+
+Out-of-tree state is user-scoped. The first rule that applies sets the root:
+
+| Platform | Root                                                                                                                                                       |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| any      | `$BMAD_LOOP_STATE_DIR`, used as-is (see [environment variables](configuration.md#environment-variables)). Must be absolute; an empty value reads as unset. |
+| POSIX    | `$XDG_STATE_HOME/bmad-loop` when that variable is absolute, else `~/.local/state/bmad-loop`                                                                |
+| Windows  | `%LOCALAPPDATA%\bmad-loop\state`, else `%USERPROFILE%\AppData\Local\bmad-loop\state`                                                                       |
+
+Each project gets a subtree keyed by the first 16 hex characters of the SHA-256 of its resolved path (`runs.project_tag`). Moving or renaming a project changes its key; the old subtree is left behind and `clean` does not reach it.
+
+```text
+<state root>/
+├── locks/                      advisory-lock files, shared across this user's projects
+├── probe-workspaces/<profile>/ Codex `probe-adapter --probe` hook script + config (owner-only, emptied each run)
+└── <project key>/
+    ├── <run-id>/               the run's control plane
+    │   ├── events/             hook-event files written by `bmad-loop relay` (BMAD_LOOP_EVENTS_DIR)
+    │   └── config-digest       baseline digest of the host-exec config, checked on resume
+    ├── _mux/                   per-project multiplexer registry (psmux)
+    ├── _plugin-snapshots/      verified copies of granted project plugins
+    └── plugin-grants.json      project-plugin trust grants (`bmad-loop plugins`)
+```
+
+## Project `.bmad-loop/` directory
+
+| Path                                 | Contents                                                                                                | Gitignored by `init` |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------- | -------------------- |
+| `.bmad-loop/policy.toml`             | per-machine [policy](configuration.md)                                                                  | yes                  |
+| `.bmad-loop/runs/<run-id>/`          | run directories (below)                                                                                 | yes                  |
+| `.bmad-loop/cache/`                  | plugin caches                                                                                           | yes                  |
+| `.bmad-loop/archive/<run-id>.tar.gz` | runs compressed by `archive` or `clean`                                                                 | no                   |
+| `.bmad-loop/decisions.json`          | sweep decisions answered for the next sweep (BMAD v7: one `decisions-<initiative>.json` per initiative) | no                   |
+| `.bmad-loop/operator/`               | per-story `awaiting-operator` park records (committed; a tickets park also records `source` and `ref`)  | no                   |
+| `.bmad-loop/profiles/*.toml`         | project adapter-profile overlays                                                                        | no                   |
+| `.bmad-loop/plugins/`                | project-local plugins                                                                                   | no                   |
+
+## Run directory
+
+```text
+.bmad-loop/runs/<run-id>/
+├── state.json                  resumable run state
+├── journal.jsonl               append-only engine decision log
+├── engine.pid                  engine pid and process identity; rewritten on resume
+├── sweep.json                  sweep runs: the launch options
+├── tasks/<task_id>/            one per agent session (see Task directory)
+├── logs/<task_id>.log          session log (pane capture; opencode: the server transcript)
+├── logs/<task_id>.server.out   opencode: the server's own stdout/stderr
+├── logs/<task_id>.provider-errors.log  opencode: one line per provider-error event
+├── logs/<task_id>.sse.jsonl    opencode: structured trace of the raw SSE frames
+├── verify/                     verifier stdout/stderr streams the journal points at
+├── worktrees/                  per-story git worktrees ([scm] isolation = "worktree")
+├── stop-request.json           pending stop request (see Stopping a run)
+├── ATTENTION                   human-readable alerts appended by gates
+├── crash.txt                   traceback of an unexpected engine exception
+├── feedback/<story>-<n>.md     verification-failure feedback handed to the next session
+├── deferred/<story>/           stashed spec of a deferred story
+├── failed/<unit>/changes.patch diff of a dropped unit
+├── resolve/<story>/            escalation context.json and the resolve agent's resolution.json
+├── restore/<story>.patch       tickets mode: a plan's intent-gap patch, moved out of the tree at re-arm
+├── ctl-window                  TUI: the control window that last accepted this run
+├── decisions.json              sweep runs: run-scoped triage decisions
+├── adopt-<triage-key>.json     sweep runs: a confirmed `resolve --adopt-result`, until the resumed sweep consumes it
+└── bundles/<name>/intent.md    sweep runs: per-bundle intent
+```
+
+Entries other than `state.json`, `journal.jsonl`, `engine.pid`, `tasks/` and `logs/` appear only when the run reaches the step that writes them. Plugins may add their own files.
+
+The opencode adapter's environment-fault classifier scans `<task_id>.server.out` and `<task_id>.provider-errors.log`, never the model-written `<task_id>.log`. On OpenCode 2.x provider failures appear only as session events, so the adapter writes each `session.retry.scheduled` / `session.step.failed` / `session.execution.failed` frame as one `provider-error event=… type=… status=… attempt=… message="…"` line built from the event's structured fields (the provider's response body is never copied). The file is created at spawn on both majors and is empty on a healthy session. As it writes a line, the adapter also matches it against the profile's usage-limit patterns: a match (the shipped profile's `provider.quota` line) is a live usage-limit sighting, so a session that then times out, stalls or crashes pauses as a usage limit rather than an environment fault.
+
+- **`state.json`** — the serialized run state (stories, phases, tokens, the `finished` / `stopped` / `crashed` flags, and `paused_reason` with the pause context). Written atomically under a per-run lock, through the pinned run-directory descriptor above; `bmad-loop status` reads it.
+- **`journal.jsonl`** — append-only, one JSON object per line with `ts` and `kind`; the first entry is `run-start` (after one `journal-unpinned` row on a filesystem that reports no inode numbers). Lines end in LF on every platform. Written through the pinned run-directory descriptor by the engine, and by commands that act on the run (for example `stop`, `resume`, `resolve`). From the first session launch on, lines carry `log_task` / `log_pos`, pointing into the most recent session's log. A `session-end` entry carries `stop_failure` (the same `error` value) only when the session ended with such a `StopFailure` uncleared. `dev-decision`, `fix-decision` and `review-retry` entries carry `uncharged` (true for a usage-limit relaunch that charges no attempt or review cycle) and `usage_relaunches` (the story's relaunches so far, after this one). Worktree provisioning journals `worktree-hook-gated` (`story_key`, `reason`) for each hook event it left out because the installed CLI is older than the event's minimum version.
+- **`heartbeat.json`** (in `tasks/<task_id>/`) — the wait loop's proof of life, overwritten at most every 30 seconds while a session runs: remaining budget, stall-recovery state and probe or sampling failure counts. A session that can wait out a usage-limit reset (`[limits] quota_wait_max_min` above 0 and a profile with `usage_wait_patterns`) also carries `quota_waiting` and `quota_wait_s` (cumulative seconds waited), plus `quota_resets_at` while it waits on a line that named a reset. A session whose last turn ended on a Claude Code `StopFailure` that no later `Stop` cleared carries `stop_failure`, the reported `error` value.
+
+Under `[skills] user_roots`, each session journals one `skill-user-root` entry (`task_id`, `role`, `skill`, `root`, `version`) per skill it loads from a user root, after the session log opens and before `session-start`. `version` is the `[bmod] version` of the user root's module record that lists the skill, or null. Worktree provisioning journals `worktree-skills-user-root` (`story_key`, `entries`: the `~/…` spellings) for the required skills the seeding gate skipped because they resolve from a user root.
+
+A `session-end` entry carries `hook_channel_silent: true` when no hook event of any kind reached the session before it timed out or stalled (see [Silent hook channel pauses](../escalations-guide.md#silent-hook-channel-pauses)), and `stop_seen: true` when a session that did not complete had seen its Stop event; each is absent otherwise. `dev-decision`, `fix-decision`, `triage-decision` and `migrate-decision` entries always carry `hook_channel_silent`, and `workflow-end` carries it only when true. A real `run`, `sweep` or `resume` journals one `hook-relay-unregistered` entry (`role`, `profile`, `problem`) per role whose project hook config does not register the bmad-loop relay.
+
+- **`adopt-<triage-key>.json`** — written by `bmad-loop resolve --adopt-result` after the operator confirms a silent-channel triage attempt's `result.json`: `story_key`, `task_id`, `attempt`, `generation`, the artifact's `sha256`, `mtime_ns` and `size`, and `adopted_at`. The resumed sweep reads it only when it reaches that triage cycle, and removes it then; a sweep that exits before that (for example, with nothing open) leaves it on disk. Declining a later `resolve --adopt-result` withdraws it. The name never matches the `triage*.json` plan caches. Four journal kinds trace it: `sweep-triage-adopt-confirmed` (`story_key`, `task_id`, `sha256`; the confirm, written by `resolve`), `sweep-triage-adopted` (`story_key`, `task_id`, `sha256` and the plan's `bundles`, `decisions`, `already_resolved`, `blocked`, `skip` counts; the resumed sweep used it as the triage plan), `sweep-triage-adopt-rejected` (`story_key`, `task_id`, `errors`; the resumed sweep refused it), and `sweep-triage-adopt-withdrawn` (`story_key`, `task_id`; a declined `resolve --adopt-result` removed it).
+
+A `session-start` entry's `model` is the configured model (`""` when the CLI's own default is used), never the model the CLI ran. That comes from the transcript or usage file the CLI wrote, read when the session ends, and a `session-end` entry carries it in one of three states:
+
+| State      | Keys                      | Meaning                                                                                                                           |
+| ---------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| observed   | `models` (list of str)    | the distinct model ids the session used, in first-seen order: the main session's first, then any a subagent or fallback turn used |
+| unresolved | `models_unresolved: true` | the CLI's usage source is read, but it named no model                                                                             |
+| untracked  | neither                   | the CLI has no model source (antigravity), or no usage was read                                                                   |
+
+Claude, Codex, Gemini, Copilot and OpenCode are tracked. OpenCode ids read `<provider>/<model>`. On OpenCode 2.x they come from the session's own messages, then each subagent session's current model; on 1.x only the session's own messages are read, so a subagent's model is missing unless the session also ran it. The `session-end` rows written when reading usage raised, or for an aborted session, carry neither key, as they carry no `tokens`. `state.json` keeps a session's observed models on its session record as `models`, written only when non-empty.
+
+A tracked session's `session-end` entry also carries `tokens_by_model`: its usage split per model, each value holding `input_tokens`, `output_tokens`, `cache_read_tokens` and `cache_creation_tokens`, summing field-wise to the session's usage (so their counts add up to the entry's `tokens`). Keys are the observed model ids plus `<unattributed>` for usage the CLI's file does not tie to a model (Claude usage with no model, Codex usage before the first turn context, a Gemini message with none, an OpenCode 1.x message missing its ids), present only when nonzero.
+
+Codex bills each stretch of its cumulative counts to the model of the latest turn context. OpenCode 2.x reports tokens per session, not per step, so a session's own usage goes to its model when its messages name exactly one and to `<unattributed>` otherwise, and each subagent session's goes to its model ref (`<unattributed>` when it has no ref, a malformed one, or the session's own messages name no model).
+
+The key is absent when no split was read (antigravity, or an unread OpenCode 2.x transcript). `state.json` keeps it on the session record as `tokens_by_model`, written only when non-empty; it never feeds any token total or budget.
+
+Claude and Codex also report the model they launched on in their SessionStart hook. The first such hook of a session journals one `session-model` entry (`task_id`, `model`, `cli`); later SessionStart hooks of the same session (a subagent's, a `/clear`) add none. On Codex only the session's first SessionStart counts, even when it names no model.
+
+Antigravity fires no SessionStart and names its model only on its Stop hook (`modelName`), so for it the row comes from the session's first fully-idle Stop that names one and that the spawn-marker check judged the session's own: never a yield's, a subagent's it identifies, or one it could not judge or read (a subagent Stop that arrives before its marker can still supply the row). That Stop usually ends the session, so the TUI agent line seldom shows an antigravity model; session-end `models` stays untracked for antigravity.
+
+Claude may omit the model, and Gemini and Copilot send none that bmad-loop reads, so the row may be absent. A journal write that fails leaves a `session-model-unjournaled` line in `session-lifecycle.jsonl` instead.
+
+`state.json` records the run's work source. A bmad-loop that does not know that source refuses to resume the run rather than drive it as a sprint run, so finish or abandon a run before downgrading bmad-loop.
+
+A run paused on a usage limit also records `paused_limit_class` (`blocked` for a `usage_limit_patterns` match, `wait` for a `usage_wait_patterns` match, from the visible pane or an opencode provider-error line alike) and `paused_reset_at`, the reset as ISO-8601 when the pane line named one that resolved (null otherwise; an unresolved clause stays in `paused_reason`, and an opencode provider-error line names no reset). Both are null on every other pause, and its `run-paused` journal entry carries them as `usage_limit_class` and `usage_limit_reset_at` when set. `resolve --at-reset` times its wait from these two fields.
+
+A tickets run's `state.json` also records `initiative` and `initiative_folder`, the BMAD v7 initiative the run is pinned to: every ticket-tree read refuses while the live `[core] active_initiative` names another. Each task carries a `ticket` binding resolved when it was picked (ref, id, epic slug and id, title, plan, risk, and the refined, hitl and checkpoint flags). `ticket_epic_filter`, `ticket_story_approvals`, `ticket_epic_closures`, `ticket_epic_closure_resumed` and `ticket_epic_closure_acked` hold the epic selector, the refs whose story file an operator approved (resuming the pick's `plan-checkpoint` pause records the ref), each finished epic's closure (its retrospective `verdict`, or `unknown`), the epics whose closure pause a resume answered (a closure recorded without one pauses again), and the epics whose one closure pause was resumed past. Tickets pauses add the `paused_stage` values `ticket-hitl`, `ticket-refine` and `ticket-tree` (causes below). `run` resolves a tickets run's selectors before it starts: `ticket_epic_filter` holds the `--epic` epic slug, `story_filter` the `--story` ticket ref, and `epic_filter` stays null.
+
+`parent_initiative` names the parent initiative when a tickets run builds one of its children, and is null otherwise. A child run's `max_stories` is what was left of the chain's `--max-stories` when it launched.
+
+When `run`, or a resume of a child run, builds a parent's children, each finished child run journals the switch: `initiative-mark` and its store commit for each drained child closed, `initiative-close-skipped` (`parent`, `slug`, `why`: `run-live`, `run-unfinished`, `runs-unread`, `work-left`, `store-refused` or `uncommitted-edit`, `blocking_run`, `detail`) for each one left open, then `initiative-chain-next` (`parent`, `from_child`, `to_child`, and the children `passed_over` with `passed_over_why`) or `initiative-chain-end` (`parent`, `end`, the `waiting` children, one row per unmet prerequisite across `waiting_child`, `waiting_on` and `waiting_on_status`, and the passed-over ones). A next child whose launch a check refuses gets `initiative-chain-next` followed by `initiative-chain-end` with `end` `launch-refused` and an `error` naming the child and the exit code. The next child's run journals `initiative-chain` (`parent`, `previous_run`, `previous_child`). The closes `run` makes before its first child's run are printed as they happen and journaled in that child's run, after its `run-start` row; a start that composes no run (no child to pick, a close that cannot be committed, a refused launch) only prints them.
+
+A v7 sweep records `initiative` and `initiative_folder` too, and its resume, `resolve` and the dashboard's re-arm refuse while the live `[core] active_initiative` names another, because its ledger and pre-answers belong to the initiative it started on. The run-end sweep of a run that builds a child initiative works that child's ledger: its `initiative` and `initiative_folder` name the child and its `parent_initiative` the parent, and it is refused while the live `[core] active_initiative` names anything but the parent.
+
+A pick pause, and a resume's stale-binding pause (`binding-moved`: an in-flight unit's ref no longer names its plan, or its verified plan is gone), journal `ticket-pick-halt` with its `cause` and `stage`:
+
+| `cause`                                                                                                        | `paused_stage`    |
+| -------------------------------------------------------------------------------------------------------------- | ----------------- |
+| `hitl`                                                                                                         | `ticket-hitl`     |
+| `refine`                                                                                                       | `ticket-refine`   |
+| `plan-checkpoint`                                                                                              | `plan-checkpoint` |
+| `awaiting-closure`, `epic-closure`, `epic-rejected`                                                            | `epic-boundary`   |
+| `blocked-plan`                                                                                                 | `escalation`      |
+| `foreign-active`, `stalled`, `tree-fault`, `pin-mismatch`, `dirty-initiative`, `ignored-plan`, `binding-moved` | `ticket-tree`     |
+
+`store_topology` is the ticket store classified at the start of a tickets run or a v7 sweep: `layout`, `placement`, `versioning`, `store_root` and `store_repo`. Resume, resolve and the TUI re-classify the store and refuse when it differs, or when the initiative folder is gone. A chained child run's store, and its run-end sweep's, is classified on the child's own folder, as at its launch. When no checkout carries the store, every artifact dir under it stays at the main checkout for a worktree unit, and the mount's `_bmad/custom/config.user.toml` is rewritten so `[core] output_folder` names that store.
+
+For a store tracked in the code checkout (T1), the commit window marks the plan itself, so the marked plan rides the unit's own commit. The save that records `COMMITTING` latches the plan's status and the sha256 of its bytes before that mark: `ticket_premark_status` and `ticket_premark_digest`, cleared when no T1 mark is owed or the plan cannot be read. A commit failure after a mark this window wrote puts the pre-mark bytes back. A resumed window whose mark is a no-op on a plan that reads another status than the latched one and no longer matches the digest finds it marked since that save, for example by an interrupted earlier window, and no bytes survive to restore it. If its commit then fails, the escalation names the plan left marked for a commit that does not exist, so the operator restores it by hand.
+
+For a shared store, the unit's commit cannot carry its plan, so the ticket's terminal mark waits until the code has landed on the target: after the commit in place, or after the merge-back under worktree isolation. The task latches it in the save that records `COMMITTING`. `ticket_done_pending` stands for `mark <ref> done`, and `ticket_park_pending` holds a park's `blocked_reason`. Under `mark_done = "never"` there is no mark, but a store that is its own git repository still owes the commit of the `built` plan the session wrote there: `ticket_commit_pending`. A resume makes any latched mark whose code had landed before it picks (`resume-ticket-mark`), and replays a lost merge-back first. A mark already made is a no-op. The latch is cleared once the mark is made. A mark that fails pauses the run at `ticket-tree` and keeps the latch.
+
+A store that is its own git repository (T3 nested, T4 external) then gets a plan-only commit there, `chore(tickets): <ref> <status> [bmad-loop <run>]`, holding the marked plan and the deferred-work ledger when the task wrote to it. Its `Bmad-Code-Repo`, `Bmad-Code-Commit` and `Bmad-Code-Range` trailers name the code it describes. Nothing else in the store is staged, and an epic's retrospective document is committed there the same way. A store commit is bookkeeping: a failure (`store-commit-failed`), or a human's staged version of a path it would overwrite (`store-commit-foreign-dirt`), keeps the latch, never pauses mid-run, and is listed by `bmad-loop status`. The run retries it before it can finish (`run-end-ticket-mark`); one still owed pauses at `ticket-tree` (`store-commit-owed`), and the resume retries it. A retrospective document whose store commit fails pauses at `epic-boundary` before the epic's closure is recorded, and the resume commits it before recording the closure. An unversioned store (T2, or a plain folder outside the checkout) journals `store-unversioned` once per run.
+
+Before a review session, a repair dev session or a dev retry after a rollback, and after an in-place defer, the engine commits the deferred-work ledger changes it left uncommitted itself (the commits are listed in the [sweep guide](../sweep-guide.md#what-gets-published)). Each journals one row:
+
+| Kind                           | Fields                                       | Meaning                                                                                          |
+| ------------------------------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `engine-ledger-commit`         | `story_key`, `site`, `commit`, `added`       | committed; `site` is `review`, `dev` or `defer`; `added` is true when the baseline had no ledger |
+| `engine-ledger-commit-failed`  | `story_key`, `site`, `error`                 | a git or filesystem fault, or nothing to commit; the session launches anyway                     |
+| `engine-ledger-commit-refused` | `story_key`, `site`, `refuse_cause`, `error` | the ledger failed the publication check (`refuse_cause` as in `sweep-ledger-commit-refused`)     |
+
+A gitignored, external, store-held or unchanged ledger journals nothing. The task records these commits in `state.json` as `bookkeeping_ledger` (`baseline`, `added`, `shas`), saved before each commit and ignored once `baseline_commit` moves. A rollback, including the reset of a story restarted on resume, restores a ledger they added. The one exception is a restart reset where the ledger is already gone or unreadable and the last recorded commit's copy cannot be read either: the reset journals `ledger-restart-capture-failed` (`story_key`, `error`) and restores nothing. The attempt-preserve step leaves out a commit that the record names and that touches only the ledger. If that check fails, the step journals `attempt-preserve-filter-failed` (`story_key`, `error`) and preserves the whole range.
+
+## Task directory
+
+`tasks/<task_id>/` is created per agent session. The task id is `<story_key>-<part>-<n>`, where `part` is `dev`, `review`, `triage` or a workflow label and `n` is the attempt or review cycle; a re-armed story adds `-g<generation>`.
+
+| File                      | Written by        | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `prompt.txt`              | adapter           | the session prompt, rewritten each launch                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `result.json`             | session           | the session's result contract (verdict, escalations)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `escalation.json`         | sweep session     | escalations raised during triage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `heartbeat.json`          | adapter           | proof of life (above)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `resultless-stops.jsonl`  | built-in adapters | one line per Stop event whose result could not be read                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `session-lifecycle.jsonl` | built-in adapters | one line per lifecycle event (timeout, budget trip, environment-fault classification, usage-limit quota wait: `quota-wait-started` / `-ended` / `-cap` / `-skipped`, `usage-reset-unparsed`; `crash-relabeled` when a dead window keeps a usage-limit or account classification; parked prompts: `parked-signal`, `session-parked` / `-unparked`, `parked-probe-failed`; `session-model-unjournaled` when the `session-model` journal write fails; `session-start-exit` (opt-in silent-hook-channel exit at `session_start_grace_s`); opencode usage: `usage-capture-failed`, `usage-child-active` / `-failed`, `usage-models-partial` (a subagent's model unread; `models` incomplete); 2.x subagent wait: `descendant-wait-started`/`-ended`/`-timeout`/`-cut`, `descendant-probe-failed`) |
+| `messages.json`           | opencode adapter  | raw server messages, kept as the transcript; the shape is the server's own (1.x: each message's info and parts; 2.x: user/assistant/idle messages, oldest first)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+
+A session parked on a permission prompt is also journaled to the run's `journal.jsonl` while it waits, so the TUI can show it live:
+
+| Journal kind       | Fields                                       | When                                                                                                  |
+| ------------------ | -------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `session-parked`   | `task_id`, `pane`, `subtype`, `auto_deny_at` | a permission-prompt signal latches; journaled again once the CLI's countdown is read                  |
+| `session-unparked` | `task_id`, `how`                             | the session moves on: `stop` (a Stop event), `activity` (transcript writes) or `ended` (session over) |
+| `parked-answered`  | `task_id`, `choice`, `by`                    | the TUI sent an `approve` or `deny` answer to the prompt (`by` is `tui`)                              |
+
+`subtype` is the CLI's notification type, or null. `auto_deny_at` is an epoch time, present only when the profile's `auto_deny_patterns` matched the pane. The newest `session-parked` for a task counts as live until a later `session-unparked` or `parked-answered` for that task.
+
+`result.json` and `escalation.json` are the shared cycle artifacts (`journal.TASK_CYCLE_ARTIFACTS`). Both built-in adapters delete them before launching a session, so a reused task id never inherits a previous session's result. Adapters refuse a task directory that is a symlink or junction, and an adapter-written file (heartbeat, breadcrumb logs, `messages.json`, session logs) that is a link or special file.
+
+## Run ids
+
+A run id is `YYYYMMDD-HHMMSS-<4 hex>` in local time, for example `20261012-011529-6a63`. The segment after the last `-` is the short ref used by [run references](cli.md#run-references). Retention reads the run's age from the timestamp prefix.
+
+## Multiplexer sessions
+
+| Object          | Name                                                                                                                                    |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| agent session   | `bmad-loop-<run-id>`, one per run, tagged with the project key (`@bmad_project`); multiplexer-driven adapters only (opencode runs none) |
+| agent window    | one per agent session, named after the task id (last 40 characters); its pane is piped to `logs/<task_id>.log`                          |
+| control session | `bmad-loop-ctl`; on psmux one per project registry. A `bmad-loop-ctl-<16 hex>` session also counts as one, but nothing launches into it |
+| control window  | `<kind>-<run-id>`, where `kind` is `run`, `sweep`, `resume` or `resolve`; opened by the TUI, parks after the command exits              |
+
+Teardown:
+
+| Event                                    | Agent session `bmad-loop-<run-id>`                                  |
+| ---------------------------------------- | ------------------------------------------------------------------- |
+| an agent session ends                    | its window is killed; the session is kept                           |
+| run finishes, or a graceful stop ends it | killed when `[adapter] cleanup_session_on_finish` is true (default) |
+| hard stop, SIGTERM or SIGINT             | killed                                                              |
+| engine crash                             | killed; `crash.txt` written; run marked `crashed`                   |
+| run pauses                               | kept                                                                |
+| engine process dies                      | left behind (the run reads as `interrupted`)                        |
+| `resume`                                 | a leftover session is killed before the relaunch                    |
+| `bmad-loop cleanup` / TUI `c`            | killed for this project's runs whose engine is not provably alive   |
+
+## Derived run status
+
+`list` and the TUI show the first status that applies:
+
+1. `finished` — `state.json` has `finished`
+2. `paused` — `state.json` has a non-null `paused_reason`
+3. `stopped` — `state.json` has `stopped`
+4. `crashed` — `state.json` has `crashed`
+5. `running` — the engine process is alive
+6. `interrupted` — the engine process is dead
+7. `unknown` — engine liveness cannot be determined, or `state.json` cannot be read
+
+## Stopping a run
+
+Both stop modes write `stop-request.json` (`{"requested_at": …, "mode": "hard" | "graceful"}`) into the run directory; the engine consumes it.
+
+|                  | Hard: `bmad-loop stop` (TUI `x`)                                                        | Graceful: `bmad-loop stop --graceful` (TUI `S`)                                   |
+| ---------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Request          | replaces any pending request                                                            | lodged only if no request is pending                                              |
+| Signal           | SIGTERM to the engine; force-kill after 10 s only if the process identity still matches | none                                                                              |
+| Engine honors it | at the next item boundary, and mid-session (the session is aborted)                     | at the next item boundary; the in-flight story or bundle completes through commit |
+| Agent session    | always killed                                                                           | killed under `[adapter] cleanup_session_on_finish`                                |
+| Auto-sweeps      | —                                                                                       | suppressed                                                                        |
+| End state        | `stopped`, resumable                                                                    | `stopped`, resumable from the next item                                           |
+
+- `stop --cancel-graceful` removes a pending request of either mode.
+- `resume` discards any pending request before restarting the engine.
+- The engine treats SIGTERM and SIGINT (Ctrl+C in its terminal) as a hard stop. On native Windows it ignores console Ctrl+C / Ctrl+Break; use `bmad-loop stop`.
+- A request still pending when the engine exits is deleted and journaled as `stop-request-discarded`.
+
+## Reclaiming sessions and disk
+
+|               | `cleanup`                                                                                                    | `clean`                                                                                                                                                                                                                | `delete <run>`                                                                                                                                                                                      | `archive <run>`                                                      |
+| ------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Reclaims      | multiplexer sessions and windows                                                                             | disk, per `[cleanup]`                                                                                                                                                                                                  | one run                                                                                                                                                                                             | one run                                                              |
+| Removes       | `bmad-loop-<run-id>` sessions of this project's runs, and parked control windows whose run is no longer live | leaked worktrees; runs past retention are trimmed then archived (or deleted with `--hard` / `archive_old = false`); runs inside retention are trimmed when `trim_artifacts` is set; orphaned control-plane directories | the run directory, its git worktree entries, its control-plane directory                                                                                                                            | same as `delete`, after writing `.bmad-loop/archive/<run-id>.tar.gz` |
+| Eligible runs | engine not provably alive (any status, including paused, and runs whose directory is gone)                   | `finished` or `stopped`, engine not provably alive                                                                                                                                                                     | any                                                                                                                                                                                                 | any                                                                  |
+| Never touches | live runs, other projects' sessions and windows, the window you run it from                                  | `--keep` runs, paused / crashed / interrupted / running runs, runs whose agent session may be live, sweep runs holding unlanded ledger closes                                                                          | a live engine or agent session; `--force` hard-stops a live engine first and skips the session guard (the session is left running); a sweep run holding unlanded ledger closes, even with `--force` | same as `delete`                                                     |
+| TUI           | `c`                                                                                                          | —                                                                                                                                                                                                                      | `D`                                                                                                                                                                                                 | `A`                                                                  |
+
+- "Trimmed" means the heavy `worktrees/` and `verify/` entries are removed; a trimmed run stays resumable.
+- Retention: concluded runs are counted oldest first; all but the newest `[cleanup] run_retention` (or `clean --retain N`) are past retention. When `retention_days` is above 0, a run must also be older than that many days.
+- Unverifiable engine liveness produces a warning; it does not block.
+- A sweep run holding ledger closes whose code never landed (or one that cannot be checked for them) is never archived, deleted, trimmed or worktree-reconciled by `clean`, `delete` or `archive`: `bmad-loop resume <run>` lands or reopens them first.
+- `[cleanup] auto_clean_on_finish` makes each `run` and `sweep` start by tearing down worktrees left under finished runs.
+
+See the [`[cleanup]` settings](configuration.md#cleanup).

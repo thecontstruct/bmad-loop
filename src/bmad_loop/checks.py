@@ -16,9 +16,13 @@ This lives in its own module rather than in ``cli`` or ``machine``:
 
 :data:`VALIDATE_CHECKS` is the registry every id must be in, enforced by an
 assert in :meth:`ValidationReport.add`. That is what keeps "one printed line =
-exactly one Finding" true: a new check site cannot ship without first naming
-itself here. The assert only ever fires on a literal an author just wrote, never
-on runtime data, so it is a lint with a stack trace rather than a validation.
+exactly one Finding" true. The assert only ever fires on a literal an author just
+wrote, never on runtime data, so it is a lint with a stack trace rather than a
+validation. The assert, the direct ``ValidationReport`` test and the
+validate-path registry test in test_cli.py all see only executed paths — there
+is no static call-site scan — so an id on a branch no test reaches can ship
+unregistered and raises only when that branch first runs. A new check site
+therefore lands with a test that reaches it.
 """
 
 # Strict-checked under #245 Stage 2, with one rule relaxed for this file only:
@@ -45,20 +49,50 @@ Severity = Literal["ok", "warning", "problem"]
 VALIDATE_CHECKS: frozenset[str] = frozenset(
     {
         "bmad-config",
+        # BMAD v7 with no `[core] active_initiative`: artifacts fall back to output_folder
+        "bmad-config.initiative-unset",
+        # BMAD v7 resolved under tickets mode past leftover v6 artifact keys
+        "bmad-config.v6-keys-ignored",
         "policy",
+        # a deprecated policy.toml key still loads (#835)
+        "policy.deprecated",
         "policy.model-qualified",
         "policy.effort-unsupported",
+        "policy.bypass-dropped",
+        # opencode-http: a role's extra_args repeating an adapter-owned serve flag (DW-483)
+        "policy.extra-args-unservable",
+        # worktree isolation beside a project that is NOT inside repo_root (a
+        # disjoint layout, #414); a nested project is supported since DW-379
         "policy.isolation-repo-root",
+        # worktree isolation beside an artifact dir inside repo_root but outside the
+        # project: shared with the main checkout, not per-worktree (DW-485)
+        "policy.isolation-shared-artifact-dir",
         "adapter.profile",
         "adapter.binary",
         "adapter.binary-unrunnable",
         "adapter.hookless",
         "adapter.httpx",
+        "adapter.launch-args-unservable",
+        # opencode-http: the server API major `--version` reports (#847)
+        "adapter.opencode-version",
+        # codex: `--version` accepts --no-daemon and the profile passes it (#901)
+        "adapter.codex-version",
         "adapter.kind",
+        # a role's profile has no `adapter.permission_mode` mapping for this platform (#727)
+        "adapter.permission-mode-unsupported",
+        # each role's permission posture (bypass/sandboxed, scm.isolation); a
+        # warning where a mapping is known not to work under worktree isolation
+        "adapter.permission-mode",
+        # `--probes`: one launch per distinct role launch, its first screen
+        # matched against the profile's parked-prompt patterns (#727)
+        "adapter.launch-probe",
         "adapter.external",
         "adapter.external-profile",
         "queue.sprint-status",
         "queue.sprint-status-unknown-keys",
+        # spec-like files one level under the artifacts dir: the sprint-mode dev
+        # read-back never searches subdirectories (#780)
+        "queue.nested-specs",
         "queue.stories-manifest",
         "git.worktree-clean",
         "git.probe",
@@ -66,33 +100,101 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "git.version",
         "hooks.config-parse",
         "hooks.registered",
+        # the Stop relay is registered but another mapped native event is not
+        # (a config written before the profile mapped it, e.g. claude StopFailure)
+        "hooks.events-incomplete",
         "hooks.trust",
         "hooks.relay-present",
         "hooks.relay-stale",
+        "hooks.relay-path-unsafe",
         "mux.backend",
         "mux.preflight",
         "mux.backends-detected",
         "mux.selection",
         "mux.external-backend",
+        # a registered backend whose platform predicate, factory or available() raised (DW-464)
+        "mux.backend-probe",
         "host.process",
         "host.win32-on-wsl-path",
         "notify.desktop-unavailable",
+        # `validate --probes`: one per configured [environment] probe, ok on pass (DW-526)
+        "environment.probe",
+        # probes configured but validate ran without --probes: a note, nothing spawned (DW-526)
+        "environment.probes-not-run",
+        # `validate --probes` with no [environment] probes configured (DW-526)
+        "environment.probes-none",
         "plugins.manifests",
+        # project plugins with an executable surface need an operator content grant (#496/#497)
+        "plugins.trust",
         "skills.base",
         "skills.base-missing",
         "skills.base-incomplete",
         "skills.base-shim",
+        # a skill tree (or a required skill in one) linked out of the project/repo
+        "skills.tree-outside",
+        # where each driven skill resolved: a project tree or a user root (validate only)
+        "skills.root",
+        # a project skill a user-root copy may override or compete with at run time
+        "skills.user-shadow",
+        # a declared user root that cannot resolve (disabler set, no home, unreadable)
+        "skills.user-root-unavailable",
+        # user-root and project bmod-method records name different BMAD-METHOD versions
+        "skills.user-root-version-skew",
+        # an opencode 1.x server while a needed skill resolves from a user root
+        "skills.user-root-unsupported",
+        # a sandboxed role whose skills resolve from a user root outside the project
+        "skills.user-root-sandboxed",
         "skills.customize-legacy",
         "skills.dev-renderer",
         "skills.dev-renderer-config",
         "skills.dev-renderer-sources",
+        "skills.dev-render-probe",
         "skills.review-layer-missing",
         "skills.review-layer-unresolved",
         "skills.review-layers-empty",
+        # v7 `workflow.review` outside none/quick/thorough/auto HALTs every build-auto run
+        "skills.review-selection-invalid",
         "skills.customize-unreadable",
         "skills.stories-dispatch",
         "skills.stories-dispatch-missing",
         "skills.stories-dispatch-stale",
+        # tickets mode: the dev primitive's step-01 routes a ticket from the v7 tree
+        "skills.tickets-dispatch",
+        "skills.tickets-dispatch-missing",
+        "skills.tickets-dispatch-stale",
+        # tickets mode preflight (install.tickets_preflight)
+        "tickets.era",
+        "tickets.script-missing",
+        "tickets.config-utils-missing",
+        "tickets.uv-missing",
+        "tickets.initiative-unset",
+        "tickets.initiative-missing",
+        # the active initiative is a parent (`[[initiative]]` children): a run needs one child
+        "tickets.initiative-parent",
+        # the ticket-store topology (ticketstore.classify_store): the classified
+        # layout, or a store tickets runs refuse (a T1 store outside the project
+        # under worktree isolation)
+        "tickets.store-topology",
+        # the initiative folder only partly tracked, or untracked but not gitignored
+        "tickets.tree-untracked",
+        # worktree isolation cannot redirect a shared store: config.user.toml is
+        # tracked or not gitignored
+        "tickets.own-repo-isolation",
+        # the project is not a git repository (a BMAD workspace): deferred
+        "tickets.workspace-unsupported",
+        # a shared store written outside the session cwd while a role sets extra_args
+        "tickets.store-sandbox",
+        # `[scm] branch_per = "run"`: build-auto's branch-fit check may HALT a ticket
+        "tickets.branch-per-run",
+        # a tracker store (or an unreadable store config): bmad-loop drives repo stores only
+        "tickets.store-not-repo",
+        # `validate --probes`: the script's `--help` offers every verb and mark status
+        "tickets.capability",
+        # tickets.py present but validate ran without --probes: nothing executed
+        "tickets.capability-not-run",
+        "skills.sweep",
+        "skills.sweep-missing",
+        "skills.sweep-incomplete",
         "operator.registry-stale",
         "operator.actions-malformed",
         "operator.confirm-interrupted",
@@ -103,6 +205,8 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "deferred.hard-gate",
         "deferred.hard-gate-unstructured",
         "deferred.ledger-unreadable",
+        "deferred.ledger-untracked",
+        "deferred.ledger-ignored-isolated",
     }
 )
 

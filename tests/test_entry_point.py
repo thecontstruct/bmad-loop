@@ -17,6 +17,7 @@ Two things every other CLI test leaves uncovered:
 """
 
 import json
+import os
 import subprocess
 import sys
 
@@ -27,7 +28,7 @@ from bmad_loop import policy as policy_mod
 from bmad_loop import sprintstatus, verify
 
 
-def _run_module(*args, cwd):
+def _run_module(*args, cwd, env=None):
     """Spawn ``python -m bmad_loop`` under the test interpreter.
 
     ``cwd`` is a per-test temp dir (never the repo root), so ``-m``'s implicit
@@ -42,7 +43,23 @@ def _run_module(*args, cwd):
         encoding="utf-8",
         timeout=60,
         cwd=str(cwd),
+        env=env,
     )
+
+
+def _clean_warning_env():
+    """The ambient env minus the knobs that widen Python's warning filters: an
+    inherited ``-W``-style setting would show a hidden category and mask #835."""
+    env = dict(os.environ)
+    env.pop("PYTHONWARNINGS", None)
+    env.pop("PYTHONDEVMODE", None)
+    return env
+
+
+def _engine_policy_project(tmp_path):
+    (tmp_path / ".bmad-loop").mkdir()
+    (tmp_path / ".bmad-loop" / "policy.toml").write_text('[engine]\nname = ""\n', encoding="utf-8")
+    return tmp_path
 
 
 # ----------------------------------------------------------------- packaging smoke
@@ -71,6 +88,66 @@ def test_module_validate_json_smoke(tmp_path):
     doc = json.loads(proc.stdout)  # whole-stdout parse == stdout-purity assertion
     assert doc["schema_version"] == 1
     assert doc["ok"] is False
+
+
+def test_module_prints_policy_deprecation_once_on_stderr(tmp_path):
+    """An empty-name ``[engine]`` block's warning reaches a CLI user as one clean stderr line
+    (#835). It was a ``DeprecationWarning``, which Python hides outside
+    ``__main__``, so a real run printed nothing. ``init`` loads policy without
+    needing a BMAD install (``plugins list`` fails on the bmad-config gate first).
+
+    Ablations: revert ``PolicyDeprecationWarning`` to a ``DeprecationWarning``
+    base → the count is 0; drop ``main()``'s ``warnings.formatwarning``
+    assignment → the stdlib form names ``FutureWarning`` and ``policy.py``."""
+    project = _engine_policy_project(tmp_path)
+    proc = _run_module("init", "--project", str(project), cwd=tmp_path, env=_clean_warning_env())
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr.count("bmad-loop: warning: [engine] in policy.toml is ignored") == 1
+    assert "FutureWarning" not in proc.stderr
+    assert "policy.py" not in proc.stderr
+
+
+def test_module_validate_reports_policy_deprecation_as_finding(tmp_path):
+    """``validate`` reports the empty-name ``[engine]`` warning as a ``policy.deprecated``
+    warning finding and does not also print it on stderr (#835): the incidental
+    ``_configure_mux`` load ignores it, and validate's own load records it.
+
+    Ablations: drop ``_configure_mux``'s ignore → the stderr assert fails; drop
+    validate's ``policy.deprecated`` emission → the finding assert fails."""
+    project = _engine_policy_project(tmp_path)
+    proc = _run_module(
+        "validate", "--json", "--project", str(project), cwd=tmp_path, env=_clean_warning_env()
+    )
+    assert proc.returncode == 1, proc.stderr  # bmad-config fails in an empty project
+    doc = json.loads(proc.stdout)
+    deprecated = [f for f in doc["findings"] if f["check"] == "policy.deprecated"]
+    assert len(deprecated) == 1, doc["findings"]
+    assert deprecated[0]["severity"] == "warning"
+    assert "[engine]" in deprecated[0]["message"]
+    assert "bmad-loop: warning:" not in proc.stderr
+
+
+def test_module_validate_refuses_a_named_engine_block(tmp_path):
+    """A named ``[engine]`` block fails ``validate``'s ``policy`` check with the
+    ``[plugins]`` migration, and no ``policy.deprecated`` finding rides along: the
+    refusal is the whole notice.
+
+    Ablations: delete the named-block refusal in ``_refuse_removed_engine`` → the
+    ``policy`` check passes and the warning becomes a ``policy.deprecated`` finding."""
+    (tmp_path / ".bmad-loop").mkdir()
+    (tmp_path / ".bmad-loop" / "policy.toml").write_text(
+        '[engine]\nname = "unity"\n', encoding="utf-8"
+    )
+    proc = _run_module(
+        "validate", "--json", "--project", str(tmp_path), cwd=tmp_path, env=_clean_warning_env()
+    )
+    assert proc.returncode != 0, proc.stderr
+    doc = json.loads(proc.stdout)
+    (pol_check,) = [f for f in doc["findings"] if f["check"] == "policy"]
+    assert pol_check["severity"] != "ok", pol_check
+    assert 'enabled = ["unity"]' in pol_check["message"]
+    assert "[plugins.unity]" in pol_check["message"]
+    assert not [f for f in doc["findings"] if f["check"] == "policy.deprecated"]
 
 
 # The child of test_extra_less_install_core_works_and_tui_hints. Kept as a module
@@ -126,9 +203,11 @@ def test_extra_less_install_core_works_and_tui_hints(tmp_path):
     """The core CLI surface works with the ``[tui]`` extra absent (#650).
 
     A core-only ``uv tool install bmad-loop`` has no pyte/rich/textual/tomlkit, but
-    every test job installs ``--all-extras`` and the packaging job's isolated wheel
-    run only calls ``--version`` — which argparse answers before any subcommand code
-    imports. That blind spot let ``ls`` crash on a missing ``pyte`` for 23 releases.
+    every test job installs ``--all-extras``, and a wheel run of only ``--version``
+    is answered by argparse before any subcommand code imports. That blind spot let
+    ``ls`` crash on a missing ``pyte`` for 23 releases. The packaging job now also
+    runs ``bmad-loop list`` from the isolated wheel, the same floor at install level;
+    this test is the in-suite half that every ``--all-extras`` job would otherwise miss.
     So: a fresh interpreter (the subprocess *is* the test, per this module's header)
     installs an import-system blocker for those four packages, proves the blocker
     bites, then runs the paths a core-only install actually takes.
@@ -234,21 +313,17 @@ def test_exit_keyboard_interrupt_is_130(tmp_path, capsys, monkeypatch):
 
 def test_exit_code_enum_values():
     """``ExitCode`` names the released rc numbers — the values are the contract, so
-    pin them literally (a rename is fine; a renumber is a breaking change)."""
+    pin them literally (a rename is fine; a renumber is a breaking change). An
+    ``IntEnum`` member *is* its int, so ``main() -> int`` and ``sys.exit`` consume
+    the members transparently and the failure paths can return them as-is."""
     assert cli.ExitCode.OK == 0
     assert cli.ExitCode.FAILURE == 1
     assert cli.ExitCode.USAGE == 2
     assert cli.ExitCode.INTERRUPTED == 130
+    assert isinstance(cli.ExitCode.FAILURE, int)
 
 
 def test_exit_code_enum_has_only_contracted_codes():
     """OK/FAILURE/USAGE/INTERRUPTED are the whole contract — codes 3-129 and 131+ are
     deferred until a consumer needs them, so guard against one sneaking in early."""
     assert {c.value for c in cli.ExitCode} == {0, 1, 2, 130}
-
-
-def test_exit_code_enum_is_int_returnable():
-    """``main() -> int`` and ``sys.exit`` both consume the members transparently:
-    an ``IntEnum`` member *is* its int, so the failure paths can return it as-is."""
-    assert isinstance(cli.ExitCode.FAILURE, int)
-    assert cli.ExitCode.FAILURE == 1

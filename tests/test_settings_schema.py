@@ -11,24 +11,31 @@ import dataclasses
 from importlib import resources
 
 import pytest
+from conftest import grant_plugin
 
 from bmad_loop import policy as policy_mod
 from bmad_loop.plugins import load_plugins
+from bmad_loop.plugins.loader import PLUGIN_FILE, USER_PLUGINS_REL
 from bmad_loop.policy import (
     BRANCH_PER_MODES,
     GATE_MODES,
     ISOLATION_MODES,
     MERGE_STRATEGIES,
+    OPERATOR_ON_REVIEW_DEMOTION_MODES,
+    PERMISSION_MODES,
     POLICY_TEMPLATE,
     RETRO_MODES,
-    REVIEW_ON_STATUS_CONTRADICTION_MODES,
     REVIEW_TRIGGER_MODES,
     SESSION_BUDGET_MODES,
+    STAGES,
     STORIES_SOURCES,
     SWEEP_AUTO_MODES,
+    TICKETS_MARK_DONE_MODES,
+    TICKETS_THOROUGH_REVIEW_MODES,
     AdapterPolicy,
     CleanupPolicy,
     DevPolicy,
+    EnvironmentPolicy,
     GatesPolicy,
     LimitsPolicy,
     MuxPolicy,
@@ -38,9 +45,11 @@ from bmad_loop.policy import (
     Policy,
     ReviewPolicy,
     ScmPolicy,
+    SkillsPolicy,
     StageAdapterPolicy,
     StoriesPolicy,
     SweepPolicy,
+    TicketsPolicy,
     TuiPolicy,
     VerifyPolicy,
 )
@@ -53,19 +62,23 @@ SECTION_DC = {
     "gates": GatesPolicy,
     "review": ReviewPolicy,
     "stories": StoriesPolicy,
+    "tickets": TicketsPolicy,
     "limits": LimitsPolicy,
     "verify": VerifyPolicy,
+    "environment": EnvironmentPolicy,
     "notify": NotifyPolicy,
     "adapter": AdapterPolicy,
     "adapter.dev": StageAdapterPolicy,
     "adapter.review": StageAdapterPolicy,
     "adapter.triage": StageAdapterPolicy,
+    "adapter.retro": StageAdapterPolicy,
     "sweep": SweepPolicy,
     "scm": ScmPolicy,
     "cleanup": CleanupPolicy,
     "tui": TuiPolicy,
     "operator": OperatorPolicy,
     "mux": MuxPolicy,
+    "skills": SkillsPolicy,
     "dev": DevPolicy,
 }
 
@@ -79,24 +92,30 @@ OPTIONS_ENUM = {
     ("gates", "mode"): GATE_MODES,
     ("gates", "retrospective"): RETRO_MODES,
     ("review", "trigger"): REVIEW_TRIGGER_MODES,
-    ("review", "on_status_contradiction"): REVIEW_ON_STATUS_CONTRADICTION_MODES,
+    ("operator", "on_review_demotion"): OPERATOR_ON_REVIEW_DEMOTION_MODES,
     ("stories", "source"): STORIES_SOURCES,
+    ("tickets", "mark_done"): TICKETS_MARK_DONE_MODES,
+    ("tickets", "thorough_review"): TICKETS_THOROUGH_REVIEW_MODES,
     ("limits", "session_budget_mode"): SESSION_BUDGET_MODES,
     ("sweep", "auto"): SWEEP_AUTO_MODES,
     ("scm", "isolation"): ISOLATION_MODES,
     ("scm", "branch_per"): BRANCH_PER_MODES,
     ("scm", "merge_strategy"): MERGE_STRATEGIES,
+    ("adapter", "permission_mode"): PERMISSION_MODES,
+    **{(f"adapter.{stage}", "permission_mode"): PERMISSION_MODES for stage in STAGES},
 }
 
 # Policy fields with no settings-screen control, by design. Each maps to a whole
 # section (the adapter stage sub-tables) or is intentionally hidden.
 HIDDEN = {
     ("gates", "on_escalation"),  # CRITICAL escalations always pause; field reserved
+    ("review", "on_status_contradiction"),  # a revoked sign-off always escalates; one value
     ("sweep", "max_migration_attempts"),  # rare legacy-ledger path; no UI knob
     ("scm", "max_parallel"),  # inert until the parallel scheduler lands
     ("adapter", "dev"),  # rendered as the adapter.dev section
     ("adapter", "review"),  # rendered as the adapter.review section
     ("adapter", "triage"),  # rendered as the adapter.triage section
+    ("adapter", "retro"),  # rendered as the adapter.retro section
     ("dev", "skill"),  # internal dev-skill seam; DEV_SKILLS has one legal value, no UI knob
     # Dashboard pane geometry — set by mouse-drag / the Ctrl+W resize mode, not a
     # form field, so no settings-screen control.
@@ -125,6 +144,23 @@ def test_defaults_match_referenced_dataclass():
         elif f.default is not None:
             # str fields may omit a default (placeholder-only); if present, sync it
             assert f.default == getattr(dc, f.key), f"{f.section}.{f.key}"
+
+
+def test_extra_args_fields_explain_the_bypass_replace_rule():
+    """DW-349: `extra_args` REPLACES the profile's `bypass_args`, so every
+    `extra_args` field (the base table and each stage) says so on the settings
+    screen; the stage entry also names the client-match inheritance."""
+    fields = {f.section: f for f in core_fields() if f.key == "extra_args"}
+    assert set(fields) == {
+        "adapter",
+        "adapter.dev",
+        "adapter.review",
+        "adapter.triage",
+        "adapter.retro",
+    }
+    for section, f in fields.items():
+        assert "replaces" in f.description and "bypass_args" in f.description, section
+    assert "only when the client matches" in fields["adapter.dev"].description
 
 
 def test_select_options_match_enum_sets():
@@ -187,6 +223,15 @@ def test_every_policy_dataclass_is_classified():
     assert policy_dcs <= classified, f"unclassified policy dataclasses: {policy_dcs - classified}"
 
 
+def test_core_widget_ids_stay_section_dash_key():
+    """Core fields carry no explicit id: their widget ids stay ``<section>-<key>``
+    with dots dashed — only plugin fields go through `plugin_field_wid`."""
+    specs = [f for s in load_core_schema() for f in s.fields]
+    assert all(f.id == "" for f in specs)
+    ids = {f.widget_id for f in specs}
+    assert {"limits-max_review_cycles", "adapter-review-model"} <= ids
+
+
 # --------------------------------------------------------------- packaging
 
 
@@ -209,14 +254,66 @@ def test_every_discovered_plugin_is_listed_with_settings():
     assert example is not None
     assert example.enabled is False  # not in [plugins] enabled
     assert example.trust_needed is False  # data-only: no [python], no toggle
+    assert (example.origin, example.grant_required, example.grant_status) == (
+        "builtin",
+        False,
+        "n/a",
+    )
     assert [f.key for f in example.fields] == ["greeting"]
     greeting = example.fields[0]
     assert greeting.section == "plugins.example"
-    assert greeting.widget_id == "plugins-example-greeting"  # dotted -> dashed, unchanged
+    assert greeting.widget_id == "plugins-example-greeting"  # safe name and key read as-is
     assert greeting.kind == "str" and greeting.default == "hello"
     # plugin_schemas cover every plugin contributing settings, so [plugins.<name>]
     # tables are typed on save even when the plugin is not enabled.
     assert "example" in reg.plugin_schemas
+
+
+def _write_project_plugin(root, name, body):
+    pdir = root / USER_PLUGINS_REL / name
+    pdir.mkdir(parents=True)
+    (pdir / PLUGIN_FILE).write_text(f'[plugin]\nname = "{name}"\napi_version = 1\n{body}')
+    return pdir
+
+
+def test_project_plugin_with_hooks_needs_a_grant(tmp_path):
+    """A project plugin with an executable surface carries a toggle — its grant —
+    even with no [python] module, and reports its grant status: ungranted, then
+    granted under a matching grant, then mismatch once its bytes move.
+
+    ABLATION: compute `trust_needed` as `python is not None` for every origin and
+    the declarative project plugin loses its toggle."""
+    pdir = _write_project_plugin(tmp_path, "hooky", '[hooks.pre_run]\ncmd = "echo hi"\n')
+    info = next(p for p in build_registry(tmp_path, Policy()).plugins if p.name == "hooky")
+    assert (info.origin, info.trust_needed, info.grant_required) == ("project", True, True)
+    assert info.grant_status == "ungranted" and not info.has_grant
+
+    grants = grant_plugin(tmp_path, "hooky")
+    reg = build_registry(tmp_path, Policy(), grants=grants)
+    assert next(p for p in reg.plugins if p.name == "hooky").grant_status == "granted"
+    (pdir / "extra.sh").write_text("echo new\n")
+    reg = build_registry(tmp_path, Policy(), grants=grants)
+    changed = next(p for p in reg.plugins if p.name == "hooky")
+    assert changed.grant_status == "mismatch" and changed.has_grant
+
+
+def test_settings_only_project_plugin_needs_no_grant(tmp_path):
+    """A project plugin with nothing executable loads freely: no toggle, no grant."""
+    _write_project_plugin(
+        tmp_path, "cfgonly", '[[settings]]\nkey = "k"\ntype = "str"\ndefault = "v"\n'
+    )
+    info = next(p for p in build_registry(tmp_path, Policy()).plugins if p.name == "cfgonly")
+    assert (info.origin, info.trust_needed, info.grant_required) == ("project", False, False)
+    assert info.grant_status == "n/a"
+    assert [f.key for f in info.fields] == ["k"]
+
+
+def test_build_registry_discovers_from_root(tmp_path):
+    """``root`` (the code root a run loads) is where plugins are discovered."""
+    _write_project_plugin(tmp_path / "code", "hooky", '[hooks.pre_run]\ncmd = "echo hi"\n')
+    names = {p.name for p in build_registry(tmp_path, Policy(), root=tmp_path / "code").plugins}
+    assert "hooky" in names
+    assert "hooky" not in {p.name for p in build_registry(tmp_path, Policy()).plugins}
 
 
 def test_enabled_state_reflects_policy():
@@ -294,6 +391,7 @@ def test_unity_plugin_is_trust_gated_and_renders_settings():
     unity = next((p for p in reg.plugins if p.name == "unity"), None)
     assert unity is not None
     assert unity.trust_needed is True  # has [python] -> enabling grants trust
+    assert (unity.origin, unity.grant_required) == ("builtin", False)  # enabled, not granted
     assert unity.enabled is False
     keys = [f.key for f in unity.fields]
     assert keys == [
@@ -313,17 +411,4 @@ def test_unity_plugin_is_trust_gated_and_renders_settings():
     editor_mode = next(f for f in unity.fields if f.key == "editor_mode")
     assert editor_mode.kind == "select"
     assert editor_mode.options == ("shared", "per_worktree")
-    assert editor_mode.widget_id == "plugins-unity-editor_mode"  # dotted -> dashed
-
-
-def test_deprecated_engine_block_folds_into_unity_plugin():
-    """A legacy [engine] block loads (with a deprecation warning) by folding onto
-    [plugins] enabled + [plugins.unity]; explicit [plugins.unity] values win."""
-    with pytest.warns(DeprecationWarning):
-        pol = policy_mod.loads(
-            '[engine]\nname = "unity"\neditor_mode = "per_worktree"\nmcp = "coplaydev"\n'
-            '[scm]\nisolation = "worktree"\n'
-        )
-    assert "unity" in pol.plugins.enabled
-    assert pol.plugin_setting("unity", "editor_mode") == "per_worktree"
-    assert pol.plugin_setting("unity", "mcp") == "coplaydev"
+    assert editor_mode.widget_id == "plugins-unity-editor_5fmode"  # plugin_field_wid-encoded

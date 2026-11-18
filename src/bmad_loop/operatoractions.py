@@ -53,13 +53,21 @@ drifted entries itself, so nothing gates on the record.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import devcontract, sprintstatus, verify
 from .bmadconfig import ProjectPaths
 from .frontmatter import operator_actions_of, read_frontmatter, status_of
-from .platform_util import atomic_write_text_confined, safe_segment
+from .platform_util import (
+    atomic_write_text_confined,
+    make_dirs_confined,
+    require_root_pinned,
+    safe_segment,
+)
+from .statemachine import is_operator_park
+from .worksource import SOURCE_TICKETS
 
 RECORDS_REL = Path(".bmad-loop") / "operator"
 LEGACY_STORE_REL = Path(".bmad-loop") / "operator-actions.json"
@@ -68,6 +76,8 @@ AWAITING_OPERATOR = verify.AWAITING_OPERATOR
 # `sprintstatus.STATUS_ORDER` because both sides of the join use it — the board
 # token and the spec's frontmatter status — and only one of those is a board.
 DONE = "done"
+# where a ticket confirmation leaves the plan under `[tickets] mark_done = "never"`
+BUILT = "built"
 
 
 def records_dir(project: Path) -> Path:
@@ -141,10 +151,25 @@ def record_park(
     spec_file: str,
     run_id: str,
     parked_at: str,
+    root_identity: os.stat_result | None = None,
+    source: str | None = None,
+    ref: str | None = None,
+    followup_review_recommended: bool | None = None,
 ) -> Path:
     """Write a story's park record, returning its path. Re-parking the same key
     overwrites rather than accumulates: a story owes whatever its latest park
     says it owes, and a stale action list is worse than none.
+
+    ``source`` and ``ref`` name the work source that parked the unit and the
+    unit's own handle there — ``"tickets"`` and the ticket ref, whose plan
+    ``confirm`` marks through the ticket chokepoint (:data:`SOURCE_TICKETS`).
+    Each is recorded only when given, so a sprint or stories record keeps its
+    five keys.
+
+    ``followup_review_recommended`` records the build session's follow-up review
+    recommendation at park time, a pass the park skips, so the record is where the
+    operator learns it is still owed. Like ``source``/``ref`` it is written only
+    when given.
 
     The write goes through :func:`platform_util.atomic_write_text` (#379), which
     carries the unlink-on-raise this used to hand-roll — hence no try/except here;
@@ -176,9 +201,29 @@ def record_park(
     writers of this same file — ``Engine._restore_park_record`` and ``confirm``'s
     prune — since write semantics belong to the FILE, not to whichever code path
     reached it last. An operator who marks a park record read-only gets the
-    ``PermissionError`` a bare ``Path.write_text`` raised before #379."""
+    ``PermissionError`` a bare ``Path.write_text`` raised before #379.
+
+    ``root_identity`` pins ``project`` (DW-445), forwarded to the confined
+    writer; ``None`` (the default) is the unpinned write. Only the engine passes
+    one, `runs.mount_root_identity` of its unit mount — under worktree isolation
+    ``project`` is the orchestrator-minted mount, not the operator's checkout.
+    Given one, a ``project`` that is no longer that directory refuses with
+    `UnconfinedWriteError` BEFORE the ``mkdir``, so a mount swapped for a link
+    gets no directories created at the link's target either. That pre-check is
+    ``lstat``-then-``mkdir`` (`platform_util.require_root_pinned`; the ``mkdir``
+    and the write each re-pin through their own handle). The identity is that of
+    ``project`` reached by an ``O_NOFOLLOW`` walk from the mount's MINT-TIME record
+    (DW-446), so a parent directory ABOVE the worktree swapped for a link refuses too.
+
+    The records directory is created by `platform_util.make_dirs_confined`
+    (DW-497), not ``mkdir(parents=True)``: that followed a link planted BELOW
+    ``project`` — at ``.bmad-loop/`` or ``.bmad-loop/operator/`` — and created the
+    tree at its target before the confined write refused. Now such a link refuses
+    with `UnconfinedWriteError` before anything is created through it, pinned or
+    not."""
     path = record_path(project, story_key)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    require_root_pinned(project, root_identity)
+    make_dirs_confined(path.parent, confine_root=project, root_identity=root_identity)
     record = {
         "story_key": story_key,
         "actions": list(actions),
@@ -186,11 +231,18 @@ def record_park(
         "run_id": run_id,
         "parked_at": parked_at,
     }
+    if source is not None:
+        record["source"] = source
+    if ref is not None:
+        record["ref"] = ref
+    if followup_review_recommended is not None:
+        record["followup_review_recommended"] = followup_review_recommended
     atomic_write_text_confined(
         path,
         json.dumps(record, indent=2, sort_keys=True),
         confine_root=project,
         require_writable_target=True,
+        root_identity=root_identity,
     )
     return path
 
@@ -291,7 +343,17 @@ class ParkedStory:
     ``commit`` is display provenance only, never a predicate input. For a park
     record it is DERIVED (``git log`` over the record's path — the record rides
     the commit it names, so it cannot store it) and is ``""`` for a record not
-    yet in any commit; a legacy index entry keeps its stored sha."""
+    yet in any commit; a legacy index entry keeps its stored sha.
+
+    A ticket park (``source`` :data:`SOURCE_TICKETS`) has no board: its committed
+    truth is the plan alone, parked as ``blocked`` with an operator-park
+    ``blocked_reason`` (read from the plan, "" when unset), and ``ref`` is the
+    ticket whose plan ``confirm`` marks.
+
+    ``followup_review_recommended`` is the build session's follow-up review
+    recommendation at park time, read from the record. None means the record
+    predates the field or holds a non-bool: unknown, deliberately distinct from
+    False (the engine always records a real bool)."""
 
     story_key: str
     actions: tuple[str, ...]
@@ -302,12 +364,32 @@ class ParkedStory:
     commit: str
     run_id: str
     parked_at: str
+    source: str = ""
+    ref: str = ""
+    blocked_reason: str = ""
+    followup_review_recommended: bool | None = None
+
+    @property
+    def ticket(self) -> bool:
+        """Whether a tickets run parked this unit: its plan, not a board, is the
+        truth, and ``confirm`` marks it through the ticket chokepoint."""
+        return self.source == SOURCE_TICKETS
+
+    @property
+    def plan_parked(self) -> bool:
+        """Whether the ticket's plan still reads as an operator park."""
+        return self.spec_status is not None and is_operator_park(
+            self.spec_status, self.blocked_reason
+        )
 
     @property
     def confirmable(self) -> bool:
         """Whether both sides of the committed truth still describe a park with
         something owed. Everything else is drift, and `confirm` refuses it rather
-        than flipping a board on the record's word alone."""
+        than flipping a board on the record's word alone. A ticket park has one
+        side, its plan."""
+        if self.ticket:
+            return bool(self.actions) and bool(self.ref) and self.plan_parked
         return (
             bool(self.actions)
             and self.spec_status == AWAITING_OPERATOR
@@ -321,8 +403,8 @@ class ParkedStory:
 
         `confirm` writes the audit section, then the spec status, then the board,
         then drops the entry. Stop it between the spec half and the board half —
-        a raising `sprintstatus.advance`, or one that returns unchanged because
-        the board line is in a shape its line regex cannot rewrite — and what is
+        a raising `sprintstatus.advance`, including the `SprintStatusWriteRefused`
+        it raises for a board row in a shape its line edit cannot rewrite — and what is
         left on disk is a signed-off spec at `done` with an entry still pointing
         at it. That reads to :meth:`drift` as a stale entry (arm 3, "its spec now
         says status: done"), so a re-run refuses the very state a re-run exists to
@@ -339,7 +421,16 @@ class ParkedStory:
         predicate and strand it — record retained, `validate` warning forever,
         and no command that will remove either. `sprintstatus.advance` is
         already idempotent at `done`, so resuming from there costs nothing and
-        finishes the one thing left: dropping the entry."""
+        finishes the one thing left: dropping the entry.
+
+        A ticket park's confirmation marks the plan ``done`` (or ``built`` under
+        ``[tickets] mark_done = "never"``) after the section; either status with
+        the section on disk is the same interruption, before the entry was
+        dropped."""
+        if self.ticket:
+            return (
+                self.confirmation_recorded and bool(self.ref) and self.spec_status in (BUILT, DONE)
+            )
         return (
             self.confirmation_recorded
             and self.spec_status == DONE
@@ -361,6 +452,15 @@ class ParkedStory:
             return "no spec file could be located for it"
         if self.spec_status is None:
             return f"its spec is missing or unreadable ({self.spec_path})"
+        if self.ticket:
+            if not self.ref:
+                return "its park record names no ticket ref"
+            if not self.plan_parked:
+                return (
+                    f"its plan now says status: {self.spec_status or '(blank)'}, not an "
+                    f"operator park"
+                )
+            return None
         if self.spec_status != AWAITING_OPERATOR:
             # A blank frontmatter `status:` reads "" (status_of normalizes YAML-null),
             # which would otherwise render as an empty tail on a human-facing line.
@@ -387,6 +487,11 @@ class ParkedStory:
 def resolve(project: Path, paths: ProjectPaths) -> list[ParkedStory]:
     """Every park entry joined to its spec and board status, sorted by key.
 
+    The board is read for every entry whatever the project's current work
+    source: a park record belongs to the source of the run that wrote it, so a
+    story parked on the sprint board stays confirmable there after the project
+    switches ``[stories] source``.
+
     Reading degrades rather than raises throughout: this backs `confirm --list`
     and a `validate` warning, and neither may be the thing that crashes on a spec
     someone deleted. The actions come from the SPEC when it can be read and from
@@ -409,6 +514,7 @@ def resolve(project: Path, paths: ProjectPaths) -> list[ParkedStory]:
         spec_path = _spec_path(entry, paths)
         spec_fm = _spec_frontmatter(spec_path)
         spec_actions = operator_actions_of(spec_fm) if spec_fm is not None else ()
+        raw = entry.get("followup_review_recommended")
         out.append(
             ParkedStory(
                 story_key=key,
@@ -422,9 +528,19 @@ def resolve(project: Path, paths: ProjectPaths) -> list[ParkedStory]:
                 commit=str(entry.get("commit") or "") or _derive_commit(project, paths, key),
                 run_id=str(entry.get("run_id") or ""),
                 parked_at=str(entry.get("parked_at") or ""),
+                source=str(entry.get("source") or ""),
+                ref=str(entry.get("ref") or ""),
+                blocked_reason=_blocked_reason(spec_fm),
+                followup_review_recommended=raw if isinstance(raw, bool) else None,
             )
         )
     return out
+
+
+def _blocked_reason(spec_fm: dict | None) -> str:
+    """A plan's ``blocked_reason`` as a string, "" when unset or not one."""
+    value = spec_fm.get("blocked_reason") if spec_fm is not None else None
+    return value.strip() if isinstance(value, str) else ""
 
 
 def _derive_commit(project: Path, paths: ProjectPaths, story_key: str) -> str:

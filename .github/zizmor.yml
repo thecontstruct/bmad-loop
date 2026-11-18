@@ -13,12 +13,14 @@ rules:
 
   cache-poisoning:
     ignore:
-      # ci.yml publishes nothing. It runs under `permissions: contents: read`,
-      # uploads no artifact, and pushes nowhere; the audit fires on its `push:`
-      # trigger alone. The two jobs that *do* produce something outside the run —
-      # release.yml's publish and ci.yml's build — set `enable-cache: false`
-      # rather than being listed here. Drop this ignore if ci.yml ever grows a
-      # publishing step.
+      # ci.yml publishes nothing. It runs under `permissions: contents: read`
+      # and pushes nowhere; the audit fires on its `push:` trigger alone. Its
+      # only artifacts are the test jobs' own metrics/JUnit diagnostics; their
+      # one consumer is the in-run `test-windows` aggregator, which reads them
+      # to grade a check and publishes nothing. The two jobs that *do* produce something
+      # outside the run — release.yml's publish and ci.yml's build — set
+      # `enable-cache: false` rather than being listed here. Drop this ignore if
+      # ci.yml ever grows a publishing step.
       - ci.yml
 
   artipacked:

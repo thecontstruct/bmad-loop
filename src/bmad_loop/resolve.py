@@ -18,17 +18,20 @@ import json
 import math
 import os
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 from stat import S_ISREG
 from typing import Any
 
+from . import devcontract, frontmatter, worksource
 from .adapters.base import SessionSpec
 from .engine import _session_task_id
 from .escalation import critical_escalations
-from .journal import TASK_CYCLE_ARTIFACTS
-from .model import RunState, StoryTask
+from .journal import TASK_CYCLE_ARTIFACTS, Journal
+from .model import PAUSE_ESCALATION, RunState, StoryTask
 from .platform_util import safe_segment
 from .runs import (
+    journal_entries_or_none,
     live_stories_root,
     rebase_recorded_project_path,
     redrive_base_ref,
@@ -36,6 +39,7 @@ from .runs import (
     task_spec_path,
     validate_restore_latch,
 )
+from .tickets_source import EPIC_CLOSED, path_overlaps
 
 RESOLVE_DIR = "resolve"
 
@@ -144,7 +148,7 @@ def _gather_escalations(
       attributes the abandoned cycle's escalation to the fresh session too.
       Open each directory once.
     * the content-keyed map — the sweep skill's own contract
-      (``data/skills/bmad-loop-sweep/automation-mode.md``) tells a producer to
+      (``skills/bmad-loop-sweep/automation-mode.md``) tells a producer to
       write ``escalation.json`` and then mirror the same entries into
       ``result.json`` ``escalations``. That mirroring is deliberate and stays;
       the READER absorbs it, so a compliant producer is not shown to the human
@@ -293,6 +297,27 @@ def _gather_escalations(
     return list(found.values()), sum(1 for key in answered if key not in found)
 
 
+def escalation_reason(state: RunState, run_dir: Path, story_key: str) -> str | None:
+    """The reason ``story_key`` escalated, for the resolve context's ``paused_reason``.
+
+    The run's ``paused_reason`` answers only while the run is paused at the escalation
+    stage on THIS story. A resume clears the pause before its engine starts, so a run
+    left with the story still escalated has none (#958), and resolving ``--story B``
+    while paused on A must not hand B's session A's reason. Otherwise the reason is
+    the last ``story-escalated`` journal row for the story; None when the journal is
+    unreadable or holds no such row, which the skill reports as a malformed context."""
+    if state.paused_stage == PAUSE_ESCALATION and state.paused_story_key == story_key:
+        return state.paused_reason
+    entries = journal_entries_or_none(run_dir)
+    if entries is None:
+        return None
+    for entry in reversed(entries):
+        if entry.get("kind") == "story-escalated" and entry.get("story_key") == story_key:
+            reason = entry.get("reason")
+            return reason if isinstance(reason, str) else None
+    return None
+
+
 def build_context(
     state: RunState,
     run_dir: Path,
@@ -349,8 +374,9 @@ def build_context(
     restore_supported = task is not None and (
         validate_restore_latch(state, task, story_key, worktree_isolation=isolated_redrive) is None
     )
+    traits = worksource.resumed_traits_for(state.source)
     stories_ctx: dict[str, Any] | None = None
-    if state.source == "stories":
+    if traits.has_spec_folder:
         # Which tree holds this run's STORY MANIFEST — the workspace root, answered by
         # `runs.live_stories_root` rather than by `task_spec_root`. Sprint mode consumes
         # no stories data, so it must not probe for a stories root at all.
@@ -361,7 +387,7 @@ def build_context(
     # The persisted detection verdict is authoritative, matching re-arm. A real spec
     # may legally have a sentinel-shaped basename, while a recorded sentinel remains a
     # sentinel even when its file is unreadable or has disappeared.
-    sentinel = state.source == "stories" and task is not None and bool(task.sentinel_kind)
+    sentinel = traits.sentinels and task is not None and bool(task.sentinel_kind)
     # DW-11: hide what an earlier resolve cycle already answered. `start` is the task's
     # own watermark — 0 for a task never resolved, and for every pre-upgrade
     # `state.json`, which is the unfiltered pre-DW-11 walk.
@@ -383,7 +409,7 @@ def build_context(
         "project_root": current_project_root.as_posix(),
         "code_root": current_code_root.as_posix(),
         # Absolute, matching the shape `bmad-loop-resolve/SKILL.md` documents: an
-        # isolated unit's `spec_file` is persisted RELATIVE to the mounted worktree
+        # isolated unit's `spec_file` is persisted RELATIVE to the mount project
         # (`model.StoryTask._serialized_worktree_path`) and the agent session runs
         # from the project root, where the main checkout carries the same
         # implementation-artifacts-relative path — the raw value would name the wrong
@@ -399,7 +425,11 @@ def build_context(
         # spelling for every reader — and consumed by an agent, which accepts '/'.
         "spec_file": context_spec_path.as_posix() if context_spec_path is not None else None,
         "baseline_commit": task.baseline_commit if task else None,
-        "paused_reason": state.paused_reason,
+        "paused_reason": escalation_reason(state, run_dir, story_key),
+        # Where the escalation's environment fault was detected (DW-523), a closed
+        # `model.ENV_FAULT_SITES` slug; None when the escalation is not one. Set,
+        # it tells the session the spec needs no change: the environment does.
+        "env_fault_site": task.env_fault_site if task else None,
         "escalations": escalations,
         # as_posix so the context contract is the same string on every OS (the
         # path is consumed by the agent, and Python/tools accept '/' on Windows).
@@ -448,6 +478,18 @@ def build_context(
     # underlying ambiguity instead). Sprint mode leaves the context unchanged.
     if stories_ctx:
         context["stories"] = stories_ctx
+    # tickets mode: the ticket the escalation is about, and its plan as it reads now —
+    # the status and blocked reason build-auto's HALT left, and its result excerpt.
+    if traits.name == worksource.SOURCE_TICKETS:
+        ticket_plan = context_spec_path
+        if ticket_plan is None and task is not None and task.ticket is not None:
+            # the binding records the plan absolute under the launch-time project
+            ticket_plan = rebase_recorded_project_path(
+                Path(task.ticket.plan), state, current_project_root
+            )
+        context["tickets"] = _tickets_context(
+            state, run_dir, story_key, task, plan_path=ticket_plan
+        )
     path = context_path(run_dir, story_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(context, indent=2, allow_nan=False), encoding="utf-8")
@@ -509,6 +551,143 @@ def _stories_context(
     return ctx
 
 
+# How much of a ticket plan's `## Auto Run Result` the resolve context carries.
+TICKET_RESULT_EXCERPT_CHARS = 2000
+
+
+def _tickets_context(
+    state: RunState,
+    run_dir: Path,
+    story_key: str,
+    task: StoryTask | None,
+    *,
+    plan_path: Path | None,
+) -> dict[str, Any]:
+    """The tickets-mode extension of the resolve context: the ticket binding the run
+    persisted (``ref``, ``ticket_id``, ``title``, ``epic``), the plan path, and what
+    the plan reads now — ``plan_status``, ``blocked_reason`` and an excerpt of its
+    ``## Auto Run Result`` (``auto_run_result``). Read natively, never through
+    ``tickets.py``. A plan that is absent reads as nulls; one that cannot be read
+    reads as nulls too, and so do the frontmatter fields of a plan whose
+    frontmatter is missing, unparseable or not a mapping. Either fault is
+    journaled as ``resolve-ticket-context-unreadable`` — through a journal pinned
+    to ``state`` — so the null is never mistaken for an empty plan."""
+    ticket = task.ticket if task is not None else None
+    plan = plan_path if plan_path is not None else Path(ticket.plan) if ticket else None
+    ctx: dict[str, Any] = {
+        "ref": ticket.ref if ticket else None,
+        "ticket_id": ticket.id if ticket else None,
+        "title": ticket.title if ticket else None,
+        "epic": ticket.epic_slug if ticket else None,
+        "plan": plan.as_posix() if plan is not None else None,
+        "plan_status": None,
+        "blocked_reason": None,
+        "auto_run_result": None,
+    }
+    if plan is None or not plan.exists():
+        return ctx
+    try:
+        text = plan.read_bytes().decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError) as e:
+        Journal(run_dir, pin=state).append(
+            "resolve-ticket-context-unreadable",
+            story_key=story_key,
+            plan=str(plan),
+            error=f"{e.__class__.__name__}: {e}",
+        )
+        return ctx
+    result = devcontract.parse_auto_run_result(text)
+    ctx["auto_run_result"] = result.detail[:TICKET_RESULT_EXCERPT_CHARS] if result.present else None
+    fault = frontmatter.frontmatter_fault(text)
+    if fault is not None:
+        Journal(run_dir, pin=state).append(
+            "resolve-ticket-context-unreadable", story_key=story_key, plan=str(plan), error=fault
+        )
+        return ctx
+    fm = frontmatter.parse_frontmatter(text)
+    reason = fm.get("blocked_reason")
+    ctx["plan_status"] = frontmatter.status_of(fm) or None
+    ctx["blocked_reason"] = str(reason) if reason not in (None, "") else None
+    return ctx
+
+
+EPIC_CLOSE_SKILL = "bmad-agent-po"
+
+
+def epic_close_prompt(
+    *,
+    slug: str,
+    initiative: str,
+    initiative_folder: Path,
+    epic_file: Path,
+    retrospective: Path,
+    verdict: str | None,
+    parent: str | None,
+    rejected: bool,
+    versioning: str,
+    repo: Path | None,
+) -> str:
+    """The one-line canonical first prompt of an epic-close session: bmad-agent-po's
+    closure check for epic ``slug``, with the absolute paths it works on, the
+    recorded retrospective ``verdict``, the parent clause of a chained run, the
+    rejected clause, and where the closed epic file is committed — ``repo`` is the
+    code repo for ``code-repo`` and the store repo for ``store-repo``, unused for
+    ``none``. Pure: it reads no file. Raises ValueError on an unknown
+    ``versioning``, or on a versioned store with no ``repo``."""
+    if versioning == "none":
+        commit = "; the store is unversioned, so there is nothing to commit"
+        clean = ""
+    elif versioning in ("code-repo", "store-repo") and repo is not None:
+        where = "the repo" if versioning == "code-repo" else "the store repo"
+        commit = f", then commit the epic file in {where} at {repo.as_posix()}"
+        clean = " and its epic folder has no uncommitted change"
+    else:
+        raise ValueError(f"no epic-close commit hint for versioning {versioning!r} (repo {repo})")
+    parts = [
+        f"/{EPIC_CLOSE_SKILL} Run your epic closure check for epic {slug} of initiative "
+        f"{initiative}.",
+        f"Initiative folder: {initiative_folder.as_posix()}.",
+        f"Epic file: {epic_file.as_posix()}.",
+        f"Retrospective: {retrospective.as_posix()} "
+        f"(verdict: {verdict if verdict else 'none recorded by this run'}).",
+    ]
+    if parent:
+        parts.append(
+            f"{initiative} is a child of parent {parent}, which [core] active_initiative "
+            f"names; work in the child folder above."
+        )
+    if rejected:
+        parts.append("The run stays held until this epic is closed.")
+    parts.append(f"If ready, set its status to done (or dropped){commit}.")
+    parts.append(f"bmad-loop resumes only when the epic file reads done or dropped{clean}.")
+    return " ".join(parts)
+
+
+def epic_close_missing(
+    epic_status: str, dirty_paths: Iterable[str], epic_prefix: str, versioning: str
+) -> list[str]:
+    """What an epic-close session left undone, deterministically: the epic's
+    status when it is not ``done``/``dropped``, and the dirty repo-relative paths
+    in or containing ``epic_prefix`` (the epic folder, the
+    ``tickets_source.path_overlaps`` rule). Dirt outside the epic folder is not
+    the session's to answer, and ``versioning == "none"`` checks no dirt at all.
+    An empty list means verified."""
+    missing: list[str] = []
+    if epic_status not in EPIC_CLOSED:
+        missing.append(f"the epic reads {epic_status or 'no status'}")
+    if versioning == "none":
+        return missing
+    touched = sorted(
+        {path.rstrip("/") for path in dirty_paths if path_overlaps(path.rstrip("/"), epic_prefix)}
+    )
+    if touched:
+        shown = ", ".join(touched[:5]) + (
+            f" and {len(touched) - 5} more" if len(touched) > 5 else ""
+        )
+        missing.append(f"{epic_prefix}: uncommitted {shown}")
+    return missing
+
+
 def run_session(
     adapter,
     project: Path,
@@ -567,3 +746,47 @@ def run_session(
     env = {**os.environ, **adapter.interactive_env(spec)}
     subprocess.run(argv, cwd=str(project), env=env)  # attached, inherited stdio
     return marker.is_file()
+
+
+def run_epic_close_session(
+    adapter,
+    project: Path,
+    run_dir: Path,
+    slug: str,
+    prompt: str,
+    *,
+    model: str = "",
+    effort: str = "",
+    skill_dir: str | None = None,
+) -> int:
+    """Launch the interactive epic-close agent for epic ``slug`` attached to the
+    caller's terminal, with ``prompt`` (:func:`epic_close_prompt`) as its first
+    prompt. ``skill_dir`` is the located skill's ``{skill_dir}`` spelling
+    (:func:`skill_locate.prompt_skill_dir`), None for the primary tree.
+
+    Blocks until the session exits. The session ends on process exit, as the
+    resolve agent's does, never on prose. The returncode is returned for the
+    journal only and is never trusted: the caller verifies the epic folder from
+    the tree afterwards (:func:`epic_close_missing`), so no marker file is
+    written or read. A ``NotImplementedError`` from ``interactive_argv`` (an
+    adapter with no interactive mode) propagates to the caller, as with
+    :func:`run_session`.
+    """
+    spec = SessionSpec(
+        task_id=_session_task_id(slug, "epic-close", 1, 0),
+        role="dev",
+        prompt=prompt,
+        cwd=project,
+        env={
+            # deliberately NOT BMAD_LOOP_MODE: this session is interactive, a
+            # human is present, the skill must be allowed to ask.
+            "BMAD_LOOP_RUN_DIR": str(run_dir),
+            "BMAD_LOOP_EPIC_REF": slug,
+        },
+        model=model,
+        effort=effort,
+        skill_dir=skill_dir,
+    )
+    argv = adapter.interactive_argv(spec)
+    env = {**os.environ, **adapter.interactive_env(spec)}
+    return subprocess.run(argv, cwd=str(project), env=env).returncode  # attached, inherited stdio

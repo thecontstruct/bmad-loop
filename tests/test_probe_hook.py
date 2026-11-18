@@ -8,7 +8,9 @@ from pathlib import Path
 SCRIPT = Path(__file__).parent.parent / "src" / "bmad_loop" / "data" / "bmad_loop_probe_hook.py"
 
 
-def run_hook(event: str, env: dict, payload) -> subprocess.CompletedProcess:
+def run_hook(
+    event: str, env: dict, payload, cwd: Path | None = None
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(SCRIPT), event],
         input=json.dumps(payload) if payload is not None else "",
@@ -16,11 +18,13 @@ def run_hook(event: str, env: dict, payload) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=10,
+        cwd=cwd,
     )
 
 
 def test_noop_without_capture_dir(tmp_path):
-    proc = run_hook("Stop", {}, {"session_id": "s1"})
+    # run from tmp_path, so a no-env write relative to the cwd would land there
+    proc = run_hook("Stop", {}, {"session_id": "s1"}, cwd=tmp_path)
     assert proc.returncode == 0
     assert list(tmp_path.iterdir()) == []
 
@@ -77,8 +81,54 @@ def test_tolerates_garbage_stdin(tmp_path):
 
 
 def test_installed_copy_matches_source(tmp_path):
-    # packaged alongside the real relay; importlib.resources resolves it
+    """The packaged resource matches the source relay. This only bites in a
+    wheel-installed run: under an editable install both sides resolve to the same
+    file."""
     from importlib import resources
 
     packaged = resources.files("bmad_loop.data").joinpath("bmad_loop_probe_hook.py")
     assert packaged.read_text(encoding="utf-8") == SCRIPT.read_text(encoding="utf-8")
+
+
+def run_hook_bytes(event: str, env: dict, data: bytes) -> subprocess.CompletedProcess:
+    """Feed ``data`` as raw stdin bytes, the way a CLI on Windows pipes UTF-8."""
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), event],
+        input=data,
+        env={"PATH": "/usr/bin:/bin", **env},
+        capture_output=True,
+        timeout=10,
+    )
+
+
+def test_utf8_payload_decodes_under_a_cp1252_stdin_locale(tmp_path):
+    # PYTHONIOENCODING=cp1252 forces the Windows code-page decode on every
+    # platform: a text-mode read would turn "ü" (C3 BC) into "Ã¼".
+    capture = tmp_path / "capture"
+    env = {"BMAD_LOOP_PROBE_CAPTURE_DIR": str(capture), "PYTHONIOENCODING": "cp1252"}
+    transcript = "C:\\Users\\u\\dwcap\\\u00fcn\u00ef545\\rollout.jsonl"
+    data = json.dumps(
+        {"session_id": "s-\u00fc", "transcript_path": transcript}, ensure_ascii=False
+    ).encode("utf-8")
+    proc = run_hook_bytes("Stop", env, data)
+    assert proc.returncode == 0
+
+    signal = json.loads(next(capture.glob("*.signal.json")).read_text(encoding="utf-8"))
+    assert signal["transcript_path"] == transcript
+    assert signal["session_id"] == "s-\u00fc"
+    captured = json.loads(next(capture.glob("*.payload.json")).read_text(encoding="utf-8"))
+    assert captured["transcript_path"] == transcript
+    assert next(capture.glob("*.stdin.raw")).read_bytes() == data
+
+
+def test_unparseable_stdin_keeps_its_bytes_verbatim(tmp_path):
+    # A truncated document parses to {}, but the raw sidecar keeps what arrived.
+    capture = tmp_path / "capture"
+    env = {"BMAD_LOOP_PROBE_CAPTURE_DIR": str(capture)}
+    data = b'{"session_id": "s1", "transcript_path": "/tmp/\xc3\xbc'
+    proc = run_hook_bytes("Stop", env, data)
+    assert proc.returncode == 0
+    captured = json.loads(next(capture.glob("*.payload.json")).read_text(encoding="utf-8"))
+    assert captured == {"argv_event": "Stop"}
+    assert next(capture.glob("*.stdin.raw")).read_bytes() == data
+    assert not list(capture.glob("*.tmp"))

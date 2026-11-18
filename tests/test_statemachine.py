@@ -1,7 +1,23 @@
 import pytest
 
 from bmad_loop.model import TERMINAL_PHASES, Phase, StoryTask
-from bmad_loop.statemachine import TRANSITIONS, IllegalTransition, advance
+from bmad_loop.sprintstatus import STATUS_ORDER
+from bmad_loop.statemachine import (
+    BOARD_REGRESSIONS,
+    PLAN_AWAITING_OPERATOR,
+    PLAN_STATUS_ORDER,
+    PLAN_TRANSITIONS,
+    TICKET_CLOSED_STATES,
+    TRANSITIONS,
+    IllegalTransition,
+    InitiativeCloseRefused,
+    PlanTransitionRefused,
+    advance,
+    check_board_regression,
+    check_initiative_close,
+    check_plan_transition,
+)
+from bmad_loop.ticketmodel import PLAN_STATUSES
 
 
 def test_table_covers_every_phase():
@@ -100,3 +116,345 @@ def test_migration_triage_commit_path_sequence():
     ):
         advance(task, phase)
     assert task.terminal
+
+
+def test_pending_migration_with_an_empty_manifest_completes_as_done():
+    """DW-440: a sweep migrate task whose input holds no legacy entries has nothing
+    to convert, so `_ensure_migration` retires it straight from PENDING to DONE
+    through `advance()` rather than dispatching a session. DONE is terminal, so
+    `migration_resume` never re-enters it."""
+    task = StoryTask(story_key="sweep-migrate", epic=0)
+    advance(task, Phase.DONE)
+    assert task.phase == Phase.DONE
+    assert task.terminal
+    with pytest.raises(IllegalTransition):
+        advance(task, Phase.TRIAGE_RUNNING)
+
+
+# ---------------------------------------------------------------------------
+# sprint-board regression allowlist (DW-383)
+
+
+def test_board_regression_allowlist_is_exactly_the_review_demotion():
+    """One pair and no more: widening this set silently licenses the sole board
+    writer to walk a story backward."""
+    assert BOARD_REGRESSIONS == frozenset({("done", "awaiting-operator")})
+
+
+def test_the_allowlisted_board_regression_passes():
+    check_board_regression("1-1-x", "done", "awaiting-operator")  # no raise
+
+
+@pytest.mark.parametrize(
+    ("current", "target"),
+    [
+        (current, target)
+        for i, current in enumerate(STATUS_ORDER)
+        for target in STATUS_ORDER[:i]
+        if (current, target) != ("done", "awaiting-operator")
+    ],
+)
+def test_every_other_board_regression_raises(current, target):
+    """Ablation: make `check_board_regression` a no-op (or widen the set) and every
+    case here reddens."""
+    with pytest.raises(IllegalTransition, match=f"{current} -> {target}"):
+        check_board_regression("1-1-x", current, target)
+
+
+# ---- BMAD v7 plan transitions -------------------------------------------------
+
+PARK = "awaiting operator: sign the release"
+OTHER_PARK = "awaiting operator: rotate the key"
+ESCALATION = "build halted: spec contradicts the epic"
+# Each current state the table can meet: a status, plus the reason a blocked plan
+# carries — an operator park and a build-auto escalation decide differently.
+PLAN_STATES = {
+    "": ("", ""),
+    **{s: (s, "") for s in PLAN_STATUSES if s != "blocked"},
+    "blocked(escalation)": ("blocked", ESCALATION),
+    "blocked(park)": ("blocked", PARK),
+    # a session-declared park, outside upstream's statuses until `park` converts it
+    "awaiting-operator": ("awaiting-operator", ""),
+}
+_BUILT_SET = ("draft", "ready-for-dev", "in-progress", "in-review", "built")
+_STARTED = ("ready-for-dev", "in-progress", "in-review", "built")
+_BLOCKED = ("blocked(escalation)", "blocked(park)")
+# The R1 table spelled out by hand, independent of `PLAN_TRANSITIONS`:
+# reason -> {(current state, target): "write" | "noop"}; every other pair refuses.
+EXPECTED: dict[str, dict[tuple[str, str], str]] = {
+    "accept": {("built", "done"): "write", ("done", "done"): "noop"},
+    "park": {
+        **{(c, "blocked"): "write" for c in _BUILT_SET},
+        ("awaiting-operator", "blocked"): "write",
+        ("blocked(park)", "blocked"): "noop",
+    },
+    "confirm": {
+        ("blocked(park)", "done"): "write",
+        ("blocked(park)", "built"): "write",
+        ("done", "done"): "noop",
+        ("built", "built"): "noop",
+    },
+    "repair": {
+        ("in-progress", "in-progress"): "noop",
+        ("in-review", "in-progress"): "write",
+        ("built", "in-progress"): "write",
+    },
+    "rearm": {
+        **{
+            (c, t): ("noop" if c == t else "write")
+            for c in ("in-progress", "in-review", "built", *_BLOCKED)
+            for t in ("ready-for-dev", "in-progress", "in-review")
+        },
+        # a replayed re-arm: the plan already sits where it would be written
+        ("ready-for-dev", "ready-for-dev"): "noop",
+    },
+    "rollback": {
+        (c, "ready-for-dev"): ("noop" if c == "ready-for-dev" else "write") for c in _STARTED
+    },
+    "replan": {
+        **{(c, "draft"): "write" for c in (*_STARTED, *_BLOCKED)},
+        ("draft", "draft"): "noop",
+    },
+    "salvage": {
+        ("in-progress", "built"): "write",
+        ("in-review", "built"): "write",
+        ("built", "built"): "noop",
+    },
+}
+
+
+def _decide(reason: str, state: str, target: str, blocked: str | None = None) -> str:
+    current, blocked_reason = PLAN_STATES[state]
+    if blocked is None and target == "blocked":
+        blocked = PARK
+    try:
+        write = check_plan_transition(
+            "1.1",
+            current,
+            target,
+            reason,  # type: ignore[arg-type]
+            has_plan=current != "",
+            blocked_reason=blocked_reason,
+            blocked=blocked,
+        )
+    except PlanTransitionRefused:
+        return "refuse"
+    return "write" if write else "noop"
+
+
+def test_plan_status_order_is_the_lifecycle_and_ticketmodel_reads_it():
+    assert PLAN_STATUS_ORDER == (
+        "",
+        "draft",
+        "ready-for-dev",
+        "in-progress",
+        "in-review",
+        "built",
+        "done",
+    )
+    assert PLAN_STATUSES == (*PLAN_STATUS_ORDER[1:], "blocked", "dropped")
+    assert set(PLAN_TRANSITIONS) == set(EXPECTED)
+
+
+@pytest.mark.parametrize(
+    ("current", "target"),
+    [
+        (c, t)
+        for i, c in enumerate(PLAN_STATUS_ORDER)
+        for t in PLAN_STATUS_ORDER[1:i]
+        if c != "done"
+    ],
+)
+def test_plan_regression_refused_without_reason(current, target):
+    """A backward move under `accept` (the reason that carries no licence to
+    regress) is refused — the regressions belong to the named reasons alone.
+
+    Ablation: drop the `target not in rule.targets` refusal from
+    `check_plan_transition` and this reddens (a regression then falls through to
+    the no-op/source checks and some is written). The `rule.sources` gate is
+    graded by `test_plan_transition_table`: answer True for every current status
+    and that table reddens."""
+    with pytest.raises(PlanTransitionRefused, match="not a legal 'accept' write"):
+        check_plan_transition("1.1", current, target, "accept", has_plan=True, blocked_reason="")
+
+
+@pytest.mark.parametrize(
+    ("reason", "state", "target"),
+    [(r, c, t) for r in sorted(EXPECTED) for c in PLAN_STATES for t in PLAN_STATUSES],
+)
+def test_plan_transition_table(reason, state, target):
+    """Every (reason, current, target) against the hand-written R1 table.
+
+    Ablation: the done/dropped sinks are held by two gates, the final-state
+    refusal in `check_plan_transition` and the rule sources (no reason lists
+    `done` or `dropped`), so one ablation alone stays green by design. Delete the
+    refusal AND add `done` to `rearm`'s sources and the rearm/done/* cells redden;
+    either edit alone is caught by the other gate. Widen the salvage rule's
+    targets to `done` and salvage/{in-progress,in-review}/done redden; widen its
+    sources to every build status and salvage/{draft,ready-for-dev}/built redden;
+    remove the rule and its write cells redden."""
+    assert _decide(reason, state, target) == EXPECTED[reason].get((state, target), "refuse")
+
+
+def test_no_plan_refuses_every_reason():
+    """bmad-loop never creates a plan: `has_plan=False` refuses even a pair the
+    table would otherwise allow."""
+    for reason in EXPECTED:
+        with pytest.raises(PlanTransitionRefused, match="no plan"):
+            check_plan_transition("1.1", "built", "done", reason, has_plan=False, blocked_reason="")
+
+
+def test_park_reason_must_be_an_operator_park():
+    """A park's reason starts `awaiting operator: `; a blocked reason goes only
+    with status blocked; a parked plan re-parked with another reason is a write.
+
+    Ablation: drop the prefix check in `check_plan_transition` and the first
+    assertion reddens."""
+    assert _decide("park", "built", "blocked", blocked=ESCALATION) == "refuse"
+    assert _decide("park", "built", "blocked", blocked=None) == "write"  # PARK by default
+    assert _decide("rearm", "built", "in-progress", blocked=PARK) == "refuse"
+    assert _decide("park", "blocked(park)", "blocked", blocked=OTHER_PARK) == "write"
+    assert _decide("confirm", "blocked(escalation)", "done") == "refuse"
+
+
+def test_leftover_blocked_reason_is_not_a_noop():
+    """A plan whose status already equals the target but still carries a
+    blocked reason gets written, so the reason is cleared."""
+    assert (
+        check_plan_transition(
+            "1.1", "in-progress", "in-progress", "rearm", has_plan=True, blocked_reason=PARK
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    ("reason", "status", "blocked", "expected"),
+    [
+        ("rearm", "in-progress", None, True),
+        ("rearm", "ready-for-dev", None, True),  # outside rearm's sources: a cleanup, not a move
+        ("repair", "in-progress", None, True),
+        ("accept", "done", None, False),  # a done plan is never picked again
+        ("park", "blocked", PARK, False),  # same park: `blocked_at` is the park's own stamp
+    ],
+)
+def test_stale_blocked_at_is_not_a_noop(reason, status, blocked, expected):
+    """A same-status write onto a plan carrying a stale `blocked_at` with no
+    reason is written, so the script's mark clears it; the script reads any
+    `blocked_at` as blocked. With no `blocked_at` every row is a no-op.
+
+    Ablation: drop the `blocked_at` term from the no-op test in
+    `check_plan_transition` and the True rows redden."""
+
+    def decide(blocked_at: str) -> bool:
+        return check_plan_transition(
+            "1.1",
+            status,
+            status,
+            reason,  # type: ignore[arg-type]
+            has_plan=True,
+            blocked_reason=blocked or "",
+            blocked=blocked,
+            blocked_at=blocked_at,
+        )
+
+    assert decide("2026-10-14") is expected
+    assert decide("") is False
+
+
+def test_session_declared_park_converts_to_blocked():
+    """A build session parks by writing `awaiting-operator` itself; the
+    commit-time conversion to an operator-park `blocked` is a legal `park` write,
+    and no other reason may move an `awaiting-operator` plan.
+
+    Ablation: drop `PLAN_AWAITING_OPERATOR` from the park rule's sources and the
+    first assertion reddens (the park is refused)."""
+    assert PLAN_AWAITING_OPERATOR == "awaiting-operator"
+    assert _decide("park", "awaiting-operator", "blocked") == "write"
+    assert _decide("park", "awaiting-operator", "blocked", blocked=ESCALATION) == "refuse"
+    for reason in sorted(set(EXPECTED) - {"park"}):
+        for target in PLAN_STATUSES:
+            assert _decide(reason, "awaiting-operator", target) == "refuse", (reason, target)
+
+
+def test_plan_transition_refused_is_an_illegal_transition():
+    with pytest.raises(IllegalTransition) as caught:
+        check_plan_transition("2.3", "draft", "done", "accept", has_plan=True, blocked_reason="")
+    err = caught.value
+    assert isinstance(err, PlanTransitionRefused)
+    assert (err.ref, err.current, err.target, err.reason) == ("2.3", "draft", "done", "accept")
+    assert str(err).startswith("2.3: plan draft -> done is not a legal 'accept' write")
+
+
+def test_unknown_reason_is_refused():
+    with pytest.raises(PlanTransitionRefused, match="unknown reason"):
+        check_plan_transition(
+            "1.1", "built", "done", "promote", has_plan=True, blocked_reason=""  # type: ignore[arg-type]
+        )
+
+
+# ---- child initiative close ---------------------------------------------------
+
+
+def _close(current: str, total: int, closed: int) -> str:
+    try:
+        return (
+            "write"
+            if check_initiative_close("auth", current, total=total, closed=closed)
+            else "noop"
+        )
+    except InitiativeCloseRefused:
+        return "refuse"
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [("", "write"), ("in-progress", "write"), ("done", "noop"), ("dropped", "refuse")],
+)
+def test_initiative_close_from_each_container_status(current, expected):
+    """A drained child closes from unset or in-progress, is a no-op when done, and
+    a dropped one is never reopened. Which rule refuses `dropped` is pinned by
+    the next row."""
+    assert _close(current, 4, 4) == expected
+
+
+def test_dropped_tickets_count_as_closed():
+    """A drain counts dropped tickets with done ones: the caller sums these."""
+    assert TICKET_CLOSED_STATES == {"done", "dropped"}
+
+
+def test_dropped_initiative_refused_as_final():
+    """Ablation: delete the dropped arm and the refusal comes from the open-status
+    check, so the `final` match reddens."""
+    with pytest.raises(InitiativeCloseRefused, match="a dropped initiative is final"):
+        check_initiative_close("auth", "dropped", total=4, closed=4)
+
+
+@pytest.mark.parametrize("current", ["", "in-progress"])
+@pytest.mark.parametrize(("total", "closed"), [(4, 3), (4, 0), (0, 0)])
+def test_initiative_close_refused_until_drained(current, total, closed):
+    """An open child with a ticket left open, or with no tickets at all, is not
+    drained. Ablation: delete the drained check and every row reddens."""
+    assert _close(current, total, closed) == "refuse"
+
+
+def test_initiative_close_done_is_a_noop_even_when_not_drained():
+    """`done` is answered before the drain: a closed child stays a no-op."""
+    assert _close("done", 4, 1) == "noop"
+
+
+@pytest.mark.parametrize("current", ["blocked", "built", "draft", "ready-for-dev", "none"])
+def test_initiative_close_refuses_any_other_status(current):
+    assert _close(current, 4, 4) == "refuse"
+
+
+def test_initiative_close_refused_is_an_illegal_transition():
+    with pytest.raises(IllegalTransition) as caught:
+        check_initiative_close("billing", "in-progress", total=3, closed=2)
+    err = caught.value
+    assert isinstance(err, InitiativeCloseRefused)
+    assert (err.slug, err.current) == ("billing", "in-progress")
+    assert str(err) == (
+        "billing: initiative in-progress -> done is not a legal close: "
+        "not drained: 2 of 3 tickets done or dropped"
+    )

@@ -5,8 +5,12 @@ import inspect
 import io
 import json
 import os
+import re
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -36,9 +40,9 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import platform_util, verify
+from bmad_loop import childrun, platform_util, verify
 from bmad_loop.model import StoryTask
-from bmad_loop.policy import Policy, ReviewPolicy, VerifyPolicy
+from bmad_loop.policy import EnvironmentPolicy, Policy, VerifyPolicy
 
 
 def make_task(paths, story_key="1-1-a"):
@@ -172,6 +176,35 @@ def test_file_bytes_at_revision_distinguishes_blob_absence_tree_and_git_failure(
         verify.file_bytes_at_revision(repo, "not-a-revision", "oracle/spec.bin")
     with pytest.raises(verify.GitError, match="ls-tree"):
         verify.worktree_file_bytes_at_revision(repo, "not-a-revision", "oracle/spec.bin")
+
+
+def _commit_one(repo, rel: str, text: str | None, message: str) -> str:
+    """Write (or, for ``None``, delete) ``rel``, commit it, and return HEAD."""
+    path = repo / rel
+    if text is None:
+        git(repo, "rm", "-q", rel)
+    else:
+        path.write_text(text, encoding="utf-8")
+        git(repo, "add", rel)
+    git(repo, "commit", "-q", "-m", message)
+    return verify.rev_parse_head(repo)
+
+
+def test_path_entry_unchanged_between_compares_one_tree_entry(project):
+    """DW-646's HEAD probe: True only when the path's tree entry (or its absence)
+    is identical at both revisions; a git failure raises, never "unchanged"."""
+    repo = project.project
+    base = _commit_one(repo, "ledger.md", "one\n", "ledger")
+    unrelated = _commit_one(repo, "other.txt", "x\n", "unrelated")
+    changed = _commit_one(repo, "ledger.md", "two\n", "ledger edit")
+    removed = _commit_one(repo, "ledger.md", None, "ledger removed")
+
+    assert verify.path_entry_unchanged_between(repo, base, unrelated, "ledger.md")
+    assert not verify.path_entry_unchanged_between(repo, base, changed, "ledger.md")
+    assert not verify.path_entry_unchanged_between(repo, changed, removed, "ledger.md")
+    assert not verify.path_entry_unchanged_between(repo, base, unrelated, "other.txt")
+    with pytest.raises(verify.GitError):
+        verify.path_entry_unchanged_between(repo, base, "not-a-revision", "ledger.md")
 
 
 def test_worktree_file_bytes_at_revision_applies_checkout_eol_filters(project):
@@ -1268,8 +1301,8 @@ def test_verify_dev_park_zero_diff_is_unknown_without_a_recorded_baseline(projec
     one, so there is nothing to measure from and the observation never happens —
     yet the waiver did, and the record still has to say so.
 
-    All three causes are named in `verify_dev`'s docstring, in `VerifyOutcome`'s
-    field comment and in `docs/FEATURES.md`; the sibling rows cover the `GitError`
+    All three causes are named in `verify_dev`'s docstring and in `VerifyOutcome`'s
+    field comment; the sibling rows cover the `GitError`
     and the git refusal, and this one covers the missing baseline, so no claim
     rests on prose.
 
@@ -1471,14 +1504,6 @@ def test_verify_dev_review_disabled_rejects_review_sprint(project):
 
     out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False)
     assert not out.ok and "sprint-status" in out.reason and "expected 'done'" in out.reason
-
-
-def test_verify_dev_lying_baseline(project):
-    task = make_task(project)
-    sp = spec_path(project, "1-1-a")
-    write_spec(sp, "in-review", "deadbeef" * 5)
-    out = verify.verify_dev(task, project, dev_result(sp))
-    assert not out.ok and "does not match" in out.reason
 
 
 def test_verify_dev_short_hash_baseline(project):
@@ -1899,29 +1924,19 @@ def _signoff_regression_task(project, sprint_status="in-progress"):
 
 
 def test_verify_review_signoff_regression_escalates(project):
-    """The default knob turns a review's board regression into a CRITICAL pause
-    that names both sides, instead of a retry no later cycle can satisfy."""
+    """A review's board regression is a CRITICAL pause that names both sides,
+    instead of a retry no later cycle can satisfy."""
     task = _signoff_regression_task(project)
     out = verify.verify_review(task, project, Policy(), sprint_reached_done=True)
 
     assert not out.ok and not out.retryable
     assert out.severity == "CRITICAL" and out.contradiction is True
     assert not out.fixable  # no repair session can reconcile a disagreement
-    # both sides are named, plus the two ways out and the opt-out knob
+    # both sides are named, plus the guide's ways out; the removed knob is not
     assert "'in-progress'" in out.reason and "'done'" in out.reason
     assert "1-1-a" in out.reason
-    assert 'review.on_status_contradiction = "retry"' in out.reason
-
-
-def test_verify_review_signoff_regression_retry_mode_is_legacy(project):
-    """`retry` restores the pre-#334 routing verbatim: an ordinary retryable
-    sprint-status failure that burns review cycles and ends in a defer."""
-    task = _signoff_regression_task(project)
-    pol = Policy(review=ReviewPolicy(on_status_contradiction="retry"))
-    out = verify.verify_review(task, project, pol, sprint_reached_done=True)
-
-    assert not out.ok and out.retryable and out.contradiction is False
-    assert out.reason == "sprint-status for 1-1-a is 'in-progress', expected 'done'"
+    assert "docs/escalations-guide.md" in out.reason
+    assert "retry" not in out.reason
 
 
 def test_verify_review_signoff_regression_needs_the_launch_flag(project):
@@ -1963,9 +1978,12 @@ def test_verify_review_awaiting_operator_board_is_a_regression(project):
     therefore a deliberate regression — not the unknown token it used to be.
 
     This is the one behavior the vocabulary PR changes, and it is the intended
-    one: until the park path exists, nothing legitimately writes this token, so a
-    review that writes it has revoked a sign-off the same way `in-progress` does.
-    When the park path lands, `operator.on_review_demotion` is what re-routes it.
+    one: a review session never legitimately writes the board, so a review that
+    writes this token onto it has revoked a sign-off the same way `in-progress`
+    does. The park path (`operator.on_review_demotion = "park"`, DW-383) routes a
+    SPEC-declared demotion through the engine, which moves the board itself; a
+    board-only write with the spec still at `done` — this case — still escalates
+    under both modes.
     """
     task = _signoff_regression_task(project, sprint_status="awaiting-operator")
 
@@ -2360,15 +2378,21 @@ def test_a_spawn_fault_unrelated_to_the_cwd_translates_too(tmp_path, monkeypatch
     assertion excludes the whole phrase, not just the `" in"` spelling, because
     the whole phrase is what the production comment promises to omit — it is
     `cli._reverify` that prefixes "could not run", and any reintroduction here
-    stutters it, however the rest of the sentence is worded."""
-    real_run = subprocess.run
+    stutters it, however the rest of the sentence is worded.
+
+    Injected at `subprocess.Popen`, which `childrun.run_child` (the one spawn
+    seam verify commands reach since DW-353) calls. `childrun.subprocess` IS the
+    global `subprocess` module, so the patch is process-wide, not scoped to
+    `childrun`: other spawns pass through only because the fake filters on the
+    `shell` keyword, which only the verify command's spawn passes."""
+    real_popen = subprocess.Popen
 
     def out_of_memory(*args, **kwargs):
         if kwargs.get("shell"):
             raise OSError(12, "Cannot allocate memory")
-        return real_run(*args, **kwargs)
+        return real_popen(*args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", out_of_memory)
+    monkeypatch.setattr(childrun.subprocess, "Popen", out_of_memory)
     policy = Policy(verify=VerifyPolicy(commands=(_OK,)))
 
     (result,) = verify.run_verify_commands(policy, tmp_path)
@@ -2421,17 +2445,382 @@ def test_unusable_cwd_escalates_as_an_environment_fault(tmp_path):
     assert out.reason.count(spawn_exc) == 1
 
 
-def test_rc_env_fault_keeps_its_own_explanatory_clause(tmp_path):
-    """The complement, so the branch is pinned from both sides: rc 127 still says
-    "command not found / not executable" — that leg IS a claim about the command,
-    and branching must not have quietly rewritten it for everyone."""
+def test_shell_rc_env_fault_does_not_assert_the_cause(tmp_path):
+    """rc 127 is the shell's code for a missing command, but a command may also
+    exit 127 on purpose — before `[verify] env_fault_rc` it was the operator's only
+    "environment broken" escape (DW-523) — so the pause text names the convention
+    instead of asserting "command not found / not executable". The `rc=127` token
+    stays on the first line, and the spawn leg's clause stays off this one."""
     policy = Policy(verify=VerifyPolicy(commands=("exit 127",)))
 
     out = verify.verify_commands_outcome(policy, tmp_path)
 
-    assert not out.ok and out.env_fault
-    assert "command not found / not executable" in out.reason
+    assert not out.ok and out.env_fault and out.env_fault_cause == "shell-rc"
+    assert out.reason.startswith("verify environment fault (rc=127): exit 127\n")
+    assert "command not found / not executable" not in out.reason
+    assert "the shell exits 127 when it cannot find a command" in out.reason
+    assert "may also exit with it deliberately" in out.reason
     assert "could not be started" not in out.reason
+
+
+def test_declared_env_fault_rc_escalates_with_declared_wording(tmp_path):
+    """A command exiting with `[verify] env_fault_rc` is an environment fault —
+    pause, attempt not charged — and the text says the operator's code fired."""
+    policy = Policy(verify=VerifyPolicy(commands=("exit 75",), env_fault_rc=75))
+
+    out = verify.verify_commands_outcome(policy, tmp_path)
+
+    assert not out.ok and out.env_fault and not out.retryable and not out.fixable
+    assert out.env_fault_cause == "declared-rc"
+    assert out.reason.startswith("verify environment fault (rc=75, [verify] env_fault_rc): exit 75")
+    assert "exited with the configured environment-fault code" in out.reason
+    assert "the shell exits 127" not in out.reason
+
+
+def test_env_fault_rc_disabled_by_default_is_an_ordinary_failure(tmp_path):
+    """Unset (0), the same exit is an ordinary fixable retry — the default stays
+    byte-identical to the behavior before the knob existed. Ablation: classify
+    with `env_fault_rc=75` hard-wired in `verify_commands_outcome` and this
+    escalates instead."""
+    policy = Policy(verify=VerifyPolicy(commands=("exit 75",)))
+
+    out = verify.verify_commands_outcome(policy, tmp_path)
+
+    assert not out.ok and out.retryable and out.fixable and not out.env_fault
+    assert out.env_fault_cause == ""
+    assert out.reason.startswith("verify command failed (rc=75): exit 75")
+
+
+def test_declared_env_fault_rc_outranks_earlier_ordinary_failure(tmp_path):
+    """Same rule as 126/127: an env fault anywhere in the pass wins over an
+    earlier ordinary failure, because a repair session for the first would still
+    run in the broken environment."""
+    policy = Policy(verify=VerifyPolicy(commands=(_FAIL, "exit 75"), env_fault_rc=75))
+
+    out = verify.verify_commands_outcome(policy, tmp_path)
+
+    assert out.env_fault and out.env_fault_cause == "declared-rc"
+    assert "exit 75" in out.reason.splitlines()[0]
+
+
+def _marker_cmd(marker: Path) -> str:
+    """A command that leaves `marker` behind when it runs, under sh and cmd."""
+    return f"\"{sys.executable}\" -c \"open(r'{marker}', 'w').close()\""
+
+
+def test_run_environment_probes_none_configured_spawns_nothing(tmp_path, monkeypatch):
+    """The default (`probes = []`) spawns nothing and reads as healthy."""
+    spawned: list[str] = []
+    monkeypatch.setattr(
+        verify, "_run_shell_command", lambda command, cwd, timeout: spawned.append(command)
+    )
+
+    probe = verify.run_environment_probes(Policy(), tmp_path)
+
+    assert probe.ok and probe.results == () and probe.failed is None and probe.reason == ""
+    assert spawned == []
+    assert not verify.preflight_required(Policy(verify=VerifyPolicy(commands=(_OK,))))
+
+
+def test_run_environment_probes_stop_at_first_failure(tmp_path):
+    """Fail-fast: the probe after the first failure never spawns."""
+    marker = tmp_path / "third-ran"
+    policy = Policy(environment=EnvironmentPolicy(probes=(_OK, "exit 3", _marker_cmd(marker))))
+
+    probe = verify.run_environment_probes(policy, tmp_path)
+
+    assert not probe.ok and not probe.interrupted
+    assert [r.command for r in probe.results] == [_OK, "exit 3"]
+    assert probe.failed is not None and probe.failed.command == "exit 3"
+    assert probe.reason == "rc=3"
+    assert not marker.exists()
+
+
+def test_probe_timeout_is_a_failure(tmp_path, monkeypatch):
+    """A probe that hangs past `probe_timeout_s` is a failed probe, not a pass and
+    not a crash; the reason names the bound. The runner is faked with its timeout
+    leg (`rc=-1`, `"timed out"`) — no test sleeps toward a deadline (docs/testing.md)."""
+    timeouts: list[float] = []
+
+    def timed_out(command, cwd, timeout):
+        timeouts.append(timeout)
+        return verify.CommandResult(command, -1, "timed out")
+
+    monkeypatch.setattr(verify, "_run_shell_command", timed_out)
+    policy = Policy(environment=EnvironmentPolicy(probes=("hangs",), probe_timeout_s=1))
+
+    probe = verify.run_environment_probes(policy, tmp_path)
+
+    assert timeouts == [1]  # the probe bound reaches the runner
+
+    assert not probe.ok and probe.failed is not None
+    assert probe.failed.returncode == -1 and probe.failed.output_tail == "timed out"
+    assert probe.reason == "timed out after 1s"
+
+
+def test_verify_command_timeout_reaches_the_runner(tmp_path, monkeypatch):
+    """`[verify] command_timeout_min` reaches the runner in seconds, once per
+    command — the bound is per command, not per pass. Faked runner; no test sleeps
+    toward a deadline. Ablation: hard-code 1800 in `run_verify_commands`, or drop
+    the `* 60`, and a row goes red."""
+    timeouts: list[float] = []
+
+    def records(command, cwd, timeout):
+        timeouts.append(timeout)
+        return verify.CommandResult(command, 0, "")
+
+    monkeypatch.setattr(verify, "_run_shell_command", records)
+
+    verify.run_verify_commands(
+        Policy(verify=VerifyPolicy(commands=("a", "b"), command_timeout_min=45)), tmp_path
+    )
+    assert timeouts == [2700, 2700]
+
+    timeouts.clear()
+    verify.run_verify_commands(Policy(verify=VerifyPolicy(commands=("a",))), tmp_path)
+    assert timeouts == [1800]  # the default 30 minutes
+
+
+def test_verify_timeout_reason_names_the_limit_neutrally(tmp_path):
+    """A timed-out command's reason names the per-command limit it hit, in words
+    that never point the repair agent at policy.toml — this text is written
+    verbatim into its feedback, and raising the limit is the operator's call.
+    The first line stays byte-identical and the failure stays an ordinary fixable
+    retry.
+
+    Ablation: key the note on `rc == -1` alone and the Hangup and spawn-error rows
+    gain it; delete the note branch and the positive row loses it."""
+    out = verify.verify_command_results_outcome(
+        [verify.CommandResult("slow", -1, "timed out")], tmp_path, command_timeout_min=45
+    )
+    assert out.reason.startswith("verify command failed (rc=-1): slow\n")
+    assert "timed out after 45 min (the per-command verify time limit)" in out.reason
+    assert "policy.toml" not in out.reason
+    assert "command_timeout_min" not in out.reason
+    assert not out.ok and out.retryable and out.fixable and not out.env_fault
+
+    # rc -1 from a signal (SIGHUP) is not the timeout leg: its own output stays
+    hangup = verify.verify_command_results_outcome(
+        [verify.CommandResult("x", -1, "Hangup")], tmp_path, command_timeout_min=45
+    )
+    assert hangup.reason == "verify command failed (rc=-1): x\nHangup"
+
+    # a timed-out-shaped result that never spawned is not the timeout leg either
+    shaped = verify.CommandResult("x", -1, "timed out", spawn_error="child not started")
+    assert not verify._timed_out_leg(shaped)
+    noted = verify.verify_command_results_outcome([shaped], tmp_path, command_timeout_min=45)
+    assert "min (the per-command verify time limit)" not in noted.reason
+
+    # without the keyword, today's exact text
+    bare = verify.verify_command_results_outcome(
+        [verify.CommandResult("slow", -1, "timed out")], tmp_path
+    )
+    assert bare.reason == "verify command failed (rc=-1): slow\ntimed out"
+
+
+def test_review_composition_passes_the_configured_limit_to_the_reason(tmp_path, monkeypatch):
+    """`verify_commands_outcome` — the review gates' composition — hands the
+    configured limit to the classifier. Ablation: drop the `command_timeout_min`
+    keyword there and the reason reverts to the bare tail."""
+    monkeypatch.setattr(
+        verify,
+        "_run_shell_command",
+        lambda command, cwd, timeout: verify.CommandResult(command, -1, "timed out"),
+    )
+
+    out = verify.verify_commands_outcome(
+        Policy(verify=VerifyPolicy(commands=("slow",), command_timeout_min=45)), tmp_path
+    )
+
+    assert not out.ok and out.fixable
+    assert "timed out after 45 min" in out.reason
+
+
+def test_probe_spawn_fault_is_a_failure(tmp_path):
+    """A probe that cannot even be started (unusable cwd) fails the pass."""
+    policy = Policy(environment=EnvironmentPolicy(probes=(_OK,)))
+
+    probe = verify.run_environment_probes(policy, tmp_path / "nowhere")
+
+    assert not probe.ok and probe.failed is not None
+    assert probe.failed.spawn_error is not None
+    assert probe.reason.startswith("could not be started: child not started")
+
+
+def test_win32_unrunnable_probe_counts_as_failure(tmp_path, monkeypatch):
+    """rc 0 is not proof on win32: cmd exits 0 for a file it cannot execute
+    (#302), so a probe the shell classifier calls unrunnable fails even though it
+    "passed". Faked through `env_fault_reason` so the wiring is pinned on every
+    platform; the cmd classifier itself is pinned by the WIN32_ONLY rows above.
+    Ablation: drop the `env_fault_reason` arm from `_probe_failed` and this
+    reads as healthy."""
+    monkeypatch.setattr(
+        verify,
+        "env_fault_reason",
+        lambda result, cwd, **_: "check.sh is not executable by cmd (extension not in PATHEXT)",
+    )
+    policy = Policy(environment=EnvironmentPolicy(probes=(_OK,)))
+
+    probe = verify.run_environment_probes(policy, tmp_path)
+
+    assert not probe.ok and probe.failed is not None and probe.failed.returncode == 0
+    assert probe.reason == "check.sh is not executable by cmd (extension not in PATHEXT)"
+
+
+# DW-526: `check_environment_probes`, the `validate --probes` runner.
+
+
+def test_check_environment_probes_none_configured_spawns_nothing(tmp_path, monkeypatch):
+    spawned: list[str] = []
+    monkeypatch.setattr(
+        verify, "_run_shell_command", lambda command, cwd, timeout: spawned.append(command)
+    )
+
+    assert verify.check_environment_probes(Policy(), tmp_path) == ()
+    assert spawned == []
+
+
+def test_check_environment_probes_all_pass(tmp_path):
+    policy = Policy(environment=EnvironmentPolicy(probes=(_OK, _OK)))
+
+    checks = verify.check_environment_probes(policy, tmp_path)
+
+    assert [c.status for c in checks] == ["pass", "pass"]
+    assert [c.reason for c in checks] == ["", ""]
+    assert all(c.result.returncode == 0 for c in checks)
+
+
+def test_check_environment_probes_is_not_fail_fast(tmp_path):
+    """Every probe runs: the one after a failure still spawns. Ablation: `break`
+    after a `fail` (the `run_environment_probes` shape) and the marker is absent."""
+    marker = tmp_path / "second-ran"
+    policy = Policy(environment=EnvironmentPolicy(probes=("exit 3", _marker_cmd(marker))))
+
+    checks = verify.check_environment_probes(policy, tmp_path)
+
+    assert [(c.result.command, c.status) for c in checks] == [
+        ("exit 3", "fail"),
+        (_marker_cmd(marker), "pass"),
+    ]
+    assert checks[0].reason == "rc=3" and checks[0].result.returncode == 3
+    assert marker.exists()
+
+
+def test_check_environment_probes_timeout(tmp_path, monkeypatch):
+    """Faked with the runner's timeout leg, as `test_probe_timeout_is_a_failure`
+    does; the probe bound reaches the runner and the reason names it."""
+    timeouts: list[float] = []
+
+    def timed_out(command, cwd, timeout):
+        timeouts.append(timeout)
+        return verify.CommandResult(command, -1, "timed out")
+
+    monkeypatch.setattr(verify, "_run_shell_command", timed_out)
+    policy = Policy(environment=EnvironmentPolicy(probes=("hangs", "also"), probe_timeout_s=2))
+
+    checks = verify.check_environment_probes(policy, tmp_path)
+
+    assert timeouts == [2, 2]  # not fail-fast on a timeout either
+    assert [c.status for c in checks] == ["timeout", "timeout"]
+    assert checks[0].reason == "timed out after 2s"
+
+
+def test_check_environment_probes_spawn_fault_is_a_fail(tmp_path):
+    policy = Policy(environment=EnvironmentPolicy(probes=(_OK,)))
+
+    [check] = verify.check_environment_probes(policy, tmp_path / "nowhere")
+
+    assert check.status == "fail" and check.result.spawn_error is not None
+    assert check.reason.startswith("could not be started: ")
+
+
+def test_check_environment_probes_interrupt_stops_the_pass(tmp_path, monkeypatch):
+    """A hard stop ends the pass: the interrupted probe is reported, nothing after
+    it spawns. Ablation: drop the `break` and the second command is spawned."""
+    spawned: list[str] = []
+
+    def interrupted(command, cwd, timeout):
+        spawned.append(command)
+        return verify.CommandResult(command, verify.INTERRUPTED_RC, "interrupted", interrupted=True)
+
+    monkeypatch.setattr(verify, "_run_shell_command", interrupted)
+    policy = Policy(environment=EnvironmentPolicy(probes=("first", "second")))
+
+    checks = verify.check_environment_probes(policy, tmp_path)
+
+    assert spawned == ["first"]
+    assert [c.status for c in checks] == ["interrupted"]
+
+
+def test_check_environment_probes_win32_unrunnable_probe_is_a_fail(tmp_path, monkeypatch):
+    """Twin of `test_win32_unrunnable_probe_counts_as_failure`: rc 0 from a probe
+    cmd cannot run is a `fail`. Ablation: drop the `env_fault_reason` arm from
+    `_probe_failed` and this reads `pass`."""
+    reason = "check.sh is not executable by cmd (extension not in PATHEXT)"
+    monkeypatch.setattr(verify, "env_fault_reason", lambda result, cwd, **_: reason)
+    policy = Policy(environment=EnvironmentPolicy(probes=(_OK,)))
+
+    [check] = verify.check_environment_probes(policy, tmp_path)
+
+    assert check.status == "fail" and check.result.returncode == 0
+    assert check.reason == reason
+
+
+def test_preflight_failure_skips_verify_commands(tmp_path):
+    """A failed probe escalates as an env fault with cause "probe" and runs NO
+    `[verify]` command; `on_results` is not called (nothing ran to record), and
+    `on_probes` sees the failed pass. Ablation: remove the `return
+    environment_preflight_outcome(probe)` in `verify_commands_outcome` and the
+    marker command runs."""
+    marker = tmp_path / "verify-ran"
+    policy = Policy(
+        verify=VerifyPolicy(commands=(_marker_cmd(marker),)),
+        environment=EnvironmentPolicy(probes=("exit 4",)),
+    )
+    seen_results: list[object] = []
+    seen_probes: list[verify.ProbeOutcome] = []
+
+    out = verify.verify_commands_outcome(
+        policy, tmp_path, on_results=seen_results.append, on_probes=seen_probes.append
+    )
+
+    assert not out.ok and out.env_fault and not out.retryable
+    assert out.env_fault_cause == "probe"
+    assert out.reason.startswith("verify environment fault (environment probe rc=4): exit 4\n")
+    assert "an [environment] probe failed, so no [verify] command was run" in out.reason
+    assert not marker.exists()
+    assert seen_results == []
+    assert len(seen_probes) == 1 and not seen_probes[0].ok
+
+
+def test_preflight_passes_then_runs_verify_commands(tmp_path):
+    """The complement: a healthy probe pass is observed and the commands run."""
+    marker = tmp_path / "verify-ran"
+    policy = Policy(
+        verify=VerifyPolicy(commands=(_marker_cmd(marker),)),
+        environment=EnvironmentPolicy(probes=(_OK,)),
+    )
+    seen_probes: list[verify.ProbeOutcome] = []
+
+    out = verify.verify_commands_outcome(policy, tmp_path, on_probes=seen_probes.append)
+
+    assert out.ok and marker.exists()
+    assert len(seen_probes) == 1 and seen_probes[0].ok
+
+
+def test_preflight_skipped_without_verify_commands(tmp_path):
+    """No `[verify]` commands, no preflight: probes guard command runs, so a
+    pass that runs nothing spawns nothing extra. Ablation: make
+    `preflight_required` ignore `verify.commands` and the probe marker appears."""
+    marker = tmp_path / "probe-ran"
+    policy = Policy(environment=EnvironmentPolicy(probes=(_marker_cmd(marker),)))
+    seen_probes: list[verify.ProbeOutcome] = []
+
+    out = verify.verify_commands_outcome(policy, tmp_path, on_probes=seen_probes.append)
+
+    assert out.ok
+    assert not marker.exists() and seen_probes == []
+    assert not verify.preflight_required(policy)
 
 
 def test_spawn_fault_rc_cannot_collide_with_a_real_return_code():
@@ -2493,7 +2882,10 @@ def test_timeout_stays_an_ordinary_fixable_retry_with_no_spawn_error(tmp_path, m
     Ablation: set `SPAWN_FAULT_RC = -1` and the sentinel assertion below stops
     discriminating; set `spawn_error` on the timeout leg and the classification
     flips to `env_fault`."""
-    monkeypatch.setattr(verify, "COMMAND_TIMEOUT_S", 0.5)
+    real = verify._run_shell_command
+    monkeypatch.setattr(
+        verify, "_run_shell_command", lambda command, cwd, timeout: real(command, cwd, 0.5)
+    )
     sleeper = tmp_path / "sleeper.py"
     sleeper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
     policy = Policy(verify=VerifyPolicy(commands=(f'"{sys.executable}" "{sleeper}"',)))
@@ -2529,7 +2921,10 @@ def test_completed_timed_out_and_never_spawned_legs_survive_one_another(tmp_path
     exception escapes before the fifth command runs; set `SPAWN_FAULT_RC = -1` and
     the two no-exit-status legs stop being distinguishable by rc.
     """
-    monkeypatch.setattr(verify, "COMMAND_TIMEOUT_S", 0.5)
+    real = verify._run_shell_command
+    monkeypatch.setattr(
+        verify, "_run_shell_command", lambda command, cwd, timeout: real(command, cwd, 0.5)
+    )
     sleeper = tmp_path / "sleeper.py"
     sleeper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
     hangs = f'"{sys.executable}" "{sleeper}"'
@@ -2558,32 +2953,170 @@ def test_completed_timed_out_and_never_spawned_legs_survive_one_another(tmp_path
     assert after_spawn_fault.returncode == 0 and after_spawn_fault.spawn_error is None
 
 
+# ---- a hard stop request interrupts the pass (DW-353) -----------------------------
+
+
+def test_hard_stop_interrupts_the_pass_one_result_apiece_and_spawns_nothing_after(
+    tmp_path, monkeypatch
+):
+    """A command killed by a hard stop yields an interrupted result, and every
+    later command yields one too WITHOUT spawning — "one CommandResult apiece"
+    survives the fourth leg, and no work starts under a pending stop.
+
+    The probe flips once the second command has started (its marker exists), so
+    the first completed normally and the third must never run.
+
+    Ablation: drop the `if interrupted:` short-circuit in `run_verify_commands`
+    and the third command spawns (the Popen count reads 3)."""
+    marker = tmp_path / "started"
+    script = tmp_path / "hang.py"
+    script.write_text(
+        f"import time\nopen({str(marker)!r}, 'w').close()\ntime.sleep(30)\n", encoding="utf-8"
+    )
+    hangs = f'"{sys.executable}" "{script}"'
+    commands = (_OK, hangs, _OK)
+    spawned: list[str] = []
+    real_popen = subprocess.Popen
+
+    def counting_popen(*args, **kwargs):
+        if kwargs.get("shell"):
+            spawned.append(args[0])
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(childrun.subprocess, "Popen", counting_popen)
+    token = childrun.install_stop_probe(marker.exists)
+    try:
+        results = verify.run_verify_commands(
+            Policy(verify=VerifyPolicy(commands=commands)), tmp_path
+        )
+    finally:
+        childrun.reset_stop_probe(token)
+
+    assert [r.command for r in results] == list(commands)
+    completed, killed, never_spawned = results
+    assert completed.returncode == 0 and not completed.interrupted
+    for result in (killed, never_spawned):
+        assert result.interrupted
+        assert result.returncode == verify.INTERRUPTED_RC
+        assert result.spawn_error is None  # interrupted is not a spawn fault
+    assert spawned == [_OK, hangs]  # the third command never spawned
+    # the journalled tail is what says whether the command ran at all
+    assert killed.output_tail == "interrupted by a hard stop request"
+    assert never_spawned.output_tail.startswith("not started:")
+    assert killed.output_tail != never_spawned.output_tail
+
+
+def test_no_probe_never_interrupts(tmp_path):
+    """Outside an engine run (`cli._reverify`, `bmad-loop confirm`) no probe is
+    installed and the pass is exactly what it was before DW-353."""
+    (result,) = verify.run_verify_commands(Policy(verify=VerifyPolicy(commands=(_OK,))), tmp_path)
+    assert result == verify.CommandResult(_OK, 0, "", "", "", 0, 0)
+
+
+def test_interrupted_rc_collides_with_no_other_sentinel_or_signal():
+    import signal as signal_mod
+
+    assert verify.INTERRUPTED_RC < 0
+    assert verify.INTERRUPTED_RC not in (-1, verify.SPAWN_FAULT_RC)
+    assert not [s for s in signal_mod.Signals if -s.value == verify.INTERRUPTED_RC]
+
+
+@pytest.mark.parametrize("position", [0, 1])
+def test_classifier_refuses_an_interrupted_pass(tmp_path, position):
+    """`VerifyInterrupted` is the fail-loud backstop: an interrupted result must
+    never be read as a pass, a failure or an env fault — the engine raises
+    `RunStopped` before reaching here. Checked ahead of the env-fault loop, so
+    even an earlier env-fault result cannot mask it.
+
+    Ablation: delete the guard and the first row classifies as a retry (rc
+    -1001 != 0), the second as an env fault."""
+    interrupted = verify.CommandResult(
+        "pytest", verify.INTERRUPTED_RC, "interrupted", interrupted=True
+    )
+    other = verify.CommandResult("missing-tool", 127, "sh: missing-tool: not found")
+    results = [interrupted, other] if position == 0 else [other, interrupted]
+
+    with pytest.raises(verify.VerifyInterrupted, match="pytest"):
+        verify.verify_command_results_outcome(results, tmp_path)
+
+
 def test_verify_commands_bound_a_stream_instead_of_holding_it_whole(tmp_path, monkeypatch):
-    """A chatty command's stream is cut to `MAX_STREAM_MEMORY_BYTES` as it is
-    collected, and what it emitted is recorded rather than lost.
+    """A chatty command's stream is cut to `MAX_STREAM_MEMORY_BYTES` WHILE it is
+    captured, and what it emitted is recorded rather than lost.
 
-    `capture_output=True` always materialises one command's whole output; what
-    this bounds is RETENTION — before it, every command's full streams stayed in
-    the results list while all the later commands ran, so peak memory scaled with
-    the number of configured verify commands instead of with the largest one.
-    Plugins are meant to see streams essentially whole, so the ceiling sits far
-    above `stream_capture_kb` and is a backstop, not a knob; the test lowers it
-    rather than emitting 32 MiB to prove the same branch.
+    The cap reaches the runner itself (DW-549): `childrun.run_child` keeps a
+    rolling tail of each stream as it reads, so peak memory is bounded by the cap
+    however long `[verify] command_timeout_min` lets a command run — not only
+    once the command has finished, which is all a cut on the returned string
+    could bound. Plugins are meant to see streams essentially whole, so the
+    ceiling sits far above `stream_capture_kb` and is a backstop, not a knob; the
+    test lowers it rather than emitting 32 MiB to prove the same branch. Read at
+    call time, which the lowered value here proves.
 
-    Ablation: hand the raw `proc.stdout` to CommandResult again and `stdout` comes
-    back 5000 bytes with `stdout_full_bytes` None. Verified.
+    Ablations: drop `max_stream_bytes=` from `_run_shell_command`'s `run_child`
+    call and the spy records no cap (the returned stream is still cut afterwards,
+    which is exactly why the spy is needed); hand the raw `child.stdout` to
+    CommandResult and `stdout` comes back 5000 bytes; drop the `child.stdout_bytes`
+    pass-through (or `child.stderr_bytes`) and `stdout_full_bytes` (or
+    `stderr_full_bytes`) reads 64.
     """
     script = tmp_path / "chatty.py"
-    script.write_text("import sys\nsys.stdout.write('o' * 5000)\n", encoding="utf-8")
+    script.write_text(
+        "import sys\nsys.stdout.write('o' * 5000)\nsys.stderr.write('e' * 5000)\n",
+        encoding="utf-8",
+    )
     policy = Policy(verify=VerifyPolicy(commands=(f'"{sys.executable}" "{script}"',)))
     monkeypatch.setattr(verify, "MAX_STREAM_MEMORY_BYTES", 64)
+    caps: list[object] = []
+    real_run_child = childrun.run_child
+
+    def spy(*args, **kwargs):
+        caps.append(kwargs.get("max_stream_bytes"))
+        return real_run_child(*args, **kwargs)
+
+    monkeypatch.setattr(childrun, "run_child", spy)
 
     (result,) = verify.run_verify_commands(policy, tmp_path)
 
+    assert caps == [64]  # bounded while captured, not after
     assert result.stdout == "o" * 64  # the TAIL survives, as at every other bound
     assert result.stdout_full_bytes == 5000  # and the emitted size is not lost
-    assert result.stderr == "" and result.stderr_full_bytes == 0
-    assert result.output_tail == "o" * 64  # merged view built from the bounded pair
+    assert result.stderr == "e" * 64 and result.stderr_full_bytes == 5000
+    assert result.output_tail == "o" * 64 + "e" * 64  # merged from the bounded pair
+
+
+def test_an_interrupted_capped_command_keeps_its_emitted_size(tmp_path, monkeypatch):
+    """The hard-stop leg carries the runner's emitted counts too: a command killed
+    mid-run after writing past the cap reports what it wrote, not what was held.
+
+    Ablation: drop the `stdout_emitted=` (or `stderr_emitted=`) pass-through to
+    `_interrupted_result` in `_run_shell_command` and `stdout_full_bytes` (or
+    `stderr_full_bytes`) reads 64 — the held tail measured as if it were the
+    whole stream."""
+    marker = tmp_path / "written"
+    script = tmp_path / "chatty_then_hangs.py"
+    script.write_text(
+        "import sys, time\n"
+        "sys.stdout.write('o' * 5000)\n"
+        "sys.stdout.flush()\n"
+        "sys.stderr.write('e' * 5000)\n"
+        "sys.stderr.flush()\n"
+        f"open({str(marker)!r}, 'w').close()\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    policy = Policy(verify=VerifyPolicy(commands=(f'"{sys.executable}" "{script}"',)))
+    monkeypatch.setattr(verify, "MAX_STREAM_MEMORY_BYTES", 64)
+    token = childrun.install_stop_probe(marker.exists)
+    try:
+        (result,) = verify.run_verify_commands(policy, tmp_path)
+    finally:
+        childrun.reset_stop_probe(token)
+
+    assert result.interrupted and result.returncode == verify.INTERRUPTED_RC
+    assert result.stdout == "o" * 64
+    assert result.stdout_full_bytes == 5000
+    assert result.stderr == "e" * 64 and result.stderr_full_bytes == 5000
 
 
 def test_verify_commands_preserve_separate_stdout_and_stderr(tmp_path):
@@ -2620,7 +3153,9 @@ def test_timeout_stream_shapes_that_carry_no_decode(value, expected):
     ``subprocess.run`` re-collects through ``communicate()`` after ``kill()`` and
     the text wrapper has already decoded — dropping it would lose that
     platform's output entirely. The bytes shape, the only one that picks a
-    codec, is covered by the real-child test below."""
+    codec, is covered by `test_drain_timeout_output_goes_through_timeout_stream`
+    in tests/test_childrun.py — since DW-353 the drain-timeout arm there is the
+    only production path into the normalisation."""
     assert verify._timeout_stream(value) == expected
 
 
@@ -2634,8 +3169,8 @@ def test_timeout_stream_shapes_that_carry_no_decode(value, expected):
 # where the guard is wanted, the inverse of what that marker buys its own tests.
 # The work is therefore driven inside a child interpreter pinned to an ASCII
 # locale. Everything below that boundary is genuine: one real grandchild script
-# emits the bytes on both paths, and CPython's own timeout leg is what hands the
-# hung one over. Monkeypatching `subprocess.run` instead would supply str objects
+# emits the bytes on both paths, and the runner's real timeout leg (tree kill,
+# then the post-kill drain) is what hands the hung one over. Monkeypatching `subprocess.run` instead would supply str objects
 # directly and never run the stdlib's decoding at all (see the #378 block below).
 _TIMEOUT_RAW = b"caf\xc3\xa9\r\nsecond\rthird\n"
 """Undecodable as ASCII and carrying both newline forms, so a single payload
@@ -2644,31 +3179,33 @@ exercises the codec choice, the CRLF pair and the lone CR at once."""
 
 @pytest.mark.skipif(
     sys.platform == "win32",
-    reason="the bytes arm is unreachable on Windows (run() re-collects via "
-    "communicate() after kill(), which returns str, already decoded and "
-    "newline-translated), and LC_ALL is not how Windows resolves the codec",
+    reason="LC_ALL is not how Windows resolves the codec, and its text wrapper "
+    "decodes in the reader threads, so there is no raw-bytes arm to diverge",
 )
 def test_verify_commands_timeout_output_matches_the_completed_path(tmp_path):
     """The same bytes must read back the same whether the command finished or
     timed out — the tail a human or a repair session sees cannot depend on that.
 
-    POSIX raises TimeoutExpired from ``_check_timeout`` with the raw chunks
-    joined, *before* the text-mode conversion at the end of ``_communicate``, so
-    the timeout arm has to redo that conversion itself. It did neither half:
-    ``bytes.decode()`` hardcoded UTF-8 against run_verify_commands' own rule
-    (#378) that host-tool output stays on the locale codec, and nothing
-    collapsed the newlines that ``Popen._translate_newlines`` collapses.
+    Before DW-353, POSIX raised TimeoutExpired from ``_check_timeout`` with the
+    raw chunks joined, *before* the text-mode conversion, so the timeout arm had
+    to redo that conversion itself (#378: locale codec, collapsed newlines). Since
+    DW-353 the timeout leg kills the tree and collects through a *completed*
+    post-kill ``communicate``, which runs the stdlib's own text-mode decode; this
+    row now pins that end-to-end equivalence through ``run_verify_commands``
+    under an ASCII locale, and no longer reaches ``timeout_stream`` at all.
 
     The completed result is the reference rather than a literal, so the assertion
     is against what the stdlib actually does, not against this test's idea of it.
 
-    Ablation, two axes, and each reddens a different assertion: drop the
-    ``locale.getpreferredencoding(False)`` argument and the codec half fails;
-    drop the ``replace`` chain and the newline half does. Note that ``LC_ALL=C``
-    alone does NOT redden the codec axis — the C locale auto-enables UTF-8 mode
-    (PEP 540), putting both spellings back on one codec — so ``PYTHONUTF8=0``
-    below is load-bearing, and the anti-vacuity checks fail loudly if it is
-    ever lost rather than letting the test pass empty."""
+    Ablation: this row no longer guards ``childrun.timeout_stream`` — breaking its
+    codec or newline half leaves it green, because the post-kill drain completes.
+    That normalisation is guarded by the drain-timeout row in
+    tests/test_childrun.py, which forces the arm with an unreachable pipe-holder.
+    What reddens here is any change that makes the timeout leg's output diverge
+    from the completed leg's (e.g. decoding the drained output differently from
+    ``text=True``). ``LC_ALL=C`` alone would make the anti-vacuity checks below
+    fail — the C locale auto-enables UTF-8 mode (PEP 540) — so ``PYTHONUTF8=0``
+    is load-bearing."""
     emit = tmp_path / "emit_timeout.py"
     emit.write_text(
         "import sys, time\n"
@@ -2689,7 +3226,8 @@ def test_verify_commands_timeout_output_matches_the_completed_path(tmp_path):
         "from pathlib import Path\n"
         "from bmad_loop import verify\n"
         "from bmad_loop.policy import Policy, VerifyPolicy\n"
-        "verify.COMMAND_TIMEOUT_S = 1.0\n"
+        "_real = verify._run_shell_command\n"
+        "verify._run_shell_command = lambda command, cwd, timeout: _real(command, cwd, 1.0)\n"
         "def run(mode):\n"
         '    cmd = \'"%s" "%s" %s\' % (sys.executable, sys.argv[1], mode)\n'
         "    (r,) = verify.run_verify_commands(\n"
@@ -2732,7 +3270,7 @@ def test_verify_commands_timeout_output_matches_the_completed_path(tmp_path):
     assert observed["timeout_rc"] == -1
     assert observed["timeout_tail"] == "timed out"
     assert observed["timeout_stdout"] == observed["completed_stdout"]
-    # The child wrote nothing to stderr, so POSIX handed _timeout_stream None.
+    # The child wrote nothing to stderr, so the drained stream is empty.
     assert observed["timeout_stderr"] == ""
 
 
@@ -3580,23 +4118,6 @@ def test_verify_dev_bundle_ancestor_probe_git_failure_stays_strict(project, monk
     assert not out.ok and "baseline" in out.reason
 
 
-def test_verify_dev_sprint_ancestor_baseline_still_fails(project):
-    """The ancestor relaxation is bundle-only: a sprint-mode dev spec is
-    authored by this session, so its baseline must match the orchestrator's
-    exactly — an older ancestor means the session planned from a stale tree."""
-    ancestor = verify.rev_parse_head(project.project)
-    (project.project / "story-work.txt").write_text("advance\n")
-    git(project.project, "add", "-A")
-    git(project.project, "commit", "-q", "-m", "advance")
-    write_sprint(project, {"1-1-a": "review"})
-    task = make_task(project)  # baseline = new HEAD
-    sp = spec_path(project, "1-1-a")
-    write_spec(sp, "in-review", ancestor)
-    (project.project / "src.txt").write_text("changed\n")
-    out = verify.verify_dev(task, project, dev_result(sp))
-    assert not out.ok and "baseline" in out.reason
-
-
 def test_verify_dev_bundle_ledger_only_counts_as_real_work(project):
     """Same false-negative as verify_dev (KNOWN-BUG-ledger-only-story-false-no-
     changes.md), on the bundle path: a dw-bundle's entire authorized diff is
@@ -3961,6 +4482,513 @@ def test_verify_review_stories_non_utf8_spec_retries(project):
     assert not out.ok and "expected 'done'" in out.reason
 
 
+# --- verify_dev_tickets / verify_review_tickets (BMAD v7 ticket plans) ---------
+
+
+def make_ticket_task(paths, story_key="epic-a/7"):
+    task = StoryTask(story_key=story_key, epic=1)
+    task.baseline_commit = verify.rev_parse_head(paths.project)
+    return task
+
+
+_NO_TICKET = object()
+
+
+def write_ticket_plan(
+    paths,
+    status: str,
+    *,
+    ticket: object = "7",
+    baseline: str | None = None,
+    operator_actions: list[str] | None = None,
+    name: str = "story-login-plan.md",
+) -> Path:
+    """Write a v7 build plan under the initiative's epic folder. ``ticket`` is the
+    RAW YAML spelling of the `ticket:` value (``"7"``, ``"'7'"``, ``'"7"'``) so a
+    test controls whether it parses as an int or a string; ``_NO_TICKET`` omits
+    the key. Bytes, not text, so Windows writes the same LF frontmatter."""
+    folder = paths.planning_artifacts / "init-a" / "epic-a"
+    folder.mkdir(parents=True, exist_ok=True)
+    lines = ["---"]
+    if ticket is not _NO_TICKET:
+        lines.append(f"ticket: {ticket}")
+    lines.append(f"status: {status}")
+    if baseline is not None:
+        lines.append(f"baseline_revision: '{baseline}'")
+    if operator_actions is not None:
+        lines.append("operator_actions:" if operator_actions else "operator_actions: []")
+        lines.extend(f"  - {a}" for a in operator_actions)
+    lines += ["---", "", "# plan", ""]
+    plan = folder / name
+    plan.write_bytes("\n".join(lines).encode("utf-8"))
+    return plan
+
+
+def _real_work(paths) -> None:
+    (paths.project / "src.txt").write_bytes(b"changed\n")
+
+
+def test_verify_dev_tickets_accepts_built(project):
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built", baseline=task.baseline_commit)
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(plan), plan=plan, ticket_id="7")
+
+    assert out.ok, out.reason
+    assert task.spec_file == str(plan)
+
+
+@pytest.mark.parametrize(
+    "rj_shape",
+    ["no spec_file", "relative spelling"],
+)
+def test_verify_dev_tickets_reads_the_binding_when_the_result_agrees(project, rj_shape):
+    """A result naming no file is read against the bound plan, and a relative
+    spelling that resolves to the plan is the same file, not "another file"."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built")
+    _real_work(project)
+    if rj_shape == "no spec_file":
+        rj: dict[str, object] = {"workflow": "auto-dev"}
+    else:
+        rj = {"workflow": "auto-dev", "spec_file": plan.relative_to(project.project).as_posix()}
+
+    out = verify.verify_dev_tickets(task, project, rj, plan=plan, ticket_id="7")
+
+    assert out.ok, out.reason
+    assert task.spec_file == str(plan)
+
+
+@pytest.mark.parametrize("status", ["done", "in-review"])
+def test_verify_dev_tickets_rejects_done_from_dev(project, status):
+    """A v7 build finishes at `built` and the orchestrator owns `done`: a dev
+    session that marked its own plan `done` (or stopped at `in-review`) is an
+    ordinary wrong-status retry, never an escalation."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, status)
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(plan), plan=plan, ticket_id="7")
+
+    assert not out.ok and out.retryable and not out.contradiction
+    assert f"spec status is '{status}', expected 'built'" in out.reason
+    assert task.spec_file is None
+
+
+@pytest.mark.parametrize(
+    "raw, ticket_id, passes",
+    [
+        ("7", "7", True),  # YAML int
+        ("'7'", "7", True),  # single-quoted string
+        ('"7"', "7", True),  # double-quoted string
+        ("7", " 7 ", True),  # the bound id is normalized the same way
+        ("8", "7", False),
+        (_NO_TICKET, "7", False),
+        ("", "7", False),  # bare `ticket:` is YAML null -> no id
+        ("true", "true", False),  # a boolean is no id, as upstream reads it
+        ("2a", "2a", True),
+        ("'bug-x'", "bug-x", True),
+        ("2a", "2b", False),
+    ],
+)
+def test_verify_dev_tickets_ticket_id_compared_as_upstream(project, raw, ticket_id, passes):
+    """The plan's `ticket:` binds by upstream's id key, not by `str()` spelling:
+    a bare `7` and a quoted `'7'` are the same ticket. A mismatch or a missing
+    id is a fixable retry (one frontmatter field)."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built", ticket=raw)
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(plan), plan=plan, ticket_id=ticket_id)
+
+    if passes:
+        assert out.ok, out.reason
+    else:
+        assert not out.ok and out.retryable and out.fixable is True
+        assert "names ticket" in out.reason and f"expected {ticket_id!r}" in out.reason
+
+
+def test_verify_dev_tickets_non_ascii_digit_id_retries(project):
+    """`str.isdigit()` accepts Unicode digits `int()` rejects (superscript two):
+    the id key follows upstream's ASCII `ID_RE`, so `ticket: '²'` is a mismatched
+    stem that retries, never a ValueError out of the gate."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built", ticket="'²'")
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(plan), plan=plan, ticket_id="7")
+
+    assert not out.ok and out.retryable
+
+
+def test_verify_dev_tickets_plan_halt_requires_marker(project):
+    """A plan-halt leg expects `ready-for-dev`, skips proof-of-work (only the plan
+    was written), and demands devcontract's `plan_halt` marker so a
+    died-mid-flight `ready-for-dev` cannot pass as a successful plan."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "ready-for-dev", baseline=task.baseline_commit)
+
+    no_marker = verify.verify_dev_tickets(
+        task, project, {"workflow": "auto-dev"}, plan=plan, ticket_id="7", plan_halt=True
+    )
+    assert not no_marker.ok and no_marker.retryable
+    assert "no plan_halt marker" in no_marker.reason
+    assert no_marker.plan_halt_zero_diff is None
+    assert task.spec_file is None
+
+    out = verify.verify_dev_tickets(
+        task,
+        project,
+        {"workflow": "auto-dev", "plan_halt": True},
+        plan=plan,
+        ticket_id="7",
+        plan_halt=True,
+    )
+    assert out.ok, out.reason  # no code change required for a plan
+    assert out.plan_halt_zero_diff is True
+    assert out.park_proof_skipped is False
+    assert task.spec_file == str(plan)
+
+
+def test_verify_dev_tickets_plan_halt_rejects_built(project):
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built")
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(
+        task,
+        project,
+        {"workflow": "auto-dev", "plan_halt": True},
+        plan=plan,
+        ticket_id="7",
+        plan_halt=True,
+    )
+
+    assert not out.ok and out.retryable
+    assert "expected 'ready-for-dev'" in out.reason
+
+
+def test_verify_dev_tickets_park_requires_actions(project):
+    """`awaiting-operator` is accepted only under the engine's park flag, and
+    only with a usable action list (fixable retry otherwise) — the same gate
+    `verify_dev` applies."""
+    task = make_ticket_task(project)
+    _real_work(project)
+
+    bare = write_ticket_plan(project, "awaiting-operator")
+    out = verify.verify_dev_tickets(
+        task, project, dev_result(bare), plan=bare, ticket_id="7", operator_park=True
+    )
+    assert not out.ok and out.retryable and out.fixable is True
+    assert "operator_actions" in out.reason
+
+    parked = write_ticket_plan(project, "awaiting-operator", operator_actions=["publish DNS"])
+    out = verify.verify_dev_tickets(
+        task, project, dev_result(parked), plan=parked, ticket_id="7", operator_park=True
+    )
+    assert out.ok, out.reason
+    assert out.park_proof_skipped is False  # park not asserted: proof-of-work still ran
+    assert task.spec_file == str(parked)
+
+    task.spec_file = None
+    off = verify.verify_dev_tickets(task, project, dev_result(parked), plan=parked, ticket_id="7")
+    assert not off.ok and off.retryable
+    assert "'awaiting-operator', expected 'built'" in off.reason
+    assert task.spec_file is None
+
+
+def test_verify_dev_tickets_asserted_park_waives_proof_of_work(project):
+    """An asserted park (the result's strict `park_asserted: True`) waives the
+    proof-of-work gate exactly as `verify_dev`'s does, and records the waiver."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "awaiting-operator", operator_actions=["publish DNS"])
+
+    unasserted = verify.verify_dev_tickets(
+        task, project, dev_result(plan), plan=plan, ticket_id="7", operator_park=True
+    )
+    assert not unasserted.ok and "no changes" in unasserted.reason
+
+    out = verify.verify_dev_tickets(
+        task,
+        project,
+        dev_result(plan, park_asserted=True),
+        plan=plan,
+        ticket_id="7",
+        operator_park=True,
+    )
+    assert out.ok, out.reason
+    assert out.park_proof_skipped is True and out.park_zero_diff is True
+
+
+@pytest.mark.parametrize("operator_park", [False, True])
+def test_verify_dev_tickets_dropped_escalates(project, operator_park):
+    """A plan a human `dropped` while its session ran is a CRITICAL contradiction:
+    no retry can build a dropped ticket.
+
+    Ablation: delete the `status == PLAN_DROPPED` arm in `verify_dev_tickets` and
+    the plan falls through to the ordinary status gate, which RETRIES
+    ("expected 'built'") — so this asserts `not out.retryable`, the CRITICAL
+    severity and `contradiction`, never merely `not out.ok`."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "dropped", operator_actions=["x"])
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(
+        task, project, dev_result(plan), plan=plan, ticket_id="7", operator_park=operator_park
+    )
+
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL" and out.contradiction is True
+    assert not out.fixable
+    assert "dropped" in out.reason and str(plan) in out.reason
+    assert task.spec_file is None
+
+
+def test_verify_dev_tickets_claimed_other_file_retries(project):
+    """The plan is the orchestrator's binding: a result naming another (existing)
+    plan retries rather than being read in its place."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built")
+    other = write_ticket_plan(project, "built", name="story-other-plan.md")
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(other), plan=plan, ticket_id="7")
+
+    assert not out.ok and out.retryable and not out.contradiction
+    assert "is bound to plan" in out.reason and str(other) in out.reason
+    assert task.spec_file is None
+
+
+@pytest.mark.parametrize("prefix", list(verify.FALLBACK_RESULT_PREFIXES))
+def test_verify_dev_tickets_fallback_result_escalates(project, prefix):
+    """A session that could not resolve its ticket writes a no-spec fallback
+    result; its block is already CRITICAL and re-dispatching cannot resolve it,
+    so the gate escalates instead of retrying. The fallback need not exist on
+    disk — the name alone selects the arm."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built")
+    fallback = project.implementation_artifacts / f"{prefix}x.md"
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(fallback), plan=plan, ticket_id="7")
+
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL"
+    assert "fallback result" in out.reason and fallback.name in out.reason
+
+
+def test_verify_dev_tickets_missing_plan_retries(project):
+    task = make_ticket_task(project)
+    plan = project.planning_artifacts / "init-a" / "epic-a" / "ghost-plan.md"
+
+    out = verify.verify_dev_tickets(
+        task, project, {"workflow": "auto-dev"}, plan=plan, ticket_id="7"
+    )
+
+    assert not out.ok and out.retryable
+    assert "bound ticket plan does not exist" in out.reason
+
+
+def test_verify_dev_tickets_no_proof_of_work_retries(project):
+    """The plan is excluded from proof-of-work as the gate's spec path, so a plan
+    at `built` with no other change since baseline is "no changes"."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built", baseline=task.baseline_commit)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(plan), plan=plan, ticket_id="7")
+
+    assert not out.ok and out.retryable
+    assert "no changes" in out.reason
+    assert task.spec_file is None
+
+
+def test_verify_dev_tickets_still_faces_the_shared_gates(project):
+    """Workflow tag and baseline match are the shared gates, unchanged here."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built")
+    _real_work(project)
+    wrong = verify.verify_dev_tickets(
+        task,
+        project,
+        {"workflow": "quick-dev", "spec_file": str(plan)},
+        plan=plan,
+        ticket_id="7",
+    )
+    assert not wrong.ok and "auto-dev" in wrong.reason
+
+    lying = write_ticket_plan(project, "built", baseline="deadbeef" * 5)
+    out = verify.verify_dev_tickets(task, project, dev_result(lying), plan=lying, ticket_id="7")
+    assert not out.ok and "does not match" in out.reason
+
+
+@pytest.mark.parametrize("board", [None, "backlog"])
+def test_verify_dev_tickets_has_no_board_gate(project, board):
+    """Tickets mode has no sprint board: the plan's own status is the record, so
+    the gate passes whether the board is absent or holds a contradicting row for
+    the story key.
+
+    Ablation: add a `story_status(paths.sprint_status, task.story_key)` check
+    (as `verify_dev` makes) to `verify_dev_tickets` and both rows fail — absent
+    board reads `None`, the stale row reads `backlog`."""
+    if board is None:
+        assert not project.sprint_status.is_file()
+    else:
+        write_sprint(project, {"epic-a/7": board})
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built", baseline=task.baseline_commit)
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(plan), plan=plan, ticket_id="7")
+
+    assert out.ok, out.reason
+
+
+def _reviewed_ticket(project, status, **kw):
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, status, **kw)
+    task.spec_file = str(plan)
+    return task, plan
+
+
+def test_verify_review_tickets_accepts_built(project):
+    """A ticket review leaves the plan where the build left it; `done` is the
+    orchestrator's, after this gate. A plan that ENTERED at `done` stays there."""
+    task, _ = _reviewed_ticket(project, "built")
+    assert verify.verify_review_tickets(task, project, Policy()).ok
+
+    task, _ = _reviewed_ticket(project, "done")
+    assert verify.verify_review_tickets(task, project, Policy(), entered_status="done").ok
+
+
+def test_verify_review_tickets_done_when_entered_built_retries(project):
+    """A review that marked the plan `done` itself moved it FORWARD — not a
+    regression, so an ordinary retry rather than a contradiction."""
+    task, plan = _reviewed_ticket(project, "done")
+
+    out = verify.verify_review_tickets(task, project, Policy())
+
+    assert not out.ok and out.retryable and not out.contradiction
+    assert out.reason == f"plan status is 'done', expected 'built': {plan}"
+
+
+def test_verify_review_tickets_needs_a_recorded_plan(project):
+    task = make_ticket_task(project)
+    out = verify.verify_review_tickets(task, project, Policy())
+    assert not out.ok and out.retryable and "no spec file recorded" in out.reason
+
+
+@pytest.mark.parametrize(
+    "entered, now",
+    [("built", "in-progress"), ("built", "in-review"), ("built", "draft"), ("done", "built")],
+)
+def test_verify_review_tickets_monotonic(project, entered, now):
+    """The board's sign-off-regression arm, rebuilt as a monotonic read-back of
+    the plan: a status strictly earlier in `PLAN_STATUS_ORDER` than the review's
+    entry status is the review walking the ticket backward, and escalates as a
+    contradiction.
+
+    Ablation: delete the `_is_plan_regression` arm in `verify_review_tickets` (or
+    make `_is_plan_regression` return False) and it retries instead — so it
+    asserts `not out.retryable` and `contradiction`."""
+    task, _ = _reviewed_ticket(project, now)
+
+    out = verify.verify_review_tickets(task, project, Policy(), entered_status=entered)
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL" and out.contradiction is True
+    assert f"back from {entered!r} to {now!r}" in out.reason
+    assert "docs/escalations-guide.md" in out.reason
+    assert "retry" not in out.reason
+
+
+@pytest.mark.parametrize(
+    "entered, now",
+    [
+        ("built", "blocked"),  # outside the lifecycle order
+        ("built", "bogus"),  # an unknown token
+        ("bogus", "in-progress"),  # an unknown entry status
+    ],
+)
+def test_verify_review_tickets_outside_the_order_is_a_plain_retry(project, entered, now):
+    """Conservative like `_is_signoff_regression`: a token outside
+    `PLAN_STATUS_ORDER` on either side never escalates."""
+    task, _ = _reviewed_ticket(project, now)
+
+    out = verify.verify_review_tickets(task, project, Policy(), entered_status=entered)
+
+    assert not out.ok and out.retryable and out.contradiction is False
+
+
+@pytest.mark.parametrize("shape", ["blank status", "non-utf8"])
+def test_verify_review_tickets_unreadable_status_is_a_plain_retry(project, shape):
+    """`""` is `PLAN_STATUS_ORDER[0]`, so a plan read as no status (a blank
+    `status:`, bytes that do not decode) would rank below the entry status. It is
+    a read fault, not a review walking the ticket back: retry, never a CRITICAL
+    contradiction. Ablation: dropping the `not status` guard in
+    `_is_plan_regression` escalates both shapes."""
+    task, plan = _reviewed_ticket(project, "built")
+    if shape == "blank status":
+        write_ticket_plan(project, "''")
+    else:
+        plan.write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\x81")
+
+    out = verify.verify_review_tickets(task, project, Policy())
+
+    assert not out.ok and out.retryable and out.contradiction is False
+
+
+@pytest.mark.parametrize("entered", ["built", "done"])
+def test_verify_review_tickets_dropped_is_contradiction(project, entered):
+    """A plan dropped during its review escalates as a contradiction from either
+    entry status: a withdrawn ticket has nothing to land."""
+    task, plan = _reviewed_ticket(project, "dropped")
+
+    out = verify.verify_review_tickets(task, project, Policy(), entered_status=entered)
+
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL" and out.contradiction is True
+    assert "dropped" in out.reason and str(plan) in out.reason
+
+
+def test_verify_review_tickets_park(project):
+    """`awaiting-operator` under the engine's park flag clears the actions gate and
+    then reaches the verify commands (none configured -> pass); without the flag
+    it is an ordinary wrong-status retry."""
+    task, _ = _reviewed_ticket(project, "awaiting-operator", operator_actions=["publish DNS"])
+    assert verify.verify_review_tickets(task, project, Policy(), operator_park=True).ok
+
+    off = verify.verify_review_tickets(task, project, Policy())
+    assert not off.ok and off.retryable and off.contradiction is False
+    assert "'awaiting-operator', expected 'built'" in off.reason
+
+    task, _ = _reviewed_ticket(project, "awaiting-operator", operator_actions=[])
+    bare = verify.verify_review_tickets(task, project, Policy(), operator_park=True)
+    assert not bare.ok and bare.retryable and bare.fixable is True
+    assert "operator_actions" in bare.reason
+
+
+def test_verify_review_tickets_runs_the_verify_commands(project):
+    """A plan at the expected status is not the whole gate: the configured verify
+    commands still decide it."""
+    task, _ = _reviewed_ticket(project, "built")
+    pol = Policy(verify=VerifyPolicy(commands=(_FAIL,)))
+
+    out = verify.verify_review_tickets(task, project, pol)
+
+    assert not out.ok
+
+
+def test_ticket_gate_literals_mirror_devcontract():
+    # verify keeps these literal to avoid a verify<-devcontract import cycle;
+    # guard the copies from drifting (as test_plan_halt_status_matches_devcontract).
+    from bmad_loop import devcontract
+
+    assert verify.PLAN_BUILT == devcontract.BUILT
+    assert verify.PLAN_DONE == devcontract.DONE
+    assert verify.PLAN_DROPPED == devcontract.DROPPED
+    assert verify.FALLBACK_RESULT_PREFIXES == devcontract.FALLBACK_RESULT_PREFIXES
+
+
 def test_verify_review_bundle_ledger_gate(project):
     task = make_bundle_task(project)
     sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
@@ -4063,10 +5091,11 @@ def _review_gate_at_done(project, mode):
 def test_verify_review_gates_run_commands_in_repo_root(project, tmp_path, mode):
     """`[verify] commands` run in the git root, not the BMAD project root (#695).
 
-    The two are the same path everywhere except under an explicit `repo_root:`
-    with `isolation = "none"` — `ProjectPaths.rebased` sets both, so worktree
-    isolation never diverges — and the `project` fixture sets no `repo_root`, so
-    no pre-existing row can tell the two apart. These three gates were the sole
+    The two are the same path everywhere except under an explicit `repo_root:` (in
+    place, or under worktree isolation with the project nested inside it, where
+    `ProjectPaths.rebased` keeps the project's offset in the mount — DW-379) — and the
+    `project` fixture sets no `repo_root`, so no pre-existing row can tell the two
+    apart. These three gates were the sole
     callers running the commands in `paths.project`; the dev side and
     `cli._reverify` both already used `repo_root`.
 
@@ -4151,9 +5180,9 @@ def test_verify_review_gates_classify_against_the_root_they_run_in(
         seen["run"] = cwd
         return real_run(policy, cwd)
 
-    def spy_classify(results, cwd):
+    def spy_classify(results, cwd, **kwargs):
         seen["classify"] = cwd
-        return real_classify(results, cwd)
+        return real_classify(results, cwd, **kwargs)
 
     monkeypatch.setattr(verify, "run_verify_commands", spy_run)
     monkeypatch.setattr(verify, "verify_command_results_outcome", spy_classify)
@@ -4163,6 +5192,33 @@ def test_verify_review_gates_classify_against_the_root_they_run_in(
     # both hops, not just execution: the classifier decides escalate-vs-retry
     assert seen["run"] == repo_root
     assert seen["classify"] == repo_root
+
+
+@pytest.mark.parametrize("mode", ["review", "review_stories", "review_bundle"])
+def test_review_preflight_runs_in_repo_root(project, tmp_path, mode):
+    """The review gates' environment preflight runs where their commands run —
+    `paths.repo_root` (#695) — and `on_probes` reaches it through all three gates.
+    Two-direction probe as in the row above: the repo-root marker passes, the
+    project marker fails the preflight (cause "probe") before any command runs."""
+    repo_root = tmp_path / "code-root"
+    repo_root.mkdir()
+    plant_root_markers(repo_root=repo_root, project=project.project)
+    paths = dataclasses.replace(project, repo_root=repo_root)
+    task, gate = _review_gate_at_done(project, mode)
+    seen: list[verify.ProbeOutcome] = []
+
+    def policy_with(probe: str) -> Policy:
+        return Policy(
+            verify=VerifyPolicy(commands=(_OK,)),
+            environment=EnvironmentPolicy(probes=(probe,)),
+        )
+
+    assert gate(task, paths, policy_with(REPO_ROOT_MARKER_CMD), on_probes=seen.append).ok
+    assert len(seen) == 1 and seen[0].ok
+
+    out = gate(task, paths, policy_with(PROJECT_MARKER_CMD), on_probes=seen.append)
+    assert not out.ok and out.env_fault and out.env_fault_cause == "probe"
+    assert len(seen) == 2 and not seen[1].ok
 
 
 def _break_the_check_before_the_commands(project, task, mode) -> None:
@@ -4466,20 +5522,6 @@ def test_safe_rollback_preserves_preexisting_untracked(project):
     assert not (repo / "junk.txt").exists()  # only run-created file removed
 
 
-def test_safe_rollback_keep_dir_protects_run_created(project):
-    repo = project.project
-    baseline = verify.rev_parse_head(repo)
-    snap = sorted(verify.untracked_files(repo))
-    out = repo / "_bmad-output"
-    out.mkdir(exist_ok=True)
-    (out / "fresh-artifact.md").write_text("generated this run\n")  # run-created
-
-    verify.safe_rollback(
-        repo, baseline, baseline_untracked=snap, keep=(".bmad-loop", "_bmad-output")
-    )
-    assert (out / "fresh-artifact.md").exists()  # protected by keep even though new
-
-
 # Names the pre-#783 line-based `untracked_files` did not answer verbatim: git
 # C-quotes a non-ASCII or newline-bearing name, and `.strip()` ate edge spaces.
 # Windows forbids a newline in a name and silently drops a trailing space.
@@ -4547,7 +5589,8 @@ def test_snapshot_worktree_parks_verbatim_named_untracked(project, name):
 @pytest.mark.parametrize("name", _VERBATIM_NAMES)
 def test_safe_rollback_removes_only_run_created_verbatim_names(project, name):
     """A run-created file of that name is deleted; the operator's pre-existing one
-    in the baseline and a keep-dir-protected one both survive."""
+    in the baseline and a keep-dir-protected one both survive: `keep` protects a
+    run-created file even though the snapshot never listed it."""
     repo = project.project
     _quote_path_default(repo)
     (repo / "pre").mkdir()
@@ -5174,7 +6217,8 @@ def test_safe_rollback_restores_policy_deleted_by_reset(project):
     """policy.toml added/committed *after* the baseline would be deleted by a
     reset to that older baseline; it is still restored from the pre-reset on-disk
     capture (the dirty src.txt here keeps the stash snapshot non-empty — the
-    clean-tree, empty-snapshot path is covered by the test below)."""
+    clean-tree, empty-snapshot path is covered by
+    `test_safe_rollback_restores_the_policy_through_the_atomic_helper`)."""
     repo = project.project
     baseline = verify.rev_parse_head(repo)  # baseline predates policy.toml
     pol = repo / ".bmad-loop" / "policy.toml"
@@ -5190,24 +6234,6 @@ def test_safe_rollback_restores_policy_deleted_by_reset(project):
     assert pol.read_text() == "[scm]\nrollback_on_failure = true\n"  # survived the reset
 
 
-def test_safe_rollback_restores_committed_policy_on_clean_tree(project):
-    """policy.toml committed AFTER the baseline, with an otherwise-clean tree:
-    `git stash create` is empty, so the old stash-gated restore skipped it and
-    `git reset --hard` reverted the operator's config. It must still survive."""
-    repo = project.project
-    baseline = verify.rev_parse_head(repo)  # baseline predates policy.toml
-    pol = repo / ".bmad-loop" / "policy.toml"
-    pol.parent.mkdir(parents=True, exist_ok=True)
-    pol.write_text("[scm]\nrollback_on_failure = true\n")
-    git(repo, "add", "-f", str(pol))
-    git(repo, "commit", "-q", "-m", "add policy after baseline")
-    snap = sorted(verify.untracked_files(repo))
-    # NOTE: no other working-tree change — tree is clean -> empty stash snapshot
-
-    verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".bmad-loop",))
-    assert pol.read_text() == "[scm]\nrollback_on_failure = true\n"  # survived
-
-
 def test_safe_rollback_restores_the_policy_through_the_atomic_helper(project, monkeypatch):
     """#379. The put-back was a bare `policy_path.write_bytes`, which truncates
     the file to zero and refills it in place: a host lost mid-write comes back
@@ -5216,6 +6242,9 @@ def test_safe_rollback_restores_the_policy_through_the_atomic_helper(project, mo
     refuses on — arriving immediately after a rollback that already discarded the
     attempt's work. The helper fsyncs before the replace, so the crash window
     yields the old file or the whole new one.
+
+    The tree is otherwise clean, so `git stash create` is empty: the put-back must
+    not be stash-gated, or `git reset --hard` reverts the operator's config.
 
     Graded by WRAPPING the binding rather than replacing it: the real write still
     lands, so the content assertion below is not measuring the stub. Recording
@@ -5710,23 +6739,14 @@ def test_path_tracked_refuses_a_glob_match_from_a_neighbour(project, meta, neigh
     assert verify.path_tracked(repo, f"{neighbour}/f.md")
 
 
-def test_path_tracked_still_matches_a_directory_prefix(project):
-    """`:(literal)` must not cost the callers the prefix match they rely on —
-    `cmd_validate`'s render-tracked warning probes a DIRECTORY, not a file."""
-    repo = project.project
-    (repo / "_bmad" / "render").mkdir(parents=True, exist_ok=True)
-    (repo / "_bmad" / "render" / "render_skill.py").write_text("# renderer\n")
-    git(repo, "add", "-A")
-    git(repo, "commit", "-q", "-m", "render")
-    assert verify.path_tracked(repo, "_bmad/render")
-
-
 def test_path_tracked_file_separates_a_file_from_a_directory_prefix(project):
     """Why this predicate is narrower than its sibling: `path_tracked` answers True for
     BOTH a tracked file and a tracked directory, and its callers have to tell those
     apart. Since #484 the shield asks `path_tracked_kind` for that — three answers, not
     two — and this boolean is kept for `_pin_tracked_config_rewrite`, where only a
-    tracked FILE can carry the skip-worktree bit the pin depends on (#392, #484).
+    tracked FILE can carry the skip-worktree bit the pin depends on (#392, #484). The
+    `path_tracked` directory answer is itself a contract: `:(literal)` must not cost
+    `cmd_validate`'s render-tracked warning, which probes a DIRECTORY, its prefix match.
 
     Ablation: return `bool(entries)` instead of comparing the set — the mechanics now
     live in `path_tracked_kind`, which this delegates to — and the directory assertion
@@ -6162,6 +7182,127 @@ def test_path_clean_ignores_stderr_chatter_on_success(project):
 
     (repo / "src.txt").write_text("real change\n", encoding="utf-8")
     assert not verify.path_clean(repo, "src.txt")  # ...and a genuine change still shows
+
+
+def test_path_clean_types_a_directory_in_no_repository(tmp_path, monkeypatch):
+    """REAL git in a directory no repository encloses answers `fatal: not a git
+    repository (or any ...)`, and `path_clean` types that answer as
+    `GitNotARepositoryError` — the one `GitError` `sweep._commit_ledger`'s ledger
+    family still degrades on (DW-336). `GIT_CEILING_DIRECTORIES` at the parent stops
+    discovery there, so an enclosing checkout (a tmp dir under a repo) cannot turn
+    the row into a clean answer.
+
+    Ablation: drop the subtype raise in `path_clean` and this fails on the plain
+    `GitError`."""
+    bare = tmp_path / "outside"
+    bare.mkdir()
+    (bare / "ledger.md").write_text("x\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    with pytest.raises(verify.GitNotARepositoryError, match="not a git repository"):
+        verify.path_clean(bare, "ledger.md")
+
+
+def test_path_clean_leaves_a_broken_gitfile_untyped(tmp_path, monkeypatch):
+    """A `.git` gitfile pointing at a missing gitdir answers `fatal: not a git
+    repository: <path>` (git 2.56+: `fatal: gitfile does not point to a valid
+    repository: <path>`) — no `(or any ` either way. That is a corrupt repository
+    pointer, not an absent repository, so it stays a plain `GitError` a ledger
+    publish re-raises.
+
+    Ablation: widen the match to `fatal: not a git repository` and this fails on the
+    subtype — before git 2.56 only; from 2.56 the gitfile wording no longer carries
+    that phrase, and `..._pre_256_broken_gitfile_wording_untyped` pins the narrow
+    match on every git."""
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / ".git").write_text(f"gitdir: {tmp_path / 'missing'}\n", encoding="utf-8")
+    (broken / "ledger.md").write_text("x\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    with pytest.raises(
+        verify.GitError,
+        match="not a git repository|gitfile does not point to a valid repository",
+    ) as info:
+        verify.path_clean(broken, "ledger.md")
+    assert not isinstance(info.value, verify.GitNotARepositoryError)
+
+
+def test_path_clean_matches_the_discovery_failure_in_stderr_only(tmp_path, monkeypatch):
+    """The discovery prefix counts only on STDERR: a stdout record carrying the same
+    text (a path git lists under that name) is not git's answer about the repository,
+    so an rc-128 failure with it in stdout alone stays a plain `GitError`.
+
+    Ablation: match against the merged `stdout + stderr` and this fails on the
+    subtype."""
+
+    def stub(cmd, repo, **kw):
+        return subprocess.CompletedProcess(
+            cmd,
+            128,
+            stdout="?? fatal: not a git repository (or any of the parent directories)\n",
+            stderr="fatal: unable to read index\n",
+        )
+
+    monkeypatch.setattr(verify, "_run_git", stub)
+    with pytest.raises(verify.GitError, match="unable to read index") as info:
+        verify.path_clean(tmp_path, "ledger.md")
+    assert not isinstance(info.value, verify.GitNotARepositoryError)
+
+
+def _stub_status_failure(monkeypatch, stderr):
+    """Pin `_run_git` to an rc-128 `git status` failing with `stderr` alone."""
+
+    def stub(cmd, repo, **kw):
+        return subprocess.CompletedProcess(cmd, 128, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(verify, "_run_git", stub)
+
+
+def test_path_clean_leaves_the_pre_256_broken_gitfile_wording_untyped(tmp_path, monkeypatch):
+    """Git before 2.56 words a broken gitfile `fatal: not a git repository: <path>`
+    — the discovery stem without `(or any `. Stubbed so the narrow match stays
+    pinned on a git 2.56+ host, where the real-gitfile row sees the new wording.
+
+    Ablation: widen the match to `fatal: not a git repository` and this fails on the
+    subtype."""
+    _stub_status_failure(monkeypatch, "fatal: not a git repository: /x/broken/.git\n")
+    with pytest.raises(verify.GitError, match="not a git repository: /x/broken") as info:
+        verify.path_clean(tmp_path, "ledger.md")
+    assert not isinstance(info.value, verify.GitNotARepositoryError)
+
+
+def test_path_clean_types_the_mount_point_discovery_failure(tmp_path, monkeypatch):
+    """Git's OTHER discovery-failure form, printed when the walk stops at a
+    filesystem boundary: `(or any parent up to mount point ...)`, followed by a
+    `Stopping at filesystem boundary` advisory line. It is the same answer — no
+    repository encloses the directory — so it takes the same type.
+
+    Ablation: lengthen the prefix to `(or any of the parent directories)` and this
+    fails on the plain `GitError`."""
+    _stub_status_failure(
+        monkeypatch,
+        "fatal: not a git repository (or any parent up to mount point /mnt)\n"
+        "Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n",
+    )
+    with pytest.raises(verify.GitNotARepositoryError, match="mount point /mnt"):
+        verify.path_clean(tmp_path, "ledger.md")
+
+
+def test_path_clean_ignores_the_discovery_prefix_quoted_mid_line(tmp_path, monkeypatch):
+    """Git quotes operator path text in its own messages (`cannot change to
+    '<repo>'`), so a repository path that happens to contain the discovery prefix
+    must not type a different fault as not-a-repository: the prefix counts only at
+    the START of a stderr line.
+
+    Ablation: match with an unanchored `_NOT_A_REPOSITORY_PREFIX in proc.stderr`
+    and this fails on the subtype."""
+    _stub_status_failure(
+        monkeypatch,
+        "fatal: cannot change to '/x/fatal: not a git repository (or any y': "
+        "No such file or directory\n",
+    )
+    with pytest.raises(verify.GitError, match="cannot change to") as info:
+        verify.path_clean(tmp_path, "ledger.md")
+    assert not isinstance(info.value, verify.GitNotARepositoryError)
 
 
 def test_verify_dev_bundle_empty_artifacts_listing_refuses_the_receipt_under_host_noise(project):
@@ -7014,22 +8155,6 @@ def test_unpublishable_target_refuses_an_absent_ledger(project):
     assert verify.unpublishable_target(ledger, "ledger") == ("target-absent", None)
 
 
-def test_unpublishable_target_refuses_an_undecodable_ledger_with_the_fault(project):
-    """`target-undecodable`, carrying the decode fault as the second element. The
-    ledger's own read contract (DW-146) raises `LedgerReadError` for bytes nobody
-    can decode, and that is what this arm folds into a refusal.
-
-    Ablation: drop the `deferredwork.LedgerReadError` arm and the call raises
-    instead of answering, reddening the assertion below."""
-    write_ledger(project, {"DW-1": "open"})
-    project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
-
-    cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
-
-    assert cause == "target-undecodable"
-    assert "not valid UTF-8" in error
-
-
 @pytest.mark.parametrize(
     "fault,cause,fragment",
     [
@@ -7049,10 +8174,14 @@ def test_unpublishable_target_splits_the_durable_decode_fault_from_the_transient
     one publisher with a durable commit latch, refuses the first and retries the
     second — and before the split both arrived as `target-unreadable`, so the
     undecodable ledger fell through to git, which accepts any bytes, and reached HEAD.
+    The `stat-refused` row is the DW-221 arm: a refused metadata probe used to answer
+    `None` on Python 3.14 and was refused `target-absent`, a present file reported as
+    gone; drop the `OSError` arm and its `PermissionError` escapes the guard.
 
     Ablation: collapse the two `except` arms back into
     `except (deferredwork.LedgerReadError, OSError)` returning `target-unreadable`
-    and the undecodable row reds on its cause."""
+    and the undecodable row reds on its cause; drop the `deferredwork.LedgerReadError`
+    arm and that row raises instead of answering."""
     write_ledger(project, {"DW-1": "open"})
     if fault == "undecodable":
         project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
@@ -7207,24 +8336,6 @@ def test_unpublishable_target_refuses_a_ledger_symlink_loop_as_unreadable(projec
 
     assert cause == "target-unreadable"
     assert "Too many levels of symbolic links" in error
-
-
-def test_unpublishable_target_folds_a_refused_ledger_metadata_probe(project, monkeypatch):
-    """The arm DW-221 newly routes here. Before it, a ledger whose metadata probe
-    the OS refused answered `None` on Python 3.14 and was refused `target-absent` —
-    a present file reported as gone. `read_for_write` raises `OSError` on every
-    interpreter now, and this guard folds it into `target-unreadable` with the
-    errno text, the same way it already folds a decode fault.
-
-    Ablation: drop `OSError` from the `except` tuple and the `PermissionError`
-    escapes this best-effort guard instead of the tuple coming back."""
-    write_ledger(project, {"DW-1": "open"})
-    fault_metadata_probe(monkeypatch, project.deferred_work, "stat")
-
-    cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
-
-    assert cause == "target-unreadable"
-    assert "Permission denied" in error
 
 
 @pytest.mark.parametrize("shape", ["enoent", "enotdir-parent"])
@@ -7730,6 +8841,85 @@ def test_commit_paths_noops_on_unchanged_paths_under_host_noise(project):
     assert verify.rev_parse_head(repo) == head  # and nothing was committed
 
 
+_HOOK_NAMES = ("pre-commit", "prepare-commit-msg", "commit-msg", "post-commit", "post-index-change")
+
+
+def _install_marker_hooks(hooks_dir: Path) -> None:
+    """One marker-writing script per `_HOOK_NAMES` entry. A hook runs at the
+    worktree root, so each marker lands as `hook-<name>` beside `src.txt`."""
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    for name in _HOOK_NAMES:
+        hook = hooks_dir / name
+        hook.write_text(f"#!/bin/sh\nprintf ran > hook-{name}\n")
+        hook.chmod(0o755)
+
+
+@pytest.mark.parametrize("hooks_at", ["git-dir", "configured"])
+def test_commit_paths_run_hooks_false_skips_pre_commit_and_commit_msg_hooks(
+    project, tmp_path, hooks_at
+):
+    """#772: `run_hooks=False` silences every repository hook across `add`, `status`
+    and `commit` — the `--no-verify` pair, and the `prepare-commit-msg`,
+    `post-commit` and `post-index-change` hooks that flag leaves live — whether they
+    sit in `.git/hooks` or in a repo-configured `core.hooksPath`, which the
+    command-line `-c core.hooksPath` outranks.
+
+    The default commit afterwards is the in-test proof that the installed hooks
+    bite: without it, a hook that never runs for an unrelated reason passes the
+    marker assertions too. It also characterizes the default `run_hooks=True`: it
+    keeps every existing caller's hooks live and the commit still lands at HEAD.
+
+    Ablation: make `commit_paths` ignore `run_hooks` (always pass `()`) and every
+    marker appears after the first commit."""
+    repo = project.project
+    if hooks_at == "git-dir":
+        hooks_dir = repo / ".git" / "hooks"
+    else:
+        hooks_dir = tmp_path / "configured-hooks"
+        git(repo, "config", "core.hooksPath", hooks_dir.as_posix())
+    _install_marker_hooks(hooks_dir)
+    base = verify.rev_parse_head(repo)
+    (repo / "src.txt").write_text("bookkeeping\n")
+
+    sha = verify.commit_paths(repo, "chore: ledger", [repo / "src.txt"], run_hooks=False)
+
+    assert sha is not None and sha != base
+    assert sha == verify.rev_parse_head(repo)
+    assert git(repo, "show", "HEAD:src.txt") == "bookkeeping"
+    assert [name for name in _HOOK_NAMES if (repo / f"hook-{name}").exists()] == []
+
+    (repo / "src.txt").write_text("hooks live\n")
+    live = verify.commit_paths(repo, "chore: hooks", [repo / "src.txt"])
+    assert live is not None and live == verify.rev_parse_head(repo)
+    assert [name for name in _HOOK_NAMES if (repo / f"hook-{name}").exists()] == list(_HOOK_NAMES)
+
+
+def test_commit_paths_run_hooks_false_ignores_gpgsign(project, tmp_path):
+    """#772: `run_hooks=False` commits with `commit.gpgsign=false`, so a repo that
+    signs every commit cannot block (or, unattended, hang on a pinentry) the
+    engine's bookkeeping commit. A `gpg.program` that does not exist makes signing
+    fail outright — portable, and the default call's `GitError` below proves the
+    configuration bites before the hookless call is trusted.
+
+    Ablation: drop `commit.gpgsign=false` from `_hookless_git_config` and the
+    hookless commit raises the same `GitError`."""
+    repo = project.project
+    git(repo, "config", "commit.gpgsign", "true")
+    git(repo, "config", "gpg.program", (tmp_path / "no-such-gpg").as_posix())
+    base = verify.rev_parse_head(repo)
+    (repo / "src.txt").write_text("signed?\n")
+
+    with pytest.raises(verify.GitError, match="git commit failed"):
+        verify.commit_paths(repo, "chore: signed", [repo / "src.txt"])
+    assert verify.rev_parse_head(repo) == base
+
+    sha = verify.commit_paths(repo, "chore: unsigned", [repo / "src.txt"], run_hooks=False)
+
+    assert sha is not None and sha != base
+    assert sha == verify.rev_parse_head(repo)
+    assert git(repo, "log", "-1", "--format=%s") == "chore: unsigned"
+
+
 def test_apply_patch_replays_saved_diff(project):
     """A patch saved off the baseline re-applies cleanly onto that same baseline —
     tracked edits AND new (untracked) files — reproducing the reverted attempt."""
@@ -7790,23 +8980,11 @@ def test_patch_new_files_names_created_files(project):
     assert verify.patch_new_files(_saved_patch(project)) == {"new_module.py", "pkg/deep.txt"}
 
 
-def test_patch_new_files_ignores_modifications(project):
-    repo = project.project
-    (repo / "src.txt").write_text("original\nedited\n")
-    assert verify.patch_new_files(_saved_patch(project)) == set()
-
-
-def test_patch_new_files_never_returns_deletions(project):
-    """A deleted file must not land in the exclusion set: the human may re-create
-    that path, and excluding it would make the next rollback delete their copy."""
-    repo = project.project
-    git(repo, "rm", "-q", "src.txt")
-    assert verify.patch_new_files(_saved_patch(project)) == set()
-
-
 def test_patch_new_files_multi_file_patch(project):
     """One patch carrying a creation, a modification and a deletion — only the
-    creation comes back."""
+    creation comes back. A deleted file must not land in the exclusion set: the
+    human may re-create that path, and excluding it would make the next rollback
+    delete their copy."""
     repo = project.project
     (repo / "created.txt").write_text("new\n")
     (repo / ".gitignore").write_text("*.log\n")
@@ -7946,11 +9124,12 @@ def test_read_frontmatter_ignores_triple_dash_in_value(project):
 
 # ------------------------------------------- repo_root override (divergent roots)
 #
-# `isolation = "none"` plus a `repo_root:` key in _bmad/bmm/config.yaml is the ONE
-# supported shape where `paths.project` and `paths.repo_root` name different
-# directories (`bmadconfig.worktree_isolation_conflict` refuses the other). The
-# `project` fixture sets no override, so `repo_root == project` and no pre-existing
-# row here can tell the two apart — which is why the wrong-root bug survived.
+# A `repo_root:` key in _bmad/bmm/config.yaml is the shape where `paths.project` and
+# `paths.repo_root` name different directories (in place, or nested in a worktree
+# mount since DW-379; `bmadconfig.worktree_isolation_conflict` refuses a disjoint one
+# under worktree isolation). The `project` fixture sets no override, so
+# `repo_root == project` and no pre-existing row here can tell the two apart — which
+# is why the wrong-root bug survived.
 
 
 def _repo_root_override(project, tmp_path):
@@ -8554,6 +9733,7 @@ def test_commit_path_bound_skips_newer_invalid_same_ledger_descendant(project):
     extra = repo / "descendant-extra.txt"
     extra.write_text("wider descendant\n", encoding="utf-8")
     git(repo, "update-index", "--chmod=+x", "--", path.name)
+    path.chmod(path.stat().st_mode | 0o111)
     git(repo, "add", "--", extra.name)
     git(repo, "commit", "-q", "-m", "multi-path same-ledger descendant")
     descendant_head = verify.rev_parse_head(repo)
@@ -8585,6 +9765,7 @@ def test_commit_path_bound_propagates_probe_failure_on_a_newer_candidate(project
         baseline_text=baseline,
     )
     git(repo, "update-index", "--chmod=+x", "--", path.name)
+    path.chmod(path.stat().st_mode | 0o111)
     git(repo, "commit", "-q", "-m", "newer ledger mode transition")
     descendant_head = verify.rev_parse_head(repo)
 
@@ -8608,7 +9789,8 @@ def test_commit_path_bound_propagates_probe_failure_on_a_newer_candidate(project
 def test_commit_path_bound_keeps_published_commit_when_index_sync_faults(project, monkeypatch):
     repo, path, baseline, accepted = _bound_publish_inputs(project)
     original_head = verify.rev_parse_head(repo)
-    real_git = verify._git
+    # The target-local `reset` runs raw through `_git_env` (DW-400).
+    real_git = verify._git_env
     faulted = []
 
     def fail_target_sync(git_repo, *args, **kwargs):
@@ -8617,7 +9799,7 @@ def test_commit_path_bound_keeps_published_commit_when_index_sync_faults(project
             return 1, "injected sync fault"
         return real_git(git_repo, *args, **kwargs)
 
-    monkeypatch.setattr(verify, "_git", fail_target_sync)
+    monkeypatch.setattr(verify, "_git_env", fail_target_sync)
     with pytest.raises(verify.GitError, match="index synchronization"):
         verify.commit_path_bound(
             repo,
@@ -8629,7 +9811,7 @@ def test_commit_path_bound_keeps_published_commit_when_index_sync_faults(project
 
     published = verify.rev_parse_head(repo)
     assert published != original_head
-    monkeypatch.setattr(verify, "_git", real_git)
+    monkeypatch.setattr(verify, "_git_env", real_git)
     assert (
         verify.commit_path_bound(
             repo,
@@ -8686,7 +9868,8 @@ def test_commit_path_bound_rejects_lossy_filter_live_text_drift(project, monkeyp
     accepted = "accepted\n"
     path.write_text(accepted, encoding="utf-8")
     original_head = verify.rev_parse_head(repo)
-    real_git = verify._git
+    # The candidate commit runs raw through `_git_env` (DW-331).
+    real_git = verify._git_env
 
     def rival_after_staging(git_repo, *args, **kwargs):
         if args[:1] == ("commit",) and git_repo != repo:
@@ -8696,7 +9879,7 @@ def test_commit_path_bound_rejects_lossy_filter_live_text_drift(project, monkeyp
     assert verify.git_normalized_blob_oid_for_bytes(
         repo, "src.txt", accepted.encode()
     ) == verify.git_normalized_blob_oid_for_bytes(repo, "src.txt", b"rival\n")
-    monkeypatch.setattr(verify, "_git", rival_after_staging)
+    monkeypatch.setattr(verify, "_git_env", rival_after_staging)
 
     with pytest.raises(verify.GitError, match="target changed"):
         verify.commit_path_bound(
@@ -8716,7 +9899,8 @@ def test_commit_path_bound_rejects_post_staging_symlink_substitution(project, mo
     original_head = verify.rev_parse_head(repo)
     replacement = repo / "replacement.txt"
     replacement.write_text(accepted, encoding="utf-8")
-    real_git = verify._git
+    # The candidate commit runs raw through `_git_env` (DW-331).
+    real_git = verify._git_env
 
     def substitute_after_staging(git_repo, *args, **kwargs):
         if args[:1] == ("commit",) and git_repo != repo:
@@ -8724,7 +9908,7 @@ def test_commit_path_bound_rejects_post_staging_symlink_substitution(project, mo
             path.symlink_to(replacement.name)
         return real_git(git_repo, *args, **kwargs)
 
-    monkeypatch.setattr(verify, "_git", substitute_after_staging)
+    monkeypatch.setattr(verify, "_git_env", substitute_after_staging)
     with pytest.raises(verify.GitError, match="target changed"):
         verify.commit_path_bound(
             repo,
@@ -8832,14 +10016,15 @@ def test_commit_path_bound_refuses_the_same_text_under_other_line_endings(projec
     repo, path, baseline, accepted = _bound_publish_inputs(project)
     original_head = verify.rev_parse_head(repo)
     rival = accepted.replace("\n", "\r\n").encode("utf-8")
-    real_git = verify._git
+    # The candidate commit runs raw through `_git_env` (DW-331).
+    real_git = verify._git_env
 
     def rerender_after_staging(git_repo, *args, **kwargs):
         if args[:1] == ("commit",) and git_repo != repo:
             path.write_bytes(rival)
         return real_git(git_repo, *args, **kwargs)
 
-    monkeypatch.setattr(verify, "_git", rerender_after_staging)
+    monkeypatch.setattr(verify, "_git_env", rerender_after_staging)
     with pytest.raises(verify.GitError, match="target changed during validation"):
         verify.commit_path_bound(
             repo,
@@ -9294,7 +10479,8 @@ def test_commit_path_bound_repairs_index_to_moved_checkout_then_refuses(project,
     unrelated = repo / "operator.txt"
     unrelated.write_text("staged operator work\n", encoding="utf-8")
     git(repo, "add", "--", unrelated.name)
-    real_git = verify._git
+    # The target-local `reset` runs raw through `_git_env` (DW-400).
+    real_git = verify._git_env
     moved = []
 
     def move_head_during_first_reset(git_repo, *args, **kwargs):
@@ -9305,7 +10491,7 @@ def test_commit_path_bound_repairs_index_to_moved_checkout_then_refuses(project,
             moved.append(True)
         return result
 
-    monkeypatch.setattr(verify, "_git", move_head_during_first_reset)
+    monkeypatch.setattr(verify, "_git_env", move_head_during_first_reset)
     with pytest.raises(verify.GitError, match="checkout changed during.*reconciliation"):
         verify.commit_path_bound(
             repo,
@@ -9344,6 +10530,9 @@ def test_commit_path_bound_preserves_tracked_executable_target_mode(project):
     path = repo / "src.txt"
     git(repo, "update-index", "--chmod=+x", "--", path.name)
     git(repo, "commit", "-q", "-m", "track executable ledger")
+    # Match the live exec bit to the committed 100755 (DW-328); Git ignores
+    # the bit where core.fileMode is false.
+    path.chmod(path.stat().st_mode | 0o111)
     baseline = path.read_text(encoding="utf-8")
     accepted = "accepted executable migration ledger\n"
     path.write_text(accepted, encoding="utf-8")
@@ -9360,6 +10549,40 @@ def test_commit_path_bound_preserves_tracked_executable_target_mode(project):
     assert git(repo, "ls-tree", published, "--", path.name).startswith("100755 blob ")
     assert git(repo, "ls-files", "-s", "--", path.name).startswith("100755 ")
     assert git(repo, "diff", "--cached", "--name-only") == ""
+    if os.name != "nt":
+        # The live-bit-matches-index half where core.fileMode is on: the worktree
+        # (exec bit included) reads clean against the published index.
+        assert git(repo, "status", "--porcelain", "--", path.name) == ""
+
+
+def test_commit_path_bound_keeps_executable_mode_when_a_hook_re_adds_the_target(project):
+    # `--chmod=+x` pins the staged mode, but a pre-commit hook that re-adds the
+    # file stages the inode's own mode: the confined writer creates it 0600, so
+    # without the exec bit carried onto the inode the hook flips it to 100644.
+    repo = project.project
+    path = repo / "src.txt"
+    git(repo, "update-index", "--chmod=+x", "--", path.name)
+    git(repo, "commit", "-q", "-m", "track executable ledger")
+    # Match the live exec bit to the committed 100755 (DW-328); Git ignores
+    # the bit where core.fileMode is false.
+    path.chmod(path.stat().st_mode | 0o111)
+    baseline = path.read_text(encoding="utf-8")
+    accepted = "accepted executable migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\ngit add -- src.txt\n")
+    hook.chmod(0o755)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "ls-tree", published, "--", path.name).startswith("100755 blob ")
 
 
 def test_commit_path_bound_rejects_hook_mode_mutation(project):
@@ -9406,6 +10629,2300 @@ def test_commit_path_bound_refuses_committed_symlink_parent_before_candidate_wri
         )
 
     assert not (outside / "ledger.md").exists()
+
+
+# DW-324/325/326/331: the detached candidate worktree's hardening.
+
+
+def _raw_git(repo, *args, env=None, input_bytes=None):
+    """A test-owned git spawn that never honours replace refs — the raw view a
+    published commit is judged by."""
+    proc = subprocess.run(
+        ["git", "--no-replace-objects", "-C", str(repo), *args],
+        capture_output=True,
+        check=True,
+        env=env,
+        input=input_bytes,
+    )
+    return proc.stdout.decode("utf-8").strip()
+
+
+def _raw_tree_with(repo, base, tmp_dir, changes):
+    """The tree of `base` with each `path -> bytes` of `changes` written in,
+    built in a throwaway index so the real one is untouched."""
+    env = {**os.environ, "GIT_INDEX_FILE": str(tmp_dir / "scratch-index")}
+    _raw_git(repo, "read-tree", base, env=env)
+    for rel, data in changes.items():
+        oid = _raw_git(repo, "hash-object", "-w", "--stdin", input_bytes=data)
+        _raw_git(repo, "update-index", "--add", "--cacheinfo", f"100644,{oid},{rel}", env=env)
+    return _raw_git(repo, "write-tree", env=env)
+
+
+def _commit_tree(repo, tree, *parents, message="bound fixture"):
+    args = ["commit-tree", tree]
+    for parent in parents:
+        args += ["-p", parent]
+    return _raw_git(repo, *args, "-m", message)
+
+
+def _rewrite_gitfile(gitfile, data):
+    """Replace a git-written `.git` gitfile's bytes in place. Git for Windows
+    marks it hidden, and Windows refuses to truncate-create (`"wb"`) over a
+    hidden file with ERROR_ACCESS_DENIED; opening the existing file does not."""
+    with open(gitfile, "r+b") as fh:
+        fh.truncate()
+        fh.write(data)
+
+
+def _intercept_candidate_checkout(monkeypatch, after_add):
+    """Run `after_add(candidate_root)` right after the candidate `worktree add`
+    returns — the window between checkout and the accepted-bytes write."""
+    real_git_env = verify._git_env
+
+    def intercept(git_repo, *args, **kwargs):
+        result = real_git_env(git_repo, *args, **kwargs)
+        if "worktree" in args and "add" in args and result[0] == 0:
+            after_add(Path(args[args.index("--detach") + 1]))
+        return result
+
+    monkeypatch.setattr(verify, "_git_env", intercept)
+
+
+@pytest.mark.parametrize("hooks_location", ["git-dir", "configured-hooks-path"])
+def test_commit_path_bound_candidate_checkout_runs_no_post_checkout_hook(
+    project, tmp_path, hooks_location
+):
+    """DW-326/401: the candidate `worktree add` and its `read-tree` index
+    population run hook-free, so neither `post-checkout` nor the
+    `post-index-change` the index write fires runs in the candidate, while the
+    candidate commit is still gated by pre-commit. Ablation: drop `-c
+    core.hooksPath` from the candidate `read-tree` and `post-index-change` runs.
+    (`--no-checkout` alone already keeps `post-checkout` from firing.)"""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    post_checkout = tmp_path / "post-checkout-ran"
+    post_index_change = tmp_path / "post-index-change-candidate"
+    pre_commit = tmp_path / "pre-commit-ran"
+    if hooks_location == "git-dir":
+        hooks = repo / ".git" / "hooks"
+    else:
+        # A repo-configured `core.hooksPath` (husky/lefthook): the command-line
+        # `-c` override must still outrank it for the candidate checkout.
+        hooks = tmp_path / "configured-hooks"
+        hooks.mkdir()
+        git(repo, "config", "core.hooksPath", hooks.as_posix())
+    hook = hooks / "post-checkout"
+    hook.write_text(f"#!/bin/sh\n: > '{post_checkout.as_posix()}'\n")
+    hook.chmod(0o755)
+    # `post-index-change` also fires for the live checkout's index sync and for
+    # the (deliberately hooked) candidate `git add`/`commit`, so it records only
+    # a run inside the candidate BEFORE the accepted bytes land there.
+    index_hook = hooks / "post-index-change"
+    index_hook.write_text(
+        "#!/bin/sh\n"
+        'case "$(pwd)" in */candidate) '
+        f"[ -e src.txt ] || : > '{post_index_change.as_posix()}' ;; esac\n"
+    )
+    index_hook.chmod(0o755)
+    gate = hooks / "pre-commit"
+    gate.write_text(f"#!/bin/sh\n: > '{pre_commit.as_posix()}'\n")
+    gate.chmod(0o755)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+    assert not post_checkout.exists()
+    assert not post_index_change.exists()
+    # Only the checkout is hook-free: the candidate commit is still gated.
+    assert pre_commit.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_commit_path_bound_replaces_a_leaf_symlink_left_after_checkout(
+    project, tmp_path_factory, monkeypatch
+):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    outside = tmp_path_factory.mktemp("outside") / "outside.txt"
+    outside.write_bytes(b"outside bytes\n")
+
+    def swap_leaf(candidate_root):
+        leaf = candidate_root / "src.txt"
+        # The checkout is `--no-checkout` (DW-401), so the leaf is normally
+        # absent; a planted link is what the confined writer must replace.
+        leaf.unlink(missing_ok=True)
+        leaf.symlink_to(outside)
+
+    _intercept_candidate_checkout(monkeypatch, swap_leaf)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert outside.read_bytes() == b"outside bytes\n"
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "ls-tree", published, "--", "src.txt").startswith("100644 blob ")
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_commit_path_bound_refuses_an_ancestor_symlink_left_after_checkout(
+    project, tmp_path_factory, monkeypatch
+):
+    repo = project.project
+    ledger_dir = repo / "ledger-dir"
+    ledger_dir.mkdir()
+    path = ledger_dir / "ledger.md"
+    baseline = "legacy migration ledger\n"
+    path.write_text(baseline, encoding="utf-8")
+    git(repo, "add", "--", "ledger-dir/ledger.md")
+    git(repo, "commit", "-q", "-m", "track nested ledger")
+    original = verify.rev_parse_head(repo)
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    outside = tmp_path_factory.mktemp("outside-dir")
+
+    def swap_ancestor(candidate_root):
+        nested = candidate_root / "ledger-dir"
+        # Absent after the `--no-checkout` add (DW-401); cleared if present.
+        if nested.is_dir():
+            shutil.rmtree(nested)
+        nested.symlink_to(outside, target_is_directory=True)
+
+    _intercept_candidate_checkout(monkeypatch, swap_ancestor)
+    with pytest.raises(verify.GitError, match="candidate content could not be written"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=original,
+        )
+
+    assert list(outside.iterdir()) == []
+    assert verify.rev_parse_head(repo) == original
+
+
+def test_commit_path_bound_builds_on_the_raw_captured_parent(project, tmp_path):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    head = verify.rev_parse_head(repo)
+    head_parents = _raw_git(repo, "rev-list", "--parents", "--max-count=1", head).split()[1:]
+    smuggled_tree = _raw_tree_with(
+        repo, head, tmp_path, {"smuggled.txt": b"smuggled through a replace ref\n"}
+    )
+    replacement = _commit_tree(repo, smuggled_tree, *head_parents, message="replacement")
+    git(repo, "replace", head, replacement)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published is not None
+    raw_lineage = _raw_git(repo, "rev-list", "--parents", "--max-count=1", published).split()
+    assert raw_lineage == [published, head]
+    assert (
+        _raw_git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", head, published)
+        == "src.txt"
+    )
+
+
+@pytest.mark.parametrize(
+    ("masked_read", "message"),
+    [
+        ("parent", "unexpected parent"),
+        ("scope", "outside its declared scope"),
+        ("ledger", "does not contain the accepted ledger"),
+    ],
+)
+def test_bound_candidate_validation_reads_raw_objects_past_a_replace_ref(
+    project, tmp_path, masked_read, message
+):
+    repo = project.project
+    rel = "src.txt"
+    baseline = (repo / rel).read_text(encoding="utf-8")
+    accepted = "accepted migration ledger\n"
+    expected_parent = verify.rev_parse_head(repo)
+    accepted_oid = verify.git_normalized_blob_oid_for_bytes(repo, rel, accepted.encode())
+    baseline_oid = verify.git_normalized_blob_oid_for_bytes(repo, rel, baseline.encode())
+    accepted_tree = _raw_tree_with(repo, expected_parent, tmp_path, {rel: accepted.encode()})
+    if masked_read == "parent":
+        rival = _commit_tree(repo, f"{expected_parent}^{{tree}}", expected_parent)
+        raw = _commit_tree(repo, accepted_tree, rival)
+    elif masked_read == "scope":
+        wide_tree = _raw_tree_with(
+            repo, expected_parent, tmp_path, {rel: accepted.encode(), "extra.txt": b"extra\n"}
+        )
+        raw = _commit_tree(repo, wide_tree, expected_parent)
+    else:
+        rival_tree = _raw_tree_with(repo, expected_parent, tmp_path, {rel: b"rival ledger\n"})
+        raw = _commit_tree(repo, rival_tree, expected_parent)
+    # The replacement is a candidate the validator would accept: exact parent,
+    # exact one-path delta, the accepted blob.
+    looks_valid = _commit_tree(repo, accepted_tree, expected_parent, message="looks valid")
+    verify._validate_bound_candidate(
+        repo, looks_valid, expected_parent, rel, accepted_oid, baseline_oid
+    )
+    git(repo, "replace", raw, looks_valid)
+
+    with pytest.raises(verify._BoundCandidateMismatch, match=message):
+        verify._validate_bound_candidate(
+            repo, raw, expected_parent, rel, accepted_oid, baseline_oid
+        )
+
+
+# DW-398/399/400: every remaining publication read is raw past a replace ref.
+
+
+def _replace_rel_on_head_parent(repo, tmp_path, head, rel, data):
+    """A replacement for `head`: its raw parents, with `rel` rewritten to `data`."""
+    parents = _raw_git(repo, "rev-list", "--parents", "--max-count=1", head).split()[1:]
+    tree = _raw_tree_with(repo, head, tmp_path, {rel: data})
+    return _commit_tree(repo, tree, *parents, message="replacement")
+
+
+def test_commit_path_bound_reads_the_raw_baseline_blob_past_a_replace_ref(project):
+    """DW-398. The baseline commit really holds rival text; a replace ref maps
+    that blob to one reading as `baseline_text`. Ablation: drop the env on the
+    baseline `cat-file` and the substitute vouches for the rival blob, so the
+    publication overwrites it."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    path.write_text("rival committed ledger\n", encoding="utf-8")
+    git(repo, "add", "--", path.name)
+    git(repo, "commit", "-q", "-m", "rival ledger")
+    rival_head = verify.rev_parse_head(repo)
+    rival_blob = _raw_git(repo, "rev-parse", f"{rival_head}:src.txt")
+    baseline_blob = _raw_git(
+        repo, "hash-object", "-w", "--stdin", input_bytes=baseline.encode("utf-8")
+    )
+    git(repo, "replace", rival_blob, baseline_blob)
+    path.write_text(accepted, encoding="utf-8")
+
+    with pytest.raises(
+        verify.GitError, match="accepted baseline does not match the committed baseline"
+    ):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=rival_head,
+        )
+
+    assert verify.rev_parse_head(repo) == rival_head
+
+
+def test_accepted_bound_transition_walks_raw_first_parent_ancestry(project, tmp_path):
+    """DW-399. Raw HEAD H is a wide commit on P; the exact transition T on P is
+    reachable only through `replace H -> R(parent T)`. Ablation: drop the env on
+    the `rev-list` and the replaced walk surfaces T, which validates in isolation."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    parent = verify.rev_parse_head(repo)
+    (repo / "extra.txt").write_text("wide commit\n", encoding="utf-8")
+    git(repo, "add", "--", path.name, "extra.txt")
+    git(repo, "commit", "-q", "-m", "wide accepted ledger")
+    head = verify.rev_parse_head(repo)
+    exact_tree = _raw_tree_with(repo, parent, tmp_path, {"src.txt": accepted.encode("utf-8")})
+    transition = _commit_tree(repo, exact_tree, parent, message="exact transition")
+    replacement = _commit_tree(repo, f"{head}^{{tree}}", transition, message="replacement")
+    git(repo, "replace", head, replacement)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+        baseline_commit=parent,
+    )
+
+    assert published is None
+    assert verify.rev_parse_head(repo) == head
+
+
+def test_commit_path_bound_replay_stages_the_raw_entry_past_a_replaced_head(project, tmp_path):
+    """DW-400. HEAD is the published transition A, replaced by a same-parent
+    commit holding rival text. Ablation: drop the env on the in-loop index
+    `reset` and it stages the replacement's entry, which the raw comparison
+    refuses on every replay."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+    assert published is not None
+    replacement = _replace_rel_on_head_parent(
+        repo, tmp_path, published, "src.txt", b"rival replacement ledger\n"
+    )
+    git(repo, "replace", published, replacement)
+
+    replayed = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert replayed == published
+    raw_blob = _raw_git(repo, "rev-parse", f"{published}:src.txt")
+    assert verify.staged_blob_oid(repo, path.name) == raw_blob
+    assert verify._bound_index_entry(repo, "src.txt") == verify._bound_tree_entry(
+        repo, published, "src.txt"
+    )
+
+
+def test_bound_index_final_repair_stages_the_raw_newest_entry(project, tmp_path, monkeypatch):
+    """DW-400, final repair. With four observations only the post-loop repair
+    targets `commits[-1]`, which a replace ref maps to rival text. Ablation: drop
+    the env on the final `reset` and it stages the rival entry, surfacing
+    `synchronization did not match` instead of the non-stabilizing refusal."""
+    repo = project.project
+    path = repo / "src.txt"
+    rel = path.name
+    commits = []
+    for number in range(4):
+        path.write_text(f"moving target {number}\n", encoding="utf-8")
+        git(repo, "add", "--", rel)
+        git(repo, "commit", "-q", "-m", f"moving target {number}")
+        commits.append(verify.rev_parse_head(repo))
+    replacement = _replace_rel_on_head_parent(
+        repo, tmp_path, commits[-1], rel, b"rival replacement target\n"
+    )
+    git(repo, "replace", commits[-1], replacement)
+    observed_index = verify._bound_index_entry(repo, rel)
+    branch = git(repo, "symbolic-ref", "HEAD")
+    observations = [verify._BoundCheckoutIdentity(branch, branch, commit) for commit in commits]
+
+    def keep_moving(_repo, *, require_branch=True):
+        assert require_branch is False
+        return observations.pop(0)
+
+    monkeypatch.setattr(verify, "_bound_checkout_identity", keep_moving)
+    expected = verify._BoundCheckoutIdentity(branch, branch, commits[0])
+    with pytest.raises(verify.GitError, match="checkout did not stabilize"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert observations == []
+    raw_blob = _raw_git(repo, "rev-parse", f"{commits[-1]}:{rel}")
+    assert verify.staged_blob_oid(repo, rel) == raw_blob
+    assert verify._bound_index_entry(repo, rel) == verify._bound_tree_entry(repo, commits[-1], rel)
+
+
+def test_commit_path_bound_clean_probe_reads_raw_head_past_a_replace_ref(
+    project, tmp_path, monkeypatch
+):
+    """DW-399. Raw HEAD already holds the accepted ledger (no exact transition), and a
+    replace ref maps HEAD to rival text at the target. Ablation: drop the env on
+    `path_clean` and the replaced status answers dirty, reaching the candidate."""
+    repo, path, baseline, accepted = _bound_clean_inputs(project)
+    head = verify.rev_parse_head(repo)
+    replacement = _replace_rel_on_head_parent(
+        repo, tmp_path, head, "src.txt", b"rival replacement ledger\n"
+    )
+    git(repo, "replace", head, replacement)
+    _no_candidate_worktree(monkeypatch)
+
+    assert (
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+        is None
+    )
+    assert verify.rev_parse_head(repo) == head
+
+
+def test_commit_path_bound_non_tree_ancestor_probe_reads_raw_head(project, tmp_path):
+    """DW-399. A replace ref maps HEAD to a commit where the nested ledger's parent
+    directory is a blob. Ablation: drop the env forwarded to
+    `path_has_non_tree_ancestor_at_revision` and the publication refuses with
+    `non-directory committed parent`."""
+    repo = project.project
+    ledger_dir = repo / "ledger-dir"
+    ledger_dir.mkdir()
+    path = ledger_dir / "ledger.md"
+    baseline = "legacy migration ledger\n"
+    path.write_text(baseline, encoding="utf-8")
+    git(repo, "add", "--", "ledger-dir/ledger.md")
+    git(repo, "commit", "-q", "-m", "track nested ledger")
+    original = verify.rev_parse_head(repo)
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+
+    env = {**os.environ, "GIT_INDEX_FILE": str(tmp_path / "scratch-index")}
+    _raw_git(repo, "read-tree", original, env=env)
+    _raw_git(repo, "update-index", "--force-remove", "--", "ledger-dir/ledger.md", env=env)
+    blob = _raw_git(repo, "hash-object", "-w", "--stdin", input_bytes=b"not a directory\n")
+    _raw_git(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},ledger-dir", env=env)
+    flattened = _raw_git(repo, "write-tree", env=env)
+    parents = _raw_git(repo, "rev-list", "--parents", "--max-count=1", original).split()[1:]
+    replacement = _commit_tree(repo, flattened, *parents, message="replacement")
+    git(repo, "replace", original, replacement)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+        baseline_commit=original,
+    )
+
+    assert published is not None
+    assert published == verify.rev_parse_head(repo)
+    assert _raw_git(repo, "rev-list", "--parents", "--max-count=1", published).split() == [
+        published,
+        original,
+    ]
+    assert _raw_git(repo, "show", f"{published}:ledger-dir/ledger.md") == accepted.rstrip("\n")
+
+
+def test_commit_path_bound_candidate_commit_builds_on_raw_head_past_a_replace_ref(
+    project, tmp_path
+):
+    """DW-331, the candidate commit. A replace ref maps the captured HEAD to a
+    same-parent commit whose tree already holds the accepted text. Ablation: drop
+    the env on the candidate `git commit` and it compares the index to the
+    replacement's tree, answers "nothing to commit", and every publication fails
+    with `candidate commit failed`."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    head = verify.rev_parse_head(repo)
+    replacement = _replace_rel_on_head_parent(
+        repo, tmp_path, head, "src.txt", accepted.encode("utf-8")
+    )
+    git(repo, "replace", head, replacement)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published is not None
+    assert published == verify.rev_parse_head(repo)
+    raw_lineage = _raw_git(repo, "rev-list", "--parents", "--max-count=1", published).split()
+    assert raw_lineage == [published, head]
+    assert _raw_git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+
+
+def _fail_candidate_cleanup(monkeypatch, fault):
+    real_git = verify._git
+
+    def failing_remove(git_repo, *args, **kwargs):
+        if args[:2] == ("worktree", "remove"):
+            if fault == "raise":
+                raise verify.GitError("injected cleanup timeout")
+            return 1, "injected cleanup fault"
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", failing_remove)
+
+
+@pytest.mark.parametrize("fault", ["rc", "raise"])
+def test_commit_path_bound_notes_a_cleanup_fault_on_the_propagating_error(
+    project, monkeypatch, fault
+):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+    _fail_candidate_cleanup(monkeypatch, fault)
+
+    with pytest.raises(verify.GitError, match="candidate commit failed") as raised:
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    notes = getattr(raised.value, "__notes__", [])
+    assert any("candidate cleanup also failed" in note for note in notes)
+    assert verify.rev_parse_head(repo) == original
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+@pytest.mark.parametrize("fault", ["rc", "raise"])
+def test_commit_path_bound_raises_and_prunes_a_cleanup_only_fault(project, monkeypatch, fault):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    _fail_candidate_cleanup(monkeypatch, fault)
+
+    with pytest.raises(verify.GitError, match="detached candidate cleanup failed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) != original
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+# DW-402/403/404: candidate worktree cleanup and confined parent creation.
+
+
+@pytest.mark.parametrize("fault", ["rc", "timeout"])
+def test_commit_path_bound_prunes_a_candidate_add_that_fails_after_registering(
+    project, monkeypatch, fault
+):
+    """DW-402: a `worktree add` that registers its entry and then exits non-zero
+    or times out still has that entry pruned. Ablation: stop setting
+    `cleanup_fault` on an add failure and the stale entry stays listed."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    real_git_env = verify._git_env
+
+    def failing_add(git_repo, *args, **kwargs):
+        result = real_git_env(git_repo, *args, **kwargs)
+        if "worktree" in args and "add" in args:
+            assert result[0] == 0  # the entry really is registered
+            if fault == "timeout":
+                raise verify.GitTimeoutError("injected candidate add timeout")
+            return 1, "injected"
+        return result
+
+    monkeypatch.setattr(verify, "_git_env", failing_add)
+    expected = verify.GitTimeoutError if fault == "timeout" else verify.GitError
+    match = "injected candidate add timeout" if fault == "timeout" else "candidate checkout failed"
+    with pytest.raises(expected, match=match) as raised:
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    notes = getattr(raised.value, "__notes__", [])
+    assert not any("temporary directory was left" in note for note in notes)
+    assert verify.rev_parse_head(repo) == original
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def _stick_candidate_temp_rmtree(monkeypatch):
+    """Make `TemporaryDirectory`'s rmtree of the candidate temp directory (the
+    one holding `no-hooks`) fail with a non-permission `OSError`, reported to
+    the handler it passes exactly as a real rmtree would: from inside an
+    `except` block, through `onexc` (3.12+) or `onerror` (3.11). Returns the
+    list the stuck directories are appended to.
+
+    Debian/Ubuntu's CPython patches `tempfile` to bind `_rmtree =
+    _shutil.rmtree` at import, so `TemporaryDirectory` never sees a later
+    `shutil.rmtree` patch there; that binding is replaced too when present."""
+    real_rmtree = shutil.rmtree
+    stuck: list[Path] = []
+
+    def stuck_rmtree(target, *args, **kwargs):
+        if not (Path(target) / "no-hooks").is_dir():
+            return real_rmtree(target, *args, **kwargs)
+        stuck.append(Path(target))
+        fault = OSError(errno.EBUSY, "injected busy temp directory", str(target))
+        try:
+            raise fault
+        except OSError:
+            if kwargs.get("onexc") is not None:
+                kwargs["onexc"](os.rmdir, target, fault)
+            elif kwargs.get("onerror") is not None:
+                kwargs["onerror"](os.rmdir, target, sys.exc_info())
+            else:
+                raise
+        return None
+
+    monkeypatch.setattr(shutil, "rmtree", stuck_rmtree)
+    if getattr(tempfile, "_rmtree", None) is real_rmtree:
+        monkeypatch.setattr(tempfile, "_rmtree", stuck_rmtree)
+    return stuck
+
+
+def test_commit_path_bound_keeps_the_cleanup_error_when_the_temp_dir_sticks(project, monkeypatch):
+    """DW-403: a failed `worktree remove` whose checkout then cannot be deleted
+    still raises the typed cleanup `GitError`, with a note naming the surviving
+    temporary directory. Ablation: drop `ignore_cleanup_errors=True` and the
+    rmtree `OSError` replaces the `GitError`; drop the note arm and the leftover
+    goes unnamed."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    _fail_candidate_cleanup(monkeypatch, "rc")
+    stuck: list[Path] = []
+
+    try:
+        with monkeypatch.context() as m:
+            stuck = _stick_candidate_temp_rmtree(m)
+            with pytest.raises(
+                verify.GitError, match="detached candidate cleanup failed"
+            ) as raised:
+                verify.commit_path_bound(
+                    repo,
+                    "chore: bound ledger",
+                    path,
+                    accepted_text=accepted,
+                    baseline_text=baseline,
+                )
+        assert len(stuck) == 1
+        notes = getattr(raised.value, "__notes__", [])
+        assert any(
+            "temporary directory was left" in note and str(stuck[0]) in note for note in notes
+        )
+    finally:
+        for leftover in stuck:
+            shutil.rmtree(leftover, ignore_errors=True)
+        git(repo, "worktree", "prune")
+
+
+def test_commit_path_bound_tolerates_a_stuck_temp_dir_after_publishing(project, monkeypatch):
+    """DW-403: once the candidate is published and its worktree removed, a temp
+    directory that cannot be deleted is tolerated — the published commit is
+    truthful. Ablation: drop `ignore_cleanup_errors=True` and the rmtree
+    `OSError` fails a successful publication."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    stuck: list[Path] = []
+
+    try:
+        with monkeypatch.context() as m:
+            stuck = _stick_candidate_temp_rmtree(m)
+            published = verify.commit_path_bound(
+                repo,
+                "chore: bound ledger",
+                path,
+                accepted_text=accepted,
+                baseline_text=baseline,
+            )
+        assert len(stuck) == 1
+    finally:
+        for leftover in stuck:
+            shutil.rmtree(leftover, ignore_errors=True)
+
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def _nested_bound_publish_inputs(project, rel):
+    """A tracked ledger at nested `rel`, committed, with the accepted text live."""
+    repo = project.project
+    path = repo / rel
+    path.parent.mkdir(parents=True)
+    baseline = "legacy migration ledger\n"
+    path.write_text(baseline, encoding="utf-8")
+    git(repo, "add", "--", rel)
+    git(repo, "commit", "-q", "-m", "track nested ledger")
+    original = verify.rev_parse_head(repo)
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    return repo, path, baseline, accepted, original
+
+
+def _select_candidate_parent_arm(monkeypatch, arm):
+    if arm == "fallback":
+        monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
+        monkeypatch.setattr(verify, "WIN32_HANDLE_PARENTS", False)
+    elif not (verify.DIR_FD_ANCHORED_WRITES or verify.WIN32_HANDLE_PARENTS):
+        pytest.skip("host has no handle-anchored parent creation")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_commit_path_bound_creates_no_parent_through_a_redirected_ancestor(
+    project, tmp_path_factory, monkeypatch, arm
+):
+    """DW-404: a candidate ancestor swapped for a link to an outside directory
+    refuses before any missing parent is created through it. Ablation: restore
+    `candidate_path.parent.mkdir(parents=True, exist_ok=True)` and `inner` is
+    created inside the outside directory."""
+    repo, path, baseline, accepted, original = _nested_bound_publish_inputs(
+        project, "outer/inner/ledger.md"
+    )
+    outside = tmp_path_factory.mktemp("outside-dir")
+    _select_candidate_parent_arm(monkeypatch, arm)
+
+    def swap_ancestor(candidate_root):
+        outer = candidate_root / "outer"
+        # Absent after the `--no-checkout` add (DW-401); cleared if present.
+        if outer.is_dir():
+            shutil.rmtree(outer)
+        outer.symlink_to(outside, target_is_directory=True)
+
+    _intercept_candidate_checkout(monkeypatch, swap_ancestor)
+    with pytest.raises(verify.GitError, match="candidate content could not be written"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=original,
+        )
+
+    assert list(outside.iterdir()) == []
+    assert verify.rev_parse_head(repo) == original
+
+
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_commit_path_bound_recreates_a_missing_candidate_parent(project, monkeypatch, arm):
+    """DW-404: the confined parent creation still recreates a plain missing
+    candidate parent, so publication succeeds. Since DW-401 the `--no-checkout`
+    add leaves every parent missing, so this is the ordinary publication path."""
+    repo, path, baseline, accepted, original = _nested_bound_publish_inputs(
+        project, "ledger-dir/ledger.md"
+    )
+    _select_candidate_parent_arm(monkeypatch, arm)
+    missing = []
+
+    def observe_parent(candidate_root):
+        missing.append(not os.path.lexists(candidate_root / "ledger-dir"))
+
+    _intercept_candidate_checkout(monkeypatch, observe_parent)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+        baseline_commit=original,
+    )
+
+    assert missing == [True]
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", "--format=", "--name-only", published) == "ledger-dir/ledger.md"
+    assert git(repo, "show", f"{published}:ledger-dir/ledger.md") == accepted.rstrip("\n")
+
+
+def _swap_candidate_root(candidate_root, outside):
+    """Replace the candidate worktree root with a link to ``outside`` (DW-338)."""
+    candidate_root.rename(candidate_root.with_name("candidate-aside"))
+    candidate_root.symlink_to(outside, target_is_directory=True)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize(
+    "swap_point", ["before-pin", "after-pin", "before-parents", "before-write"]
+)
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_commit_path_bound_refuses_a_candidate_root_swapped_for_a_link(
+    project, tmp_path_factory, monkeypatch, arm, swap_point
+):
+    """DW-338: the engine-minted candidate root is pinned once after `worktree
+    add`. A root that is already a link at the pin is refused (`before-pin`); one
+    swapped right after the pin is refused by the re-check before the index
+    population (`after-pin`, DW-425); one swapped after the index population is
+    refused by the parent creation (`before-parents`) or by the confined writer
+    (`before-write`, the outside tree carrying the same subpath so only the
+    root pin can refuse). Nothing lands outside, HEAD stays.
+
+    Ablations, each failing its rows: drop the `candidate_identity is None`
+    refusal (`before-pin` — parents are created in `outside`); drop
+    `root_identity=` to `_make_candidate_parents` or its path-arm
+    `_root_still_pinned` check (`before-parents`); drop `root_identity=` to
+    `atomic_write_bytes_confined` (`before-write` — `ledger.md` lands outside);
+    drop the cleanup's `candidate_identity is None` skip (`before-pin` — the
+    remove runs on the linked root). `after-pin` is pinned by message in the
+    DW-425 test below."""
+    repo, path, baseline, accepted, original = _nested_bound_publish_inputs(
+        project, "outer/inner/ledger.md"
+    )
+    outside = tmp_path_factory.mktemp("outside-root")
+    _select_candidate_parent_arm(monkeypatch, arm)
+    swapped = []
+
+    def swap(candidate_root):
+        _swap_candidate_root(candidate_root, outside)
+        swapped.append(True)
+
+    removes = None
+    if swap_point == "before-pin":
+        removes = _record_worktree_removes(monkeypatch)
+        _intercept_candidate_checkout(monkeypatch, swap)
+    elif swap_point == "after-pin":
+        real_pin = verify.pinned_root_identity
+
+        def pin_then_swap(root):
+            identity = real_pin(root)
+            swap(root)
+            return identity
+
+        monkeypatch.setattr(verify, "pinned_root_identity", pin_then_swap)
+    elif swap_point == "before-parents":
+        real_git_env = verify._git_env
+
+        def read_tree_then_swap(git_repo, *args, **kwargs):
+            result = real_git_env(git_repo, *args, **kwargs)
+            if "read-tree" in args:
+                swap(Path(git_repo))
+            return result
+
+        monkeypatch.setattr(verify, "_git_env", read_tree_then_swap)
+    else:
+        (outside / "outer" / "inner").mkdir(parents=True)
+        real_parents = verify._make_candidate_parents
+
+        def parents_then_swap(root, parent, **kwargs):
+            real_parents(root, parent, **kwargs)
+            swap(root)
+
+        monkeypatch.setattr(verify, "_make_candidate_parents", parents_then_swap)
+
+    with pytest.raises(verify.GitError) as raised:
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=original,
+        )
+
+    assert swapped
+    written = sorted(p.relative_to(outside).as_posix() for p in outside.rglob("*"))
+    expected = ["outer", "outer/inner"] if swap_point == "before-write" else []
+    assert written == expected
+    assert verify.rev_parse_head(repo) == original
+    if swap_point == "before-pin":
+        # A root never pinned is never handed to `worktree remove` (DW-425).
+        notes = getattr(raised.value, "__notes__", [])
+        assert any("never pinned; worktree remove skipped" in note for note in notes)
+        assert removes == []
+        assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_commit_path_bound_refuses_a_candidate_parent_swapped_for_a_link_holding_a_real_root(
+    project, tmp_path, monkeypatch
+):
+    """DW-446: the candidate is pinned at its mint (right after `worktree add`) and
+    that pin is HELD for its one-call lifetime, so it needs no persisted record. Its
+    `TemporaryDirectory` parent swapped after the pin for a link to a tree holding a
+    REAL `candidate/` (a full copy, `.git` gitfile included) makes the candidate path
+    reach a real, non-link directory — a fresh `lstat` of it accepts that tree — but
+    the re-check compares against the held pin and refuses. Nothing is written into
+    the outside copy, HEAD stays.
+
+    Ablation: make `platform_util._root_still_pinned` accept any fresh non-link
+    `lstat` (re-take the pin at each re-check) and this reddens — the root
+    re-checks pass the outside candidate and the call goes on to fail elsewhere."""
+    import tempfile
+
+    temp_base = tmp_path / "tmp"
+    temp_base.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temp_base))
+    repo, path, baseline, accepted, original = _nested_bound_publish_inputs(
+        project, "outer/inner/ledger.md"
+    )
+    outside = tmp_path / "outside"
+    real_pin = verify.pinned_root_identity
+    swapped: list[Path] = []
+    snapshot: list[str] = []
+
+    def pin_then_swap_parent(root):
+        identity = real_pin(root)
+        if root.name == "candidate" and not swapped:
+            parent = root.parent
+            shutil.copytree(parent, outside, symlinks=True)
+            parent.rename(parent.with_name(parent.name + "-aside"))
+            parent.symlink_to(outside, target_is_directory=True)
+            assert root.is_dir() and not root.is_symlink()  # the premise
+            swapped.append(parent)
+            snapshot.extend(sorted(p.relative_to(outside).as_posix() for p in outside.rglob("*")))
+        return identity
+
+    monkeypatch.setattr(verify, "pinned_root_identity", pin_then_swap_parent)
+
+    with pytest.raises(verify.GitError, match="replaced"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=original,
+        )
+
+    assert swapped
+    written = sorted(p.relative_to(outside).as_posix() for p in outside.rglob("*"))
+    assert written == snapshot  # nothing created in the outside candidate
+    assert verify.rev_parse_head(repo) == original
+
+
+# DW-401/420/425: filter-free candidate checkout, root re-checks, handle-anchored
+# win32 parent creation.
+
+
+def test_commit_path_bound_candidate_checkout_runs_no_smudge_filter(project, tmp_path, monkeypatch):
+    """DW-401: the candidate `worktree add` is `--no-checkout` and its index is
+    filled by `read-tree` without `-u`, so a repo-configured smudge driver never
+    runs, while the published blob and the rest of the tree are exactly right,
+    and the candidate `git add` still applies the clean driver. Ablation: drop
+    `--no-checkout` and the smudge marker is written; a candidate `git add`
+    that stopped cleaning appends no `candidate` line to the clean record."""
+    repo = project.project
+    marker = tmp_path / "smudge-ran"
+    cleaned_in = tmp_path / "clean-ran-in"
+    git(repo, "config", "filter.recorder.smudge", f": > '{marker.as_posix()}'; cat")
+    git(repo, "config", "filter.recorder.clean", f"pwd >> '{cleaned_in.as_posix()}'; cat")
+    (repo / ".gitattributes").write_text("* filter=recorder\n", encoding="utf-8")
+    git(repo, "add", "--", ".gitattributes")
+    git(repo, "commit", "-q", "-m", "route tracked files through a smudge recorder")
+    marker.unlink(missing_ok=True)
+    cleaned_in.unlink(missing_ok=True)
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    # Only the lines the candidate `git add` itself appends: a later candidate
+    # `git commit` may re-clean a racily-clean target and would mask a lost filter.
+    cleaned_by_add = []
+    real_git = verify._git
+
+    def observe_add(git_repo, *args, **kwargs):
+        if args[:1] != ("add",):
+            return real_git(git_repo, *args, **kwargs)
+        before = cleaned_in.read_text(encoding="utf-8") if cleaned_in.exists() else ""
+        result = real_git(git_repo, *args, **kwargs)
+        after = cleaned_in.read_text(encoding="utf-8") if cleaned_in.exists() else ""
+        cleaned_by_add.extend(after[len(before) :].splitlines())
+        return result
+
+    monkeypatch.setattr(verify, "_git", observe_add)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert not marker.exists()
+    # The candidate `git add` still cleans: with no `.gitattributes` on disk the
+    # checkin attributes fall back to the index.
+    assert any(line.rstrip("/").endswith("candidate") for line in cleaned_by_add)
+    accepted_oid = git(repo, "hash-object", "--", "src.txt")
+    assert git(repo, "rev-parse", f"{published}:src.txt") == accepted_oid
+    assert git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", original, published) == (
+        "src.txt"
+    )
+
+
+def _candidate_tree(candidate_root):
+    """Every entry under the candidate root, relative and sorted. A linked
+    worktree's `.git` is a gitdir FILE, so it is listed like any other file."""
+    found = []
+    for dirpath, dirs, files in os.walk(candidate_root):
+        base = Path(dirpath).relative_to(candidate_root)
+        found.extend((base / name).as_posix() for name in [*dirs, *files])
+    return sorted(found)
+
+
+def test_commit_path_bound_candidate_holds_only_the_target(project, monkeypatch):
+    """DW-401: the candidate worktree holds only `.git` after the add, and only
+    the target path (with its parents) once the confined write lands. Ablation:
+    drop `--no-checkout` and every tracked file is listed after the add."""
+    repo, path, baseline, accepted, original = _nested_bound_publish_inputs(
+        project, "outer/inner/ledger.md"
+    )
+    seen = {}
+    _intercept_candidate_checkout(
+        monkeypatch, lambda root: seen.setdefault("after-add", _candidate_tree(root))
+    )
+    real_git = verify._git
+
+    def observe_add(git_repo, *args, **kwargs):
+        if args[:1] == ("add",):
+            seen["before-stage"] = _candidate_tree(Path(git_repo))
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", observe_add)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+        baseline_commit=original,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert seen["after-add"] == [".git"]
+    assert seen["before-stage"] == [
+        ".git",
+        "outer",
+        "outer/inner",
+        "outer/inner/ledger.md",
+    ]
+    assert git(repo, "show", "--format=", "--name-only", published) == "outer/inner/ledger.md"
+
+
+def _outside_repo(tmp_path_factory):
+    """A separate repository the swapped candidate root points at: a git call
+    that follows the link would stage or commit here."""
+    outside = tmp_path_factory.mktemp("outside-repo")
+    git(outside, "init", "-q")
+    (outside / "keep.txt").write_text("outside\n", encoding="utf-8")
+    git(outside, "add", "--", "keep.txt")
+    git(outside, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "outside")
+    return outside
+
+
+def _record_worktree_removes(monkeypatch):
+    removes = []
+    real_git = verify._git
+
+    def recording(git_repo, *args, **kwargs):
+        if args[:2] == ("worktree", "remove"):
+            removes.append(args)
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", recording)
+    return removes
+
+
+_CANDIDATE_POINTS = [
+    "before-pin",
+    "before-read-tree",
+    "before-add",
+    "before-index-read",
+    "before-commit",
+    "before-rev-parse",
+]
+
+
+def _at_candidate_point(monkeypatch, point, act):
+    """Run `act(candidate_root)` at one point of the candidate flow: right after
+    `worktree add` (`before-pin`), right after the root pin (`after-root-pin`,
+    between it and the gitfile pin), right after the gitfile pin
+    (`before-read-tree`), or at the DW-425 re-check hooks before `git add`, the
+    staged-entry read, `git commit` and the candidate `rev-parse`."""
+    if point == "before-pin":
+        _intercept_candidate_checkout(monkeypatch, act)
+    elif point == "after-root-pin":
+        real_root_pin = verify.pinned_root_identity
+
+        def root_pin_then_act(root):
+            identity = real_root_pin(root)
+            act(root)
+            return identity
+
+        monkeypatch.setattr(verify, "pinned_root_identity", root_pin_then_act)
+    elif point == "before-read-tree":
+        real_pin = verify._pin_candidate_gitfile
+
+        def pin_then_act(repo_root, root, *rest):
+            pin = real_pin(repo_root, root, *rest)
+            act(root)
+            return pin
+
+        monkeypatch.setattr(verify, "_pin_candidate_gitfile", pin_then_act)
+    elif point == "before-add":
+        real_write = verify.atomic_write_bytes_confined
+
+        def write_then_act(target, data, **kwargs):
+            real_write(target, data, **kwargs)
+            act(kwargs["confine_root"])
+
+        monkeypatch.setattr(verify, "atomic_write_bytes_confined", write_then_act)
+    elif point == "before-index-read":
+        real_git = verify._git
+
+        def add_then_act(git_repo, *args, **kwargs):
+            result = real_git(git_repo, *args, **kwargs)
+            if args[:1] == ("add",):
+                act(Path(git_repo))
+            return result
+
+        monkeypatch.setattr(verify, "_git", add_then_act)
+    elif point == "before-commit":
+        real_entry = verify._bound_index_entry
+
+        def entry_then_act(git_repo, rel):
+            result = real_entry(git_repo, rel)
+            if Path(git_repo).name == "candidate":
+                act(Path(git_repo))
+            return result
+
+        monkeypatch.setattr(verify, "_bound_index_entry", entry_then_act)
+    else:
+        assert point == "before-rev-parse"
+        real_git_env = verify._git_env
+
+        def commit_then_act(git_repo, *args, **kwargs):
+            result = real_git_env(git_repo, *args, **kwargs)
+            if args[:1] == ("commit",):
+                act(Path(git_repo))
+            return result
+
+        monkeypatch.setattr(verify, "_git_env", commit_then_act)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize(
+    "swap_point",
+    [
+        "after-root-pin",
+        "before-read-tree",
+        "before-add",
+        "before-index-read",
+        "before-commit",
+        "before-rev-parse",
+    ],
+)
+def test_commit_path_bound_rechecks_the_candidate_root_before_each_git_call(
+    project, tmp_path_factory, monkeypatch, swap_point
+):
+    """DW-425: the pinned candidate root is re-checked before every later git
+    call on it. A root swapped for a link to another repository right before
+    the index population, `git add`, the staged-entry read, `git commit` or the
+    candidate `rev-parse` refuses with a typed `GitError`; nothing runs in the
+    other repository, HEAD stays, cleanup skips `worktree remove` and the
+    registration is pruned. A root swapped between the root pin and the gitfile
+    pin (`after-root-pin`, DW-442) refuses as a replaced root too, not as a
+    foreign gitfile read through the link — ablate the root re-check in
+    `_pin_candidate_gitfile` and that row's message changes.
+
+    Ablation: drop the matching `_require_pinned_candidate` call and its row
+    fails — the refusal message changes (the git call runs in `outside`, e.g.
+    `before-commit` finds nothing staged there and fails as "candidate commit
+    failed"). Drop the cleanup pin
+    check and `worktree remove` runs on the swapped path."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    outside = _outside_repo(tmp_path_factory)
+    outside_head = verify.rev_parse_head(outside)
+    swapped = []
+
+    def swap(candidate_root):
+        _swap_candidate_root(candidate_root, outside)
+        swapped.append(True)
+
+    removes = _record_worktree_removes(monkeypatch)
+    _at_candidate_point(monkeypatch, swap_point, swap)
+
+    with pytest.raises(verify.GitError, match="candidate checkout root was replaced") as raised:
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert swapped
+    notes = getattr(raised.value, "__notes__", [])
+    assert any("worktree remove skipped" in note for note in notes)
+    assert removes == []
+    assert verify.rev_parse_head(repo) == original
+    assert verify.rev_parse_head(outside) == outside_head
+    assert git(outside, "status", "--porcelain") == ""
+    assert sorted(p.name for p in outside.iterdir()) == [".git", "keep.txt"]
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+@pytest.mark.parametrize("rewrite_point", _CANDIDATE_POINTS)
+def test_commit_path_bound_refuses_a_rewritten_candidate_gitfile(
+    project, tmp_path_factory, monkeypatch, rewrite_point
+):
+    """DW-442: git picks the candidate's repository from its `.git` gitfile, so
+    the gitfile is pinned beside the root. One rewritten to name another
+    repository's gitdir right after `worktree add` is refused at the pin (it
+    names no directory under this repo's `<git-common-dir>/worktrees/`); one
+    rewritten after the pin is refused by the re-check before the index
+    population, `git add`, the staged-entry read, `git commit` or the candidate
+    `rev-parse`. Nothing lands in the other repository (HEAD, index bytes,
+    status), this repo's HEAD stays, and the registration is pruned (git refuses
+    `worktree remove` on a gitfile that does not point back). No links, so it
+    runs on win32 too.
+
+    Ablations, each failing its row on the refusal message: the `before-pin`
+    row is refused twice over (no `worktrees/` location, no back-pointer in
+    `outside`), so only dropping both of those pin checks fails it — `read-tree`
+    runs against `outside` and fails there (each alone is isolated by a
+    `..._naming_no_candidate_admin_dir` row); drop the gitfile half of
+    `_require_pinned_candidate` (every other row — the next candidate git call
+    runs against `outside`, e.g. `before-add` stages into its index and fails
+    later as "candidate commit failed")."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    outside = _outside_repo(tmp_path_factory)
+    outside_head = verify.rev_parse_head(outside)
+    outside_index = (outside / ".git" / "index").read_bytes()
+    rewritten = []
+
+    def rewrite(candidate_root):
+        _rewrite_gitfile(
+            candidate_root / ".git", f"gitdir: {(outside / '.git').as_posix()}\n".encode()
+        )
+        rewritten.append(True)
+
+    _at_candidate_point(monkeypatch, rewrite_point, rewrite)
+    expected = (
+        "gitfile .* does not name a worktree of"
+        if rewrite_point == "before-pin"
+        else "candidate checkout gitfile was rewritten"
+    )
+
+    with pytest.raises(verify.GitError, match=expected):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert rewritten
+    assert verify.rev_parse_head(repo) == original
+    assert verify.rev_parse_head(outside) == outside_head
+    assert (outside / ".git" / "index").read_bytes() == outside_index
+    assert git(outside, "status", "--porcelain") == ""
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def _gitfile_target(gitfile):
+    """The admin dir a worktree gitfile's `gitdir:` line names, as a Path."""
+    value = gitfile.read_bytes()[len(b"gitdir: ") :].rstrip(b"\r\n")
+    return gitfile.parent / os.fsdecode(value)
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    ["dotdot", "linked-admin", "sibling", "foreign", "foreign-commondir", "nul-byte", "no-prefix"],
+)
+def test_commit_path_bound_pin_refuses_a_gitfile_naming_no_candidate_admin_dir(
+    project, tmp_path_factory, monkeypatch, forgery
+):
+    """DW-442: right after `worktree add`, the pin accepts only a gitfile whose
+    `gitdir:` names a real directory directly under this repo's `worktrees/`
+    whose `gitdir` back-pointer names this candidate's `.git` and whose
+    `commondir` names this repo's common dir. Each row plants
+    whatever else it needs so that only one guard stands between the forgery
+    and the candidate git calls:
+
+    - `dotdot` names `worktrees/..` (this repo's own gitdir, back-pointer
+      planted) — ablate the `..` name guard and the candidate calls run against
+      this repo's own gitdir (the refusal becomes a later ref-transaction
+      failure);
+    - `linked-admin` names `worktrees/evil`, a symlink to another repository's
+      gitdir (back-pointer planted there; POSIX symlinks) — ablate the
+      `pinned_root_identity` link guard and git runs against `outside`; the
+      link stays planted through cleanup, so it also holds DW-494's guard on
+      the cleanup `worktree remove` and `worktree prune`;
+    - `sibling` names a real sibling linked worktree's admin dir — ablate the
+      back-pointer check and the candidate calls run in the sibling's admin dir
+      and publication goes through (only cleanup fails);
+    - `foreign` names another repository's gitdir directly, with a back-pointer
+      and a `commondir` naming this repo's common dir planted there — ablate
+      the `worktrees/` location check and `read-tree` writes `outside`'s
+      index;
+    - `foreign-commondir` names a real admin dir planted under `worktrees/`
+      whose back-pointer names the candidate but whose `commondir` names
+      another repository's gitdir — ablate the `commondir` check and git takes
+      its objects and refs from `outside` (`read-tree` fails there);
+    - `nul-byte` holds a NUL in the value — ablate the `ValueError` conversion
+      and an untyped `ValueError` escapes;
+    - `no-prefix` spells the prefix `GITDIR: ` before the real admin dir —
+      ablate the prefix check and the pin passes, leaving git's own parse to
+      fail `read-tree`.
+
+    Every row refuses with the typed "does not name a worktree of" `GitError`,
+    and nothing moves: this repo's HEAD and index, the other repository's HEAD,
+    index and status, the sibling's HEAD and index."""
+    if forgery == "linked-admin" and sys.platform == "win32":
+        pytest.skip("POSIX symlinks")
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    outside = _outside_repo(tmp_path_factory)
+    outside_head = verify.rev_parse_head(outside)
+    outside_index = (outside / ".git" / "index").read_bytes()
+    sibling = None
+    if forgery == "sibling":
+        sibling = tmp_path_factory.mktemp("sibling-parent") / "sibling"
+        git(repo, "worktree", "add", "-q", "--detach", str(sibling), "HEAD")
+    sibling_head = verify.rev_parse_head(sibling) if sibling else None
+    sibling_admin = _gitfile_target(sibling / ".git") if sibling else None
+    sibling_index = (sibling_admin / "index").read_bytes() if sibling_admin else None
+    seen = {}
+
+    def forge(candidate_root):
+        gitfile = candidate_root / ".git"
+        admin = _gitfile_target(gitfile)
+        worktrees = admin.parent
+        seen["repo-index"] = (repo / ".git" / "index").read_bytes()
+        back = f"{gitfile.as_posix()}\n"
+        if forgery == "dotdot":
+            (worktrees.parent / "gitdir").write_text(back, encoding="utf-8")
+            value = f"{worktrees.as_posix()}/.."
+        elif forgery == "linked-admin":
+            (outside / ".git" / "gitdir").write_text(back, encoding="utf-8")
+            (worktrees / "evil").symlink_to(outside / ".git", target_is_directory=True)
+            value = f"{worktrees.as_posix()}/evil"
+        elif forgery == "sibling":
+            value = sibling_admin.as_posix()
+        elif forgery == "foreign":
+            (outside / ".git" / "gitdir").write_text(back, encoding="utf-8")
+            (outside / ".git" / "commondir").write_text(
+                f"{worktrees.parent.as_posix()}\n", encoding="utf-8"
+            )
+            value = (outside / ".git").as_posix()
+        elif forgery == "foreign-commondir":
+            evil = worktrees / "evil"
+            evil.mkdir()
+            (evil / "gitdir").write_text(back, encoding="utf-8")
+            (evil / "commondir").write_text(f"{(outside / '.git').as_posix()}\n", encoding="utf-8")
+            (evil / "HEAD").write_bytes((admin / "HEAD").read_bytes())
+            value = evil.as_posix()
+        elif forgery == "nul-byte":
+            value = f"{worktrees.as_posix()}/cand\x00idate"
+        else:
+            _rewrite_gitfile(gitfile, f"GITDIR: {admin.as_posix()}\n".encode())
+            return
+        _rewrite_gitfile(gitfile, f"gitdir: {value}\n".encode())
+
+    _intercept_candidate_checkout(monkeypatch, forge)
+    if forgery == "foreign-commondir":
+        # With the back-pointer planted, the cleanup's `worktree remove --force`
+        # resolves the candidate path to the real `evil` entry, validates it,
+        # and deletes that admin dir, leaving the real entry unpruned. That is
+        # the unchanged cleanup flow, not the pin, so undo the plant before it
+        # runs and observe only the candidate calls.
+        real_git = verify._git
+
+        def unplant_then_git(git_repo, *args, **kwargs):
+            if args[:2] == ("worktree", "remove"):
+                for evil in Path(git_repo).glob(".git/worktrees/evil"):
+                    shutil.rmtree(evil)
+                (outside / ".git" / "gitdir").unlink(missing_ok=True)
+            return real_git(git_repo, *args, **kwargs)
+
+        monkeypatch.setattr(verify, "_git", unplant_then_git)
+
+    try:
+        with pytest.raises(verify.GitError, match="gitfile .* does not name a worktree of") as info:
+            verify.commit_path_bound(
+                repo,
+                "chore: bound ledger",
+                path,
+                accepted_text=accepted,
+                baseline_text=baseline,
+            )
+    finally:
+        (outside / ".git" / "gitdir").unlink(missing_ok=True)
+        (outside / ".git" / "commondir").unlink(missing_ok=True)
+
+    if forgery == "linked-admin":
+        # DW-494: the `evil` link stays planted through cleanup. Git follows it
+        # during `worktree remove --force` (its back-pointer claims the
+        # candidate) and during `worktree prune`, emptying `outside/.git`, so
+        # both are skipped and named on the refusal — ablate either guard and
+        # the `outside` asserts below fail. The manual recovery then clears the
+        # left-over registration.
+        evil = repo / ".git" / "worktrees" / "evil"
+        assert (outside / ".git" / "HEAD").is_file()
+        assert verify.rev_parse_head(outside) == outside_head
+        assert evil.is_symlink()
+        notes = "\n".join(getattr(info.value, "__notes__", []))
+        assert f"cleanup also failed in {repo}: linked worktree admin entry {evil}" in notes
+        assert f"git worktree prune skipped in {repo}: linked worktree admin entry {evil}" in notes
+        evil.unlink()
+        git(repo, "worktree", "prune")
+
+    assert seen
+    assert verify.rev_parse_head(repo) == original
+    assert (repo / ".git" / "index").read_bytes() == seen["repo-index"]
+    assert verify.rev_parse_head(outside) == outside_head
+    assert (outside / ".git" / "index").read_bytes() == outside_index
+    assert git(outside, "status", "--porcelain") == ""
+    if sibling is not None:
+        assert verify.rev_parse_head(sibling) == sibling_head
+        assert (sibling_admin / "index").read_bytes() == sibling_index
+    expected_worktrees = 2 if sibling is not None else 1
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == expected_worktrees
+
+
+@pytest.mark.parametrize("kind", ["directory", "fifo", "link"])
+@pytest.mark.parametrize("replace_point", ["before-pin", "before-add"])
+def test_commit_path_bound_refuses_a_non_regular_candidate_gitfile(
+    project, monkeypatch, kind, replace_point
+):
+    """DW-442: a candidate `.git` replaced by a directory, a FIFO or a link to a
+    copy of itself — at the pin or at a later re-check — is refused with a
+    typed `GitError` (win32: the open of a directory already fails), and the
+    FIFO never blocks the read. Ablations: drop `O_NONBLOCK` from
+    `_read_pinned_file` and the `fifo` rows hang; drop its `S_ISREG` check and
+    every POSIX `directory`/`fifo` row fails on the reason (a directory read
+    raises `IsADirectoryError`, a writerless FIFO reads as empty); drop its
+    `O_NOFOLLOW` and both `link` rows fail — `before-pin` publishes through the
+    link, `before-add` is still refused, but by the identity compare rather
+    than at the open."""
+    if kind == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("no FIFOs on this platform")
+    if kind == "link" and sys.platform == "win32":
+        pytest.skip("POSIX symlinks; O_NOFOLLOW degrades to 0 on win32")
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    replaced = []
+
+    def replace(candidate_root):
+        gitfile = candidate_root / ".git"
+        data = gitfile.read_bytes()
+        gitfile.unlink()
+        if kind == "directory":
+            gitfile.mkdir()
+        elif kind == "fifo":
+            os.mkfifo(gitfile)
+        else:
+            copy = candidate_root.parent / "gitfile-copy"
+            copy.write_bytes(data)
+            gitfile.symlink_to(copy)
+        replaced.append(True)
+
+    _at_candidate_point(monkeypatch, replace_point, replace)
+
+    with pytest.raises(verify.GitError, match="candidate checkout gitfile") as raised:
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    # The re-check chains the reader's refusal; the pin raises it directly.
+    reason = raised.value if replace_point == "before-pin" else raised.value.__cause__
+    expected = (
+        "could not be opened" if kind == "link" else "is not a regular file|could not be opened"
+    )
+    assert re.search(expected, str(reason))
+    assert replaced
+    assert verify.rev_parse_head(repo) == original
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def _admin_copy_into(parent, admin):
+    """A copy of the candidate admin dir `admin` at `parent/<its name>` whose
+    `commondir` is a hard link to the pinned one — same `(st_dev, st_ino)`, same
+    bytes — so only the admin dir's own identity tells the two apart. With
+    `parent` directly under the common dir, the relative `commondir` still
+    resolves there: a working stand-in git would take the candidate's index,
+    HEAD and commit through without a complaint."""
+    copy = parent / admin.name
+    shutil.copytree(admin, copy, symlinks=True)
+    (copy / "commondir").unlink()
+    os.link(admin / "commondir", copy / "commondir")
+    return copy
+
+
+@pytest.mark.parametrize("tamper_point", _CANDIDATE_POINTS[1:])
+@pytest.mark.parametrize("tamper", ["admin-link", "commondir", "intermediate-link"])
+def test_commit_path_bound_refuses_a_candidate_admin_dir_changed_after_the_pin(
+    project, tmp_path_factory, monkeypatch, tamper, tamper_point
+):
+    """DW-493/DW-495: git re-resolves the admin dir the candidate gitfile names,
+    and that dir's `commondir`, by path on every call, so both are pinned beside
+    the gitfile and every re-check refuses — the gitfile untouched — when after
+    the pin:
+
+    - `admin-link`: `<common-dir>/worktrees/<name>` is swapped for a link to a
+      working copy of itself (POSIX symlinks);
+    - `commondir`: its `commondir` is rewritten in place (same inode) to name
+      another repository's gitdir;
+    - `intermediate-link`: the gitfile, rewritten before the pin to reach the
+      admin dir through `L -> <common-dir>/worktrees` (which the pin accepts),
+      keeps its bytes while `L` is retargeted to a tree holding a working copy
+      of the admin dir (DW-495; POSIX symlinks).
+
+    Nothing moves: this repo's HEAD, the other repository's HEAD and index, and
+    the registration is gone after cleanup.
+
+    The link rows' stand-in shares the pinned `commondir` by hard link and sits
+    where its relative `commondir` still names this repo's common dir, so the
+    `commondir` half cannot see the swap. Ablations, each failing its rows:
+    drop the admin-dir half of `_require_pinned_candidate` and the link rows
+    run the candidate calls in the stand-in and publish (`intermediate-link`
+    then fails only its cleanup); drop its `commondir` half and the `commondir`
+    rows run them against `outside`'s objects and refs — refused later on
+    another reason ("candidate commit failed"), or not at all."""
+    if tamper != "commondir" and sys.platform == "win32":
+        pytest.skip("POSIX symlinks")
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    common_dir = repo / ".git"
+    outside = _outside_repo(tmp_path_factory)
+    outside_head = verify.rev_parse_head(outside)
+    outside_index = (outside / ".git" / "index").read_bytes()
+    stand_in = common_dir / "stand-in"
+    stand_in.mkdir()
+    link = tmp_path_factory.mktemp("link-parent") / "wt-link"
+    tampered = []
+    restore = []
+
+    if tamper == "intermediate-link":
+
+        def via_link(candidate_root):
+            admin = _gitfile_target(candidate_root / ".git")
+            link.symlink_to(admin.parent, target_is_directory=True)
+            _rewrite_gitfile(
+                candidate_root / ".git", f"gitdir: {(link / admin.name).as_posix()}\n".encode()
+            )
+
+        _intercept_candidate_checkout(monkeypatch, via_link)
+
+    def tamper_with(candidate_root):
+        admin = _gitfile_target(candidate_root / ".git")
+        if tamper == "admin-link":
+            copy = _admin_copy_into(stand_in, admin)
+            pinned = common_dir / f"{admin.name}-pinned"
+            admin.rename(pinned)
+            admin.symlink_to(copy, target_is_directory=True)
+
+            def put_back():
+                admin.unlink()
+                pinned.rename(admin)
+
+            restore.append(put_back)
+        elif tamper == "commondir":
+            (admin / "commondir").write_bytes(f"{(outside / '.git').as_posix()}\n".encode())
+        else:
+            _admin_copy_into(stand_in, admin)
+            link.unlink()
+            link.symlink_to(stand_in, target_is_directory=True)
+        tampered.append(True)
+
+    _at_candidate_point(monkeypatch, tamper_point, tamper_with)
+    # The cleanup refuses to hand git a linked admin entry (DW-494), which would
+    # leave the registration behind; put the pinned one back before that guard
+    # looks and observe only the candidate calls.
+    real_fault = verify._linked_worktree_admin_fault
+
+    def restore_then_check(repo_root):
+        while restore:
+            restore.pop()()
+        return real_fault(repo_root)
+
+    monkeypatch.setattr(verify, "_linked_worktree_admin_fault", restore_then_check)
+    expected = "commondir was rewritten" if tamper == "commondir" else "admin dir was replaced"
+
+    with pytest.raises(verify.GitError, match=expected):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert tampered
+    assert verify.rev_parse_head(repo) == original
+    assert verify.rev_parse_head(outside) == outside_head
+    assert (outside / ".git" / "index").read_bytes() == outside_index
+    assert git(outside, "status", "--porcelain") == ""
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_commit_path_bound_publishes_through_an_intact_intermediate_admin_link(
+    project, tmp_path_factory, monkeypatch
+):
+    """DW-495: the pin holds the admin dir through the path the gitfile names,
+    with no canonical-path check, so a gitfile reaching the admin dir through an
+    intermediate `L -> <common-dir>/worktrees` link that stays put publishes as
+    before. Ablation (the other direction): add a canonical-path check at the
+    pin — the resolved `gitdir:` path against its lexical spelling — and this
+    publish is refused."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    link = tmp_path_factory.mktemp("link-parent") / "wt-link"
+    seen = []
+
+    def via_link(candidate_root):
+        admin = _gitfile_target(candidate_root / ".git")
+        link.symlink_to(admin.parent, target_is_directory=True)
+        _rewrite_gitfile(
+            candidate_root / ".git", f"gitdir: {(link / admin.name).as_posix()}\n".encode()
+        )
+        seen.append(True)
+
+    _intercept_candidate_checkout(monkeypatch, via_link)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert seen
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+@pytest.mark.parametrize("which", ["admin-dir", "commondir"])
+def test_commit_path_bound_pin_refuses_a_zero_inode_admin_dir_or_commondir(
+    project, monkeypatch, which
+):
+    """DW-493: an admin dir or `commondir` whose stat carries a zero inode (some
+    win32 filesystems) has no identity to hold, so the pin refuses it outright,
+    as it does a zero-inode gitfile, rather than letting the first re-check
+    report it as replaced. Ablation: drop the matching zero-inode check in
+    `_pin_candidate_gitfile` and the refusal moves to that re-check ("admin dir
+    was replaced" / "commondir was rewritten")."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    if which == "admin-dir":
+        real_identity = verify.pinned_root_identity
+
+        def zero_admin(root):
+            info = real_identity(root)
+            if info is not None and Path(root).parent.name == "worktrees":
+                return os.stat_result((info.st_mode, 0, *tuple(info)[2:10]))
+            return info
+
+        monkeypatch.setattr(verify, "pinned_root_identity", zero_admin)
+    else:
+        real_read = verify._read_candidate_commondir
+        monkeypatch.setattr(
+            verify,
+            "_read_candidate_commondir",
+            lambda admin: dataclasses.replace(real_read(admin), ino=0),
+        )
+    expected = "admin dir" if which == "admin-dir" else "commondir"
+
+    with pytest.raises(verify.GitError, match=f"worktree {expected} carries no file identity"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def _unit_candidate_pin(tmp_path):
+    """A candidate root and a full `_CandidateGitdirPin` for it, built without
+    git: a gitfile, and an admin dir holding a `commondir`."""
+    root = tmp_path / "candidate"
+    root.mkdir()
+    admin = tmp_path / "worktrees" / "candidate"
+    admin.mkdir(parents=True)
+    (admin / "commondir").write_bytes(b"../..\n")
+    (root / ".git").write_bytes(f"gitdir: {admin.as_posix()}\n".encode())
+    identity = platform_util.pinned_root_identity(root)
+    admin_identity = platform_util.pinned_root_identity(admin)
+    assert identity is not None and admin_identity is not None
+    pin = verify._CandidateGitdirPin(
+        verify._read_candidate_gitfile(root),
+        admin,
+        admin_identity,
+        verify._read_candidate_commondir(admin),
+    )
+    verify._require_pinned_candidate(root, identity, pin)
+    return root, identity, pin
+
+
+def test_linked_worktree_admin_fault_names_only_link_entries(project, tmp_path, monkeypatch):
+    """DW-494: no `worktrees/` and a real admin dir under it are no fault; a
+    symlinked entry is, named with the recovery; a failed common-dir probe or an
+    unlistable `worktrees/` fails closed; an entry gone before its stat is
+    skipped, not taken for an empty scan. Ablation: drop the `link_like_stat`
+    filter and the real-dir case faults; return None on the listing fault, the
+    probe's non-zero exit or its `GitError` and that case fails; let the
+    vanished entry's `FileNotFoundError` end the scan and the later link is
+    missed."""
+    repo = project.project
+    worktrees = repo / ".git" / "worktrees"
+    assert not worktrees.exists()
+    assert verify._linked_worktree_admin_fault(repo) is None
+    (worktrees / "real").mkdir(parents=True)
+    assert verify._linked_worktree_admin_fault(repo) is None
+    if sys.platform != "win32":
+        (worktrees / "evil").symlink_to(tmp_path, target_is_directory=True)
+        fault = verify._linked_worktree_admin_fault(repo)
+        assert fault is not None
+        assert str(worktrees / "evil") in fault
+        assert str(worktrees / "real") not in fault
+        assert "then run `git worktree prune`" in fault
+        (worktrees / "evil").unlink()
+
+        # An entry gone between the listing and its stat is skipped, never
+        # taken for an empty scan that hides a later link.
+        real_scandir = os.scandir
+
+        class Vanished:
+            name = "vanished"
+
+            def stat(self, *, follow_symlinks=True):
+                raise FileNotFoundError(2, "gone")
+
+        class Listing:
+            def __init__(self, path):
+                self.inner = real_scandir(path)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.inner.close()
+
+            def __iter__(self):
+                yield Vanished()
+                yield from self.inner
+
+        (worktrees / "evil").symlink_to(tmp_path, target_is_directory=True)
+        with monkeypatch.context() as patched:
+            patched.setattr(verify.os, "scandir", Listing)
+            assert str(worktrees / "evil") in (verify._linked_worktree_admin_fault(repo) or "")
+        (worktrees / "evil").unlink()
+
+    def unlistable(_path):
+        raise PermissionError("denied")
+
+    def probe_raises(*_args):
+        raise verify.GitError("git timed out")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(verify.os, "scandir", unlistable)
+        assert "could not be listed" in (verify._linked_worktree_admin_fault(repo) or "")
+    with monkeypatch.context() as patched:
+        patched.setattr(verify, "_git_raw_out", lambda *_a: (128, "", "fatal: nope"))
+        assert "probe failed: fatal: nope" in (verify._linked_worktree_admin_fault(repo) or "")
+    with monkeypatch.context() as patched:
+        patched.setattr(verify, "_git_raw_out", probe_raises)
+        assert "probe failed: git timed out" in (verify._linked_worktree_admin_fault(repo) or "")
+
+
+def test_require_pinned_candidate_holds_the_gitfile_identity_and_bytes(tmp_path, monkeypatch):
+    """DW-442: the re-check refuses a gitfile whose bytes changed in place, one
+    replaced by an identical copy (a new inode), and any pin with a zero inode —
+    an identity that proves nothing never matches, even against a current read
+    that is also zero. Ablation: drop the `(st_dev, st_ino)` compare and the
+    identical-copy case passes (as does a zero pin against a real read, which
+    only that compare refuses); drop BOTH zero-inode guards and the
+    zero-against-zero case passes. Either guard alone refuses that case, since
+    it only arises when both sides are zero, so dropping just one stays green."""
+    root, identity, pin = _unit_candidate_pin(tmp_path)
+    gitfile = root / ".git"
+
+    zero = dataclasses.replace(pin.gitfile, ino=0)
+    zero_pin = dataclasses.replace(pin, gitfile=zero)
+    with pytest.raises(verify.GitError, match="gitfile was rewritten"):
+        verify._require_pinned_candidate(root, identity, zero_pin)
+    with monkeypatch.context() as patched:
+        patched.setattr(verify, "_read_candidate_gitfile", lambda _root: zero)
+        with pytest.raises(verify.GitError, match="gitfile was rewritten"):
+            verify._require_pinned_candidate(root, identity, zero_pin)
+
+    copy = root / "gitfile-copy"
+    copy.write_bytes(pin.gitfile.data)
+    os.replace(copy, gitfile)
+    with pytest.raises(verify.GitError, match="gitfile was rewritten"):
+        verify._require_pinned_candidate(root, identity, pin)
+
+    repinned = dataclasses.replace(pin, gitfile=verify._read_candidate_gitfile(root))
+    verify._require_pinned_candidate(root, identity, repinned)
+    gitfile.write_bytes(b"gitdir: /elsewhere/.git\n")
+    with pytest.raises(verify.GitError, match="gitfile was rewritten"):
+        verify._require_pinned_candidate(root, identity, repinned)
+
+
+def test_require_pinned_candidate_holds_the_commondir_identity_and_bytes(tmp_path, monkeypatch):
+    """DW-493: the re-check holds the admin dir's `commondir` as it holds the
+    gitfile — bytes changed in place, an identical copy (a new inode) and a
+    zero-inode pin all refuse, the gitfile untouched. Ablation: drop the
+    `commondir` half of `_require_pinned_candidate` and every case passes."""
+    root, identity, pin = _unit_candidate_pin(tmp_path)
+    commondir = pin.admin_dir / "commondir"
+
+    zero = dataclasses.replace(pin.commondir, ino=0)
+    zero_pin = dataclasses.replace(pin, commondir=zero)
+    with pytest.raises(verify.GitError, match="commondir was rewritten"):
+        verify._require_pinned_candidate(root, identity, zero_pin)
+    with monkeypatch.context() as patched:
+        patched.setattr(verify, "_read_candidate_commondir", lambda _admin: zero)
+        with pytest.raises(verify.GitError, match="commondir was rewritten"):
+            verify._require_pinned_candidate(root, identity, zero_pin)
+
+    copy = pin.admin_dir / "commondir-copy"
+    copy.write_bytes(pin.commondir.data)
+    os.replace(copy, commondir)
+    with pytest.raises(verify.GitError, match="commondir was rewritten"):
+        verify._require_pinned_candidate(root, identity, pin)
+
+    repinned = dataclasses.replace(pin, commondir=verify._read_candidate_commondir(pin.admin_dir))
+    verify._require_pinned_candidate(root, identity, repinned)
+    commondir.write_bytes(b"/elsewhere/.git\n")
+    with pytest.raises(verify.GitError, match="commondir was rewritten"):
+        verify._require_pinned_candidate(root, identity, repinned)
+    commondir.unlink()
+    with pytest.raises(verify.GitError, match="commondir was rewritten") as raised:
+        verify._require_pinned_candidate(root, identity, repinned)
+    assert "could not be opened" in str(raised.value.__cause__)
+
+
+def test_require_pinned_candidate_holds_the_admin_dir_identity(tmp_path):
+    """DW-493: the re-check refuses an admin dir replaced — by a fresh directory
+    holding identical files (a new inode), or by a link to it on POSIX — with the
+    gitfile untouched and the `commondir` bytes the same, and refuses a zero-inode
+    admin pin. Ablation: drop the admin-dir half of `_require_pinned_candidate`
+    and every case fails: the zero-inode pin and the link — it names the
+    original admin dir, so its `commondir` still matches — pass, and the fresh
+    directory is refused only as a rewritten `commondir`."""
+    root, identity, pin = _unit_candidate_pin(tmp_path)
+    zero = os.stat_result((pin.admin_identity.st_mode, 0, *tuple(pin.admin_identity)[2:10]))
+    with pytest.raises(verify.GitError, match="admin dir was replaced"):
+        verify._require_pinned_candidate(
+            root, identity, dataclasses.replace(pin, admin_identity=zero)
+        )
+
+    moved = tmp_path / "moved-admin"
+    pin.admin_dir.rename(moved)
+    pin.admin_dir.mkdir()
+    (pin.admin_dir / "commondir").write_bytes(pin.commondir.data)
+    with pytest.raises(verify.GitError, match="admin dir was replaced"):
+        verify._require_pinned_candidate(root, identity, pin)
+
+    if sys.platform == "win32":
+        return  # POSIX symlinks
+    shutil.rmtree(pin.admin_dir)
+    pin.admin_dir.symlink_to(moved, target_is_directory=True)
+    with pytest.raises(verify.GitError, match="admin dir was replaced"):
+        verify._require_pinned_candidate(root, identity, pin)
+
+
+def test_commit_path_bound_publishes_through_a_relative_candidate_gitfile(project, monkeypatch):
+    """DW-442: with `worktree.useRelativePaths` (git >= 2.48) the candidate
+    gitfile names its gitdir relative to the candidate root; the pin resolves it
+    there, finds it under this repo's `worktrees/`, resolves the admin dir's
+    relative back-pointer and `commondir` against that dir, and publication
+    proceeds. Ablation: resolve the `gitdir:` value, the back-pointer or the
+    `commondir` against the process cwd instead and the pin refuses."""
+    reported = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout
+    if not verify.git_version_at_least(reported, (2, 48)):
+        pytest.skip("worktree.useRelativePaths needs git >= 2.48")
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    git(repo, "config", "worktree.useRelativePaths", "true")
+    gitfiles = []
+
+    def record(root):
+        gitfiles.append((root / ".git").read_bytes())
+        admin = _gitfile_target(root / ".git")
+        gitfiles.append((admin / "gitdir").read_bytes())
+        gitfiles.append((admin / "commondir").read_bytes())
+
+    _intercept_candidate_checkout(monkeypatch, record)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    gitfile, back, commondir = gitfiles
+    assert not Path(os.fsdecode(gitfile[len(b"gitdir: ") :].rstrip(b"\r\n"))).is_absolute()
+    assert not Path(os.fsdecode(back.rstrip(b"\r\n"))).is_absolute()
+    assert not Path(os.fsdecode(commondir.rstrip(b"\r\n"))).is_absolute()
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+@pytest.mark.parametrize("fault", ["swapped", "unpinned"])
+def test_commit_path_bound_skips_worktree_remove_on_a_replaced_candidate_root(
+    project, tmp_path_factory, monkeypatch, fault
+):
+    """DW-425: a candidate root replaced after the last git call on it (here,
+    after publication) is never handed to `worktree remove --force`. The
+    successful publication raises the typed cleanup `GitError`, and the
+    registration is pruned once the temporary directory is gone. `unpinned`
+    stands in for the swap by failing the pin check at cleanup, so the row runs
+    on every host. Ablation: drop the cleanup pin check and `removes` records
+    the remove (on `swapped`, git deletes through the link)."""
+    if fault == "swapped" and sys.platform == "win32":
+        pytest.skip("POSIX symlinks")
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    outside = _outside_repo(tmp_path_factory)
+    removes = _record_worktree_removes(monkeypatch)
+    real_publish = verify._publish_bound_candidate
+    roots = []
+    _intercept_candidate_checkout(monkeypatch, roots.append)
+
+    def publish_then_replace(*args, **kwargs):
+        real_publish(*args, **kwargs)
+        if fault == "swapped":
+            _swap_candidate_root(roots[0], outside)
+        else:
+            monkeypatch.setattr(platform_util, "_root_still_pinned", lambda *_a: False)
+
+    monkeypatch.setattr(verify, "_publish_bound_candidate", publish_then_replace)
+
+    with pytest.raises(verify.GitError, match="cleanup failed.*worktree remove skipped"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    published = verify.rev_parse_head(repo)
+    assert published != original
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+    assert removes == []
+    assert sorted(p.name for p in outside.iterdir()) == [".git", "keep.txt"]
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def test_commit_path_bound_refuses_a_hook_staging_the_missing_tree(project):
+    """DW-401: the candidate worktree holds only the target, so a pre-commit
+    hook running `git add -A` stages every other tracked path as deleted; the
+    one-path scope validation refuses that candidate before anything publishes.
+    Ablation: drop the scope check in `_validate_bound_candidate` and the
+    deletions publish."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    others = [rel for rel in git(repo, "ls-files").splitlines() if rel != "src.txt"]
+    assert others
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\ngit add -A\n")
+    hook.chmod(0o755)
+
+    with pytest.raises(verify.GitError, match="outside its declared scope"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+    assert all((repo / rel).exists() for rel in others)
+
+
+def _plant_directory_link(link, target):
+    """A junction on win32 (the unprivileged redirect), a symlink elsewhere."""
+    if sys.platform == "win32":
+        import _winapi  # Windows-only stdlib module, as test_win32_at uses it
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+@pytest.mark.skipif(not platform_util.HANDLE_ANCHORED_WRITES, reason="no handle-anchored arm")
+def test_make_candidate_parents_refuses_a_linked_component_without_the_path_check(
+    tmp_path, monkeypatch
+):
+    """DW-420: on every handle-anchored host `_make_candidate_parents` refuses a
+    link at a missing-parent component by handle, not by the path check — on
+    win32 through `win32_at`'s create-or-open with `AT_NOFOLLOW`, on POSIX
+    through the `dir_fd` walk. `path_is_confined` is forced True to stand in for
+    the check-then-act race the path arm loses. Ablation (win32): drop the
+    `WIN32_HANDLE_PARENTS` arm and the path arm creates `inner` through the
+    junction, inside `outside`."""
+    monkeypatch.setattr(verify, "path_is_confined", lambda *_a: True)
+    root = tmp_path / "candidate"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _plant_directory_link(root / "outer", outside)
+
+    with pytest.raises(OSError) as raised:
+        verify._make_candidate_parents(
+            root,
+            root / "outer" / "inner",
+            root_identity=platform_util.pinned_root_identity(root),
+        )
+
+    assert raised.value.errno in (errno.ELOOP, errno.ENOTDIR)
+    assert platform_util.is_link_like(root / "outer")
+    assert list(outside.iterdir()) == []
+    # Positive control: plain missing parents are created, and existing ones reused.
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    (clean / "a").mkdir()
+    verify._make_candidate_parents(
+        clean,
+        clean / "a" / "b" / "c",
+        root_identity=platform_util.pinned_root_identity(clean),
+    )
+    assert (clean / "a" / "b" / "c").is_dir()
+
+
+@pytest.mark.skipif(not platform_util.HANDLE_ANCHORED_WRITES, reason="no handle-anchored arm")
+def test_make_candidate_parents_refuses_a_root_replaced_by_a_link(tmp_path):
+    """DW-338/420: the handle arms open `root` through `open_dir_confined` with
+    the pin, so a root renamed aside and replaced by a directory link (a
+    junction on win32) is refused before any parent is created through it.
+    Ablation: drop `root_identity=` from the arm's `open_dir_confined` and
+    `outer/inner` is created inside `outside`."""
+    root = tmp_path / "candidate"
+    root.mkdir()
+    identity = platform_util.pinned_root_identity(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root.rename(tmp_path / "candidate-aside")
+    _plant_directory_link(root, outside)
+
+    with pytest.raises(OSError):
+        verify._make_candidate_parents(root, root / "outer" / "inner", root_identity=identity)
+
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_snapshot_bytes_fallback_refuses_a_linked_snapshot_directory(tmp_path, monkeypatch):
+    """DW-338: without descriptor anchoring `_snapshot_bytes` pins its
+    orchestrator-minted snapshot directory, so a linked one is refused rather than
+    written through. Ablation: drop the `pinned_root_identity` refusal and this
+    fails `DID NOT RAISE`, the sidecar landing in `outside`."""
+    monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    pin = verify._run_dir_pin(run_dir, platform_util.root_identity_record(run_dir))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    snapshots = run_dir / "snapshots"
+    snapshots.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="missing or redirected"):
+        verify._snapshot_bytes(b"target bytes", snapshots / "sidecar", pin)
+
+    assert list(outside.iterdir()) == []
+    # Positive control: the same arm writes into a real snapshot directory.
+    real = run_dir / "real-snapshots"
+    real.mkdir()
+    verify._snapshot_bytes(b"target bytes", real / "sidecar", pin)
+    assert (real / "sidecar").read_bytes() == b"target bytes"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_stream_snapshot_fallback_refuses_a_linked_snapshot_directory(tmp_path, monkeypatch):
+    """DW-338: `_stream_snapshot`'s no-dir-fd arm stages with `mkstemp` into
+    `destination.parent`, so it pre-checks the pin like `_snapshot_bytes`.
+    Ablation: drop the pre-check and this fails `DID NOT RAISE`, the sidecar
+    landing in `outside`."""
+    monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"target bytes")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    snapshots = tmp_path / "snapshots"
+    snapshots.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="missing or redirected"):
+        verify._stream_snapshot(source, snapshots / "sidecar")
+
+    assert list(outside.iterdir()) == []
+    real = tmp_path / "real-snapshots"
+    real.mkdir()
+    verify._stream_snapshot(source, real / "sidecar")
+    assert (real / "sidecar").read_bytes() == b"target bytes"
+
+
+def _snapshot_arm(arm, monkeypatch):
+    """Select the integration-snapshot arm under test: ``dir-fd`` (POSIX descriptor
+    anchoring, skipped where absent) or ``path`` (the no-dir-fd check-then-write arm)."""
+    if arm == "dir-fd" and not verify.DIR_FD_ANCHORED_WRITES:
+        pytest.skip("dir-fd anchoring is POSIX-only")
+    if arm == "path":
+        monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
+
+
+def _snapshot_run(project, tmp_path):
+    """A target file to capture and a minted run dir under ``runs/``, with its record."""
+    (project.project / "captured.bin").write_bytes(b"target bytes")
+    runs_dir = tmp_path / "state" / "runs"
+    run_dir = runs_dir / "r1"
+    run_dir.mkdir(parents=True)
+    return runs_dir, run_dir, platform_util.root_identity_record(run_dir)
+
+
+def _swap_for_a_link(runs_dir, run_dir, outside, swapped):
+    """Replace ``runs/`` — or the run dir itself — with a link to a tree holding a
+    REAL ``r1/`` (``outside/r1``, which the caller has populated)."""
+    moved = runs_dir if swapped == "runs" else run_dir
+    moved.rename(moved.with_name(moved.name + "-aside"))
+    moved.symlink_to(outside if swapped == "runs" else outside / "r1", target_is_directory=True)
+
+
+def _files_under(tree):
+    return sorted(p.relative_to(tree).as_posix() for p in tree.rglob("*") if p.is_file())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("when", ["before-capture", "after-root"])
+@pytest.mark.parametrize("swapped", ["runs", "run-dir"])
+@pytest.mark.parametrize("arm", ["dir-fd", "path"])
+def test_capture_integration_state_refuses_a_run_dir_swapped_after_the_mint(
+    project, tmp_path, monkeypatch, arm, swapped, when
+):
+    """DW-500: the capture root and every sidecar are pinned to the run dir's
+    MINT-TIME record (`RunState.run_dir_identity`, DW-446). `runs/` — or the run
+    dir — swapped after the mint for a link to a tree holding a real `r1/` refuses
+    on both arms, whether the swap lands before the capture (the root's pin) or
+    after the capture root was created (the sidecar writers' pin), and no sidecar
+    lands outside.
+
+    A fresh `lstat` refuses a link only at the final component, and
+    `run_dir.resolve()` follows one anywhere: the run dir reached THROUGH the link
+    is a real directory, so the pre-DW-500 pins accepted it.
+
+    Ablations. Build the pin from `pinned_root_identity(run_dir)` (a fresh `lstat`)
+    instead of the record in `verify._run_dir_pin` and both `runs-before-capture`
+    rows fail `DID NOT RAISE`, the sidecar written under `outside/r1/` (the
+    `run-dir-before-capture` rows stay green: a run dir that is itself a link
+    fails that `lstat` too, the DW-338 leaf refusal). Pass ``pin=None`` to the
+    capture's `_stream_snapshot` (the pre-DW-500 leaf-only writer) and all four
+    `after-root` rows fail `DID NOT RAISE`: the pin is taken once, before the swap,
+    so only the writers' own pin sees a swap that lands mid-capture."""
+    _snapshot_arm(arm, monkeypatch)
+    runs_dir, run_dir, record = _snapshot_run(project, tmp_path)
+    outside = tmp_path / "outside"
+    if when == "before-capture":
+        (outside / "r1").mkdir(parents=True)
+        _swap_for_a_link(runs_dir, run_dir, outside, swapped)
+    else:
+        original = verify._integration_snapshot_root
+
+        def root_then_swap(*args):
+            root = original(*args)
+            # the outside tree holds a real copy of the freshly created capture root
+            shutil.copytree(run_dir, outside / "r1")
+            _swap_for_a_link(runs_dir, run_dir, outside, swapped)
+            return root
+
+        monkeypatch.setattr(verify, "_integration_snapshot_root", root_then_swap)
+
+    with pytest.raises(verify.IntegrationEvidenceError):
+        verify.capture_integration_state(
+            project.project, run_dir, "c" * 32, ("captured.bin",), run_dir_identity=record
+        )
+
+    assert _files_under(outside) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("arm", ["dir-fd", "path"])
+def test_capture_ignored_entries_refuses_a_runs_dir_swapped_after_the_mint(
+    project, tmp_path, monkeypatch, arm
+):
+    """DW-500 for the ignored-entry sidecar (`_snapshot_bytes`): `runs/` swapped,
+    after the capture, for a link to a tree holding a real copy of the run dir
+    refuses, and the outside copy's capture root gains nothing.
+
+    Ablation: build the pin from `pinned_root_identity(run_dir)` in
+    `verify._run_dir_pin` and both rows fail `DID NOT RAISE`, `ignored.lst`
+    written under `outside/r1/`."""
+    _snapshot_arm(arm, monkeypatch)
+    runs_dir, run_dir, record = _snapshot_run(project, tmp_path)
+    operation = "d" * 32
+    verify.capture_integration_state(
+        project.project, run_dir, operation, ("captured.bin",), run_dir_identity=record
+    )
+    outside = tmp_path / "outside"
+    shutil.copytree(run_dir, outside / "r1")
+    before = _files_under(outside)
+    _swap_for_a_link(runs_dir, run_dir, outside, "runs")
+
+    with pytest.raises(verify.IntegrationEvidenceError):
+        verify.capture_ignored_entries(project.project, run_dir, operation, run_dir_identity=record)
+
+    assert _files_under(outside) == before
+
+
+@pytest.mark.parametrize("arm", ["dir-fd", "path"])
+def test_capture_integration_state_writes_under_an_intact_minted_run_dir(
+    project, tmp_path, monkeypatch, arm
+):
+    """DW-500's positive control: an intact run dir whose record matches captures
+    as before on both arms — the regular file's sidecar and the ignored-entry
+    sidecar land under `integration-snapshots/<operation>/` with their bytes."""
+    _snapshot_arm(arm, monkeypatch)
+    _runs_dir, run_dir, record = _snapshot_run(project, tmp_path)
+    operation = "e" * 32
+
+    [entry], _submodules = verify.capture_integration_state(
+        project.project, run_dir, operation, ("captured.bin",), run_dir_identity=record
+    )
+    ignored = verify.capture_ignored_entries(
+        project.project, run_dir, operation, run_dir_identity=record
+    )
+
+    assert (run_dir / str(entry["sidecar"])).read_bytes() == b"target bytes"
+    assert str(entry["sidecar"]).startswith(f"integration-snapshots/{operation}/")
+    assert (run_dir / str(ignored["sidecar"])).is_file()
+
+
+@pytest.mark.parametrize("arm", ["dir-fd", "path"])
+def test_capture_integration_state_refuses_a_legacy_run_until_its_record_is_backfilled(
+    project, tmp_path, monkeypatch, arm
+):
+    """DW-446's rule for a legacy run, applied to the snapshots (DW-500): a run dir
+    with no mint-time record (a pre-DW-446 state not yet resumed) REFUSES — it never
+    degrades to a fresh `lstat` — and creates nothing; the locked resume/re-arm
+    backfill (`runs.reconcile_root_identities`) records it, and the capture then
+    proceeds.
+
+    Ablation: map a None record to `pinned_root_identity(run_dir)` in
+    `verify._run_dir_pin` and both rows fail `DID NOT RAISE`."""
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+    from bmad_loop.model import RunState
+
+    _snapshot_arm(arm, monkeypatch)
+    _runs_dir, run_dir, _record = _snapshot_run(project, tmp_path)
+    state = RunState(run_id="r1", project=str(project.project), started_at="now")
+    assert state.run_dir_identity is None  # the legacy premise
+
+    with pytest.raises(verify.IntegrationEvidenceError):
+        verify.capture_integration_state(
+            project.project,
+            run_dir,
+            "f" * 32,
+            ("captured.bin",),
+            run_dir_identity=state.run_dir_identity,
+        )
+    assert not (run_dir / "integration-snapshots").exists()
+
+    assert runs.reconcile_root_identities(state, run_dir, Journal(run_dir), project.project)
+    [entry], _submodules = verify.capture_integration_state(
+        project.project,
+        run_dir,
+        "f" * 32,
+        ("captured.bin",),
+        run_dir_identity=state.run_dir_identity,
+    )
+    assert (run_dir / str(entry["sidecar"])).read_bytes() == b"target bytes"
 
 
 def test_prepared_ref_timeout_before_commit_is_not_indeterminate(project):
@@ -9643,6 +13160,786 @@ def test_bound_index_reconciliation_can_align_a_moved_symlink_entry(project, mon
     entry = verify._bound_index_entry(repo, rel)
     assert entry is not None and entry.mode == "120000"
     assert entry == verify._bound_tree_entry(repo, symlink_commit, rel)
+
+
+# --- DW-327: the bound index compare-then-reset holds index.lock across the pair
+
+
+def _real_index(repo):
+    return repo / git(repo, "rev-parse", "--git-path", "index")
+
+
+def _stage_drift(repo, tmp_path, rel):
+    """Stage worktree drift on `rel` (so the sync has a reset to do), stage an
+    unrelated operator path, and write a rival blob; returns the rival oid."""
+    (repo / rel).write_text("staged drift\n", encoding="utf-8")
+    git(repo, "add", "--", rel)
+    unrelated = repo / "operator.txt"
+    unrelated.write_text("staged operator work\n", encoding="utf-8")
+    git(repo, "add", "--", unrelated.name)
+    rival_file = tmp_path / "rival.txt"
+    rival_file.write_text("rival staged content\n", encoding="utf-8")
+    return git(repo, "hash-object", "-w", str(rival_file))
+
+
+def test_bound_index_sync_refuses_a_rival_stage_between_compare_and_reset(
+    project, tmp_path, monkeypatch
+):
+    """DW-327 headline. A cooperating writer stages the target just before the
+    reset runs. Under the held `index.lock` its write is refused and never
+    lands. Ablation: restore the bare compare-then-reset (or drop the lock) and
+    the rival's `update-index` succeeds, then the reset silently overwrites it."""
+    repo = project.project
+    rel = "src.txt"
+    rival = _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    real_git_env = verify._git_env
+    rivals = []
+
+    def rival_before_reset(git_repo, *args, env):
+        if "reset" in args:
+            rivals.append(
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repo),
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        f"100644,{rival},{rel}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+            )
+        return real_git_env(git_repo, *args, env=env)
+
+    monkeypatch.setattr(verify, "_git_env", rival_before_reset)
+    verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert len(rivals) == 1
+    assert rivals[0].returncode != 0
+    assert "index.lock" in rivals[0].stdout + rivals[0].stderr
+    entry = verify._bound_index_entry(repo, rel)
+    assert entry == verify._bound_tree_entry(repo, expected.oid, rel)
+    assert entry is not None and entry.oid != rival
+    assert git(repo, "diff", "--cached", "--name-only") == "operator.txt"
+    assert not _real_index(repo).with_name("index.lock").exists()
+
+
+def test_bound_index_sync_refuses_a_rival_staged_before_the_lock(project, tmp_path):
+    """DW-327. The rival staged before the lock was taken: the locked compare
+    sees it, refuses, and the rival entry stays staged."""
+    repo = project.project
+    rel = "src.txt"
+    rival = _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    git(repo, "update-index", "--add", "--cacheinfo", f"100644,{rival},{rel}")
+
+    with pytest.raises(verify.GitError, match="real index target changed"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    entry = verify._bound_index_entry(repo, rel)
+    assert entry is not None and entry.oid == rival
+    assert not _real_index(repo).with_name("index.lock").exists()
+
+
+def test_bound_index_sync_refuses_a_foreign_index_lock_and_leaves_it(project, tmp_path):
+    """DW-327. A pre-existing `index.lock` belongs to another writer: refuse,
+    keep its bytes, and leave the index untouched. Ablation: drop `O_EXCL` and
+    the call writes into the foreign lock and renames it over the index."""
+    repo = project.project
+    rel = "src.txt"
+    _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    index = _real_index(repo)
+    lock = index.with_name("index.lock")
+    lock.write_bytes(b"foreign writer in progress")
+    before = index.read_bytes()
+
+    with pytest.raises(verify.GitError, match="locked by another git process"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert lock.read_bytes() == b"foreign writer in progress"
+    assert index.read_bytes() == before
+
+
+def test_bound_index_sync_failed_reset_leaves_index_and_removes_lock(
+    project, tmp_path, monkeypatch
+):
+    """DW-327. A reset failing under the lock refuses with the existing message,
+    removes only its own lock, and never touches the real index."""
+    repo = project.project
+    rel = "src.txt"
+    _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    index = _real_index(repo)
+    before = index.read_bytes()
+    real_git_env = verify._git_env
+    locked_during_reset = []
+
+    def failing_reset(git_repo, *args, env):
+        if "reset" in args:
+            locked_during_reset.append(index.with_name("index.lock").exists())
+            return 1, "injected reset failure"
+        return real_git_env(git_repo, *args, env=env)
+
+    monkeypatch.setattr(verify, "_git_env", failing_reset)
+    with pytest.raises(verify.GitError, match="target-local index synchronization failed"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert locked_during_reset == [True]
+    assert index.read_bytes() == before
+    assert not index.with_name("index.lock").exists()
+
+
+def test_bound_index_sync_mismatched_side_index_leaves_index_and_removes_lock(
+    project, tmp_path, monkeypatch
+):
+    """DW-327. The side index's verify failing under the lock refuses with the
+    existing message and publishes nothing."""
+    repo = project.project
+    rel = "src.txt"
+    _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    index = _real_index(repo)
+    before = index.read_bytes()
+    real_tree_entry = verify._bound_tree_entry
+
+    def wrong_target(*args, **kwargs):
+        entry = real_tree_entry(*args, **kwargs)
+        assert entry is not None
+        return dataclasses.replace(entry, oid="0" * len(entry.oid))
+
+    monkeypatch.setattr(verify, "_bound_tree_entry", wrong_target)
+    with pytest.raises(verify.GitError, match="synchronization did not match committed content"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert index.read_bytes() == before
+    assert not index.with_name("index.lock").exists()
+
+
+def test_bound_index_sync_publishes_when_no_index_exists(project):
+    """DW-327. With no index file the side index starts absent, the reset
+    creates it, and the result is published as the real index."""
+    repo = project.project
+    rel = "src.txt"
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    index = _real_index(repo)
+    index.unlink()
+
+    verify._synchronize_bound_index(repo, expected, rel, None)
+
+    assert index.exists()
+    assert verify._bound_index_entry(repo, rel) == verify._bound_tree_entry(repo, expected.oid, rel)
+    assert not index.with_name("index.lock").exists()
+
+
+def test_bound_index_sync_keeps_a_racily_clean_edit_visible(project):
+    """DW-327. An unrelated same-size edit whose mtime equals the index's is only
+    caught by Git's racy-clean check against the index file's mtime. Ablation:
+    drop the `os.utime` onto the side index and the fresh mtime stops `reset`
+    smudging the entry, so the published index hides the edit."""
+    repo = project.project
+    rel = "src.txt"
+    git(repo, "config", "core.trustctime", "false")
+    other = repo / "other.txt"
+    other.write_text("aaaa\n", encoding="utf-8")
+    git(repo, "add", "--", other.name)
+    git(repo, "commit", "-q", "-m", "add other")
+    (repo / rel).write_text("staged drift\n", encoding="utf-8")
+    git(repo, "add", "--", rel)
+    index = _real_index(repo)
+    index_stat = index.stat()
+    other.write_text("bbbb\n", encoding="utf-8")
+    os.utime(other, ns=(index_stat.st_mtime_ns, index_stat.st_mtime_ns))
+    time.sleep(1.2)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+
+    verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert verify._bound_index_entry(repo, rel) == verify._bound_tree_entry(repo, expected.oid, rel)
+    assert other.name in git(repo, "diff", "--name-only").splitlines()
+    assert not index.with_name("index.lock").exists()
+
+
+def test_bound_index_sync_publishes_the_side_index_write_time(project, tmp_path, monkeypatch):
+    """DW-327. The published index carries the mtime `reset` gave the side index,
+    not the later copy-back time, so Git's racy-clean check still compares entry
+    mtimes against Git's own write time. Ablation: drop the `os.utime` onto the
+    lock and the published mtime is the copy time instead."""
+    repo = project.project
+    rel = "src.txt"
+    _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    real_git_env = verify._git_env
+    written = []
+
+    def record_side_index_mtime(git_repo, *args, env):
+        result = real_git_env(git_repo, *args, env=env)
+        if "reset" in args:
+            written.append(os.stat(env["GIT_INDEX_FILE"]).st_mtime_ns)
+        return result
+
+    monkeypatch.setattr(verify, "_git_env", record_side_index_mtime)
+    verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert len(written) == 1
+    assert _real_index(repo).stat().st_mtime_ns == written[0]
+
+
+def _keep_moving_checkout(repo, monkeypatch, rel):
+    """Commit `rel` four times and make every checkout observation move, so the
+    sync exhausts its retry loop and reaches the final repair (the 4th reset)."""
+    path = repo / rel
+    commits = []
+    for number in range(4):
+        path.write_text(f"moving target {number}\n", encoding="utf-8")
+        git(repo, "add", "--", rel)
+        git(repo, "commit", "-q", "-m", f"moving target {number}")
+        commits.append(verify.rev_parse_head(repo))
+    branch = git(repo, "symbolic-ref", "HEAD")
+    observations = [verify._BoundCheckoutIdentity(branch, branch, commit) for commit in commits]
+
+    def keep_moving(_repo, *, require_branch=True):
+        assert require_branch is False
+        return observations.pop(0)
+
+    monkeypatch.setattr(verify, "_bound_checkout_identity", keep_moving)
+    return commits, verify._BoundCheckoutIdentity(branch, branch, commits[0])
+
+
+def test_bound_index_sync_final_repair_refuses_a_rival_stage_under_the_lock(
+    project, tmp_path, monkeypatch
+):
+    """DW-327, final-repair site. A cooperating writer stages the target just
+    before the post-loop repair's reset: the held lock refuses it. Ablation:
+    restore a bare `reset` at the final repair and the rival lands."""
+    repo = project.project
+    rel = "src.txt"
+    rival_file = tmp_path / "rival.txt"
+    rival_file.write_text("rival staged content\n", encoding="utf-8")
+    rival = git(repo, "hash-object", "-w", str(rival_file))
+    commits, expected = _keep_moving_checkout(repo, monkeypatch, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    real_git_env = verify._git_env
+    resets = []
+    rivals = []
+
+    def rival_before_final_reset(git_repo, *args, env):
+        if "reset" in args:
+            resets.append(args)
+            if len(resets) == 4:
+                rivals.append(
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-index",
+                            "--add",
+                            "--cacheinfo",
+                            f"100644,{rival},{rel}",
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                )
+        return real_git_env(git_repo, *args, env=env)
+
+    monkeypatch.setattr(verify, "_git_env", rival_before_final_reset)
+    with pytest.raises(verify.GitError, match="checkout did not stabilize"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert len(resets) == 4
+    assert len(rivals) == 1
+    assert rivals[0].returncode != 0
+    assert "index.lock" in rivals[0].stdout + rivals[0].stderr
+    entry = verify._bound_index_entry(repo, rel)
+    assert entry == verify._bound_tree_entry(repo, commits[-1], rel)
+    assert entry is not None and entry.oid != rival
+    assert not _real_index(repo).with_name("index.lock").exists()
+
+
+def test_bound_index_sync_final_repair_refuses_a_rival_staged_before_its_lock(
+    project, tmp_path, monkeypatch
+):
+    """DW-327, final-repair site. A rival staged before the post-loop repair
+    takes its lock is caught by the locked compare, and stays staged. Ablation:
+    drop the final repair's compare and its reset overwrites the rival."""
+    repo = project.project
+    rel = "src.txt"
+    rival_file = tmp_path / "rival.txt"
+    rival_file.write_text("rival staged content\n", encoding="utf-8")
+    rival = git(repo, "hash-object", "-w", str(rival_file))
+    _commits, expected = _keep_moving_checkout(repo, monkeypatch, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    real_tree_entry = verify._bound_tree_entry
+    lookups = []
+
+    def rival_before_final_lookup(*args, **kwargs):
+        lookups.append(args)
+        if len(lookups) == 4:
+            git(repo, "update-index", "--add", "--cacheinfo", f"100644,{rival},{rel}")
+        return real_tree_entry(*args, **kwargs)
+
+    monkeypatch.setattr(verify, "_bound_tree_entry", rival_before_final_lookup)
+    with pytest.raises(verify.GitError, match="real index target changed"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert len(lookups) == 4
+    entry = verify._bound_index_entry(repo, rel)
+    assert entry is not None and entry.oid == rival
+    assert not _real_index(repo).with_name("index.lock").exists()
+
+
+def test_bound_index_sync_failed_publish_rename_leaves_index_and_removes_lock(
+    project, tmp_path, monkeypatch
+):
+    """DW-327. A failure after the lock is written (the rename) refuses and
+    removes the lock without touching the real index."""
+    repo = project.project
+    rel = "src.txt"
+    _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    index = _real_index(repo)
+    before = index.read_bytes()
+
+    def failing_replace(_tmp, _target):
+        raise OSError(errno.EIO, "injected rename failure")
+
+    monkeypatch.setattr(verify, "atomic_replace", failing_replace)
+    with pytest.raises(verify.GitError, match="real index could not be published"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert index.read_bytes() == before
+    assert not index.with_name("index.lock").exists()
+
+
+def test_bound_index_sync_locks_and_publishes_a_linked_worktree_index(project, tmp_path):
+    """DW-327. In a linked worktree the lock and publish land on that worktree's
+    own index; the main checkout's index is untouched."""
+    repo = project.project
+    rel = "src.txt"
+    worktree = tmp_path / "linked"
+    git(repo, "worktree", "add", "-q", "-b", "dw327-linked", str(worktree))
+    try:
+        main_index = _real_index(repo)
+        main_before = main_index.read_bytes()
+        _stage_drift(worktree, tmp_path, rel)
+        observed_index = verify._bound_index_entry(worktree, rel)
+        expected = verify._bound_checkout_identity(worktree, require_branch=False)
+        worktree_index = _real_index(worktree)
+        assert worktree_index.parent == repo / ".git" / "worktrees" / worktree.name
+
+        verify._synchronize_bound_index(worktree, expected, rel, observed_index)
+
+        assert verify._bound_index_entry(worktree, rel) == verify._bound_tree_entry(
+            worktree, expected.oid, rel
+        )
+        assert main_index.read_bytes() == main_before
+        assert not worktree_index.with_name("index.lock").exists()
+    finally:
+        git(repo, "worktree", "remove", "--force", str(worktree))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows chmod only toggles the read-only flag")
+def test_bound_index_sync_preserves_the_index_permission_bits(project, tmp_path):
+    """DW-327. The published index keeps the real index's permission bits
+    rather than taking the lock file's umask-derived mode."""
+    repo = project.project
+    rel = "src.txt"
+    _stage_drift(repo, tmp_path, rel)
+    observed_index = verify._bound_index_entry(repo, rel)
+    expected = verify._bound_checkout_identity(repo, require_branch=False)
+    index = _real_index(repo)
+    index.chmod(0o600)
+
+    verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert stat.S_IMODE(index.stat().st_mode) == 0o600
+    assert verify._bound_index_entry(repo, rel) == verify._bound_tree_entry(repo, expected.oid, rel)
+    assert not index.with_name("index.lock").exists()
+
+
+# --- DW-328/329/330: every success return is closed by a final observation
+
+_POSIX_EXEC_BIT = pytest.mark.skipif(
+    os.name == "nt", reason="exec bit is ignored where core.fileMode is false (every Windows init)"
+)
+
+
+def _no_candidate_worktree(monkeypatch):
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("candidate publication was reached")
+
+    monkeypatch.setattr(verify, "path_has_non_tree_ancestor_at_revision", refuse)
+
+
+def _bound_clean_inputs(project):
+    """HEAD already holds the accepted text through a commit that is not an
+    exact one-path transition, so the call takes the clean `None` return."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    extra = repo / "clean-extra.txt"
+    extra.write_text("wider commit\n", encoding="utf-8")
+    git(repo, "add", "--", path.name, extra.name)
+    git(repo, "commit", "-q", "-m", "multi-path accepted ledger")
+    return repo, path, baseline, accepted
+
+
+def _bound_ignored_inputs(project):
+    repo = project.project
+    path = repo / "ignored-ledger.md"
+    exclude = repo / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a", encoding="utf-8") as handle:
+        handle.write(f"\n/{path.name}\n")
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    assert verify.path_ignored(repo, path)
+    return repo, path, "legacy\n", accepted, verify.rev_parse_head(repo)
+
+
+@_POSIX_EXEC_BIT
+@pytest.mark.parametrize("committed_exec", [False, True], ids=["live-plus-x", "live-minus-x"])
+def test_commit_path_bound_refuses_live_mode_mismatch_before_candidate(
+    project, monkeypatch, committed_exec
+):
+    repo = project.project
+    path = repo / "src.txt"
+    assert verify._honors_file_mode(repo)
+    if committed_exec:
+        git(repo, "update-index", "--chmod=+x", "--", path.name)
+        git(repo, "commit", "-q", "-m", "track executable ledger")
+        path.chmod(path.stat().st_mode & ~0o111)
+    else:
+        path.chmod(path.stat().st_mode | 0o111)
+    baseline = path.read_text(encoding="utf-8")
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    original = verify.rev_parse_head(repo)
+    index_before = git(repo, "ls-files", "-s", "--", path.name)
+    live_mode = path.stat().st_mode
+    _no_candidate_worktree(monkeypatch)
+
+    with pytest.raises(verify.GitError, match="target mode does not match its committed mode"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+    assert git(repo, "ls-files", "-s", "--", path.name) == index_before
+    assert path.stat().st_mode == live_mode
+    assert path.read_text(encoding="utf-8") == accepted
+
+
+@_POSIX_EXEC_BIT
+def test_commit_path_bound_refuses_replay_over_a_live_mode_flip(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+    path.chmod(path.stat().st_mode | 0o111)
+    synced = []
+    monkeypatch.setattr(verify, "_synchronize_bound_index", lambda *a, **k: synced.append(a))
+
+    with pytest.raises(verify.GitError, match="target mode does not match its committed mode"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert synced == []
+    assert verify.rev_parse_head(repo) == published
+
+
+@_POSIX_EXEC_BIT
+def test_commit_path_bound_ignores_live_mode_where_file_mode_is_off(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    git(repo, "config", "core.fileMode", "false")
+    path.chmod(path.stat().st_mode | 0o111)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "ls-tree", published, "--", path.name).startswith("100644 blob ")
+
+
+@_POSIX_EXEC_BIT
+def test_commit_path_bound_refuses_an_executable_never_tracked_ledger(project, monkeypatch):
+    # HEAD does not track the target, so its committed mode is 100644.
+    repo = project.project
+    path = repo / "new-ledger.md"
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    path.chmod(path.stat().st_mode | 0o111)
+    baseline_commit = verify.rev_parse_head(repo)
+    _no_candidate_worktree(monkeypatch)
+
+    with pytest.raises(verify.GitError, match="target mode does not match its committed mode"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text="legacy\n",
+            baseline_commit=baseline_commit,
+        )
+
+    assert verify.rev_parse_head(repo) == baseline_commit
+    assert git(repo, "ls-files", "--", path.name) == ""
+
+
+class _PinnedTimesStat:
+    def __init__(self, real, mtime_ns, ctime_ns):
+        self._real = real
+        self.st_mtime_ns = mtime_ns
+        self.st_ctime_ns = ctime_ns
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@_POSIX_EXEC_BIT
+def test_commit_path_bound_refuses_a_chmod_that_moves_no_stat_time(project, monkeypatch):
+    # A coarse-ctime filesystem can leave ctime (and chmod never moves mtime)
+    # where they were, so only the observed mode itself refuses the flip.
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    target = path.resolve()
+    real_lstat = Path.lstat
+    pinned = {}
+
+    def lstat_with_pinned_times(self, *args, **kwargs):
+        st = real_lstat(self, *args, **kwargs)
+        if self != target:
+            return st
+        pinned.setdefault("times", (st.st_mtime_ns, st.st_ctime_ns))
+        return _PinnedTimesStat(st, *pinned["times"])
+
+    real_validate = verify._validate_bound_candidate
+    flipped = []
+
+    def chmod_after_candidate_validation(*args, **kwargs):
+        real_validate(*args, **kwargs)
+        if not flipped:
+            flipped.append(True)
+            path.chmod(path.stat().st_mode | 0o111)
+
+    monkeypatch.setattr(Path, "lstat", lstat_with_pinned_times)
+    monkeypatch.setattr(verify, "_validate_bound_candidate", chmod_after_candidate_validation)
+
+    with pytest.raises(verify.GitError, match="changed during validation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert flipped
+    assert verify.rev_parse_head(repo) == original
+
+
+def test_commit_path_bound_returns_none_for_a_clean_accepted_target(project):
+    repo, path, baseline, accepted = _bound_clean_inputs(project)
+    head = verify.rev_parse_head(repo)
+
+    assert (
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+        is None
+    )
+    assert verify.rev_parse_head(repo) == head
+
+
+@pytest.mark.parametrize("move", ["advance", "same-oid-switch"])
+def test_commit_path_bound_refuses_checkout_move_after_the_clean_probe(project, monkeypatch, move):
+    repo, path, baseline, accepted = _bound_clean_inputs(project)
+    original = verify.rev_parse_head(repo)
+    real_clean = verify.path_clean
+
+    def move_after_probe(git_repo, rel, **kwargs):
+        result = real_clean(git_repo, rel, **kwargs)
+        if move == "advance":
+            git(repo, "commit", "-q", "--allow-empty", "-m", "rival advance")
+        else:
+            git(repo, "branch", "same-object-rival", original)
+            git(repo, "symbolic-ref", "HEAD", "refs/heads/same-object-rival")
+        return result
+
+    monkeypatch.setattr(verify, "path_clean", move_after_probe)
+
+    with pytest.raises(
+        verify.GitError, match="checkout changed during exact-path clean validation"
+    ):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+
+@pytest.mark.parametrize("shape", ["tracked", "ignored-untracked"])
+def test_commit_path_bound_refuses_target_stage_after_the_clean_probe(project, monkeypatch, shape):
+    if shape == "tracked":
+        repo, path, baseline, accepted = _bound_clean_inputs(project)
+        baseline_commit = None
+    else:
+        repo, path, baseline, accepted, baseline_commit = _bound_ignored_inputs(project)
+    shadow = repo / "foreign-index.txt"
+    shadow.write_text("foreign staged ledger\n", encoding="utf-8")
+    foreign_oid = git(repo, "hash-object", "-w", "--", str(shadow))
+    shadow.unlink()
+    # The cleanliness probe is `path_clean`, then (for an untracked target)
+    # `path_ignored`; the stage lands after whichever runs last.
+    probe = "path_clean" if shape == "tracked" else "path_ignored"
+    real_probe = getattr(verify, probe)
+
+    def stage_after_probe(*args, **kwargs):
+        result = real_probe(*args, **kwargs)
+        git(repo, "update-index", "--add", "--cacheinfo", "100644", foreign_oid, path.name)
+        return result
+
+    monkeypatch.setattr(verify, probe, stage_after_probe)
+
+    with pytest.raises(verify.GitError, match="real index target changed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=baseline_commit,
+        )
+
+    assert verify.staged_blob_oid(repo, path.name) == foreign_oid
+
+
+@_POSIX_EXEC_BIT
+def test_commit_path_bound_refuses_live_mode_mismatch_behind_a_false_clean(project):
+    # `--assume-unchanged` makes porcelain read clean over a live exec-bit flip,
+    # so only the clean return's own mode check refuses it.
+    repo, path, baseline, accepted = _bound_clean_inputs(project)
+    path.chmod(path.stat().st_mode | 0o111)
+    git(repo, "update-index", "--assume-unchanged", "--", path.name)
+    assert verify.path_clean(repo, path.name)
+
+    with pytest.raises(verify.GitError, match="target mode does not match its committed mode"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+
+@_POSIX_EXEC_BIT
+def test_commit_path_bound_never_mode_checks_an_ignored_untracked_target(project):
+    repo, path, baseline, accepted, baseline_commit = _bound_ignored_inputs(project)
+    path.chmod(path.stat().st_mode | 0o111)
+    head = verify.rev_parse_head(repo)
+
+    assert (
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=baseline_commit,
+        )
+        is None
+    )
+    assert verify.rev_parse_head(repo) == head
+
+
+@pytest.mark.parametrize("route", ["fresh", "replay"])
+def test_commit_path_bound_refuses_a_rival_live_write_during_index_sync(
+    project, monkeypatch, route
+):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    published = None
+    if route == "replay":
+        published = verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+    rival = b"rival ledger written during index synchronization\n"
+    real_sync = verify._synchronize_bound_index
+
+    def rewrite_during_sync(*args, **kwargs):
+        real_sync(*args, **kwargs)
+        path.write_bytes(rival)
+
+    monkeypatch.setattr(verify, "_synchronize_bound_index", rewrite_during_sync)
+
+    with pytest.raises(verify.GitError, match="changed during validation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    head = verify.rev_parse_head(repo)
+    if published is not None:
+        assert head == published
+    else:
+        assert head != original
+        assert git(repo, "show", f"{head}:src.txt") == accepted.rstrip("\n")
+    assert path.read_bytes() == rival
+    # The refusal is nonterminal: replay then refuses the rival text.
+    monkeypatch.setattr(verify, "_synchronize_bound_index", real_sync)
+    with pytest.raises(verify.GitError, match="changed during validation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+    assert verify.rev_parse_head(repo) == head
 
 
 def test_stories_relpaths_follows_the_root_it_is_given(project, tmp_path):
@@ -10522,6 +14819,69 @@ def test_commits_above_lists_attempt_commits_newest_first(project):
     assert commits == [head]
 
 
+def _commit_files(repo: Path, message: str, files: dict[str, str]) -> str:
+    for rel, text in files.items():
+        (repo / rel).write_text(text)
+    git(repo, "add", "--", *files)
+    git(repo, "commit", "-q", "-m", message)
+    return verify.rev_parse_head(repo)
+
+
+def test_bookkeeping_only_commits_filters_mixed_commits(project):
+    """#772: only a commit whose own change set is exactly the ledger is
+    bookkeeping-only. A commit that ALSO carries other work, one that touches
+    only other work, a merge (whose plain `diff-tree` names nothing) and an empty
+    commit all stay out — a misrecorded sha never filters real work out of a
+    preserve range. A sha git cannot read raises rather than reading as "not
+    bookkeeping".
+
+    Ablation: replace `names == {rel}` with `rel in names` and the mixed commit
+    joins the result; with `names <= {rel}` the merge and the empty commit do."""
+    repo = project.project
+    ledger = "deferred-work.md"
+    trunk = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    only_ledger = _commit_files(repo, "ledger", {ledger: "DW-1\n"})
+    mixed = _commit_files(repo, "ledger + work", {ledger: "DW-2\n", "src.txt": "work\n"})
+    other = _commit_files(repo, "work", {"other.txt": "other\n"})
+    git(repo, "commit", "-q", "--allow-empty", "-m", "empty")
+    empty = verify.rev_parse_head(repo)
+    git(repo, "checkout", "-q", "-b", "side", only_ledger)
+    _commit_files(repo, "side work", {"side.txt": "side\n"})
+    git(repo, "checkout", "-q", trunk)
+    git(repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+    merge = verify.rev_parse_head(repo)
+
+    found = verify.bookkeeping_only_commits(repo, [only_ledger, mixed, other, empty, merge], ledger)
+
+    assert found == {only_ledger}
+    assert verify.bookkeeping_only_commits(repo, [], ledger) == set()
+    with pytest.raises(verify.GitError, match="diff-tree"):
+        verify.bookkeeping_only_commits(repo, [only_ledger, "0" * 40], ledger)
+
+
+def test_path_absent_at_revision_reads_presence_and_raises_on_git_failure(project):
+    """#772: the ledger's `added` bit — absence is a successful empty `ls-tree`
+    answer; a tracked file or a directory both read as present, and an unreadable
+    revision raises instead of reading as "absent".
+
+    Ablation: make `_entry_at_revision` return None on a nonzero `ls-tree` and the
+    raise below fails."""
+    repo = project.project
+    nested = repo / "dir" / "f.txt"
+    nested.parent.mkdir()
+    nested.write_text("x\n")
+    git(repo, "add", "dir")
+    git(repo, "commit", "-q", "-m", "nested")
+    head = verify.rev_parse_head(repo)
+
+    assert verify.path_absent_at_revision(repo, head, "src.txt") is False
+    assert verify.path_absent_at_revision(repo, head, "dir") is False
+    assert verify.path_absent_at_revision(repo, head, "dir/f.txt") is False
+    assert verify.path_absent_at_revision(repo, head, "missing.md") is True
+    with pytest.raises(verify.GitError, match="ls-tree"):
+        verify.path_absent_at_revision(repo, "not-a-revision", "src.txt")
+
+
 def test_pinned_revision_preservation_does_not_follow_checkout_head(project):
     """A named story tip, not whichever branch the caller has checked out, is parked."""
     repo = project.project
@@ -10948,6 +15308,35 @@ def test_ref_exists_sees_full_refnames_outside_heads(project):
     assert verify.ref_exists(repo / "no-such-repo", ref) is False  # git failure -> absent
 
 
+def test_branch_exists_checked_raises_on_an_unreadable_repo(project):
+    """`branch_exists_checked` answers True/False for a readable repo — matching the
+    exact branch, not a ref nested beneath it — and RAISES where `branch_exists`
+    folds a git failure into False.
+
+    Ablation: return `rc == 0 and ...` instead of raising and the last row fails."""
+    repo = project.project
+    assert verify.branch_exists_checked(repo, "main") is True
+    assert verify.branch_exists_checked(repo, "no-such-branch") is False
+    git(repo, "branch", "nest/inner")
+    assert verify.branch_exists_checked(repo, "nest") is False  # pattern prefix, not a match
+    assert verify.branch_exists(repo / "no-such-repo", "main") is False
+    with pytest.raises(verify.GitError):
+        verify.branch_exists_checked(repo / "no-such-repo", "main")
+
+
+def test_create_ref_refuses_to_overwrite(project):
+    """`create_ref` writes a new full ref and refuses one that already exists."""
+    repo = project.project
+    ref = "refs/attempt-preserve-dirty/run-abc12345-abandon"
+    head = git(repo, "rev-parse", "HEAD").strip()
+    verify.create_ref(repo, ref, head)
+    assert git(repo, "rev-parse", ref).strip() == head
+    git(repo, "commit", "-q", "--allow-empty", "-m", "next")
+    with pytest.raises(verify.GitError):
+        verify.create_ref(repo, ref, "HEAD")
+    assert git(repo, "rev-parse", ref).strip() == head
+
+
 def test_snapshot_worktree_noop_clean_tree(project):
     """A clean tree (identical to HEAD) has nothing uncommitted to park: returns
     None and creates no ref, so a plain reset proceeds unchanged."""
@@ -11022,6 +15411,27 @@ def test_snapshot_worktree_succeeds_without_git_identity(project, monkeypatch, t
     assert ref == "refs/attempt-preserve-dirty/run-noident"
     assert git(repo, "show", "-s", "--format=%an", ref) == "bmad-loop"  # synthetic author used
     assert git(repo, "show", f"{ref}:src.txt") == "edit with no identity"  # work captured
+
+
+@pytest.mark.parametrize("kind", ["worktree", "commit"])
+def test_snapshot_commits_ignore_an_inherited_commit_date(project, monkeypatch, kind):
+    """A launching shell's ``GIT_COMMITTER_DATE``/``GIT_AUTHOR_DATE`` does not reach a
+    preservation commit: retention ranks preserve refs by ``committerdate``, so a
+    snapshot back-dated to 2001 would be the first one pruned.
+
+    Ablation: build the env from ``os.environ`` unfiltered (the pre-fix
+    ``_snapshot_ident_env``) and both rows read 2001."""
+    repo = project.project
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2001-01-01T00:00:00Z")
+    monkeypatch.setenv("GIT_AUTHOR_DATE", "2001-01-01T00:00:00Z")
+    ref = f"refs/attempt-preserve-dirty/run-dated-{kind}"
+    if kind == "worktree":
+        (repo / "src.txt").write_text("dirty\n")
+        assert verify.snapshot_worktree(repo, ref, baseline_untracked=[]) == ref
+    else:
+        verify.snapshot_commit(repo, ref, git(repo, "rev-parse", "HEAD"), "detached snapshot")
+    dates = git(repo, "show", "-s", "--format=%cI %aI", ref).split()
+    assert all(not d.startswith("2001") for d in dates), dates
 
 
 def test_snapshot_worktree_scopes_to_run_created_untracked(project):
@@ -11455,3 +15865,1338 @@ def test_unfolded_changes_reads_a_squash_the_target_had_moved_under_three_way(pr
         "blob.bin",
         "shared.txt",
     )
+
+
+# --------------------------------------------- worktree-mount pin (DW-423)
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+def test_set_frontmatter_field_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """`root_identity=` pins the worktree mount `set_frontmatter_field` confines to:
+    the mount renamed aside and a link planted at its name to an outside tree with
+    the same spec subpath refuses the re-stamp; the outside bytes are unchanged. The
+    unpinned control shows the swap really lands outside.
+
+    Ablation: drop the `root_identity=` forward in `set_frontmatter_field` and the
+    pinned call lands outside instead of raising."""
+    text = "---\nstatus: blocked\nbaseline_revision: old\n---\nbody\n"
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(text, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    outside_spec = outside / "specs" / "6-4.md"
+    outside_spec.write_text(text, encoding="utf-8")
+    mount.rename(mount.with_name("1-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        verify.set_frontmatter_field(
+            spec, "baseline_revision", "new", confine_root=mount, root_identity=identity
+        )
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    # Control: unpinned, the swap carries the write outside the repository.
+    assert verify.set_frontmatter_field(spec, "baseline_revision", "new", confine_root=mount)
+    assert "baseline_revision: new" in outside_spec.read_text(encoding="utf-8")
+
+
+def test_worktree_clean_excludes_a_nested_projects_policy_at_its_offset(project):
+    """DW-379: probing the CODE root of a nested layout must still ignore the project's
+    own policy.toml, which sits at `app/.bmad-loop/policy.toml` there — a TUI settings
+    edit is not a dirty tree — while any other change still reads dirty. Tracked here
+    (force-added past the nested `.gitignore`) so the edit is a real modification.
+
+    Ablation: spell the exclusion as the bare `POLICY_FILE_REL` whatever `project` says
+    and the first assertion reddens."""
+    paths = nested_repo_root_paths(project)
+    repo, app = paths.repo_root, paths.project
+    policy_file = app / ".bmad-loop" / "policy.toml"
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text("[scm]\n", encoding="utf-8")
+    git(repo, "add", "-f", "app/.bmad-loop/policy.toml")
+    git(repo, "commit", "-q", "-m", "track the nested policy")
+    policy_file.write_text("[scm]\n# edited in the settings screen\n", encoding="utf-8")
+
+    assert verify.worktree_clean(repo, project=app)
+    assert not verify.worktree_clean(repo), "without the project the edit reads dirty"
+
+    (app / "src.txt").write_text("real work\n", encoding="utf-8")
+    assert not verify.worktree_clean(repo, project=app)
+
+
+# --- [verify] reuse_unchanged: worktree fingerprint + reuse seam (#1002) ------------
+
+
+def _fp(repo: Path) -> verify.TreeFingerprint:
+    return verify.worktree_fingerprint(repo)
+
+
+def test_worktree_fingerprint_stable_on_clean_tree(project):
+    repo = project.project
+    first = _fp(repo)
+    assert first == _fp(repo)
+    assert first.head == git(repo, "rev-parse", "HEAD")
+    assert first.tree == git(repo, "rev-parse", "HEAD^{tree}")
+
+
+def test_worktree_fingerprint_tracked_edit_moves_tree(project):
+    repo = project.project
+    before = _fp(repo)
+    (repo / "src.txt").write_text("edited\n")
+    after = _fp(repo)
+    assert after.head == before.head
+    assert after.tree != before.tree
+
+
+def test_worktree_fingerprint_untracked_file_moves_tree(project):
+    repo = project.project
+    before = _fp(repo)
+    (repo / "new.txt").write_text("new\n")
+    assert _fp(repo).tree != before.tree
+
+
+def test_worktree_fingerprint_ignored_file_is_a_blind_spot(project):
+    """Pins the documented blind spot: an ignored path never reaches the tree, so
+    a change there (node_modules, build output) leaves the fingerprint equal.
+    `.git/info/exclude` keeps the ignore rule itself out of the tree."""
+    repo = project.project
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("build/\n")
+    before = _fp(repo)
+    (repo / "build").mkdir()
+    (repo / "build" / "out.bin").write_text("artifact\n")
+    assert _fp(repo) == before
+
+
+def test_worktree_fingerprint_excludes_automator_dir_without_ignore(project):
+    """`.bmad-loop/` is left out by the fingerprint itself, not by `.gitignore`:
+    the sandbox ignores only `.bmad-loop/runs/`, so a file beside it is NOT
+    ignored and must still leave the fingerprint equal.
+
+    Ablation: drop both the `:(exclude)` walk prune on `worktree_fingerprint`'s
+    `add` and `AUTOMATOR_DIR_REL` from its post-stage `reset`; the file is staged
+    and the trees differ (either one alone still leaves it out)."""
+    repo = project.project
+    before = _fp(repo)
+    (repo / ".bmad-loop").mkdir(exist_ok=True)
+    (repo / ".bmad-loop" / "notes.txt").write_text("orchestrator state\n")
+    assert "notes.txt" in git(repo, "status", "--porcelain", "-uall")  # not ignored
+    assert _fp(repo) == before
+
+
+@pytest.mark.parametrize("rule", [".bmad-loop/", ".bmad-loop/runs/"])
+def test_worktree_fingerprint_under_an_ignored_automator_dir(project, rule):
+    """A project that gitignores the whole `.bmad-loop/` (this repo's own layout)
+    fingerprints at all, as does one ignoring only `.bmad-loop/runs/`: edits under
+    `.bmad-loop/` — a tracked file there (force-added under the whole-dir rule)
+    and new run state — leave the fingerprint equal, while a code edit moves it.
+
+    Ablation: pass the `:(exclude).bmad-loop` prune to the `add` whatever
+    `check-ignore` says; the whole-dir case raises `GitError` ("paths are
+    ignored"). Dropping `AUTOMATOR_DIR_REL` from the post-stage `reset` instead
+    restages the force-added file and moves the whole-dir tree."""
+    repo = project.project
+    tracked = _committed(repo, ".bmad-loop/profiles/x.toml", "a = 1\n", force=True)
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write(f"{rule}\n")
+    before = _fp(repo)
+    assert before.tree == git(repo, "rev-parse", "HEAD^{tree}")
+    tracked.write_text("a = 2\n")
+    runs = repo / ".bmad-loop" / "runs" / "r1"
+    runs.mkdir(parents=True, exist_ok=True)
+    (runs / "journal.jsonl").write_text("{}\n")
+    (repo / ".bmad-loop" / "notes.txt").write_text("orchestrator state\n")
+    assert _fp(repo) == before
+    (repo / "src.txt").write_text("edited\n")
+    after = _fp(repo)
+    assert after.head == before.head
+    assert after.tree != before.tree
+
+
+def test_worktree_fingerprint_never_hashes_the_automator_archive(project):
+    """In the `init` layout (only `.bmad-loop/runs/` ignored) an archived run's
+    tarball under `.bmad-loop/archive/` is not ignored, yet the fingerprint never
+    walks it: its blob never reaches the object store, and it leaves the
+    fingerprint equal.
+
+    Ablation: drop the `:(exclude)` walk prune from `worktree_fingerprint`'s
+    `add`; the tarball is hashed (its blob is written) before the reset drops it."""
+    repo = project.project
+
+    def ignored(rel: str) -> bool:
+        cmd = ["git", "-C", str(repo), "check-ignore", "-q", "--no-index", rel]
+        return subprocess.run(cmd, capture_output=True, check=False).returncode == 0
+
+    assert ignored(".bmad-loop/runs/x") and not ignored(".bmad-loop")
+    before = _fp(repo)
+    archive = repo / ".bmad-loop" / "archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    (archive / "20261111-000000-abcd.tar.gz").write_bytes(b"archived run state\n")
+    assert ".bmad-loop/archive/" in git(repo, "status", "--porcelain", "-uall")  # not ignored
+    blob = git(repo, "hash-object", ".bmad-loop/archive/20261111-000000-abcd.tar.gz")
+    assert _fp(repo) == before
+    probe = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", blob], capture_output=True, check=False
+    )
+    assert probe.returncode != 0, "the archive blob was written to the object store"
+
+
+def test_worktree_fingerprint_check_ignore_fault_raises(project, monkeypatch):
+    """A `check-ignore` that neither answers ignored (0) nor not ignored (1) is a
+    git fault: the fingerprint raises rather than guessing a prune.
+
+    Ablation: treat any non-zero exit as "not ignored"; no `GitError` is raised."""
+    repo = project.project
+    real = verify._git
+
+    def broken(where: Path, *args: str) -> tuple[int, str]:
+        if args[:1] == ("check-ignore",):
+            return 128, "fatal: simulated"
+        return real(where, *args)
+
+    monkeypatch.setattr(verify, "_git", broken)
+    with pytest.raises(verify.GitError, match="check-ignore"):
+        _fp(repo)
+
+
+def test_worktree_fingerprint_automator_dir_created_after_the_ignore_check(project, monkeypatch):
+    """Under a dir-only whole-dir rule, a `.bmad-loop/` missing at the ignore check
+    and created before the `add` still fingerprints: the check reads the missing
+    directory as ignored, so no prune pathspec is passed for git to refuse.
+
+    Ablation: drop the trailing slash from the `check-ignore` path; the missing
+    directory reads as not ignored, the prune is passed, and `add` raises."""
+    repo = project.project
+    assert not (repo / ".bmad-loop").exists()
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write(".bmad-loop/\n")
+    real = verify._git
+
+    def creating(where: Path, *args: str) -> tuple[int, str]:
+        result = real(where, *args)
+        if args[:1] == ("check-ignore",):
+            (repo / ".bmad-loop").mkdir(exist_ok=True)
+            (repo / ".bmad-loop" / "late.txt").write_text("written mid-read\n")
+        return result
+
+    monkeypatch.setattr(verify, "_git", creating)
+    assert _fp(repo).tree == git(repo, "rev-parse", "HEAD^{tree}")
+
+
+def test_worktree_fingerprint_commit_moves_head(project):
+    repo = project.project
+    before = _fp(repo)
+    (repo / "src.txt").write_text("committed\n")
+    git(repo, "commit", "-qam", "move")
+    after = _fp(repo)
+    assert after.head != before.head
+    assert after.head == git(repo, "rev-parse", "HEAD")
+
+
+def test_worktree_fingerprint_never_touches_real_index(project):
+    """An operator's staged state survives the read byte for byte: the staged
+    `src.txt` differs from both HEAD and the worktree, and stays staged.
+
+    Ablation: point the fingerprint's `add` at the real index (drop the
+    `GIT_INDEX_FILE` env); the bytes change and `staged` is overwritten."""
+    repo = project.project
+    (repo / "src.txt").write_text("staged\n")
+    git(repo, "add", "src.txt")
+    (repo / "src.txt").write_text("edited\n")
+    (repo / "new.txt").write_text("new\n")
+    assert git(repo, "diff", "--cached", "--name-only") == "src.txt"
+    assert git(repo, "show", ":src.txt") == "staged"
+    index = repo / ".git" / "index"
+    before = index.read_bytes()
+    _fp(repo)
+    assert index.read_bytes() == before
+    assert git(repo, "diff", "--cached", "--name-only") == "src.txt"
+    assert git(repo, "show", ":src.txt") == "staged"
+
+
+def test_worktree_fingerprint_covers_siblings_of_a_subdirectory_project(project):
+    """A project in a subdirectory of a larger repo: its verify commands may read
+    a sibling, so a sibling edit (tracked or untracked) moves the fingerprint.
+
+    Ablation: scope the fingerprint's `add` to `.` instead of `:/`; both edits
+    leave the fingerprint taken from `app/` equal."""
+    repo = project.project
+    app = repo / "app"
+    app.mkdir()
+    (app / "main.txt").write_text("app\n")
+    git(repo, "add", "app")
+    git(repo, "commit", "-qm", "app")
+    before = _fp(app)
+    (repo / "src.txt").write_text("sibling edit\n")
+    tracked = _fp(app)
+    assert tracked.tree != before.tree
+    (repo / "shared.txt").write_text("sibling new\n")
+    assert _fp(app).tree != tracked.tree
+
+
+def test_worktree_fingerprint_covers_force_added_ignored_files(project):
+    """A file the real index tracks although an ignore rule matches it (`add -f`,
+    not yet in HEAD) is what the commit after a reuse takes, so an edit or a
+    deletion of it moves the fingerprint.
+
+    Ablation: drop the `update-index` restage; the edit and the deletion both
+    leave the fingerprint equal."""
+    repo = project.project
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("gen/\n")
+    (repo / "gen").mkdir()
+    (repo / "gen" / "out.txt").write_text("generated\n")
+    git(repo, "add", "-f", "gen/out.txt")
+    before = _fp(repo)
+    (repo / "gen" / "out.txt").write_text("regenerated\n")
+    edited = _fp(repo)
+    assert edited.tree != before.tree
+    (repo / "gen" / "out.txt").unlink()
+    assert _fp(repo).tree not in (before.tree, edited.tree)
+
+
+def _committed(repo: Path, rel: str, text: str, *, force: bool = False) -> Path:
+    path = repo / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    git(repo, "add", *(("-f",) if force else ()), rel)
+    git(repo, "commit", "-qm", f"add {rel}")
+    return path
+
+
+def test_worktree_fingerprint_exclude_leaves_the_path_out(project):
+    """An `exclude` path is left out of the fingerprint: an edit to it keeps the
+    fingerprint equal, while an edit to any other path still moves it.
+
+    Ablation: drop the excluded-path `reset` from `worktree_fingerprint`; the
+    excluded edit moves the tree."""
+    repo = project.project
+    ledger = _committed(repo, "notes/ledger.md", "open\n")
+    exclude = ("notes/ledger.md",)
+    before = verify.worktree_fingerprint(repo, exclude)
+    ledger.write_text("done\n")
+    assert verify.worktree_fingerprint(repo, exclude) == before
+    assert _fp(repo).tree != before.tree  # the edit is real; only the exclusion hides it
+    (repo / "src.txt").write_text("edited\n")
+    assert verify.worktree_fingerprint(repo, exclude).tree != before.tree
+
+
+def test_worktree_fingerprint_exclude_covers_a_force_added_path(project):
+    """An excluded file an ignore rule matches (tracked by `add -f`) is restaged
+    by the force-added listing, and the exclusion still leaves its edit out —
+    without git refusing the stage over a pathspec that names an ignored path.
+
+    Ablation: spell the exclusion as `:(exclude,literal)` pathspecs on the
+    listing and the `add` instead of the `reset`; `add` refuses ("paths are
+    ignored") and the fingerprint raises `GitError`."""
+    repo = project.project
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("gen/\n")
+    ledger = _committed(repo, "gen/ledger.md", "open\n", force=True)
+    exclude = ("gen/ledger.md",)
+    before = verify.worktree_fingerprint(repo, exclude)
+    ledger.write_text("done\n")
+    assert verify.worktree_fingerprint(repo, exclude) == before
+    assert _fp(repo).tree != before.tree
+
+
+def test_worktree_fingerprint_exclude_of_an_untracked_ignored_path(project):
+    """A gitignored, untracked excluded file (a ledger under an ignored output
+    folder) fingerprints at all — `add` never sees a pathspec naming it — and a
+    new excluded file that is NOT ignored stays out of the tree too.
+
+    Ablation: spell the exclusion as `:(exclude,literal)` pathspecs on the
+    `add`; the ignored case raises `GitError`."""
+    repo = project.project
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("out/\n")
+    (repo / "out").mkdir()
+    (repo / "out" / "ledger.md").write_text("open\n")
+    before = verify.worktree_fingerprint(repo, ("out/ledger.md",))
+    assert before == _fp(repo)
+    (repo / "notes").mkdir()
+    (repo / "notes" / "ledger.md").write_text("new\n")
+    assert verify.worktree_fingerprint(repo, ("notes/ledger.md",)) == before
+
+
+def _embedded_repo(repo: Path, name: str = "sub") -> None:
+    sub = repo / name
+    sub.mkdir()
+    git(sub, "init", "-q", "-b", "main")
+    (sub / "f.txt").write_text("inner\n")
+    git(sub, "add", "f.txt")
+    git(sub, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "inner")
+
+
+def _tracked_gitlink(repo: Path) -> None:
+    """A committed gitlink with its checkout present: the submodule shape, minus
+    the `.gitmodules` URL plumbing a clone would need."""
+    _embedded_repo(repo, "vendored")
+    git(repo, "add", "vendored")
+    git(repo, "commit", "-qm", "gitlink")
+
+
+@pytest.mark.parametrize("make", [_embedded_repo, _tracked_gitlink], ids=["embedded", "submodule"])
+def test_worktree_fingerprint_fingerprints_gitlinks(project, make):
+    """A gitlink's working tree is fingerprinted as a level of its own: an
+    untracked embedded repo (which `add -A` stages as a gitlink) and a committed
+    gitlink both read stable, with the checkout's HEAD in `submodules`."""
+    repo = project.project
+    make(repo)
+    first = _fp(repo)
+    assert first == _fp(repo)
+    assert len(first.submodules) == 1
+    path, head, tree = first.submodules[0]
+    assert head == git(repo / path, "rev-parse", "HEAD")
+    assert tree is not None
+
+
+def _add_submodule(repo: Path, tmp_path: Path, name: str = "module") -> Path:
+    """A populated submodule at `name`, committed in `repo`; returns its checkout.
+    Mirrors `_add_test_submodule` in test_verify_worktree.py."""
+    origin = tmp_path / f"{name}-origin"
+    origin.mkdir()
+    git(origin, "init", "-q", "-b", "main")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    (origin / "payload.txt").write_text("submodule old\n")
+    git(origin, "add", "payload.txt")
+    git(origin, "commit", "-q", "-m", "submodule baseline")
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(origin), name)
+    git(repo, "commit", "-q", "-m", f"add submodule {name}")
+    checkout = repo / name
+    git(checkout, "config", "user.email", "test@example.com")
+    git(checkout, "config", "user.name", "Test")
+    return checkout
+
+
+def _uninitialized_submodule(repo: Path, tmp_path: Path) -> Path:
+    """A populated submodule deinitialised: gitlink in the index, `.gitmodules`
+    in place, and an empty directory at the path — the shape a clone without
+    `--recurse-submodules` leaves every gitlink in."""
+    checkout = _add_submodule(repo, tmp_path)
+    git(repo, "submodule", "deinit", "-q", "-f", "--", "module")
+    assert checkout.is_dir() and not any(checkout.iterdir())
+    return checkout
+
+
+def _nested_submodule(repo: Path, tmp_path: Path) -> Path:
+    """`module` holding its own submodule `inner`, both checked out; returns the
+    `inner` checkout."""
+    inner_origin = tmp_path / "inner-origin"
+    inner_origin.mkdir()
+    git(inner_origin, "init", "-q", "-b", "main")
+    (inner_origin / "deep.txt").write_text("deep\n")
+    git(inner_origin, "add", "deep.txt")
+    git(inner_origin, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "deep")
+    outer_origin = tmp_path / "outer-origin"
+    outer_origin.mkdir()
+    git(outer_origin, "init", "-q", "-b", "main")
+    (outer_origin / "payload.txt").write_text("outer\n")
+    git(
+        outer_origin,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(inner_origin),
+        "inner",
+    )
+    git(outer_origin, "add", "-A")
+    git(outer_origin, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "outer")
+    git(
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(outer_origin),
+        "module",
+    )
+    git(
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "-q",
+        "--init",
+        "--recursive",
+    )
+    git(repo, "commit", "-q", "-m", "add nested submodule")
+    inner = repo / "module" / "inner"
+    assert (inner / "deep.txt").is_file()
+    return inner
+
+
+def _same_dir(a: str | Path, b: Path) -> bool:
+    return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(b.resolve()))
+
+
+def _entry(fp: verify.TreeFingerprint, path: str) -> tuple[str, str | None, str | None]:
+    found = [entry for entry in fp.submodules if entry[0] == path]
+    assert len(found) == 1, fp.submodules
+    return found[0]
+
+
+def test_worktree_fingerprint_submodule_tracked_edit_moves(project, tmp_path):
+    """A tracked edit inside a submodule leaves the parent's tree hash (it pins
+    only the gitlink commit) equal, and still moves the fingerprint.
+
+    Ablation: skip the recursion (append the entry without fingerprinting the
+    checkout); the two reads compare equal."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    before = _fp(repo)
+    (checkout / "payload.txt").write_text("edited\n")
+    after = _fp(repo)
+    assert after.tree == before.tree
+    assert after != before
+
+
+def test_worktree_fingerprint_submodule_untracked_file_moves(project, tmp_path):
+    """A new untracked file inside a submodule moves the fingerprint.
+
+    Ablation: skip the recursion; the two reads compare equal."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    before = _fp(repo)
+    (checkout / "new.txt").write_text("new\n")
+    after = _fp(repo)
+    assert after.tree == before.tree
+    assert after != before
+
+
+def test_worktree_fingerprint_submodule_head_moves(project, tmp_path):
+    """A commit inside a submodule moves its recorded HEAD (and the parent's
+    staged gitlink).
+
+    Ablation: drop `sub_head` from the entry; the entry no longer names the new
+    commit."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    before = _fp(repo)
+    git(checkout, "commit", "-q", "--allow-empty", "-m", "moved")
+    after = _fp(repo)
+    assert after != before
+    assert _entry(after, "module")[1] == git(checkout, "rev-parse", "HEAD")
+
+
+def test_worktree_fingerprint_submodule_ignore_all_head_moves(project, tmp_path):
+    """Under `.gitmodules`' `ignore = all` the parent's `add -A` keeps the old
+    gitlink commit, and an empty commit leaves the submodule's tree alike: only
+    the recorded HEAD sees the move.
+
+    Ablation: drop `sub_head` from the entry; the two reads compare equal."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    git(repo, "config", "-f", ".gitmodules", "submodule.module.ignore", "all")
+    git(repo, "commit", "-q", "-am", "ignore all")
+    before = _fp(repo)
+    git(checkout, "commit", "-q", "--allow-empty", "-m", "moved")
+    after = _fp(repo)
+    assert after.tree == before.tree
+    assert _entry(after, "module")[2] == _entry(before, "module")[2]
+    assert after != before
+
+
+def test_worktree_fingerprint_nested_submodule_recurses(project, tmp_path):
+    """A submodule inside a submodule is found in the outer one's own listing and
+    fingerprinted at its top-relative path; an edit there moves only its entry.
+
+    Ablation: a depth cap of 1; the read refuses `depth: module/inner`."""
+    repo = project.project
+    inner = _nested_submodule(repo, tmp_path)
+    before = _fp(repo)
+    assert [entry[0] for entry in before.submodules] == ["module", "module/inner"]
+    assert before == _fp(repo)
+    (inner / "deep.txt").write_text("edited\n")
+    after = _fp(repo)
+    assert after.tree == before.tree
+    assert _entry(after, "module") == _entry(before, "module")
+    assert _entry(after, "module/inner") != _entry(before, "module/inner")
+
+
+def test_worktree_fingerprint_gitlink_beside_a_subdirectory_project(project, tmp_path):
+    """Read from a project in a subdirectory, a submodule at the repository root
+    is still found at its root-relative path and fingerprinted.
+
+    Ablation: drop `--full-name` from the gitlink listing; the path reads
+    `../module` from `app/` and the read refuses."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    app = repo / "app"
+    app.mkdir()
+    (app / "main.txt").write_text("app\n")
+    git(repo, "add", "app")
+    git(repo, "commit", "-q", "-m", "app")
+    before = _fp(app)
+    assert [entry[0] for entry in before.submodules] == ["module"]
+    (checkout / "payload.txt").write_text("edited\n")
+    assert _fp(app) != before
+
+
+def test_worktree_fingerprint_depth_cap_refuses(project, tmp_path, monkeypatch):
+    """A gitlink deeper than the cap refuses with its top-relative path.
+
+    Ablation: drop the depth check; the read returns a fingerprint."""
+    repo = project.project
+    _nested_submodule(repo, tmp_path)
+    monkeypatch.setattr(verify, "_FINGERPRINT_MAX_DEPTH", 1)
+    with pytest.raises(verify.FingerprintRefused, match=r"^depth: module/inner$"):
+        _fp(repo)
+
+
+def test_worktree_fingerprint_uninitialized_submodule_is_stable(project, tmp_path):
+    """An unpopulated submodule (an empty directory) is pinned as empty, and reads
+    stable.
+
+    Ablation: classify an empty directory like a populated one; the toplevel
+    probe names the superproject and the read refuses `not-a-checkout`."""
+    repo = project.project
+    _uninitialized_submodule(repo, tmp_path)
+    first = _fp(repo)
+    assert first.submodules == (("module", None, None),)
+    assert first == _fp(repo)
+
+
+def test_worktree_fingerprint_unpopulated_then_populated_moves(project, tmp_path):
+    """Populating an uninitialised submodule at its pinned commit leaves the
+    parent's staged gitlink equal, and still moves the fingerprint.
+
+    Ablation: record no entry for either an unpopulated directory or a checked-out
+    one (skip the recursion); the two reads compare equal."""
+    repo = project.project
+    _uninitialized_submodule(repo, tmp_path)
+    before = _fp(repo)
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init")
+    after = _fp(repo)
+    assert after.tree == before.tree
+    assert after != before
+    assert _entry(after, "module")[1] is not None
+
+
+def test_worktree_fingerprint_unpopulated_dir_with_files_refuses(project, tmp_path):
+    """Files written into an unpopulated submodule's directory belong to no
+    repository of their own (git keeps the gitlink staged): the toplevel probe
+    from inside names the superproject, so the read refuses.
+
+    Ablation: drop the toplevel check; the read no longer refuses
+    `not-a-checkout`."""
+    repo = project.project
+    checkout = _uninitialized_submodule(repo, tmp_path)
+    (checkout / "stray.txt").write_text("stray\n")
+    with pytest.raises(verify.FingerprintRefused, match=r"^not-a-checkout: module$"):
+        _fp(repo)
+
+
+def test_worktree_fingerprint_unborn_nested_head_faults(project, tmp_path):
+    """A submodule switched to an unborn branch cannot be staged or read: a
+    git fault, never a fingerprint."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    git(checkout, "checkout", "-q", "--orphan", "unborn")
+    with pytest.raises(verify.GitError):
+        _fp(repo)
+
+
+def test_worktree_fingerprint_nested_repo_without_commit_faults(project):
+    """An untracked nested repo with no commit is a git fault (`add -A` refuses
+    it), never a fingerprint."""
+    repo = project.project
+    nested = repo / "fresh"
+    nested.mkdir()
+    git(nested, "init", "-q", "-b", "main")
+    (nested / "f.txt").write_text("x\n")
+    with pytest.raises(verify.GitError):
+        _fp(repo)
+
+
+def test_worktree_fingerprint_submodule_real_index_untouched(project, tmp_path):
+    """A submodule's staged state survives the read byte for byte, like the
+    parent's (`test_worktree_fingerprint_never_touches_real_index`).
+
+    Ablation: drop the nested level's own `GIT_INDEX_FILE` (stage into the
+    submodule's real index); the bytes change and `staged` is overwritten.
+    Ablation: drop `GIT_OPTIONAL_LOCKS=0`; the `git status` the parent's `add`
+    runs inside the submodule refreshes its index, and the bytes change."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    (checkout / "payload.txt").write_text("staged\n")
+    git(checkout, "add", "payload.txt")
+    (checkout / "payload.txt").write_text("edited\n")
+    (checkout / "new.txt").write_text("new\n")
+    index = checkout / git(checkout, "rev-parse", "--git-path", "index")
+    before = index.read_bytes()
+    _fp(repo)
+    assert index.read_bytes() == before
+    assert git(checkout, "diff", "--cached", "--name-only") == "payload.txt"
+    assert git(checkout, "show", ":payload.txt") == "staged"
+
+
+def test_worktree_fingerprint_nested_env_isolated(project, tmp_path, monkeypatch):
+    """No git call inside a submodule inherits the parent level's environment:
+    not its temp `GIT_INDEX_FILE` (which would stage the submodule into the
+    parent's temp index), nor a repository-local variable from the process
+    environment. The parent tree stays the fresh build's.
+
+    Ablation: pass the parent level's `env` down as the nested `base`; the
+    parent's `GIT_INDEX_FILE` reaches the submodule's calls."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    (checkout / "payload.txt").write_text("edited\n")
+    monkeypatch.setenv("GIT_REPLACE_REF_BASE", "refs/fingerprint-test-replace/")
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+    real = verify._run_git
+
+    def spy(cmd, repo_arg, **kwargs):
+        calls.append((list(cmd), kwargs.get("env")))
+        return real(cmd, repo_arg, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(verify, "_run_git", spy)
+        fp = _fp(repo)
+    parent_indexes = {
+        env["GIT_INDEX_FILE"]
+        for cmd, env in calls
+        if env and "GIT_INDEX_FILE" in env and cmd[2] == str(repo)
+    }
+    assert len(parent_indexes) == 1
+    nested = [(cmd, env) for cmd, env in calls if cmd[1] == "-C" and _same_dir(cmd[2], checkout)]
+    assert nested
+    for cmd, env in nested:
+        assert env is not None, cmd
+        assert "GIT_REPLACE_REF_BASE" not in env, cmd
+        assert "GIT_DIR" not in env and "GIT_WORK_TREE" not in env, cmd
+        assert env.get("GIT_INDEX_FILE") not in parent_indexes, cmd
+    assert fp.tree == _fresh_fp(repo, monkeypatch).tree
+
+
+def test_worktree_fingerprint_submodule_mixed_eol_under_safecrlf(project, tmp_path):
+    """`core.autocrlf=true` + `core.safecrlf=true` inside a submodule: the nested
+    `add` takes the same `-c core.safecrlf=false` as the top level.
+
+    Ablation: drop `-c core.safecrlf=false`; the nested `add` fails and this
+    raises GitError."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    git(checkout, "config", "core.autocrlf", "true")
+    git(checkout, "config", "core.safecrlf", "true")
+    (checkout / "payload.txt").write_bytes(b"one\r\ntwo\nthree\r\n")
+    fp = _fp(repo)
+    assert _entry(fp, "module")[1] == git(checkout, "rev-parse", "HEAD")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_worktree_fingerprint_symlinked_gitlink_refuses(project, tmp_path):
+    """A gitlink whose checkout is a symlink refuses. `add -A` restages a symlink
+    as a link, so the gitlink survives only where the post-stage reset restores
+    HEAD's entry: an `exclude`d path.
+
+    Ablation: drop the `is_symlink` check; the read follows the link and returns."""
+    repo = project.project
+    _tracked_gitlink(repo)
+    elsewhere = tmp_path / "elsewhere"
+    (repo / "vendored").rename(elsewhere)
+    (repo / "vendored").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(verify.FingerprintRefused, match=r"^symlink: vendored$"):
+        verify.worktree_fingerprint(repo, ("vendored",))
+
+
+def test_worktree_fingerprint_unborn_head_raises(project):
+    repo = project.project
+    git(repo, "checkout", "-q", "--orphan", "unborn")
+    with pytest.raises(verify.GitError):
+        _fp(repo)
+
+
+def test_worktree_fingerprint_mixed_eol_under_safecrlf(project):
+    """`core.autocrlf=true` + `core.safecrlf=true` makes `add` refuse an
+    irreversible EOL conversion, which a mixed-EOL tracked file is.
+
+    Ablation: drop `-c core.safecrlf=false`; the `add` fails and this raises
+    GitError."""
+    repo = project.project
+    git(repo, "config", "core.autocrlf", "true")
+    git(repo, "config", "core.safecrlf", "true")
+    (repo / "src.txt").write_bytes(b"one\r\ntwo\nthree\r\n")
+    fp = _fp(repo)
+    assert fp.head == git(repo, "rev-parse", "HEAD")
+
+
+# --- fingerprint temp index seeded from the real index (DW-638) -------------------
+
+
+def _fresh_fp(repo: Path, monkeypatch, exclude: tuple[str, ...] = ()) -> verify.TreeFingerprint:
+    """The fingerprint with the seed forced off: the temp index built from HEAD."""
+    with monkeypatch.context() as m:
+        m.setattr(verify, "_seed_fingerprint_index", lambda *_args: "forced")
+        return verify.worktree_fingerprint(repo, exclude)
+
+
+def _seeded_fp(repo: Path, monkeypatch, exclude: tuple[str, ...] = ()) -> verify.TreeFingerprint:
+    """The fingerprint, asserting it really took the seeded path."""
+    real = verify._seed_fingerprint_index
+    reasons: list[str | None] = []
+
+    def spy(*args):
+        reasons.append(real(*args))
+        return reasons[-1]
+
+    with monkeypatch.context() as m:
+        m.setattr(verify, "_seed_fingerprint_index", spy)
+        fp = verify.worktree_fingerprint(repo, exclude)
+    assert reasons == [None]
+    return fp
+
+
+def test_fingerprint_seed_with_a_submodule_matches_fresh_build(project, tmp_path, monkeypatch):
+    """Each level seeds its own temp index from its own real index (the nested
+    seed locates the submodule's index, not the parent's temp one), and the
+    seeded read equals the fresh build with edits at both levels.
+
+    Ablation: hand the nested seed its temp-index `env` as `base_env`; `--git-path
+    index` names the temp index itself and the nested seed is refused."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    (checkout / "payload.txt").write_text("edited\n")
+    (checkout / "new.txt").write_text("new\n")
+    (repo / "top.txt").write_text("top\n")
+    real = verify._seed_fingerprint_index
+    reasons: list[str | None] = []
+
+    def spy(*args):
+        reasons.append(real(*args))
+        return reasons[-1]
+
+    with monkeypatch.context() as m:
+        m.setattr(verify, "_seed_fingerprint_index", spy)
+        seeded = verify.worktree_fingerprint(repo)
+    assert reasons == [None, None]
+    assert seeded == _fresh_fp(repo, monkeypatch)
+    assert _entry(seeded, "module")[1] == git(checkout, "rev-parse", "HEAD")
+
+
+def _seed_reason(repo: Path, tmp_path: Path) -> str | None:
+    """`_seed_fingerprint_index` run directly against a temp index outside the repo."""
+    env = {**os.environ, "GIT_INDEX_FILE": str(tmp_path / "seed-index")}
+    return verify._seed_fingerprint_index(repo, git(repo, "rev-parse", "HEAD"), env)
+
+
+def _debug_stat(repo: Path, index: Path, rel: str) -> tuple[str, str]:
+    """`(mtime, size)` of `rel`'s entry in `index`, from `ls-files --debug`."""
+    out = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--debug", "--", rel],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "GIT_INDEX_FILE": str(index)},
+    ).stdout
+    mtime = re.search(r"mtime: (\S+)", out)
+    size = re.search(r"size: (\d+)", out)
+    assert mtime and size, out
+    return mtime[1], size[1]
+
+
+def test_fingerprint_seed_matches_fresh_build_over_staged_only_state(project, monkeypatch):
+    """The seeded read equals the fresh build in a state mixing worktree changes
+    with every kind of staged-only real-index state the copy carries: a staged edit
+    that differs from the worktree, a staged new file since deleted, an `add -N`
+    entry, a staged file under the excluded `.bmad-loop/`, and a `git rm --cached`
+    of a committed file `.git/info/exclude` matches.
+
+    Ablation: drop the `read-tree -m -i` and fingerprint the raw copy; the staged
+    `.bmad-loop/` file and the `rm --cached` file diverge from the fresh build."""
+    repo = project.project
+    _committed(repo, "gone.txt", "doomed\n").unlink()
+    staged = _committed(repo, "staged.txt", "head\n")
+    cached = _committed(repo, "cached.log", "kept in HEAD\n")
+    (repo / "src.txt").write_text("edited\n")
+    (repo / "new.txt").write_text("untracked\n")
+    staged.write_text("staged\n")
+    git(repo, "add", "staged.txt")
+    staged.write_text("worktree\n")
+    (repo / "ghost.txt").write_text("staged then deleted\n")
+    git(repo, "add", "ghost.txt")
+    (repo / "ghost.txt").unlink()
+    (repo / "intent.txt").write_text("intent to add\n")
+    git(repo, "add", "-N", "intent.txt")
+    (repo / ".bmad-loop").mkdir(exist_ok=True)
+    (repo / ".bmad-loop" / "staged.txt").write_text("orchestrator\n")
+    git(repo, "add", ".bmad-loop/staged.txt")
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("*.log\n")
+    git(repo, "rm", "-q", "--cached", "cached.log")
+    assert cached.exists()
+
+    seeded = _seeded_fp(repo, monkeypatch)
+    assert seeded == _fresh_fp(repo, monkeypatch)
+    assert seeded.tree != git(repo, "rev-parse", "HEAD^{tree}")
+
+
+def test_fingerprint_seed_matches_fresh_build_with_exclude_and_force_added(project, monkeypatch):
+    """An `exclude` and a force-added ignored file take the same tree seeded as
+    fresh, both before and after an edit to each."""
+    repo = project.project
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("gen/\n")
+    ledger = _committed(repo, "notes/ledger.md", "open\n")
+    (repo / "gen").mkdir()
+    (repo / "gen" / "out.txt").write_text("generated\n")
+    git(repo, "add", "-f", "gen/out.txt")
+    exclude = ("notes/ledger.md",)
+    before = _seeded_fp(repo, monkeypatch, exclude)
+    assert before == _fresh_fp(repo, monkeypatch, exclude)
+    ledger.write_text("done\n")
+    (repo / "gen" / "out.txt").write_text("regenerated\n")
+    after = _seeded_fp(repo, monkeypatch, exclude)
+    assert after == _fresh_fp(repo, monkeypatch, exclude)
+    assert after.tree != before.tree
+
+
+def test_fingerprint_seed_keeps_the_stat_cache(project, tmp_path):
+    """The point of the seed: an entry whose blob matches HEAD keeps the real
+    index's stat info (a fresh `read-tree HEAD` has none, so `add -A` re-hashes).
+
+    Ablation: swap `read-tree -m -i` for a plain `read-tree` on the copy; the entry
+    comes back with a zero mtime and size."""
+    repo = project.project
+    past = time.time() - 100  # well before the index write: never racily clean
+    os.utime(repo / "src.txt", (past, past))
+    git(repo, "update-index", "-q", "--refresh")
+    real = _debug_stat(repo, repo / ".git" / "index", "src.txt")
+    assert real[1] != "0"
+    assert _seed_reason(repo, tmp_path) is None
+    assert _debug_stat(repo, tmp_path / "seed-index", "src.txt") == real
+
+
+def test_fingerprint_seed_leaves_the_real_index_untouched(project, monkeypatch):
+    """A seeded read only copies the real index: its bytes and its mtime survive.
+
+    Ablation: seed by running `read-tree -m` on the real index (drop the copy and
+    the temp `GIT_INDEX_FILE` from the seed); the staged edit is lost."""
+    repo = project.project
+    (repo / "src.txt").write_text("staged\n")
+    git(repo, "add", "src.txt")
+    (repo / "src.txt").write_text("edited\n")
+    index = repo / ".git" / "index"
+    before = (index.read_bytes(), index.stat().st_mtime_ns)
+    _seeded_fp(repo, monkeypatch)
+    assert (index.read_bytes(), index.stat().st_mtime_ns) == before
+
+
+def _subdir_project(repo: Path) -> Path:
+    app = repo / "app"
+    app.mkdir()
+    (app / "main.txt").write_text("app\n")
+    git(repo, "add", "app")
+    git(repo, "commit", "-qm", "app")
+    return app
+
+
+def test_fingerprint_seed_from_a_subdirectory_project(project, monkeypatch):
+    """A project in a subdirectory seeds too: `--git-path index` answers relative
+    to it (`../.git/index`), and a dirty sibling lands the same tree as fresh."""
+    app = _subdir_project(project.project)
+    (project.project / "src.txt").write_text("sibling edit\n")
+    assert _seeded_fp(app, monkeypatch) == _fresh_fp(app, monkeypatch)
+
+
+def test_fingerprint_seed_flags_check_covers_siblings(project, tmp_path, monkeypatch):
+    """A flagged entry outside a subdirectory project still refuses: `add -A :/`
+    would skip the sibling's edit, so the flags check reads the whole index.
+
+    Ablation: drop the `:/` pathspec from the `ls-files -v`; the reason is
+    `None`."""
+    repo = project.project
+    app = _subdir_project(repo)
+    git(repo, "update-index", "--assume-unchanged", "src.txt")
+    (repo / "src.txt").write_text("sibling edit\n")
+    assert _seed_reason(app, tmp_path) == "index-flags"
+    assert verify.worktree_fingerprint(app) == _fresh_fp(app, monkeypatch)
+
+
+def _assert_refused_to_fresh(repo: Path, tmp_path: Path, monkeypatch, reason: str) -> None:
+    """The seed refuses with `reason`, and the fingerprint still answers — the
+    fresh build's tree, which carries the dirty `src.txt`."""
+    (repo / "src.txt").write_text("dirty\n")
+    assert _seed_reason(repo, tmp_path) == reason
+    fp = verify.worktree_fingerprint(repo)
+    assert fp == _fresh_fp(repo, monkeypatch)
+    assert fp.tree != git(repo, "rev-parse", "HEAD^{tree}")
+
+
+def test_fingerprint_seed_refuses_split_index(project, tmp_path, monkeypatch):
+    """A split index's shared half is not in the copy.
+
+    Ablation: drop the `core.splitindex` check; the reason becomes
+    `shared-index` (or `None` once the shared file is gone)."""
+    repo = project.project
+    git(repo, "config", "core.splitIndex", "true")
+    git(repo, "update-index", "--split-index")
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "split-index")
+
+
+def test_fingerprint_seed_refuses_a_shared_index_file(project, tmp_path, monkeypatch):
+    """A `sharedindex.*` beside the index refuses even with `core.splitIndex` unset.
+
+    Ablation: drop the `sharedindex.*` glob; the seed returns `None`."""
+    repo = project.project
+    (repo / ".git" / "sharedindex.0").write_bytes(b"")
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "shared-index")
+
+
+@pytest.mark.parametrize("value", ["true", "", "a-hook"])
+def test_fingerprint_seed_refuses_fsmonitor(project, tmp_path, value):
+    """Any `core.fsmonitor` value but a clear false refuses — its valid bits stand
+    in for the stat check. Reason only: a fingerprint under `true` would spawn the
+    fsmonitor daemon; the full fallback runs in the hook row of the next test.
+
+    Ablation: drop the `core.fsmonitor` check; every row returns `None`."""
+    repo = project.project
+    git(repo, "config", "core.fsmonitor", value)
+    assert _seed_reason(repo, tmp_path) == "fsmonitor"
+
+
+def test_fingerprint_seed_fsmonitor_hook_falls_back(project, tmp_path, monkeypatch):
+    """A (missing) fsmonitor hook refuses and the fresh build still answers.
+
+    Ablation: drop the `core.fsmonitor` check; the reason is `None`."""
+    repo = project.project
+    git(repo, "config", "core.fsmonitor", str(tmp_path / "missing-hook"))
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "fsmonitor")
+
+
+@pytest.mark.parametrize("value", ["false", "No", "OFF", "0"])
+def test_fingerprint_seed_accepts_a_clear_false_fsmonitor(project, tmp_path, monkeypatch, value):
+    """A clear-false `core.fsmonitor` does not refuse.
+
+    Ablation: treat any set value as on; every row refuses `fsmonitor`."""
+    repo = project.project
+    git(repo, "config", "core.fsmonitor", value)
+    assert _seed_reason(repo, tmp_path) is None
+    (repo / "src.txt").write_text("dirty\n")
+    assert _seeded_fp(repo, monkeypatch) == _fresh_fp(repo, monkeypatch)
+
+
+def test_fingerprint_seed_refuses_a_missing_index(project, tmp_path, monkeypatch):
+    """No real index file, nothing to copy.
+
+    Ablation: drop the `is_file()` check; the copy fails and the reason is
+    `copy`."""
+    repo = project.project
+    (repo / ".git" / "index").unlink()
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "no-index")
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_fingerprint_seed_refuses_flagged_entries(project, tmp_path, monkeypatch, flag):
+    """`read-tree -m` keeps an entry's assume-unchanged / skip-worktree bit, and
+    `add -A` would then skip the flagged file's edit.
+
+    Ablation: drop the `ls-files -v` tag check; the reason is `None` and the
+    seeded tree misses the `src.txt` edit."""
+    repo = project.project
+    git(repo, "update-index", flag, "src.txt")
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "index-flags")
+
+
+def test_fingerprint_seed_refuses_an_unmerged_index(project, tmp_path, monkeypatch):
+    """A conflicted merge leaves stages `read-tree -m -i` will not merge onto.
+
+    Ablation: swap `read-tree -m -i` for a plain `read-tree`; it discards the
+    stages and the reason is `None`."""
+    repo = project.project
+    git(repo, "checkout", "-q", "-b", "side")
+    (repo / "src.txt").write_text("side\n")
+    git(repo, "commit", "-qam", "side")
+    git(repo, "checkout", "-q", "-")
+    (repo / "src.txt").write_text("main\n")
+    git(repo, "commit", "-qam", "main")
+    merge = subprocess.run(["git", "-C", str(repo), "merge", "-q", "side"], capture_output=True)
+    assert merge.returncode != 0
+    assert git(repo, "ls-files", "-u")
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "read-tree-m")
+
+
+def test_fingerprint_seed_refuses_a_config_read_fault(project, tmp_path, monkeypatch):
+    """A `config --get-regexp` rc other than 0/1 is a fault, not "unset".
+
+    Ablation: accept any rc from the config read; the reason is `None`."""
+    repo = project.project
+    (repo / "src.txt").write_text("dirty\n")
+    fresh = _fresh_fp(repo, monkeypatch)
+    real = verify.git_bytes
+
+    def faulty(repo_: Path, *args: str, **kwargs):
+        if args[:2] == ("config", "--get-regexp"):
+            return subprocess.CompletedProcess(list(args), 2, b"", b"config broke")
+        return real(repo_, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "git_bytes", faulty)
+    assert _seed_reason(repo, tmp_path) == "config"
+    assert verify.worktree_fingerprint(repo) == fresh
+
+
+def test_verify_reuse_key_folds_case_under_normcase(tmp_path, monkeypatch):
+    import ntpath
+
+    monkeypatch.setattr(os.path, "normcase", ntpath.normcase)
+    pol = Policy(verify=VerifyPolicy(commands=(_OK,)))
+    assert verify.verify_reuse_key(pol, tmp_path / "Root") == verify.verify_reuse_key(
+        pol, tmp_path / "ROOT"
+    )
+    assert verify.verify_reuse_key(pol, tmp_path / "a") != verify.verify_reuse_key(
+        pol, tmp_path / "b"
+    )
+
+
+def test_verify_reuse_key_ignores_stream_capture_kb(tmp_path):
+    a = Policy(verify=VerifyPolicy(commands=(_OK,), stream_capture_kb=1))
+    b = Policy(verify=VerifyPolicy(commands=(_OK,), stream_capture_kb=2))
+    assert verify.verify_reuse_key(a, tmp_path) == verify.verify_reuse_key(b, tmp_path)
+
+
+_REUSE_FP = verify.TreeFingerprint(head="h" * 40, tree="t" * 40)
+_REUSE_OUTCOME = verify.VerifyOutcome(ok=True, reason="stored green pass")
+
+
+class _ReuseRig:
+    """Counts `run_verify_commands` calls and fingerprint reads, and records every
+    reuse decision; `fp` is what the stubbed fingerprint answers (an exception
+    instance is raised instead)."""
+
+    def __init__(self, monkeypatch, fp: object = _REUSE_FP):
+        self.runs = 0
+        self.fp_reads = 0
+        self.fp = fp
+        self.decisions: list[verify.ReuseDecision] = []
+        self.results: list[tuple] = []
+
+        def run(policy, cwd):
+            self.runs += 1
+            return []
+
+        def fingerprint(repo):
+            self.fp_reads += 1
+            if isinstance(self.fp, BaseException):
+                raise self.fp
+            return self.fp
+
+        monkeypatch.setattr(verify, "run_verify_commands", run)
+        monkeypatch.setattr(verify, "worktree_fingerprint", fingerprint)
+
+    def request(self, key: verify.VerifyReuseKey) -> verify.VerifyReuse:
+        return verify.VerifyReuse(
+            key=key,
+            fingerprint=_REUSE_FP,
+            outcome=_REUSE_OUTCOME,
+            on_decision=self.decisions.append,
+        )
+
+
+def _reuse_policy(**kw) -> Policy:
+    return Policy(verify=VerifyPolicy(commands=(_OK,), **kw))
+
+
+def test_reuse_seam_match_returns_stored_outcome_without_running(project, monkeypatch):
+    rig = _ReuseRig(monkeypatch)
+    pol = _reuse_policy()
+    reuse = rig.request(verify.verify_reuse_key(pol, project.repo_root))
+    out = verify._verify_review_commands(pol, project, on_results=rig.results.append, reuse=reuse)
+    assert out is _REUSE_OUTCOME
+    assert rig.runs == 0
+    assert rig.results == []
+    assert rig.decisions == [verify.ReuseDecision(True, None, None, _REUSE_FP)]
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        {"commands": ("exit 0", "exit 0")},
+        {"command_timeout_min": 7},
+        {"env_fault_rc": 75},
+        {"cwd": "elsewhere"},
+    ],
+    ids=["commands", "timeout", "env_fault_rc", "cwd"],
+)
+def test_reuse_seam_policy_mismatch_runs(project, monkeypatch, field):
+    """Each key field on its own refuses the reuse, before any fingerprint is spent.
+
+    Ablation: drop the key comparison in `_decide_reuse`; every row reuses."""
+    rig = _ReuseRig(monkeypatch)
+    pol = _reuse_policy()
+    key = dataclasses.replace(verify.verify_reuse_key(pol, project.repo_root), **field)
+    out = verify._verify_review_commands(pol, project, reuse=rig.request(key))
+    assert out is not _REUSE_OUTCOME
+    assert rig.runs == 1
+    assert rig.fp_reads == 0
+    assert [d.decline for d in rig.decisions] == ["policy-mismatch"]
+    assert not rig.decisions[0].reused
+
+
+def test_reuse_seam_tree_mismatch_runs(project, monkeypatch):
+    """Ablation: drop the fingerprint comparison in `_decide_reuse`; it reuses."""
+    moved = verify.TreeFingerprint(head=_REUSE_FP.head, tree="u" * 40)
+    rig = _ReuseRig(monkeypatch, fp=moved)
+    pol = _reuse_policy()
+    out = verify._verify_review_commands(
+        pol, project, reuse=rig.request(verify.verify_reuse_key(pol, project.repo_root))
+    )
+    assert out is not _REUSE_OUTCOME
+    assert rig.runs == 1
+    assert rig.decisions == [verify.ReuseDecision(False, "tree-mismatch", None, moved)]
+
+
+@pytest.mark.parametrize(
+    ("exc", "decline", "detail"),
+    [
+        (verify.GitError("git broke"), "fingerprint-fault", "git broke"),
+        (verify.GitSpawnError("no spawn"), "fingerprint-fault", "no spawn"),
+        (OSError("disk full"), "fingerprint-fault", "disk full"),
+        (
+            verify.FingerprintRefused("not-a-checkout: vendored"),
+            "gitlinks",
+            "not-a-checkout: vendored",
+        ),
+    ],
+    ids=["git", "spawn", "oserror", "gitlinks"],
+)
+def test_reuse_seam_fingerprint_fault_runs(project, monkeypatch, exc, decline, detail):
+    """A fault is never a match: it declines with its reason and the commands run.
+    A refusal's cause and path ride in `detail`, like a fault's text.
+
+    Ablation: let `_decide_reuse` treat a fault as a match; every row reuses.
+    Ablation: decline `gitlinks` with a `None` detail; the `gitlinks` row fails."""
+    rig = _ReuseRig(monkeypatch, fp=exc)
+    pol = _reuse_policy()
+    out = verify._verify_review_commands(
+        pol, project, reuse=rig.request(verify.verify_reuse_key(pol, project.repo_root))
+    )
+    assert out is not _REUSE_OUTCOME
+    assert rig.runs == 1
+    assert rig.decisions == [verify.ReuseDecision(False, decline, detail, None)]
+
+
+def test_decide_reuse_fingerprints_with_the_request_exclude(project):
+    """`_decide_reuse` takes the gate-time fingerprint with `VerifyReuse.exclude`,
+    so a pass fingerprinted with an exclusion matches at the gate after a change
+    to the excluded path alone — and declines `tree-mismatch` without it.
+
+    Ablation: call `worktree_fingerprint(cwd)` in `_decide_reuse` regardless of
+    the request's `exclude`; the first decision declines."""
+    repo = project.repo_root
+    ledger = _committed(repo, "notes/ledger.md", "open\n")
+    exclude = ("notes/ledger.md",)
+    pol = _reuse_policy()
+    key = verify.verify_reuse_key(pol, repo)
+    minted = verify.worktree_fingerprint(repo, exclude)
+    ledger.write_text("done\n")
+
+    def request(excl: tuple[str, ...]) -> verify.VerifyReuse:
+        return verify.VerifyReuse(
+            key=key,
+            fingerprint=minted,
+            outcome=_REUSE_OUTCOME,
+            on_decision=lambda _d: None,
+            exclude=excl,
+        )
+
+    assert verify._decide_reuse(request(exclude), pol, repo) == verify.ReuseDecision(
+        True, None, None, minted
+    )
+    declined = verify._decide_reuse(request(()), pol, repo)
+    assert (declined.reused, declined.decline) == (False, "tree-mismatch")
+
+
+def test_reuse_seam_hard_stop_declines_a_match(project, monkeypatch):
+    """A hard stop pending once the fingerprint matched must not let the stored
+    green pass commit the story: the match declines with `hard-stop` and the
+    commands run, where a pending stop yields interrupted, unspawned results.
+
+    Ablation: drop the `hard_stop_pending()` check in `verify_commands_outcome`;
+    the stored outcome comes back and nothing runs."""
+    rig = _ReuseRig(monkeypatch)
+    monkeypatch.setattr(childrun, "hard_stop_pending", lambda: True)
+    pol = _reuse_policy()
+    out = verify._verify_review_commands(
+        pol, project, reuse=rig.request(verify.verify_reuse_key(pol, project.repo_root))
+    )
+    assert out is not _REUSE_OUTCOME
+    assert rig.runs == 1
+    assert rig.decisions == [verify.ReuseDecision(False, "hard-stop", None, _REUSE_FP)]
+
+
+def test_reuse_seam_failed_preflight_decides_nothing(project, monkeypatch):
+    """The environment preflight still runs ahead of a reuse, and a failed one
+    returns before any decision is taken.
+
+    Ablation: move the reuse decision above the preflight; a decision lands."""
+    rig = _ReuseRig(monkeypatch)
+    pol = Policy(
+        verify=VerifyPolicy(commands=(_OK,)), environment=EnvironmentPolicy(probes=(_FAIL,))
+    )
+    out = verify._verify_review_commands(
+        pol, project, reuse=rig.request(verify.verify_reuse_key(pol, project.repo_root))
+    )
+    assert not out.ok
+    assert out is not _REUSE_OUTCOME
+    assert rig.runs == 0
+    assert rig.decisions == []
+
+
+def test_verify_review_status_failure_decides_nothing(project, monkeypatch):
+    """Status checks stay ahead of the commands: a spec short of `done` fails the
+    gate with no reuse decision and no run."""
+    task, gate = _review_gate_at_done(project, "review")
+    write_spec(Path(task.spec_file), "in-progress", task.baseline_commit)
+    rig = _ReuseRig(monkeypatch)
+    pol = _reuse_policy()
+    out = gate(
+        task, project, pol, reuse=rig.request(verify.verify_reuse_key(pol, project.repo_root))
+    )
+    assert not out.ok and "spec status" in out.reason
+    assert rig.runs == 0
+    assert rig.decisions == []
+
+
+@pytest.mark.parametrize(
+    "mode", ["review", "review_stories", "review_bundle", "review_tickets", "review_tickets_park"]
+)
+def test_review_gates_forward_reuse(project, monkeypatch, mode):
+    """Each eligible review gate threads `reuse=` through to the seam, the tickets
+    gate on both of its command paths (built, and the awaiting-operator park), and
+    the sweep bundle gate past its ledger done-check.
+
+    Ablation: drop `reuse=reuse` from a gate's `_verify_review_commands` call; its
+    row runs the commands."""
+    kw: dict[str, object] = {}
+    if mode == "review_tickets":
+        task, _ = _reviewed_ticket(project, "built")
+        gate = verify.verify_review_tickets
+    elif mode == "review_tickets_park":
+        task, _ = _reviewed_ticket(project, "awaiting-operator", operator_actions=["publish DNS"])
+        gate = verify.verify_review_tickets
+        kw["operator_park"] = True
+    else:
+        task, gate = _review_gate_at_done(project, mode)
+    rig = _ReuseRig(monkeypatch)
+    pol = _reuse_policy()
+    out = gate(
+        task,
+        project,
+        pol,
+        reuse=rig.request(verify.verify_reuse_key(pol, project.repo_root)),
+        **kw,
+    )
+    assert out is _REUSE_OUTCOME
+    assert rig.runs == 0
+    assert [d.reused for d in rig.decisions] == [True]

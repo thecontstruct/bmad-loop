@@ -21,18 +21,34 @@ it lazily for its own tests.
 from __future__ import annotations
 
 import copy
+import dataclasses
+import difflib
 import json
+import posixpath
 import secrets
+from collections import Counter
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
-from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, NoReturn
 
-from . import artifact_publication, gates, verify
+from . import (
+    artifact_publication,
+    codex_trust,
+    deferredwork,
+    gates,
+    skill_locate,
+    sprintstatus,
+    ticketstore,
+    verify,
+    worksource,
+    workspace_trust,
+)
 from .adapters.profile import ProfileError
+from .escalation import pause_title
 from .install import (
     _REVIEW_LAYER_SKILLS,
+    ANTIGRAVITY_HOOK_GROUP,
     BASE_SKILLS,
     BMAD_DIR,
     BMAD_SCRIPTS_SEED_REL,
@@ -46,6 +62,7 @@ from .install import (
     RENDERER_SCRIPT_MARKER,
     RENDERER_SCRIPT_UNIT_REL,
     RENDERER_SEED_SENTINELS,
+    SkillTree,
     _absent_renderer_sources,
     _copy_traversable,
     _hook_command,
@@ -56,14 +73,20 @@ from .install import (
     _walk_traversable_files,
     _worktree_local_exclude,
     dev_primitive_or_default,
+    gated_hook_events,
     merge_hooks,
     missing_stories_support,
     renderer_stub_resolved,
     resolve_review_layers,
+)
+from .install import skills_root as _skills_root
+from .install import (
+    strip_event_relays,
     strip_relay_hooks,
 )
 from .model import Phase
-from .platform_util import atomic_write_text
+from .mountpaths import rebased_project
+from .platform_util import atomic_write_text, filesystem_type, root_identity_record
 from .workspace import (
     UnitWorkspace,
     Workspace,
@@ -76,7 +99,7 @@ if TYPE_CHECKING:
     from importlib.resources.abc import Traversable
 
     from .adapters.base import CodingCLIAdapter
-    from .adapters.profile import CLIProfile
+    from .adapters.profile import CLIProfile, WorkspaceTrustSpec
     from .bmadconfig import ProjectPaths
     from .journal import Journal
     from .model import RunState, StoryTask
@@ -101,13 +124,232 @@ def _crlf_normalized(data: bytes) -> bytes:
     return data.replace(b"\r\n", b"\n")
 
 
-def _worktree_skill_copy_candidates(repo_root: Path, tree: str) -> tuple[str, ...]:
-    """Every upstream skill worth best-effort copying into ``tree``."""
+def _in_store(artifact: Path, shared_store: Path | None) -> bool:
+    """True when ``artifact`` lies in the shared ticket store
+    (``ProjectPaths.shared_store``), which a worktree mount reads in place through
+    its redirect — nothing there is seeded, named as dropped, or carried."""
+    return shared_store is not None and (
+        artifact == shared_store or artifact.is_relative_to(shared_store)
+    )
+
+
+def _artifact_seed(
+    artifact: Path, repo: Path, worktree: Path, *, shared_store: Path | None = None
+) -> tuple[str, ...]:
+    """The seed rel for one orchestrator-owned artifact (ledger or board), or ``()``.
+
+    The shared body of ``WorktreeFlow._ledger_seed`` and ``_board_seed``. The rel
+    is the CONFIGURED path — the parent resolved, the leaf NOT — because that is
+    the path ``ProjectPaths.rebased`` hands every worktree reader. Resolving the
+    leaf too followed a symlinked artifact to its target's rel, so the copy landed
+    where no reader looks (DW-377, was #462).
+
+    ``repo`` and ``worktree`` are the project-local roots :func:`provision_roots`
+    names — the main project and the mount project (the checkout roots themselves in
+    the default config, DW-379) — so the rel is project-relative, and "out-of-repo"
+    below means outside the PROJECT.
+
+    The fully resolved target rel has two uses. First, it keeps the out-of-project
+    exclusion: the seed loop refuses such a source whatever rel it is handed, so
+    an untracked leaf link to an outside target leaves the worktree's configured
+    path absent (the worktree reads an outside target in place only when the
+    checkout carries the link, or when the artifacts DIR itself is out of tree).
+    Second, it is the seed rel when the checkout carries the link as a tracked
+    DANGLING entry: the seed loop will not copy through a link, so the target is
+    the only path it will write, and the link then reads that copy.
+
+    ``()`` on any resolve/relative fault; for an artifact absent from the main
+    checkout (dropped silently by the seed loop, so naming it would be invisible
+    rather than inert); for one the checkout already delivers; behind a
+    worktree link whose target is already in the worktree; and for one in the shared
+    ticket store ``shared_store``, which ``rebased`` leaves unmoved and the mount is
+    redirected to. Every probe is total.
+    """
+    if _in_store(artifact, shared_store):
+        return ()
+    try:
+        repo_resolved = repo.resolve()
+        rel = (artifact.parent.resolve() / artifact.name).relative_to(repo_resolved).as_posix()
+        target_rel = artifact.resolve().relative_to(repo_resolved).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return ()
+    if not _is_file(artifact) or _is_file(worktree / rel):
+        return ()
+    try:
+        linked = (worktree / rel).is_symlink()
+    except (OSError, ValueError):
+        # An entry that cannot be inspected is not safe to write through either.
+        return ()
+    if linked:
+        return () if _occupied(worktree / target_rel) else (target_rel,)
+    return (rel,)
+
+
+def _artifact_seed_dropped(
+    artifact: Path, repo: Path, worktree: Path, *, shared_store: Path | None = None
+) -> tuple[str, ...]:
+    """The configured rel :func:`_artifact_seed` excluded as out-of-project, when the
+    worktree ends up without it — or ``()`` (DW-432).
+
+    Naming only: the out-of-project exclusion itself stands, and nothing here seeds or
+    copies. It exists because that exclusion was silent — an untracked leaf symlink
+    whose target resolves outside the PROJECT left the worktree's configured path
+    absent with no journal entry saying so. For a nested project a target that is
+    inside ``repo_root`` but outside the project is named too (and still not copied:
+    the copier's checkout-wide containment check would let it through, which would be
+    a behavior change).
+
+    ``(rel,)`` only when the configured rel (parent resolved, leaf not — the one
+    :func:`_artifact_seed` derives) lies inside ``repo``, the fully resolved target
+    does NOT, the main-checkout artifact reads as a file, and ``worktree / rel`` does
+    not (a checkout carrying the link as a tracked live entry delivers it). ``repo``
+    and ``worktree`` are the :func:`provision_roots` pair, so the rel is
+    project-relative like every other ``worktree-seed-dropped`` entry. Meant to run
+    after provisioning, on the post-provisioning worktree. Total: a resolve fault is
+    "not dropped", and so is an artifact in the shared ticket store, which the mount
+    reads in place.
+    """
+    if _in_store(artifact, shared_store):
+        return ()
+    try:
+        repo_resolved = repo.resolve()
+        rel = (artifact.parent.resolve() / artifact.name).relative_to(repo_resolved).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return ()
+    try:
+        artifact.resolve().relative_to(repo_resolved)
+    except ValueError:
+        pass  # the target escapes the project: the exclusion this names
+    except (OSError, RuntimeError):
+        return ()
+    else:
+        return ()  # an in-project target is _artifact_seed's to deliver
+    if not _is_file(artifact) or _is_file(worktree / rel):
+        return ()
+    return (rel,)
+
+
+def provision_roots(worktree: Path, repo_root: Path, project: Path | None) -> tuple[Path, Path]:
+    """``(src_root, dst_root)``: where provisioning reads each project-local surface
+    in the main checkout, and where it lands it in the mount (DW-379).
+
+    The project lies inside ``repo_root`` (the default config included), so the
+    mount mirrors the main checkout: ``src_root`` is the main project and
+    ``dst_root`` the mount project, :func:`mountpaths.rebased_project`'s single
+    definition (``<worktree>/<offset>``; ``worktree`` itself when the offset is
+    ``.``). ``project=None`` keeps the checkout roots, ``(repo_root, worktree)``.
+
+    A project NOT inside ``repo_root`` (a disjoint layout) raises
+    :class:`verify.GitError`: the checkout carries no copy of it, so there is no
+    mirror to build, and `bmadconfig.worktree_isolation_conflict` refuses worktree
+    isolation for that layout before any mount is made (#414). Reaching here with
+    one is a bypassed refusal, and seeding from either root would bring back the
+    silent stall the refusal exists for, so it fails loud instead.
+
+    Lexical: the caller hands over the spellings it wants compared (provisioning
+    resolves all three first). Containment is NOT narrowed by this — every caller
+    keeps judging sources against ``repo_root`` and destinations against
+    ``worktree``, checkout-wide."""
+    if project is None:
+        return repo_root, worktree
+    if not project.is_relative_to(repo_root):
+        raise verify.GitError(
+            f"cannot provision a worktree for a project ({project}) outside repo_root "
+            f"({repo_root}): worktree isolation is refused for that layout (#414)"
+        )
+    return project, rebased_project(project, repo_root, worktree)
+
+
+def _shield_rel(worktree: Path, dst_root: Path, rel: str) -> str:
+    """A ``dst_root``-relative rel spelled worktree-relative, for the git-add shield.
+
+    Identity when ``dst_root`` is the worktree (the default config, byte-for-byte);
+    otherwise the project's offset is prefixed, so a pattern built as ``f"/{rel}"``
+    anchors at ``/<offset>/...`` where provisioning actually wrote."""
+    offset = dst_root.relative_to(worktree).as_posix()
+    if offset == ".":
+        return rel
+    return posixpath.normpath(f"{offset}/{rel}")
+
+
+def _normalized_ledger_lines(text: str) -> list[str]:
+    """Rstripped non-blank lines, engine ``seen-again:`` stamps dropped."""
+    return [
+        line
+        for line in (raw.rstrip() for raw in text.splitlines())
+        if line and not line.startswith("seen-again:")
+    ]
+
+
+def _uncarried_ledger_changes(
+    seed: str,
+    current: str,
+    *,
+    harvested: Collection[tuple[str, str]],
+    closed: Collection[str],
+) -> tuple[list[str], int]:
+    """What differs between a seeded ledger and its worktree copy beyond engine writes.
+
+    Pure (DW-375). ``harvested`` is the task's recorded ``(origin, source_spec)``
+    pairs and ``closed`` its intended story/bundle close ids — the writes the
+    post-merge carry re-applies. Explained ids are the closed ids plus every id
+    NEW in ``current`` that carries a harvested pair (harvest ids minted in the
+    worktree are not recorded, so the pair is the key, as it is the carry's).
+    Entries compare by id over a normalized body (rstripped non-blank lines,
+    ``seen-again:`` dropped). Returns the unexplained ids — seed order, then
+    current order — and ``count``, the symmetric multiset difference of
+    normalized non-blank lines outside every canonical span (flat blocks and
+    other non-entry text).
+    """
+    seed_entries = deferredwork.parse_ledger(seed)
+    current_entries = deferredwork.parse_ledger(current)
+
+    def bodies(entries: list[deferredwork.DWEntry]) -> dict[str, list[list[str]]]:
+        by_id: dict[str, list[list[str]]] = {}
+        for entry in entries:
+            by_id.setdefault(entry.id, []).append(_normalized_ledger_lines(entry.body))
+        return by_id
+
+    seed_bodies = bodies(seed_entries)
+    current_bodies = bodies(current_entries)
+    explained = set(closed)
+    for entry in current_entries:
+        if entry.id not in seed_bodies and any(
+            deferredwork.field_line_present(entry, "origin", origin)
+            and deferredwork.field_line_present(entry, "source_spec", source_spec)
+            for origin, source_spec in harvested
+        ):
+            explained.add(entry.id)
+    unexplained: list[str] = []
+    for entry in (*seed_entries, *current_entries):
+        dw_id = entry.id
+        if dw_id in explained or dw_id in unexplained:
+            continue
+        if seed_bodies.get(dw_id) != current_bodies.get(dw_id):
+            unexplained.append(dw_id)
+
+    def outside(text: str, entries: list[deferredwork.DWEntry]) -> Counter[str]:
+        kept: list[str] = []
+        cursor = 0
+        for start, end in sorted(entry.span for entry in entries):
+            kept.append(text[cursor:start])
+            cursor = max(cursor, end)
+        kept.append(text[cursor:])
+        return Counter(line for chunk in kept for line in _normalized_ledger_lines(chunk))
+
+    before = outside(seed, seed_entries)
+    after = outside(current, current_entries)
+    count = sum(((before - after) + (after - before)).values())
+    return unexplained, count
+
+
+def _worktree_skill_copy_candidates(repo_root: Path, tree: SkillTree) -> tuple[str, ...]:
+    """Every upstream skill worth best-effort copying into ``tree``'s project trees."""
     resolved = resolve_review_layers(repo_root, tree)
     return tuple(dict.fromkeys((*BASE_SKILLS, *(resolved.skills() if resolved else ()))))
 
 
-def _required_worktree_skills(repo_root: Path, tree: str) -> tuple[str, ...]:
+def _required_worktree_skills(repo_root: Path, tree: SkillTree) -> tuple[str, ...]:
     """Upstream skills whose absence deterministically stalls this tree's run.
 
     Match :func:`install.missing_base_skills`: gate the selected dev primitive and
@@ -119,7 +361,7 @@ def _required_worktree_skills(repo_root: Path, tree: str) -> tuple[str, ...]:
     resolved = resolve_review_layers(repo_root, tree)
     if resolved is not None:
         review_skills = tuple(resolved.required)
-    elif (repo_root / tree / MERGED_REVIEW_SKILL / "SKILL.md").is_file():
+    elif skill_locate.locate(repo_root, skill_locate.as_scope(tree), MERGED_REVIEW_SKILL):
         review_skills = (MERGED_REVIEW_SKILL,)
     else:
         review_skills = tuple(sorted(_REVIEW_LAYER_SKILLS))
@@ -325,7 +567,7 @@ def _reconcile_tracked_patterns(
     return kept, (" ".join(reasons) if reasons else None)
 
 
-def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
+def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> tuple[bool, str | None]:
     """Keep a rewritten TRACKED hook config out of the unit's story commits.
 
     The worktree-local exclude cannot: git consults ignore rules only for
@@ -338,11 +580,19 @@ def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
     (it is the sparse-checkout mechanism) and that dies with the worktree, so
     the rewrite stays session-local.
 
-    While the pin holds, the config is orchestrator-owned: a story's own edit to
-    the pinned file stays session-local and is discarded with the worktree. That
-    is deliberate — before this pin the tracked case stalled outright (#352), so
-    there is no prior working behavior to preserve, and any file-level hiding
-    that keeps OUR rewrite out of `add -A` hides a story's edit with it.
+    While the pin holds, a story's own edit to the pinned file is hidden from
+    `add -A` along with OUR rewrite — any file-level hiding hides both — so it
+    never reaches the unit commit. Rather than let teardown delete it with the
+    worktree, the caller records each pinned rewrite (``provision_worktree``'s
+    ``on_pinned``) and success teardown compares the file on disk against that
+    record with relay hooks ignored: any other difference journals
+    ``pinned-config-edit-refused`` and pauses the run with the worktree kept
+    (DW-368, ``WorktreeFlow._refuse_pinned_config_edits``). The edit is not
+    carried anywhere; the operator does that by hand.
+
+    Returns ``(pinned, degrade)``: ``pinned`` is True only when the skip-worktree
+    bit was actually set, so a caller can tell a pin from "not tracked" / "not a
+    repo" (both ``(False, None)``); ``degrade`` is the observation fault below.
 
     NOT-A-REPO IS SILENT for the same reason the shield's tracked-probe is:
     provisioning a plain directory is ordinary, and there is no index and no
@@ -356,14 +606,14 @@ def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
     """
     try:
         if verify.git_bytes(worktree, "rev-parse", "--absolute-git-dir").returncode != 0:
-            return None
+            return False, None
     except (verify.GitError, OSError):
-        return None
+        return False, None
     try:
         if not verify.path_tracked_file(worktree, rel):
-            return None
+            return False, None
     except (verify.GitError, OSError) as e:
-        return (
+        return False, (
             f"could not check whether the rewritten hook config {rel} is tracked "
             f"({e}); if the project tracks it, the worktree's machine-specific relay "
             "command may be committed and merged back (#352)"
@@ -375,14 +625,189 @@ def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:
             "config is tracked, so without the pin its machine-specific relay rewrite "
             "would reach story commits and merge back (#352)"
         )
-    return None
+    return True, None
 
 
-def _seed_bmad_tree(worktree: Path, repo_root: Path) -> tuple[list[str], list[str]]:
+def _normalized_pinned_config(parsed: dict[str, Any], dialect: str) -> dict[str, Any]:
+    """A parsed hook config with the orchestrator-owned relay hooks removed.
+
+    Drops exactly what ``strip_relay_hooks`` drops, plus the hook container once
+    that leaves it empty — provisioning may have created it only to hold the relay.
+    Works on a deep copy: the strip mutates.
+    """
+    cfg = copy.deepcopy(parsed)
+    strip_relay_hooks(cfg, dialect)
+    key = ANTIGRAVITY_HOOK_GROUP if dialect == "antigravity-hooks-json" else "hooks"
+    if cfg.get(key) == {}:
+        del cfg[key]
+    return cfg
+
+
+def _json_canonical(value: Any) -> str:
+    """JSON text with sorted keys: equal only for the same JSON value. Python's
+    ``==`` alone is not — it reads ``true`` as ``1`` and ``1`` as ``1.0``."""
+    return json.dumps(value, sort_keys=True)
+
+
+def _pinned_config_edits(worktree: Path, pins: dict[str, dict[str, str]]) -> list[str]:
+    """Describe every story edit to a pinned hook config, or ``[]`` for none (DW-368).
+
+    ``pins`` is ``StoryTask.pinned_config_rewrites``: worktree-relative path ->
+    ``{"dialect", "text"}`` as provisioning wrote it. A file byte-identical to its
+    record is untouched; otherwise both sides are parsed and compared with relay
+    hooks and an emptied hook container ignored, so a changed or removed relay
+    command, or a reformat, is not an edit. A non-relay hook a story or user added
+    IS one. Deterministic, and conservative because teardown is irreversible: a
+    config that is missing, unreadable, undecodable, unparseable or not a JSON
+    object while pinned counts as an edit, its description naming the fault.
+    """
+    edits: list[str] = []
+    for rel in sorted(pins):
+        entry = pins[rel]
+        recorded_text = str(entry.get("text", ""))
+        dialect = str(entry.get("dialect", ""))
+        path = worktree / rel
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            edits.append(f"{rel}: deleted while pinned")
+            continue
+        except OSError as e:
+            edits.append(f"{rel}: unreadable while pinned ({e})")
+            continue
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            edits.append(f"{rel}: not valid UTF-8 ({e})")
+            continue
+        if text == recorded_text:
+            continue
+        try:
+            current = json.loads(text)
+        except json.JSONDecodeError as e:
+            edits.append(f"{rel}: no longer parses as JSON ({e})")
+            continue
+        if not isinstance(current, dict):
+            edits.append(f"{rel}: no longer a JSON object ({type(current).__name__})")
+            continue
+        try:
+            recorded = json.loads(recorded_text)
+        except json.JSONDecodeError as e:
+            edits.append(f"{rel}: the recorded rewrite cannot be parsed ({e})")
+            continue
+        if not isinstance(recorded, dict):
+            edits.append(f"{rel}: the recorded rewrite is not a JSON object")
+            continue
+        now = _normalized_pinned_config(current, dialect)
+        was = _normalized_pinned_config(recorded, dialect)
+        if _json_canonical(now) == _json_canonical(was):
+            continue
+        # keys on one side only (even with a null value) plus keys whose values differ
+        changed = sorted(
+            (now.keys() ^ was.keys())
+            | {
+                k
+                for k in now.keys() & was.keys()
+                if _json_canonical(now[k]) != _json_canonical(was[k])
+            }
+        )
+        edits.append(f"{rel}: changed outside the relay hooks (keys: {', '.join(changed)})")
+    return edits
+
+
+_PINNED_FORENSICS_HEADER = (
+    "# bmad-loop (DW-479): edits to skip-worktree-pinned hook configs.\n"
+    "# `git diff` reads a skip-worktree path as clean, so the patch above (if any)\n"
+    "# omits these. Each diff's base is the rewrite provisioning wrote and pinned\n"
+    "# (bmad-loop relay hooks included), not the baseline commit, so this section is\n"
+    "# commented out and does NOT apply: `git apply` skips it; carry it by hand.\n"
+)
+
+
+def _unified_diff_text(before: str, after: str | None, rel: str) -> str:
+    """A unified diff of ``before`` -> ``after`` for ``rel`` (``after=None``: deleted,
+    diffed to ``/dev/null``), with git's no-newline marker where a side lacks one.
+    Every line is ``# ``-prefixed: its base is the relay-bearing rewrite, not the
+    baseline, so a live hunk would make an all-or-nothing ``git apply`` of the whole
+    patch fail; commented, ``git apply`` skips it as garbage."""
+    lines = difflib.unified_diff(
+        _lines_keepends(before),
+        _lines_keepends(after or ""),
+        fromfile=f"a/{rel}",
+        # patch-format spelling of "no file", on every platform (not os.devnull)
+        tofile=posixpath.devnull if after is None else f"b/{rel}",
+    )
+    out: list[str] = []
+    for line in lines:
+        out.append(f"# {line}")
+        if not line.endswith("\n"):
+            out.append("\n# \\ No newline at end of file\n")
+    return "".join(out)
+
+
+def _lines_keepends(text: str) -> list[str]:
+    """``text`` split on ``\n`` only, ends kept. ``str.splitlines`` also splits on
+    U+2028/U+2029/``\x85``/``\r`` and more, all legal raw inside a JSON string,
+    which would put a bogus line break mid-hunk."""
+    parts = [f"{piece}\n" for piece in text.split("\n")]
+    parts[-1] = parts[-1][:-1]  # the last piece had no newline after it
+    return parts if parts[-1] else parts[:-1]
+
+
+def _pinned_config_forensics(worktree: Path, pins: dict[str, dict[str, str]]) -> str:
+    """The forensic-patch section for story edits to pinned hook configs, or ``""``
+    when there is none (DW-479).
+
+    A DEFERRED unit's ``changes.patch`` is ``git diff <baseline>``, which reads a
+    skip-worktree-pinned config as clean, so a story's edit to one never reached the
+    patch and was lost silently when teardown removed the worktree. ``pins`` is
+    ``StoryTask.pinned_config_rewrites``; each rel is judged alone by
+    :func:`_pinned_config_edits`, so a relay-only change or a reformat adds nothing.
+    Each edited rel gets its description line(s) as ``#`` comments, then a
+    commented-out unified diff from the recorded rewrite to the on-disk text (to
+    ``/dev/null`` when the file is gone) — commented so ``git apply`` of the patch
+    above still works. No git call: the recorded rewrite is exactly what provisioning
+    wrote, so the diff isolates the story's own delta without the relay noise.
+
+    Total: a file that cannot be read or decoded keeps its description line and
+    gets no diff.
+    """
+    sections: list[str] = []
+    for rel in sorted(pins):
+        entry = pins[rel]
+        edits = _pinned_config_edits(worktree, {rel: entry})
+        if not edits:
+            continue
+        section = "".join(f"# {line}\n" for line in edits)
+        after: str | None
+        try:
+            after = (worktree / rel).read_bytes().decode("utf-8")
+        except FileNotFoundError:
+            after = None
+        except (OSError, UnicodeDecodeError):
+            sections.append(section)
+            continue
+        sections.append(section + _unified_diff_text(str(entry.get("text", "")), after, rel))
+    if not sections:
+        return ""
+    return _PINNED_FORENSICS_HEADER + "".join(sections)
+
+
+def _seed_bmad_tree(
+    worktree: Path, repo_root: Path, *, project: Path | None = None
+) -> tuple[list[str], list[str]]:
     """Merge the repo's project-local BMAD surface into an isolated worktree.
 
-    Renderer-backed skills receive the worktree as their project root and do not
-    walk upward for ``_bmad``. Copy every usable file except generated render output,
+    Read from ``<src_root>/_bmad`` and landed at ``<dst_root>/_bmad``
+    (:func:`provision_roots`) — under a nested project that is the mount project,
+    never the checkout root. Both returned readings are WORKTREE-relative, because
+    both feed the git-add shield, which git reads from the worktree root.
+
+    Renderer-backed skills receive the mount PROJECT as their project root — the
+    worktree itself in the default config, ``<worktree>/<offset>`` for a project
+    nested in ``repo_root`` (DW-379), which is also the session cwd (DW-484) — and
+    do not walk upward for ``_bmad``.
+    Copy every usable file except generated render output,
     per-file and without clobbering checkout content. The shared Traversable walk is
     intentional: unlike ``rglob``, it descends a symlinked child directory, allowing
     the result-side completeness predicates to see every file the copier considered.
@@ -402,10 +827,12 @@ def _seed_bmad_tree(worktree: Path, repo_root: Path) -> tuple[list[str], list[st
       their own, so the answer has to stay per-file even when ``shield_rels``
       collapsed.
     """
-    src_root = repo_root / BMAD_DIR
+    source_root, mount_root = provision_roots(worktree, repo_root, project)
+    bmad_rel = _shield_rel(worktree, mount_root, BMAD_DIR)
+    src_root = source_root / BMAD_DIR
     if not _is_dir(src_root):
         return [], []
-    dst_root = worktree / BMAD_DIR
+    dst_root = mount_root / BMAD_DIR
     had_bmad = _is_dir(dst_root)
     try:
         tops = sorted(src_root.iterdir(), key=lambda entry: entry.name)
@@ -427,10 +854,10 @@ def _seed_bmad_tree(worktree: Path, repo_root: Path) -> tuple[list[str], list[st
                 worktree=worktree,
                 repo_root=repo_root,
             ):
-                seeded.append(f"{BMAD_DIR}/{rel}")
+                seeded.append(f"{bmad_rel}/{rel}")
     if not seeded:
         return [], []
-    return ([BMAD_DIR] if not had_bmad else seeded), seeded
+    return ([bmad_rel] if not had_bmad else seeded), seeded
 
 
 def _record_seeded(
@@ -474,27 +901,40 @@ def _written_rels(worktree: Path, landed: Sequence[Path]) -> list[str]:
     return [p.relative_to(worktree).as_posix() for p in landed if _is_file(p)]
 
 
-def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
+def _bmad_scripts_seed_incomplete(
+    worktree: Path, repo_root: Path, *, project: Path | None = None
+) -> bool:
     """Whether a required repo renderer unit member missed the worktree.
 
     Match the renderer preflight's content-keyed required-file predicate. Arbitrary
     sibling scripts are still merge-seeded, but their absence cannot prove the
     renderer will HALT and therefore must not arm the CRITICAL escalation gate.
+    Probes the project-local roots :func:`provision_roots` names.
     """
+    src_root, dst_root = provision_roots(worktree, repo_root, project)
     return any(
-        _renderer_unit_required(repo_root, rel)
-        and _is_file(repo_root / rel)
-        and not _is_file(worktree / rel)
+        _renderer_unit_required(src_root, rel)
+        and _is_file(src_root / rel)
+        and not _is_file(dst_root / rel)
         for rel in RENDERER_SCRIPT_UNIT_REL
     )
 
 
-def _central_config_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
+def _central_config_seed_incomplete(
+    worktree: Path, repo_root: Path, *, project: Path | None = None
+) -> bool:
     """Whether the repo's required renderer config failed to reach the worktree."""
-    return _is_file(repo_root / CENTRAL_CONFIG_REL) and not _is_file(worktree / CENTRAL_CONFIG_REL)
+    src_root, dst_root = provision_roots(worktree, repo_root, project)
+    return _is_file(src_root / CENTRAL_CONFIG_REL) and not _is_file(dst_root / CENTRAL_CONFIG_REL)
 
 
-def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence[str]) -> list[str]:
+def base_skills_seed_incomplete(
+    worktree: Path,
+    repo_root: Path,
+    trees: Sequence[SkillTree],
+    *,
+    project: Path | None = None,
+) -> list[str]:
     """Required upstream skill rels present in the repo but absent in the worktree.
 
     ``BASE_SKILLS`` is a copy-if-present catalog, not a requirement set. Gate only
@@ -513,35 +953,75 @@ def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence
     ``SKILL.md`` remains the run-start preflight's concern and cannot produce a false
     CRITICAL escalation here. Stories mode adds its content-keyed dispatch probe at
     the caller, where the run mode is available.
+
+    The skill trees are project-local: probed under :func:`provision_roots`. A
+    :class:`~bmad_loop.skill_locate.SkillScope` widens that to every project tree
+    (the copy :func:`~bmad_loop.skill_locate.locate` picks is the one checked) and,
+    with ``[skills] user_roots`` on, exempts a required skill located in a user
+    root: the session loads it from the operator's home, which no worktree
+    carries and seeding never copies (:func:`base_skills_user_rooted` names them
+    for the journal).
     """
+    src_root, dst_root = provision_roots(worktree, repo_root, project)
     missing: list[str] = []
     for tree in dict.fromkeys(trees):
-        primitive = dev_primitive_or_default(repo_root, tree)
-        for skill in _required_worktree_skills(repo_root, tree):
-            repo_skill = repo_root / tree / skill
-            worktree_skill = worktree / tree / skill
-            if not _is_file(repo_skill / "SKILL.md"):
+        scope = skill_locate.as_scope(tree)
+        primitive = dev_primitive_or_default(src_root, tree)
+        for skill in _required_worktree_skills(src_root, tree):
+            located = skill_locate.locate(src_root, scope, skill)
+            if located is not None and located.origin == "user":
+                continue
+            if located is None:
                 # Distinguish an unreadable directory from a skill the repo simply
                 # does not carry. The walk yields only the former as a directory leaf.
-                if any(_is_dir(src) for _, src in _walk_traversable_files(repo_skill)):
-                    missing.append(f"{tree}/{skill}")
+                for project_tree in scope.project_trees():
+                    repo_skill = src_root / project_tree / skill
+                    if any(_is_dir(src) for _, src in _walk_traversable_files(repo_skill)):
+                        missing.append(f"{project_tree}/{skill}")
+                        break
                 continue
+            located_tree = located.root
+            repo_skill = src_root / located_tree / skill
+            worktree_skill = dst_root / located_tree / skill
             if not _is_file(worktree_skill / "SKILL.md"):
-                missing.append(f"{tree}/{skill}")
+                missing.append(f"{located_tree}/{skill}")
                 continue
             if skill != primitive:
                 continue
             missing.extend(
-                f"{tree}/{skill}/{rel}"
+                f"{located_tree}/{skill}/{rel}"
                 for rel in DEV_PRIMITIVE_MARKERS
                 if _is_file(repo_skill / rel) and not _is_file(worktree_skill / rel)
             )
             missing.extend(
-                f"{tree}/{skill}/{rel}"
+                f"{located_tree}/{skill}/{rel}"
                 for rel in _absent_renderer_sources(worktree_skill)
                 if _is_file(repo_skill.joinpath(*rel.split("/")))
             )
     return missing
+
+
+def base_skills_user_rooted(
+    repo_root: Path,
+    trees: Sequence[SkillTree],
+    *,
+    project: Path | None = None,
+) -> list[str]:
+    """Required upstream skills :func:`base_skills_seed_incomplete` exempts
+    because :func:`~bmad_loop.skill_locate.locate` puts them in a user root
+    (``[skills] user_roots`` on), as display spellings (``~/.agents/skills/x``).
+    Plain tree strings never resolve to a user root, so they yield nothing."""
+    src_root = repo_root if project is None else project  # provision_roots' src_root
+    found: dict[str, None] = {}
+    for tree in dict.fromkeys(trees):
+        scope = skill_locate.as_scope(tree)
+        if not scope.resolve_user:
+            continue
+        for skill in _required_worktree_skills(src_root, tree):
+            located = skill_locate.locate(src_root, scope, skill)
+            if located is not None and located.origin == "user":
+                found[located.display] = None
+    return list(found)
 
 
 def worktree_seed_undelivered(
@@ -550,8 +1030,14 @@ def worktree_seed_undelivered(
     seed_files: Sequence[str] = (),
     seed_globs: Sequence[str] = (),
     config_paths: Sequence[str] = (),
+    *,
+    project: Path | None = None,
 ) -> list[str]:
     """Seed rels the repo carries that never reached the worktree.
+
+    Rels are project-relative, read under and probed against the roots
+    :func:`provision_roots` names, exactly as provisioning copied them; the
+    containment arms below stay checkout-wide (``repo_root``/``worktree``).
 
     Source containment is deliberately *not* an eligibility requirement: a source
     symlink resolving outside the repo is the canonical entry the seed loop refuses
@@ -564,28 +1050,30 @@ def worktree_seed_undelivered(
     source escape, a symlinked destination, or destination escape proves the seed was
     refused. This report is informational and is never an escalation gate.
     """
-    unresolved_repo_root = repo_root
+    unresolved_src_root, _ = provision_roots(worktree, repo_root, project)
     try:
         worktree = worktree.resolve()
         repo_root = repo_root.resolve()
+        project = project.resolve() if project is not None else None
     except (OSError, RuntimeError, ValueError):
         # Observation only: root uncertainty cannot prove delivery, but it must
         # not turn an informational journal probe into a run-wide failure.
         rels = [str(rel) for rel in seed_files]
         for pattern in seed_globs:
             try:
-                matches = sorted(unresolved_repo_root.glob(pattern))
+                matches = sorted(unresolved_src_root.glob(pattern))
             except (OSError, RuntimeError, ValueError):
                 continue
-            rels.extend(match.relative_to(unresolved_repo_root).as_posix() for match in matches)
+            rels.extend(match.relative_to(unresolved_src_root).as_posix() for match in matches)
         return list(dict.fromkeys(rels))
+    src_root, dst_root = provision_roots(worktree, repo_root, project)
     rels = [str(rel) for rel in seed_files]
     for pattern in seed_globs:
         try:
-            matches = sorted(repo_root.glob(pattern))
+            matches = sorted(src_root.glob(pattern))
         except (OSError, RuntimeError, ValueError):
             continue
-        rels.extend(match.relative_to(repo_root).as_posix() for match in matches)
+        rels.extend(match.relative_to(src_root).as_posix() for match in matches)
     hook_configs = {Path(rel) for rel in config_paths}
 
     def contained(path: Path, root: Path) -> bool:
@@ -633,10 +1121,10 @@ def worktree_seed_undelivered(
 
     undelivered: list[str] = []
     for rel in dict.fromkeys(rels):
-        src = repo_root / rel
+        src = src_root / rel
         if not (_is_file(src) or _is_dir(src)):
             continue
-        dst = worktree / rel
+        dst = dst_root / rel
         if Path(rel) in hook_configs:
             try:
                 destination_is_link = dst.is_symlink()
@@ -655,8 +1143,15 @@ def module_skills_seed_undelivered(
     worktree: Path,
     trees: Sequence[str],
     skills_root: Traversable | None = None,
+    *,
+    repo_root: Path | None = None,
+    project: Path | None = None,
 ) -> list[str]:
     """Wheel-bundled ``MODULE_SKILLS`` whose content never reached the worktree.
+
+    The skill trees sit under the mount project when ``repo_root`` and ``project``
+    are both given (:func:`provision_roots`), at the worktree root otherwise;
+    containment stays judged against the whole worktree.
 
     Re-probes DISK, never the copier's bookkeeping: a user-authored
     ``scm.worktree_seed`` entry that happens to spell a skill rel can therefore
@@ -673,7 +1168,8 @@ def module_skills_seed_undelivered(
     Informational, and NEVER an escalation gate. No ``MODULE_SKILLS`` entry has a
     worktree-resident consumer — sweep triage dispatches ``/bmad-loop-sweep`` at the
     MAIN checkout, ``bmad-loop-resolve`` runs at the main checkout too, and
-    ``bmad-loop-setup`` has no session consumer at all — so an absence here cannot
+    ``bmad-loop-setup`` and the ``bmod-bmad-loop`` module record have no session
+    consumer at all — so an absence here cannot
     prove a stall, and a CRITICAL gate would refuse healthy runs. Extension point: if
     a consumer ever becomes worktree-resident (e.g. sweep triage moving into unit
     worktrees), arm the gate by routing this predicate's result into
@@ -682,7 +1178,8 @@ def module_skills_seed_undelivered(
     Returns coarse ``"{tree}/{skill}"`` posix rels in iteration order.
     """
     if skills_root is None:
-        skills_root = resources.files("bmad_loop.data").joinpath("skills")
+        skills_root = _skills_root()
+    unresolved_worktree = worktree
     try:
         worktree = worktree.resolve()
     except (OSError, RuntimeError, ValueError):
@@ -717,13 +1214,16 @@ def module_skills_seed_undelivered(
             # such an entry either, so its absence is not a delivery failure.
         return True
 
+    dst_root = worktree
+    if repo_root is not None:
+        dst_root = provision_roots(unresolved_worktree, repo_root, project)[1]
     undelivered: list[str] = []
     for tree in dict.fromkeys(trees):
         for skill in MODULE_SKILLS:
             src = skills_root.joinpath(skill)
             if not (_is_file(src) or _is_dir(src)):
                 continue
-            if not delivered(src, worktree / tree / skill):
+            if not delivered(src, dst_root / tree / skill):
                 undelivered.append(f"{tree}/{skill}")
     return undelivered
 
@@ -736,6 +1236,10 @@ def provision_worktree(
     seed_globs: Sequence[str] = (),
     *,
     on_degraded: Callable[[str], None] | None = None,
+    on_pinned: Callable[[str, str, str], None] | None = None,
+    project: Path | None = None,
+    on_hook_gated: Callable[[str], None] | None = None,
+    user_roots: bool = False,
 ) -> list[str]:
     """Make a freshly-created git worktree a self-sufficient bmad-loop project.
 
@@ -804,28 +1308,57 @@ def provision_worktree(
     seeding actually wrote, never inferred from the seed entry that covers the path
     (#592).
 
+    A TRACKED hook config the hook step rewrites is pinned skip-worktree in the
+    worktree's index so the machine-specific relay command stays out of story
+    commits (#352). After each successful pin, ``on_pinned`` is called with
+    ``(rel, dialect, text)`` — the worktree-relative config path, the profile's hook
+    dialect, and the exact text written — so the caller can later tell a story's
+    own edit to the pinned file from our rewrite (DW-368). It is not called for an
+    untracked config, a non-repo worktree, or a config the hook step left alone.
+
     The repo's `_bmad/` surface is also merge-seeded, excluding generated render
     output. Renderer and upstream-skill completeness failures share the return
     channel with ordinary no-op seeds so they are journaled, but the caller re-probes
     the skill result and content-gates the renderer sentinels before escalating.
 
+    `project` is the BMAD project (DW-379). Every project-local surface — the
+    `seed_files`/`seed_globs` entries, `_bmad/`, the skill trees, the hook configs —
+    is read under ``src_root`` and landed under ``dst_root``
+    (:func:`provision_roots`): the main project and the mount project at the same
+    offset inside `repo_root`, so the mount mirrors the main checkout; ``None``
+    keeps the checkout roots, and a project outside `repo_root` raises (that layout
+    is refused before any mount, #414). Containment stays checkout-wide (sources
+    inside `repo_root`, destinations inside `worktree`), and the shield patterns and
+    the pinned config rel handed to ``on_pinned`` are worktree-relative, offset
+    included. Returned entries keep the project-relative spelling they were given.
+
     Returns the `seed_files` entries that copied NOTHING because everything they
     name was already present, plus reserved completeness reports. A directory entry
     that seeded even one child is not a no-op and is not reported.
     """
-    if not profiles and not seed_files and not seed_globs and not _is_dir(repo_root / BMAD_DIR):
+    bmad_source = provision_roots(worktree, repo_root, project)[0] / BMAD_DIR
+    if not profiles and not seed_files and not seed_globs and not _is_dir(bmad_source):
         return []
     unresolved_worktree = worktree
     unresolved_repo_root = repo_root
+    unresolved_project = project
     try:
         worktree = worktree.resolve()
         repo_root = repo_root.resolve()
+        project = project.resolve() if project is not None else None
     except (OSError, RuntimeError, ValueError) as e:
         raise verify.GitError(
             "cannot resolve worktree provisioning roots safely "
-            f"(worktree={unresolved_worktree}, repo_root={unresolved_repo_root}): {e}"
+            f"(worktree={unresolved_worktree}, repo_root={unresolved_repo_root}"
+            + (f", project={unresolved_project}" if unresolved_project is not None else "")
+            + f"): {e}"
         ) from e
-    skills_root = resources.files("bmad_loop.data").joinpath("skills")
+    src_root, dst_root = provision_roots(worktree, repo_root, project)
+
+    def shield(rel: str) -> str:
+        return _shield_rel(worktree, dst_root, rel)
+
+    skills_root = _skills_root()
 
     # project gitignored MCP/CLI configs: copy from the main repo when absent.
     # Resolve-and-contain guards against an `..`/absolute entry escaping either tree.
@@ -855,9 +1388,9 @@ def provision_worktree(
     # misconfiguration, exactly like the glob-expanded matches below.
     skipped: list[str] = []
     for rel in seed_files:
-        raw = worktree / rel
+        raw = dst_root / rel
         try:
-            src = (repo_root / rel).resolve()
+            src = (src_root / rel).resolve()
             dst = raw.resolve()
         except (OSError, RuntimeError, ValueError):
             continue
@@ -928,12 +1461,12 @@ def provision_worktree(
     # worktree path mirrors the repo layout; resolve only guards containment.
     for pattern in seed_globs:
         try:
-            matches = sorted(repo_root.glob(pattern))
+            matches = sorted(src_root.glob(pattern))
         except (OSError, RuntimeError, ValueError):
             continue
         for match in matches:
-            rel = match.relative_to(repo_root)
-            raw = worktree / rel
+            rel = match.relative_to(src_root)
+            raw = dst_root / rel
             try:
                 src = match.resolve()
                 dst = raw.resolve()
@@ -960,21 +1493,25 @@ def provision_worktree(
             _record_seeded(seeded_from, landed, src, raw)
             written.update(_written_rels(worktree, landed))
 
-    # Renderer-backed skills are handed the worktree as their project root. Merge
+    # Renderer-backed skills are handed the mount project as their project root (the
+    # worktree, or `<worktree>/<offset>` under a nested `repo_root`, DW-379), which is
+    # also the session cwd (DW-484). Merge
     # the repo's project-local BMAD surface after explicit seeds (operator intent wins
     # on collisions) and reserve the two renderer sentinels for result-side checks.
-    seeded_bmad, bmad_written = _seed_bmad_tree(worktree, repo_root)
+    seeded_bmad, bmad_written = _seed_bmad_tree(worktree, repo_root, project=project)
     written.update(bmad_written)
     skipped = [rel for rel in skipped if rel not in RENDERER_SEED_SENTINELS]
-    if _bmad_scripts_seed_incomplete(worktree, repo_root):
+    if _bmad_scripts_seed_incomplete(worktree, repo_root, project=project):
         skipped.append(BMAD_SCRIPTS_SEED_REL)
-    if _central_config_seed_incomplete(worktree, repo_root):
+    if _central_config_seed_incomplete(worktree, repo_root, project=project):
         skipped.append(CENTRAL_CONFIG_REL)
 
-    # bundled skills into each CLI's skill tree (deduped: codex+gemini share one);
-    # never clobber a skill the checkout already carries (tracked or pre-existing).
+    # bundled skills into each CLI's PRIMARY skill tree (deduped: codex+gemini share
+    # one); never clobber a skill the checkout already carries (tracked or
+    # pre-existing). An extra tree gets none: `module_skills_seed_undelivered`
+    # probes the primary trees only, and bmad-loop's own skills live there.
     for tree in dict.fromkeys(p.skill_tree for p in profiles):
-        tree_dir = worktree / tree
+        tree_dir = dst_root / tree
         for skill in MODULE_SKILLS:
             dst = tree_dir / skill
             # `copied_paths` is read only by the shield: when this tree turns out to
@@ -995,56 +1532,65 @@ def provision_worktree(
         # caller as `worktree-module-skills-dropped`) — but journal-only, never the
         # CRITICAL gate below: no MODULE_SKILLS entry has a worktree-resident consumer
         # (sweep triage and bmad-loop-resolve dispatch at the MAIN checkout;
-        # bmad-loop-setup has no session consumer), so a partial wheel copy cannot
-        # prove a stall the way a missing upstream dev/review skill does. A future
+        # bmad-loop-setup and the bmod-bmad-loop record have no session consumer),
+        # so a partial wheel copy cannot prove a stall the way a missing upstream
+        # dev/review skill does. A future
         # worktree-resident consumer arms the gate via escalate_unit over that
         # predicate's result.
-        # The orchestrator-driven upstream skills are not in the wheel; copy them
-        # from the MAIN REPO's installed tree (same tree path) so an isolated
-        # worktree can still resolve the dev primitive and the review layers. Skip
-        # silently when the main repo lacks them — the run-start preflight reports
-        # it.
-        #
-        # BASE_SKILLS names BOTH primitive eras, which is what carries the skill
-        # across the rename: the resolution below returns REVIEW skills only, so a
-        # primitive the catalog did not name would be silently left behind (the
-        # is_dir guard swallows the miss) and every isolated session would stall on
-        # an Unknown command.
-        #
-        # BASE_SKILLS is only the floor. The review layers this project actually
-        # invokes are read from the installed primitive — resolved on disk, so a
-        # renamed project resolves its own layers rather than degrading to the
-        # static catalog — exactly as the preflight reads them, so a reviewer named
-        # by a project override (a custom or renamed skill) is provisioned too.
-        # Validating a skill here and then not copying it is how preflight passes in
-        # the main checkout while the isolated review fails on a skill that was
-        # never there.
-        for skill in _worktree_skill_copy_candidates(repo_root, tree):
-            dst = tree_dir / skill
-            try:
-                src = (repo_root / tree / skill).resolve()
-            except (OSError, RuntimeError, ValueError):
-                continue
-            if not src.is_relative_to(repo_root) or not _is_dir(src):
-                continue
-            landed = []
-            _copy_traversable(
-                src,
-                dst,
-                skip_existing=True,
-                worktree=worktree,
-                repo_root=repo_root,
-                copied_paths=landed,
-            )
-            written.update(_written_rels(worktree, landed))
+
+    # The orchestrator-driven upstream skills are not in the wheel; copy them
+    # from the MAIN REPO's installed trees (same tree paths) so an isolated
+    # worktree can still resolve the dev primitive and the review layers. Skip
+    # silently when the main repo lacks them — the run-start preflight reports
+    # it.
+    #
+    # BASE_SKILLS names BOTH primitive eras, which is what carries the skill
+    # across the rename: the resolution below returns REVIEW skills only, so a
+    # primitive the catalog did not name would be silently left behind (the
+    # is_dir guard swallows the miss) and every isolated session would stall on
+    # an Unknown command.
+    #
+    # BASE_SKILLS is only the floor. The review layers this project actually
+    # invokes are read from the installed primitive — resolved on disk, so a
+    # renamed project resolves its own layers rather than degrading to the
+    # static catalog — exactly as the preflight reads them, so a reviewer named
+    # by a project override (a custom or renamed skill) is provisioned too.
+    # Validating a skill here and then not copying it is how preflight passes in
+    # the main checkout while the isolated review fails on a skill that was
+    # never there.
+    #
+    # Every PROJECT tree of each profile (`skill_tree`, then `extra_skill_trees`)
+    # is seeded the same way, each from its own main-repo counterpart. A user
+    # root (`[skills] user_roots`) is never a source: the session reads that copy
+    # from the operator's home in place, and the gate below exempts it.
+    scopes = list(
+        dict.fromkeys(skill_locate.scope_for(p, resolve_user=user_roots) for p in profiles)
+    )
+    for scope in scopes:
+        candidates = _worktree_skill_copy_candidates(src_root, scope)
+        for tree in scope.project_trees():
+            for skill in candidates:
+                dst = dst_root / tree / skill
+                try:
+                    src = (src_root / tree / skill).resolve()
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                if not src.is_relative_to(repo_root) or not _is_dir(src):
+                    continue
+                landed = []
+                _copy_traversable(
+                    src,
+                    dst,
+                    skip_existing=True,
+                    worktree=worktree,
+                    repo_root=repo_root,
+                    copied_paths=landed,
+                )
+                written.update(_written_rels(worktree, landed))
 
     # Re-ask the result rather than trusting copy bookkeeping. A user-authored seed
     # can happen to spell a skill rel, so only this disk predicate may arm the gate.
-    skipped.extend(
-        base_skills_seed_incomplete(
-            worktree, repo_root, [profile.skill_tree for profile in profiles]
-        )
-    )
+    skipped.extend(base_skills_seed_incomplete(worktree, repo_root, scopes, project=project))
 
     # per-CLI signal-hook registration, baked to the main repo's relay (absolute).
     # Hookless profiles (HTTP/SSE transport) have no config to merge.
@@ -1052,7 +1598,7 @@ def provision_worktree(
     for profile in profiles:
         if profile.hookless:
             continue
-        raw_config_path = worktree / profile.hooks.config_path
+        raw_config_path = dst_root / profile.hooks.config_path
         # Refuse before mkdir, read, or write: hook commands are worktree-specific
         # and must never mutate a shared dotfile through a live or dangling link.
         # Inspect every component: a non-strict resolve either leaves a symlink cycle
@@ -1141,10 +1687,17 @@ def provision_worktree(
                     "terminal, so repairing the file alone does not put the story "
                     "back in the run (#592)"
                 ) from e
+        # The same version gate `init` applies (#865): a hook event the installed
+        # CLI is too old for (or whose version cannot be read) stays out, because
+        # one unknown key can make the CLI skip the whole config — Stop included.
+        events, gate_notes = gated_hook_events(profile)
+        if on_hook_gated is not None:
+            for note in gate_notes:
+                on_hook_gated(note)
         try:
             registrations = {
-                native: _hook_command(repo_root, profile, canonical)
-                for native, canonical in profile.hooks.events.items()
+                native: _hook_command(src_root, profile, canonical)
+                for native, canonical in events.items()
             }
         except ProfileError as e:
             raise verify.GitError(f"cannot register worktree relay: {e}") from e
@@ -1160,6 +1713,13 @@ def provision_worktree(
         if config_path not in stripped_paths:
             strip_relay_hooks(config, profile.hooks.dialect)
             stripped_paths.add(config_path)
+        # A seeded relay under a gated-out event goes too, even on a later
+        # profile's pass over a shared config (the full strip above runs once).
+        strip_event_relays(
+            config,
+            profile.hooks.dialect,
+            [native for native in profile.hooks.events if native not in events],
+        )
         config, _ = merge_hooks(config, registrations, profile.hooks.dialect)
         # Write — and pin — only when the strip+merge actually changed the parsed
         # config. A tracked config may already carry exactly the installed command,
@@ -1188,14 +1748,18 @@ def provision_worktree(
             # reading `0444`. This is the operator's own settings file, round-tripped
             # through the parse above, so a read-only one earns the `PermissionError`
             # the `write_text` this replaced raised.
-            atomic_write_text(
-                config_path,
-                json.dumps(config, indent=2) + "\n",
-                require_writable_target=True,
-            )
-            pin_degrade = _pin_tracked_config_rewrite(worktree, profile.hooks.config_path)
+            written_text = json.dumps(config, indent=2) + "\n"
+            atomic_write_text(config_path, written_text, require_writable_target=True)
+            # Worktree-relative, offset included: the pin runs git from the worktree
+            # root, and the recorded rel is read back against it (DW-368).
+            pinned_rel = shield(profile.hooks.config_path)
+            pinned, pin_degrade = _pin_tracked_config_rewrite(worktree, pinned_rel)
             if pin_degrade is not None and on_degraded is not None:
                 on_degraded(pin_degrade)
+            if pinned and on_pinned is not None:
+                # Profiles may share a config_path: a later pass rewrites the same
+                # file, so its call supersedes the earlier one (last write wins).
+                on_pinned(pinned_rel, profile.hooks.dialect, written_text)
 
     # Shield exactly the paths we wrote (skill trees + hook configs + seeded
     # configs) from the unit's `git add -A`, in case a project doesn't gitignore
@@ -1208,23 +1772,29 @@ def provision_worktree(
     # inert (#392), and over a tracked DIRECTORY swaps the entry for one pattern per
     # file `written` recorded under it (#484). `written` is therefore not an
     # alternative source of patterns but the substitution ledger that step reads.
-    patterns = {f"/{p.skill_tree}" for p in profiles}
+    #
+    # Every rel below is spelled worktree-relative through `shield`: git reads the
+    # exclude from the worktree root, and a nested project's surfaces sit under its
+    # offset there (DW-379). `written` and `seeded_bmad` already are.
+    patterns = {
+        f"/{shield(tree)}" for p in profiles for tree in (p.skill_tree, *p.extra_skill_trees)
+    }
     # hookless profiles have no config_path, so there is nothing to shield: their
     # empty string would render as a bare "/", which git strips to a zero-length
     # pattern (the trailing slash becomes MUSTBEDIR) that matches nothing — inert,
     # unlike "/*" or "*", which do blanket. A junk line in a generated file, then,
     # not a worktree-wide exclusion.
-    patterns |= {f"/{p.hooks.config_path}" for p in profiles if not p.hookless}
-    patterns |= {f"/{rel}" for rel in seeded}
+    patterns |= {f"/{shield(p.hooks.config_path)}" for p in profiles if not p.hookless}
+    patterns |= {f"/{shield(rel)}" for rel in seeded}
     patterns |= {f"/{rel}" for rel in seeded_bmad}
-    if f"/{BMAD_DIR}" not in patterns:
+    if f"/{shield(BMAD_DIR)}" not in patterns:
         # The renderer may create or rewrite this generated directory during the
         # session, after provisioning has finished. Give it a dedicated transient
         # shield unless the blanket root shield already subsumes it: `/_bmad` prunes
         # the directory before git descends, so `/_bmad/render/` would provably never
         # be consulted. Avoiding that inert sibling keeps the worktree-local exclude
         # precise; the file and its lines disappear with this worktree.
-        patterns.add(f"/{RENDER_DIR_REL}/")
+        patterns.add(f"/{shield(RENDER_DIR_REL)}/")
     patterns, tracked_degrade = _reconcile_tracked_patterns(worktree, patterns, written)
     if tracked_degrade is not None and on_degraded is not None:
         on_degraded(tracked_degrade)
@@ -1285,7 +1855,10 @@ class WorktreeFlow:
     callables: ``emit`` fires a plugin hook (late-bound so a monkeypatched
     ``Engine._emit`` still wins), ``save`` persists run state, ``gate_unit`` runs
     the per-unit ready gate, ``carry_isolated_ledger_writes`` applies Engine-owned
-    ledger bookkeeping after a successful merge, ``workspace_get``/``workspace_set``
+    ledger bookkeeping after a successful merge, ``land_post_landing_writes`` makes
+    the writes the engine latched for after landing, ``reopen_unlanded_close`` undoes
+    the writes that assumed a landing before an escalation's terminal save,
+    ``workspace_get``/``workspace_set``
     read and swap the engine's active workspace, and ``escalation_pause`` raises the
     engine's ``RunPaused`` (injected so this module need not import ``engine`` — that
     would reintroduce a runtime<->engine import cycle)."""
@@ -1306,8 +1879,12 @@ class WorktreeFlow:
         gate_unit: Callable[[StoryTask], bool],
         carry_isolated_ledger_writes: Callable[[StoryTask], None],
         escalation_pause: Callable[..., NoReturn],
+        land_post_landing_writes: Callable[[StoryTask], None] = lambda task: None,
+        reopen_unlanded_close: Callable[[StoryTask], None] = lambda task: None,
         workspace_get: Callable[[], Workspace],
         workspace_set: Callable[[Workspace], None],
+        unit_branch_epic: Callable[[StoryTask], str | None] = lambda task: None,
+        sprint_board: Callable[[], bool] | None = None,
     ) -> None:
         self.paths = paths
         self.policy = policy
@@ -1325,9 +1902,19 @@ class WorktreeFlow:
         self._save = save
         self._gate_unit = gate_unit
         self._carry_isolated_ledger_writes = carry_isolated_ledger_writes
+        self._land_post_landing_writes = land_post_landing_writes
+        self._reopen_unlanded_close = reopen_unlanded_close
         self._pause = escalation_pause
         self._workspace_get = workspace_get
         self._workspace_set = workspace_set
+        # The unit branch's epic segment (`workspace.unit_branch_name`); None —
+        # every mode but tickets — keeps the two-segment name.
+        self._unit_branch_epic = unit_branch_epic
+        # Whether this run keeps a v6 sprint board (`Engine._has_sprint_board`).
+        # None reads the persisted source's `SourceTraits.sprint_board`.
+        self._sprint_board = sprint_board or (
+            lambda: worksource.resumed_traits_for(self.state.source).sprint_board
+        )
         verify.reconcile_integration_state_roots(
             run_dir, (task.integration_attempt for task in state.tasks.values())
         )
@@ -1388,11 +1975,14 @@ class WorktreeFlow:
         fakes) contribute nothing, so provisioning is a no-op for them.
 
         The role set is :data:`install.DEV_PRIMITIVE_ROLES` — the same constant
-        `cli._skill_trees` gates on — rather than a local pair, so the provisioned
-        set and the gated set cannot drift apart. A tree gated but not provisioned
+        `cli._skill_scopes` starts from — rather than a local pair, so the gated set
+        stays a subset of the provisioned one: a tree gated but not provisioned
         ships a session into the `Unknown command` stall the preflight exists to
-        catch; a tree provisioned but not gated refuses runs over a skill no session
-        reads."""
+        catch. The converse is deliberate: `cli._skill_scopes` drops the review tree
+        when ``[review]`` is off and no plugin binds a review workflow (DW-380), but
+        provisioning keeps both profiles always — they drive per-CLI Stop-signal
+        hook registration too, and a worktree without one stalls any session of
+        that CLI on a missing completion signal."""
         seen: dict[str, CLIProfile] = {}
         adapters = self._adapters_get()
         for adapter in (adapters[role] for role in DEV_PRIMITIVE_ROLES):
@@ -1400,6 +1990,94 @@ class WorktreeFlow:
             if profile is not None and profile.name not in seen:
                 seen[profile.name] = profile
         return list(seen.values())
+
+    def gate_codex_hook_trust(
+        self,
+        task: StoryTask,
+        worktree: Path,
+        *,
+        roles: tuple[str, ...] = DEV_PRIMITIVE_ROLES,
+    ) -> None:
+        """Escalate the unit unless Codex trusts its hooks in the mount at
+        ``worktree`` (DW-341).
+
+        Provisioning writes a fresh ``.codex/hooks.json`` per worktree path, and
+        Codex silently skips hooks without a trust grant for that path — the
+        session's Stop would never arrive. The path queried is the mount PROJECT,
+        where both the hook config and the session cwd sit (DW-484): ``worktree``
+        itself by default, ``<worktree>/<offset>`` under a nested ``repo_root``,
+        where the mount root holds no hook config. So each Codex-dialect adapter among
+        ``roles`` is checked through the one trust oracle
+        (:func:`codex_trust.project_hook_trust`) with the binary it will launch.
+        Two callers: :meth:`run_isolated` checks every dev/review role at unit
+        entry, before any dev work is spent; ``Engine._run_session`` checks the
+        launching role before every worktree session, which covers the resume
+        arms that reopen a mounted unit without passing through unit entry.
+
+        A stage's ``extra_args`` replace the profile's ``bypass_args`` at launch,
+        so they are folded into the queried profile: args that may move hook
+        discovery come back ``unverifiable``. A failed ``hooks/list`` query
+        (:data:`codex_trust.QUERY_FAILED_REASON` — spawn error, timeout) is
+        retried exactly once; a real verdict never is. Fail closed — anything but
+        ``trusted`` escalates, leaving the worktree mounted at its deterministic
+        path so the operator can grant trust there, re-arm, and resume. Codex's
+        own trust state is never written. Adapters without a profile (test fakes)
+        and non-Codex dialects are skipped; main-checkout sessions never reach here.
+        """
+        adapters = self._adapters_get()
+        mount = self._mount_project(worktree)
+        seen: set[tuple[str, str, tuple[str, ...] | None]] = set()
+        for role in roles:
+            adapter = adapters[role]
+            profile = getattr(adapter, "profile", None)
+            hooks = getattr(profile, "hooks", None)
+            if profile is None or getattr(hooks, "dialect", None) != "codex-hooks-json":
+                continue
+            binary = getattr(adapter, "binary", None) or profile.binary
+            extra_args = getattr(adapter, "extra_args", None)
+            key = (profile.name, binary, extra_args)
+            if key in seen:
+                continue
+            seen.add(key)
+            queried = (
+                profile
+                if extra_args is None
+                else dataclasses.replace(profile, bypass_args=extra_args)
+            )
+            trust = codex_trust.project_hook_trust(mount, queried, binary=binary)
+            if trust.status == "unverifiable" and trust.reason == codex_trust.QUERY_FAILED_REASON:
+                # The query itself failed, not Codex's verdict: one retry absorbs a
+                # transient app-server spawn failure or timeout before escalating.
+                trust = codex_trust.project_hook_trust(mount, queried, binary=binary)
+            if trust.status == "trusted":
+                continue
+            self.escalate_unit(  # always raises RunPaused
+                task, self._codex_trust_reason(role, mount, trust.status, trust.reason)
+            )
+
+    def _codex_trust_reason(self, role: str, worktree: Path, status: str, reason: str) -> str:
+        """The operator-facing escalation text for a failed worktree trust query.
+
+        Status-specific: accepting a trust prompt clears ``untrusted``, but an
+        ``unverifiable`` verdict usually has a cause a prompt cannot fix, so that
+        text names the likely fixes first. Both end with the remediation and leave
+        out the recovery command: :meth:`escalate_unit` appends its own
+        "resolve, then resume" suffix, and docs/setup-guide.md spells out the
+        ``resolve --no-interactive`` recovery sequence.
+        """
+        head = (
+            f"Codex hook trust is {status} for the {role} session's worktree {worktree} "
+            f"({reason}) — Codex would skip its hooks and the session's Stop would never "
+            "reach the orchestrator. "
+        )
+        if status == "unverifiable":
+            head += (
+                "bmad-loop could not verify Codex's hook trust for that worktree. Likely "
+                "fixes: remove stage `extra_args` or profile `launch_args` that may move "
+                "Codex hook discovery, make sure the Codex binary is on PATH, and make "
+                "sure the worktree's hook config is readable. "
+            )
+        return head + "Open Codex in that worktree, accept its hook trust prompt"
 
     def engine_agent_ids(self) -> list[str]:
         """The Unity-MCP `setup-mcp` agent ids for every CLI that runs in a
@@ -1413,6 +2091,20 @@ class WorktreeFlow:
             if agent not in ids:
                 ids.append(agent)
         return ids
+
+    def _mount_roots(self, worktree: Path) -> tuple[Path, Path]:
+        """:func:`provision_roots` for this run's project in the mount at ``worktree``:
+        ``(src_root, dst_root)``, the project-local roots in the main checkout and in
+        the mount. Lexical, over the spellings ``self.paths`` and ``worktree`` carry."""
+        return provision_roots(worktree, self.paths.repo_root, self.paths.project)
+
+    def _mount_project(self, worktree: Path) -> Path:
+        """The mount project for the mount at ``worktree`` — the tree a relative spec
+        spelling is anchored on there. The lexical form of
+        ``self.paths.rebased(worktree).project`` (both go through
+        :func:`mountpaths.rebased_project`): ``worktree`` itself by default,
+        ``<worktree>/<offset>`` for a project nested inside ``repo_root`` (DW-379)."""
+        return rebased_project(self.paths.project, self.paths.repo_root, worktree)
 
     def _ledger_seed(self, worktree: Path) -> tuple[str, ...]:
         """The deferred-work ledger, when a worktree checkout cannot deliver it.
@@ -1446,27 +2138,27 @@ class WorktreeFlow:
         seed loop itself decides on, and unlike ``verify.path_tracked`` it costs no
         subprocess and cannot raise.
 
-        A ledger that is itself a symlink keeps the dir in-tree, so ``rebased``
-        moves it and the worktree path does not exist: the exclusion is still right
-        for an out-of-repo target (``provision_worktree`` refuses that source
-        whatever rel it is handed), but an in-repo target is seeded to the WRONG
-        path and still hits #426 (#462). Resolving also names the target of a
-        TRACKED ledger symlink whose target is untracked — the only path the seed
-        loop will write, since it refuses to copy through a link. ``relative_to``
-        decides PLACEMENT; containment is re-checked against both roots at the copy
-        site.
+        A ledger that is itself a symlink is seeded at its CONFIGURED path — the
+        one ``ProjectPaths.rebased`` hands the worktree's readers — and never at
+        the link's target rel, which is where resolving the leaf used to put it,
+        so the gate read an absent file and the unit still hit #426 (DW-377, was
+        #462). The target is seeded only when the checkout already carries the
+        link as a tracked, dangling entry: the seed loop refuses to copy through
+        a link, so the target is the one path it will write, and the checked-out
+        link then reads the copy. An out-of-repo target stays excluded
+        (``provision_worktree`` refuses that source whatever rel it is handed).
+        That drop is no longer silent: :meth:`_artifact_seed_drops` names the
+        configured rel in ``worktree-seed-dropped`` (DW-432).
+        See :func:`_artifact_seed`; containment is re-checked against both roots
+        at the copy site.
 
         Deduped against ``scm.worktree_seed`` by the caller.
         """
-        ledger = self.paths.deferred_work
-        repo = self.paths.repo_root
-        try:
-            rel = ledger.resolve().relative_to(repo.resolve()).as_posix()
-        except (OSError, RuntimeError, ValueError):
-            return ()
-        if not _is_file(ledger) or _is_file(worktree / rel):
-            return ()
-        return (rel,)
+        return _artifact_seed(
+            self.paths.deferred_work,
+            *self._mount_roots(worktree),
+            shared_store=self.paths.shared_store,
+        )
 
     def _board_seed(self, worktree: Path) -> tuple[str, ...]:
         """The sprint board, when a worktree checkout cannot deliver it (#350).
@@ -1507,8 +2199,11 @@ class WorktreeFlow:
         WORKTREE, not of git, for the ledger's reason: it is the predicate the seed
         loop itself decides on, it costs no subprocess and it cannot raise.
 
-        A board that is itself a symlink inherits ``_ledger_seed``'s caveat verbatim
-        (#462); it is derived there and not repeated here.
+        A board that is itself a symlink is placed exactly as ``_ledger_seed``
+        places a symlinked ledger — at the configured path, or at the target only
+        behind a tracked dangling link (DW-377, was #462); both delegate to
+        :func:`_artifact_seed`. An out-of-project target is excluded as for the
+        ledger, and :meth:`_artifact_seed_drops` names that drop (DW-432).
 
         INHERITED LIMITATION — parity, not a regression, and NOT fixed here: a
         non-fixable rollback does not restore a seeded board. Rollback resets
@@ -1522,17 +2217,34 @@ class WorktreeFlow:
         board escapes, via the rollback's ``reset --hard``. Seeding neither
         introduces the trap nor widens it.
 
+        Nothing for a run without a sprint board (``SourceTraits.sprint_board``,
+        or a sweep on a v7 project): tickets mode and a v7 sweep never read or
+        write one, so a stray board file at the configured path is not seeded
+        either.
+
         Deduped against ``scm.worktree_seed`` by the caller.
         """
-        board = self.paths.sprint_status
-        repo = self.paths.repo_root
-        try:
-            rel = board.resolve().relative_to(repo.resolve()).as_posix()
-        except (OSError, RuntimeError, ValueError):
+        if not self._sprint_board():
             return ()
-        if not _is_file(board) or _is_file(worktree / rel):
-            return ()
-        return (rel,)
+        return _artifact_seed(
+            self.paths.sprint_status,
+            *self._mount_roots(worktree),
+            shared_store=self.paths.shared_store,
+        )
+
+    def _artifact_seed_drops(self, worktree: Path) -> list[str]:
+        """The ledger's and board's configured rels that :meth:`_ledger_seed` /
+        :meth:`_board_seed` excluded as out-of-project and the worktree still lacks
+        (DW-432) — project-relative, deduped, ledger first. Naming only; run after
+        provisioning. See :func:`_artifact_seed_dropped`. A source without a sprint
+        board names no board drop, since it seeds none."""
+        roots, store = self._mount_roots(worktree), self.paths.shared_store
+        drops = [*_artifact_seed_dropped(self.paths.deferred_work, *roots, shared_store=store)]
+        if self._sprint_board():
+            drops.extend(
+                _artifact_seed_dropped(self.paths.sprint_status, *roots, shared_store=store)
+            )
+        return list(dict.fromkeys(drops))
 
     def _accepted_spec_seed(
         self,
@@ -1663,7 +2375,9 @@ class WorktreeFlow:
             return _AcceptedSpecEnds(source=source)
         rel = relative.as_posix()
         try:
-            destination = (worktree / relative).resolve(strict=False)
+            # The mount project, not the mount root: `relative` is project-relative
+            # and the mount mirrors the main checkout (DW-379).
+            destination = (self._mount_project(worktree) / relative).resolve(strict=False)
             mounted_root = worktree.resolve(strict=True)
             destination.relative_to(mounted_root)
         except (OSError, RuntimeError, ValueError):
@@ -1830,7 +2544,7 @@ class WorktreeFlow:
         ends = self._accepted_spec_pair(task, worktree, project_relative_only=project_relative_only)
         if ends.relative is None and not ends.faulted:
             return
-        probe = worktree / (ends.relative or str(task.spec_file))
+        probe = self._mount_project(worktree) / (ends.relative or str(task.spec_file))
         # File-ness alone is not delivery, for the reason the escalating probe states:
         # a parent that is a real directory in the main checkout but a committed
         # OUTWARD symlink in the mounted commit lands the probe on an unrelated
@@ -1867,6 +2581,8 @@ class WorktreeFlow:
         accepted_spec_before = task.spec_file
         task.relativize_project_local_accepted_spec(self.paths.project)
         accepted_spec_relocated = task.spec_file != accepted_spec_before
+        epic_segment = self._unit_branch_epic(task)
+        branch_kw = {"epic_segment": epic_segment} if epic_segment else {}
         try:
             unit = self._open_unit_workspace(
                 self.paths.repo_root,
@@ -1893,6 +2609,7 @@ class WorktreeFlow:
                     worktree=worktree,
                     ref=ref,
                 ),
+                **branch_kw,
             )
         except verify.GitSpawnError as e:
             # a spawn fault is machine-wide, not this unit's: deferring would
@@ -1910,19 +2627,28 @@ class WorktreeFlow:
             task.defer_reason = f"could not open worktree: {e}"
             task.phase = Phase.DEFERRED  # deliberate: no legal move from PENDING
             self.journal.append("worktree-open-failed", story_key=task.story_key, error=str(e))
+            # Persist DEFERRED before the notify (DW-630): a host loss inside a
+            # slow notify command must not leave the unit PENDING on disk.
+            self._save()
             gates.notify(
                 self.policy, self.run_dir, f"worktree open failed: {task.story_key}", str(e)
             )
-            self._save()
             return
         task.worktree_path = str(unit.path)
+        # The mount's mint-time identity (DW-446), taken before any session runs
+        # and persisted with `worktree_path`: every mount writer's pin compares the
+        # mount it opens against this record, never a per-write `lstat`.
+        task.worktree_identity = root_identity_record(unit.path)
         self.journal.append(
             "worktree-opened", story_key=task.story_key, branch=unit.branch, path=str(unit.path)
         )
         task.branch = unit.branch
         if task.dw_ids:
             try:
-                artifact_publication.capture(task, self.paths)
+                try:
+                    artifact_publication.capture(task, self.paths)
+                finally:
+                    self._journal_unpinned_artifact_observations(task.story_key)
             except (artifact_publication.PublicationError, OSError, ValueError) as exc:
                 self._save()
                 self._pause(f"artifact baseline capture failed: {exc}", task.story_key, cause=exc)
@@ -1966,7 +2692,8 @@ class WorktreeFlow:
         seeds.extend(scm.worktree_seed)
         # the two orchestrator-owned artifacts a tracked-only checkout can leave
         # behind — each decides its own exclusions; see the methods.
-        seeds.extend(self._ledger_seed(unit.path))
+        ledger_seed = self._ledger_seed(unit.path)
+        seeds.extend(ledger_seed)
         seeds.extend(self._board_seed(unit.path))
         seeds.extend(
             self._accepted_spec_seed(
@@ -1982,6 +2709,11 @@ class WorktreeFlow:
         seeds.extend(self._registry.seed_files())
         seed_files = list(dict.fromkeys(seeds))  # dedupe, preserve order
         seed_globs = self._registry.seed_globs()
+        pinned_rewrites: dict[str, dict[str, str]] = {}
+
+        def _record_pin(rel: str, dialect: str, text: str) -> None:
+            pinned_rewrites[rel] = {"dialect": dialect, "text": text}
+
         try:
             skipped_seeds = provision_worktree(
                 unit.path,
@@ -1990,6 +2722,14 @@ class WorktreeFlow:
                 seed_files=seed_files,
                 seed_globs=seed_globs,
                 on_degraded=lambda msg: self._exclude_degraded(task.story_key, msg),
+                on_pinned=_record_pin,
+                project=self.paths.project,
+                # A hook event the installed CLI is too old for stays out of the
+                # worktree's config (#865); journaled so the gap is visible.
+                on_hook_gated=lambda note: self.journal.append(
+                    "worktree-hook-gated", story_key=task.story_key, reason=note
+                ),
+                user_roots=self.policy.skills.user_roots,
             )
         except verify.GitError as e:
             # Every provisioning refusal carries its own cause — an unresolvable
@@ -1998,6 +2738,49 @@ class WorktreeFlow:
             # "why" to the inner message rather than asserting one of the three.
             reason = f"cannot safely provision the worktree for {task.story_key}: {e}"
             self.escalate_unit(task, reason)  # always raises RunPaused
+        # A shared ticket store (no checkout carries its own copy) is read and
+        # written in place: point the mount's `tickets.py` and renderer at it before
+        # anything inside the mount resolves `output_folder`, and before the
+        # escalating gates below, so a failed redirect never reaches a session. A
+        # chained run's child initiative is written the same way on every layout:
+        # the live `active_initiative` names the parent, and inside the mount the
+        # child is the active initiative (the user's own file is never written).
+        store = self.paths.shared_store
+        child = self.state.initiative if self.state.parent_initiative is not None else None
+        if store is not None or child is not None:
+            try:
+                ticketstore.redirect_mount_config(
+                    unit.workspace.paths.project, main_store=store, initiative=child
+                )
+            except ticketstore.TicketStoreError as e:
+                targets = [
+                    *(["the shared ticket store"] if store is not None else []),
+                    *([f"the child initiative {child!r}"] if child is not None else []),
+                ]
+                reason = (
+                    f"cannot point the worktree for {task.story_key} at "
+                    f"{' and '.join(targets)}: {e}"
+                )
+                self.escalate_unit(task, reason)  # always raises RunPaused
+        # Before any session launches in the worktree: a CLI that gates sessions
+        # on a home-level exact-path allowlist would otherwise block on its trust
+        # dialog in this fresh path until the session timeout (DW-390).
+        self.seed_workspace_trust(task, unit.path, profiles)
+        # The seeded ledger's text as it landed, for the success-path teardown
+        # check (DW-375): the carry brings back only the writes the engine
+        # recorded, so anything else a session appends to this copy vanishes with
+        # the worktree. A fresh open, so always overwritten — None when no ledger
+        # was nominated, the seed was undelivered, or the read degraded.
+        task.ledger_seed_text = (
+            deferredwork.observe_ledger(unit.workspace.paths.deferred_work)[0]
+            if ledger_seed
+            else None
+        )
+        # Each tracked hook config provisioning rewrote and pinned, with the exact
+        # text written, for the success-path teardown check (DW-368): the pin hides
+        # a story's own edit to that file from the unit commit. A fresh open, so
+        # always overwritten.
+        task.pinned_config_rewrites = pinned_rewrites
         if skipped_seeds:
             # A seed entry whose destination already exists is a no-op. Harmless for
             # a file the checkout legitimately carries, but a directory entry is
@@ -2019,7 +2802,13 @@ class WorktreeFlow:
             seed_files=seed_files,
             seed_globs=seed_globs,
             config_paths=[p.hooks.config_path for p in profiles if not p.hookless],
+            project=self.paths.project,
         )
+        # A ledger/board the seed step excluded because its leaf link escapes the
+        # project is otherwise dropped without a word (DW-432): name it here.
+        for rel in self._artifact_seed_drops(unit.path):
+            if rel not in undelivered_seeds:
+                undelivered_seeds.append(rel)
         if undelivered_seeds:
             self.journal.append(
                 "worktree-seed-dropped", story_key=task.story_key, entries=undelivered_seeds
@@ -2043,7 +2832,8 @@ class WorktreeFlow:
         # unresolvable probe cannot prove delivery, so every filesystem fault
         # escalates rather than binding.
         if accepted_spec_relocated:
-            accepted_probe = unit.path / str(task.spec_file)
+            # Project-relative spelling, so anchored on the mount project (DW-379).
+            accepted_probe = self._mount_project(unit.path) / str(task.spec_file)
             try:
                 accepted_delivered = _is_file(accepted_probe) and accepted_probe.resolve(
                     strict=False
@@ -2058,11 +2848,19 @@ class WorktreeFlow:
                 )
 
         trees = [p.skill_tree for p in profiles]
+        # Every project tree plus, under `[skills] user_roots`, the user roots each
+        # CLI loads: the gates below check the copy each session will really run.
+        user_roots = self.policy.skills.user_roots
+        scopes = list(
+            dict.fromkeys(skill_locate.scope_for(p, resolve_user=user_roots) for p in profiles)
+        )
         # The wheel's own bundled skills, journal-only like worktree-seed-dropped but
         # under their own kind so a user seed that spells a skill rel can neither forge
         # nor mask an entry. No MODULE_SKILLS entry has a worktree-resident consumer,
         # so an absence here cannot prove a stall and must never escalate.
-        undelivered_module_skills = module_skills_seed_undelivered(unit.path, trees)
+        undelivered_module_skills = module_skills_seed_undelivered(
+            unit.path, trees, repo_root=self.paths.repo_root, project=self.paths.project
+        )
         if undelivered_module_skills:
             self.journal.append(
                 "worktree-module-skills-dropped",
@@ -2074,7 +2872,18 @@ class WorktreeFlow:
         # renderer-era primitives. Re-probe disk rather than trusting skipped_seeds,
         # which a user-authored seed rel could otherwise forge. Check this first so a
         # wholly absent primitive is not misdiagnosed as a renderer-surface problem.
-        absent_skills = base_skills_seed_incomplete(unit.path, self.paths.repo_root, trees)
+        # A required skill located in a user root is exempt (no worktree carries
+        # the operator's home, and seeding never copies from it); say which.
+        user_rooted = base_skills_user_rooted(
+            self.paths.repo_root, scopes, project=self.paths.project
+        )
+        if user_rooted:
+            self.journal.append(
+                "worktree-skills-user-root", story_key=task.story_key, entries=user_rooted
+            )
+        absent_skills = base_skills_seed_incomplete(
+            unit.path, self.paths.repo_root, scopes, project=self.paths.project
+        )
         if absent_skills:
             reason = (
                 "the worktree is missing required upstream skill contract files the repo has "
@@ -2093,7 +2902,9 @@ class WorktreeFlow:
         # while a tracked stale worktree copy proves that existence alone is not
         # enough. Either shape would HALT a folder+id dispatch before writing a spec.
         stories_support = (
-            missing_stories_support(unit.path, trees) if self.state.source == "stories" else []
+            missing_stories_support(self._mount_roots(unit.path)[1], scopes)
+            if worksource.resumed_traits_for(self.state.source).stories_primitive
+            else []
         )
         if stories_support:
             short_dispatch = []
@@ -2115,7 +2926,7 @@ class WorktreeFlow:
         # renderer stub consumes the surface. The conjunct is load-bearing: inline
         # pre-#2601 SKILL.md projects may carry the same repo paths and must proceed.
         short_surface = [rel for rel in RENDERER_SEED_SENTINELS if rel in skipped_seeds]
-        if short_surface and renderer_stub_resolved(self.paths.project, trees):
+        if short_surface and renderer_stub_resolved(self.paths.project, scopes):
             reason = (
                 f"the dev primitive renders via {RENDERER_SCRIPT_MARKER} but the "
                 "worktree's renderer surface came up short of the repo's "
@@ -2125,6 +2936,11 @@ class WorktreeFlow:
             )
             self.escalate_unit(task, reason)  # always raises RunPaused
 
+        # Codex skips hooks it has not trusted for this exact worktree path, with no
+        # message, so its Stop would never reach the orchestrator. Escalating gate,
+        # so it sits above the advisory warnings below (DW-341).
+        self.gate_codex_hook_trust(task, unit.path)
+
         # The residue the delivery probe above cannot see, stated as a warning rather
         # than a write: a spec the mount DID deliver, whose bytes are the committed
         # ones rather than the operator's uncommitted corrections (DW-101). Ungated by
@@ -2132,7 +2948,7 @@ class WorktreeFlow:
         # escalated above, and a spec the task already spelled project-relative
         # reaches exactly the same loss without ever passing through the normalizer.
         #
-        # LAST, below every gate that escalates: each of the three above always raises,
+        # LAST, below every gate that escalates: each of the four above always raises,
         # so a call placed among them would record "the mount superseded your spec" for
         # a unit that then never got near a session. Here the only things left are the
         # ready gate's veto and drive() itself.
@@ -2229,6 +3045,9 @@ class WorktreeFlow:
             # after a crash in the merge-to-carry window.
             task.isolated_ledger_carried = True
             self._save()
+            # The unit's code is on the target now: make the writes the engine
+            # latched for after landing (a shared ticket store's mark).
+            self._land_post_landing_writes(task)
         else:  # DEFERRED — capture the diff, keep or drop per keep_failed
             patch = close_unit_workspace(
                 unit,
@@ -2242,6 +3061,7 @@ class WorktreeFlow:
                 on_teardown_degraded=lambda msg: self.journal.append(
                     "worktree-teardown-degraded", story_key=task.story_key, error=msg
                 ),
+                forensic_extra=self._pinned_config_forensic_extra(task, unit),
             )
             self.journal.append(
                 "unit-closed",
@@ -2250,8 +3070,36 @@ class WorktreeFlow:
                 kept=scm.keep_failed,
                 patch=str(patch) if patch else None,
             )
+            # The unit's work is discarded by design, so no uncarried-write check
+            # runs here (DW-375); drop the seed snapshot rather than keep it.
+            if task.ledger_seed_text is not None:
+                task.ledger_seed_text = None
+                self._save()
+            # A torn-down worktree takes the record's purpose with it; a kept one
+            # keeps the record, which gc_run_worktrees' refusal reads (DW-502).
+            self._drop_pinned_config_record(task)
 
-    def _carried_artifact_rels(self, repo: Path) -> tuple[str, ...]:
+    @staticmethod
+    def _pinned_config_forensic_extra(task: StoryTask, unit: UnitWorkspace) -> str:
+        """The ``forensic_extra`` every failed-unit teardown passes to
+        ``close_unit_workspace``: `git diff` reads a skip-worktree-pinned hook config
+        as clean, so a story's edit to one would miss ``changes.patch`` (DW-479).
+        Built while the worktree is still mounted; ``""`` without pins or a mount.
+        Shared by the DEFERRED arm of :meth:`integrate_unit` and
+        :meth:`keep_branch_and_escalate`, so both record the same edits (DW-501).
+        """
+        if not task.pinned_config_rewrites:
+            return ""
+        try:
+            mounted = unit.path.is_dir()
+        except OSError:
+            # an unprovable mount: the per-file reads name the fault
+            mounted = True
+        if not mounted:
+            return ""
+        return _pinned_config_forensics(unit.path, task.pinned_config_rewrites)
+
+    def _carried_artifact_rels(self, repo: Path, task: StoryTask) -> tuple[str, ...]:
         """The repo-relative posix paths the RUN commits for itself after the merge —
         ``clean_incoming_collisions``' ``protected`` operand (#618).
 
@@ -2266,6 +3114,28 @@ class WorktreeFlow:
         own bytes to commit under a `chore(...)` message. The blast radius is strictly
         same-path (`git commit -- <pathspec>` is implicitly `--only`), which is why
         this is an exact path set and not a policy.
+
+        OBLIGATION-GATED, one rule for both artifacts (DW-354): a path is protected
+        only when ``task`` actually carries a write to it, because a carry that never
+        runs never stages the path and an operator's unstaged edit there is then as
+        inert as any other stray — refusing the merge over it paused unattended runs
+        with no hazard to point at.
+
+        * The ledger is carried when the task holds a payload for it:
+          ``harvested_deferrals``, ``story_closes_intended``, or the sweep's
+          ``bundle_closes_intended`` — the operands ``_carry_isolated_ledger_writes``
+          and the ``SweepEngine`` override commit to ``paths.deferred_work``. NOT
+          ``harvest_carry_commit_pending``: that latch can outlive its payload (the
+          fresh-attempt reset clears ``harvested_deferrals`` without clearing it, and
+          ``_carry_harvested_deferrals`` returns early on an empty list), so it would
+          protect the ledger with nothing to carry. NOT refiles either: they are
+          written to the worktree ledger before the unit's commit and ride the branch
+          into the incoming set, never a post-merge carry.
+        * The board is carried when ``task.board_advance_intended`` is set — the only
+          guard ``_carry_board_advance`` checks ("the record IS the carry's guard").
+          ``SweepEngine`` and ``StoriesEngine`` never record one, nor does a generic
+          task with no recorded advance, so their merges tolerate an unrelated
+          operator board edit.
 
         ``self.paths``, not ``self.workspace.paths``: the carries read the MAIN
         checkout's copies (their docstrings say so explicitly), and this is the
@@ -2308,8 +3178,15 @@ class WorktreeFlow:
         being wrong that way is a refusal the operator can act on; the other way it is
         silent.
         """
+        artifacts: list[Path] = []
+        if task.board_advance_intended:
+            artifacts.append(self.paths.sprint_status)
+        if task.harvested_deferrals or task.story_closes_intended or task.bundle_closes_intended:
+            artifacts.append(self.paths.deferred_work)
         rels: list[str] = []
-        for artifact in (self.paths.sprint_status, self.paths.deferred_work):
+        for artifact in artifacts:
+            if _in_store(artifact, self.paths.shared_store):
+                continue  # the shared ticket store: the unit wrote the one copy in place
             try:
                 rel = artifact.resolve().relative_to(repo.resolve()).as_posix()
             except (OSError, RuntimeError, ValueError):
@@ -2473,6 +3350,7 @@ class WorktreeFlow:
             self.run_dir,
             operation_identity,
             snapshot_paths,
+            run_dir_identity=self.state.run_dir_identity,
             payload_max_bytes=self.policy.limits.artifact_payload_max_mb * 1_048_576,
         )
         # The flag words of the index OUTSIDE the snapshot set — a hook's
@@ -2487,7 +3365,10 @@ class WorktreeFlow:
                 self.paths.repo_root, exclude=[str(entry["path"]) for entry in snapshots]
             )
             ignored = verify.capture_ignored_entries(
-                self.paths.repo_root, self.run_dir, operation_identity
+                self.paths.repo_root,
+                self.run_dir,
+                operation_identity,
+                run_dir_identity=self.state.run_dir_identity,
             )
         except BaseException:
             verify.discard_integration_state(
@@ -2724,8 +3605,11 @@ class WorktreeFlow:
         first_integration: bool = False,
     ) -> None:
         """Merge a DONE unit's branch into the target branch from the main repo."""
+        self.require_target_checked_out(task)
         if first_integration:
             self._emit("pre_integrate", task)
+        if not replay or first_integration:
+            self.refuse_superseded_replay(task, unit)
         if task.dw_ids:
             self.prepare_publication(task, unit.workspace.paths)
         receipt_required = False
@@ -2786,8 +3670,9 @@ class WorktreeFlow:
         # inert and is tolerated and journaled while a staged one escalates. What the RUN
         # can commit is the second question, and `protected` is what asks it: the
         # post-merge carry stages the board and the ledger BY PATHSPEC, so any dirt on
-        # them — staged or not, whoever wrote it — would ride the run's own bookkeeping
-        # commit. Inert-under-merge and safe-to-proceed are not the same predicate.
+        # one this task carries into (`_carried_artifact_rels`, DW-354) — staged or not,
+        # whoever wrote it — would ride the run's own bookkeeping commit.
+        # Inert-under-merge and safe-to-proceed are not the same predicate.
         target_ref = f"refs/heads/{target}" if receipt_required else ""
         landed = False
         update: verify.IntegrationRefUpdate | None = None
@@ -2900,6 +3785,50 @@ class WorktreeFlow:
                 paths=paths,
             )
 
+        def note_preserved(ref: str, paths: list[str]) -> None:
+            """Journal the recovery ref parking operator bytes the cleanup restores.
+
+            A dirty TRACKED path in the incoming set is restored to the target's
+            committed version before the merge, and it may be an operator's own
+            uncommitted edit rather than an Editor leak — the ref is the only place
+            those bytes survive (DW-356), so the journal names it and the paths. The
+            event claims only that the bytes were parked; restoration is
+            ``merge-target-cleaned``'s claim."""
+            self.journal.append(
+                "merge-target-preserved",
+                story_key=task.story_key,
+                branch=unit.branch,
+                ref=ref,
+                paths=paths,
+            )
+
+        def preserve_failed_reason(*, receipt: bool) -> str:
+            """What a snapshot failure's ``str(exc)`` does not say — the merge, that
+            nothing was cleaned, and (receipt leg) the remedy — for the arms to join
+            with ``: <exc>`` (the no-receipt arm directly, then its own remedy; the
+            receipt arm through ``_pause_integration_evidence``'s ``prefix``). The
+            exception carries the paths, the ref family and git's detail once.
+
+            The remedies differ. Without a receipt the unit escalates and the
+            operator's edit is theirs to save or discard; ``escalate_unit`` already
+            appends the resume instruction. With one the receipt stays
+            ``cleanup-pending``: committing moves the target ref (the replay then
+            refuses the epoch) and discarding is undone by the replay's restore of
+            the captured pre-clean bytes, so the paths must be left as they are and
+            only the fault fixed — the resume replays the receipt and parks them
+            again."""
+            head = (
+                f"merge of {unit.branch} into {target} blocked before its pre-flight "
+                "cleanup, nothing was cleaned"
+            )
+            if not receipt:
+                return head
+            return (
+                f"{head}; leave those paths exactly as they are, fix the underlying "
+                f"fault, then `bmad-loop resume {self.state.run_id}` — the resume "
+                "replays the integration receipt and parks them again"
+            )
+
         try:
             if landed:
                 collision_plan = verify.IncomingCollisionPlan((), (), ())
@@ -2909,7 +3838,7 @@ class WorktreeFlow:
                     repo,
                     planned_target_revision,
                     merge_ref,
-                    protected=self._carried_artifact_rels(repo),
+                    protected=self._carried_artifact_rels(repo, task),
                     on_tolerated=note_tolerated,
                 )
                 cleaned_without_receipt = None
@@ -2918,10 +3847,22 @@ class WorktreeFlow:
                     repo,
                     target,
                     merge_ref,
-                    protected=self._carried_artifact_rels(repo),
+                    protected=self._carried_artifact_rels(repo, task),
                     on_tolerated=note_tolerated,
+                    on_preserved=note_preserved,
                 )
                 collision_plan = verify.IncomingCollisionPlan((), (), ())
+        except verify.MergePreflightPreserveError as e:
+            # Ahead of the generic arm, which would word this as the stray-dirt
+            # guard's refusal: these paths lie INSIDE the incoming set, and nothing
+            # was mutated — the snapshot failed before the first restore (DW-356).
+            self.keep_branch_and_escalate(
+                task,
+                unit,
+                f"{preserve_failed_reason(receipt=False)}: {e}; save or discard your "
+                "uncommitted edits to those paths (or fix the underlying fault)",
+            )
+            return
         except (verify.GitError, OSError, RuntimeError) as e:
             # OSError/RuntimeError join GitError because clean_incoming_collisions
             # mutates the checkout directly (resolve/unlink/iterdir/rmdir) — non-spawn
@@ -3215,10 +4156,16 @@ class WorktreeFlow:
                     collision_plan,
                     before_mutate=cleanup_identity_unchanged,
                     progress=progress,
+                    on_preserved=note_preserved,
                 )
                 if cleaned_without_receipt is None
                 else cleaned_without_receipt
             )
+        except verify.MergePreflightPreserveError as e:
+            # Raised before the first mutation (`progress` is empty), so there is
+            # nothing to restore; the receipt stays `cleanup-pending` and the resume
+            # replays it like any other interrupted cleanup (DW-356).
+            self._pause_integration_evidence(task, e, prefix=preserve_failed_reason(receipt=True))
         except (verify.GitError, OSError, RuntimeError) as e:
             if receipt_required and attempt is not None:
                 try:
@@ -3786,17 +4733,46 @@ class WorktreeFlow:
         self._emit("post_merge", task)
         self.finish_publication(task, unit)
 
+    def _journal_unpinned_artifact_observations(self, story_key: str) -> None:
+        """Journal each artifacts root whose fallback observation ran unpinned.
+
+        DW-444, recorded decision "Degrade observation, journaled": on a host
+        without descriptor-relative reads, an artifacts root whose ``lstat``
+        carries no inode is pinned only weakly, and ``artifact_publication``
+        counts each such read (and each identity-less leaf ``capture`` accepts
+        under it). One ``artifact-observation-unpinned`` event per root keeps the
+        degrade visible: ``filesystem`` is the full label (volume path included),
+        ``fs_type`` its type alone. Draining clears the count, so a later drain
+        journals only newer degrades — including any counted from an entry point
+        that does not drain itself."""
+        for root, filesystem, count in artifact_publication.drain_unpinned_observations():
+            self.journal.append(
+                "artifact-observation-unpinned",
+                story_key=story_key,
+                root=root,
+                filesystem=filesystem,
+                fs_type=filesystem_type(filesystem),
+                count=count,
+            )
+
     def prepare_publication(self, task: StoryTask, source: ProjectPaths) -> None:
-        """Persist accepted bytes before merge can consume the unit."""
+        """Persist accepted bytes before merge can consume the unit. Nothing to
+        persist when the artifacts dir is in the shared ticket store: the mount
+        wrote the main checkout's one copy in place."""
+        if source.in_shared_store(source.implementation_artifacts):
+            return
         try:
             limits = self.policy.limits
-            artifact_publication.prepare(
-                task,
-                self.paths,
-                source,
-                file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
-                payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
-            )
+            try:
+                artifact_publication.prepare(
+                    task,
+                    self.paths,
+                    source,
+                    file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
+                    payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
+                )
+            finally:
+                self._journal_unpinned_artifact_observations(task.story_key)
             self._save()
         except artifact_publication.PublicationSizeError as exc:
             self.journal.append(
@@ -3850,12 +4826,15 @@ class WorktreeFlow:
             artifact_publication.arm_binding(task, acceptance_identity)
             self._save()
             limits = self.policy.limits
-            artifact_publication.bind_armed(
-                task,
-                source,
-                file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
-                payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
-            )
+            try:
+                artifact_publication.bind_armed(
+                    task,
+                    source,
+                    file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
+                    payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
+                )
+            finally:
+                self._journal_unpinned_artifact_observations(task.story_key)
             self._save()
         except artifact_publication.PublicationSizeError as exc:
             self.journal.append(
@@ -3877,9 +4856,15 @@ class WorktreeFlow:
             self._pause(f"artifact publication binding failed: {exc}", task.story_key, cause=exc)
 
     def validate_staged_publication(self, task: StoryTask, source: ProjectPaths) -> dict[str, str]:
-        """Validate final staged Git deliverables or retain the unit mount."""
+        """Validate final staged Git deliverables or retain the unit mount. An
+        artifacts dir in the shared ticket store stages nothing: ``{}``."""
+        if source.in_shared_store(source.implementation_artifacts):
+            return {}
         try:
-            return artifact_publication.validate_staged(task, source)
+            try:
+                return artifact_publication.validate_staged(task, source)
+            finally:
+                self._journal_unpinned_artifact_observations(task.story_key)
         except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
             self.journal.append(
                 "artifact-publication-refused", story_key=task.story_key, error=str(exc)
@@ -3907,7 +4892,10 @@ class WorktreeFlow:
                 raise artifact_publication.PublicationError(
                     "validated staged artifact snapshot is missing or malformed"
                 )
-            artifact_publication.validate_committed(task, source, revision, staged_snapshot)
+            try:
+                artifact_publication.validate_committed(task, source, revision, staged_snapshot)
+            finally:
+                self._journal_unpinned_artifact_observations(task.story_key)
         except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
             self.journal.append(
                 "artifact-publication-refused", story_key=task.story_key, error=str(exc)
@@ -3920,10 +4908,21 @@ class WorktreeFlow:
             )
 
     def finish_publication(self, task: StoryTask, unit: UnitWorkspace | None) -> None:
-        """Publish and latch before successful teardown, including merge replay."""
-        if task.dw_ids:
+        """Publish and latch before successful teardown, including merge replay.
+        An artifacts dir in the shared ticket store has nothing to publish (the
+        mount wrote the main checkout's one copy in place, so
+        :meth:`prepare_publication` recorded no intent): the publication is
+        latched complete as is."""
+        if task.dw_ids and self.paths.in_shared_store(self.paths.implementation_artifacts):
+            if not task.artifact_publication_complete:
+                task.artifact_publication_complete = True
+                self._save()
+        elif task.dw_ids:
             try:
-                artifact_publication.publish(task, self.paths)
+                try:
+                    artifact_publication.publish(task, self.paths)
+                finally:
+                    self._journal_unpinned_artifact_observations(task.story_key)
                 self._save()
             except (
                 artifact_publication.PublicationError,
@@ -3941,7 +4940,18 @@ class WorktreeFlow:
                     cause=exc,
                 )
         if unit is None:
-            return  # journal-proven merge can publish from durable bytes alone
+            # journal-proven merge can publish from durable bytes alone. With the
+            # mount gone there is nothing left to check, so drop the snapshot rather
+            # than keep it in state.json; a still-mounted worktree gets a follow-up
+            # call with its reopened unit, whose check needs the snapshot.
+            if task.ledger_seed_text is not None and not (
+                task.worktree_path and Path(task.worktree_path).is_dir()
+            ):
+                task.ledger_seed_text = None
+                self._save()
+            return
+        self._warn_isolated_ledger_uncarried(task, unit)
+        self._refuse_pinned_config_edits(task, unit.path)
         scm = self.policy.scm
         close_unit_workspace(
             unit,
@@ -3954,13 +4964,239 @@ class WorktreeFlow:
                 "worktree-teardown-degraded", story_key=task.story_key, error=msg
             ),
         )
+        self._drop_pinned_config_record(task)
+
+    def _drop_pinned_config_record(self, task: StoryTask) -> None:
+        """Forget the pinned-config record once the worktree is really gone.
+
+        It holds a full copy of the operator's settings text, so it must not sit in
+        state.json for every finished unit; while the worktree is still mounted
+        (teardown degraded or kept it) it stays, so a later pass still refuses.
+        """
+        if not task.pinned_config_rewrites:
+            return
+        try:
+            mounted = Path(task.worktree_path).is_dir() if task.worktree_path else False
+        except OSError:
+            mounted = True
+        if mounted:
+            return
+        task.pinned_config_rewrites = {}
+        self._save()
+
+    def _warn_isolated_ledger_uncarried(self, task: StoryTask, unit: UnitWorkspace) -> None:
+        """Journal the seeded-ledger writes the post-merge carry will not bring back.
+
+        Under worktree isolation a gitignored ledger reaches the unit only as the
+        seeded copy, the unit commit is shielded from it, and
+        ``_carry_isolated_ledger_writes`` re-applies only what the engine recorded
+        on the task — harvested deferrals and story/bundle closes. Anything else
+        the session wrote to that copy (a canonical entry of its own, an edit to a
+        seeded entry, a flat block) is lost when teardown removes the worktree
+        (DW-375). The decision is warn-only: nothing is carried back.
+
+        Runs here, before ``close_unit_workspace``, because ``merge_local`` has
+        already consumed the merge but the worktree is still mounted; the carry
+        runs later, against the main ledger. OBSERVATION: never raises, never
+        pauses, never writes a ledger — a read fault is journaled under the same
+        kind with an ``error`` field. The snapshot is cleared and SAVED right after
+        the record, so a replay after that save cannot record the same loss twice;
+        a crash in the narrow window between the journal append and the save can
+        still replay it once more. Engine
+        ``seen-again:`` stamps are excused (their loss is accepted); a
+        review-timeout salvage refile is not, since it is never carried.
+        """
+        seed = task.ledger_seed_text
+        if seed is None:
+            return
+        try:
+            mounted = unit.path.is_dir()
+        except OSError:
+            mounted = False
+        if not mounted:
+            # replay after the worktree was already removed
+            task.ledger_seed_text = None
+            self._save()
+            return
+        current, fault = deferredwork.observe_ledger(unit.workspace.paths.deferred_work)
+        ledger = str(self.paths.deferred_work)
+        if fault is not None:
+            self.journal.append(
+                "isolated-ledger-writes-uncarried",
+                story_key=task.story_key,
+                ledger=ledger,
+                error=fault,
+            )
+        else:
+            harvested = [
+                (str(item.get("origin", "")), str(item.get("source_spec", "")))
+                for item in task.harvested_deferrals
+            ]
+            closed = [*task.story_closes_intended, *task.bundle_closes_intended]
+            dw_ids, count = _uncarried_ledger_changes(
+                seed, current or "", harvested=harvested, closed=closed
+            )
+            if dw_ids or count:
+                self.journal.append(
+                    "isolated-ledger-writes-uncarried",
+                    story_key=task.story_key,
+                    ledger=ledger,
+                    dw_ids=dw_ids,
+                    count=count,
+                )
+        task.ledger_seed_text = None
+        self._save()
+
+    def _refuse_pinned_config_edits(self, task: StoryTask, worktree: Path) -> None:
+        """Pause rather than tear down a worktree holding an edit to a pinned config.
+
+        Provisioning pins a rewritten TRACKED hook config skip-worktree
+        (``_pin_tracked_config_rewrite``), which hides a story's own edit to that
+        file from ``git add -A``: it never reaches the unit commit, and removing
+        the worktree would delete it silently (DW-368). Recorded decision: detect
+        and refuse. Each pinned file is compared with the rewrite recorded on the
+        task, relay hooks ignored (``_pinned_config_edits``); any other difference
+        journals ``pinned-config-edit-refused`` and pauses with the worktree kept.
+
+        The merge has already landed, so the phase stays DONE (never ESCALATED —
+        that would skip the resume ledger carry) and nothing here carries, commits
+        or copies the edit, nor touches the pin. The record is never cleared, so the
+        refusal fires again on every retry while the edit remains; removing the
+        worktree is the operator's acknowledgement, after which this is a no-op.
+        """
+        pins = task.pinned_config_rewrites
+        if not pins:
+            return
+        try:
+            mounted = worktree.is_dir()
+        except OSError:
+            # teardown is irreversible: an unprovable "gone" checks, and the
+            # read below reports whatever fault stands in the way
+            mounted = True
+        if not mounted:
+            return
+        edits = _pinned_config_edits(worktree, pins)
+        if not edits:
+            return
+        self.journal.append(
+            "pinned-config-edit-refused",
+            story_key=task.story_key,
+            worktree=str(worktree),
+            edits=edits,
+        )
+        self._save()
+        self._pause(
+            f"{task.story_key} left an edit to a pinned hook config in its worktree "
+            f"{worktree}, outside the bmad-loop relay hooks; the skip-worktree pin kept it "
+            "out of the unit commit, so tearing the worktree down would delete it "
+            f"(DW-368): {'; '.join(edits)}. Carry the change into "
+            f"{self.state.target_branch} by hand — the pin hides it from `git diff`, so "
+            f"compare the file with `git -C {worktree} show HEAD:<file>`, and leave the "
+            "bmad-loop relay hook entries out (#352) — then `git worktree remove --force "
+            f"{worktree}`, delete branch {task.branch} if you do not keep it, and "
+            f"`bmad-loop resume {self.state.run_id}`",
+            task.story_key,
+        )
+
+    def require_target_checked_out(self, task: StoryTask) -> None:
+        """Pause unless the main checkout is on the run's pinned target branch.
+
+        `verify.merge_branch` merges into whatever the main checkout has checked out,
+        and `ensure_target_branch` checks the target only once, at run start. A run
+        paused before integration (a replay minted with `--no-resume` included) can be
+        resumed after the operator checked out another branch, and the unit would land
+        there. Asked before any hook, write-ahead record or target mutation, so the
+        pause leaves nothing to undo: check the target out and a plain
+        `bmad-loop resume` replays the merge. A run with no pinned target (persisted
+        before target_branch existed) keeps merging into the checkout as it did."""
+        target = self.state.target_branch
+        if not target:
+            return
+        repo = self.paths.repo_root
+        try:
+            on = verify.current_branch(repo)
+        except verify.GitError as e:
+            self._pause(
+                f"cannot read the main checkout's branch before merging {task.branch} "
+                f"into {target}: {e}",
+                task.story_key,
+                cause=e,
+            )
+        if on == target:
+            return
+        self.journal.append(
+            "merge-target-not-checked-out",
+            story_key=task.story_key,
+            branch=task.branch,
+            target_branch=target,
+            checked_out_branch=on,
+        )
+        self._pause(
+            f"the main checkout {repo} is on {on!r}, not this run's target branch "
+            f"{target!r}, so unit {task.branch} was not merged; `git checkout {target}` "
+            "there, then `bmad-loop resume`",
+            task.story_key,
+        )
+
+    def refuse_superseded_replay(self, task: StoryTask, unit: UnitWorkspace) -> None:
+        """Keep a replay run's unit unmerged when its story is already done (DW-534).
+
+        `runs.standalone_replay_refusal` reads the board only when the replay run is
+        minted (DW-533). A replay minted with `--no-resume`, or one paused and resumed
+        later, can reach this merge after another run finished the story, and the
+        post-merge carry would not notice: `sprintstatus.advance` never regresses a
+        done row. So a replay run (`state.replay_of`) re-reads the story's row on the
+        MAIN checkout's board right before a merge starts. This run's own advances
+        land in the unit's copy, so the main row is never done on this run's behalf.
+        A done row, or a board that cannot be read, journals `replay-merge-refused`
+        and keeps the branch and escalates, the shape of every DONE unit that cannot
+        merge. Not asked while a merge is in flight (`merge_local`'s replay arms): a
+        refusal there could strand a half-landed merge."""
+        if not self.state.replay_of:
+            return
+        key = task.story_key
+        board = self.paths.sprint_status
+        by_hand = f"recover the work by hand from branch {task.branch!r}"
+        status: str | None = None
+        try:
+            status = sprintstatus.story_status(board, key)
+        except (sprintstatus.SprintStatusError, OSError, ValueError) as e:
+            error = str(e)
+            reason = (
+                f"replay run {self.state.run_id} cannot read the sprint board at {board} "
+                f"to rule out story {key} already being done ({e}), so its unit was not "
+                f"merged; fix the board, then `bmad-loop resolve {self.state.run_id} "
+                f"--adopt-branch` merges the kept branch (a plain re-arm discards it), or "
+                f"{by_hand}"
+            )
+        else:
+            if status != "done":
+                return
+            error = None
+            reason = (
+                f"story {key} is already done on the sprint board, so replay run "
+                f"{self.state.run_id}'s unit (replaying run {self.state.replay_of}) is "
+                f"superseded work and was not merged; {by_hand}; then close the "
+                f"replay run with `bmad-loop resolve {self.state.run_id} --abandon`"
+            )
+        self.journal.append(
+            "replay-merge-refused",
+            story_key=key,
+            replay_of=self.state.replay_of,
+            path=str(board),
+            status=status,
+            error=error,
+        )
+        self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
 
     def keep_branch_and_escalate(self, task: StoryTask, unit: UnitWorkspace, reason: str) -> None:
         """Preserve a DONE unit's branch (no delete, kept for manual merge) and
         escalate. Shared by every merge-back failure path: a target dirtied with
         stray work, a merge git refused at pre-flight, a merge that died part-way
         through its checkout, a merge whose COMMIT git refused, a genuine content
-        conflict, and a failure nothing classified."""
+        conflict, and a failure nothing classified. Its ``changes.patch`` records
+        pinned-config edits as the DEFERRED arm's does (DW-501); the worktree is kept,
+        so the pinned-config record stays."""
         close_unit_workspace(
             unit,
             success=False,
@@ -3969,24 +5205,103 @@ class WorktreeFlow:
             unit_key=task.story_key,
             delete_branch=False,
             diff_max_file_bytes=self.failed_diff_max_bytes(),
+            forensic_extra=self._pinned_config_forensic_extra(task, unit),
         )
+        # A DONE unit whose code did not land: undo its pre-landing writes here,
+        # since `escalate_unit` leaves a terminal task's alone (DW-569).
+        self._reopen_unlanded_close(task)
         self.escalate_unit(task, reason)  # always raises RunPaused
+
+    def seed_workspace_trust(
+        self, task: StoryTask, worktree: Path, profiles: Sequence[CLIProfile]
+    ) -> None:
+        """Extend the operator's workspace-trust grant for the main project to the
+        mount project in ``worktree``, for every loaded profile declaring
+        ``[workspace_trust]`` (DW-390). See :mod:`bmad_loop.workspace_trust` for the confinement and the
+        root-trust rule. Profiles without the table touch nothing under ``~``.
+
+        Seeded → ``worktree-trust-seeded``; root not trusted or file/key missing →
+        ``worktree-trust-unseeded`` with the reason (a degrade, the run goes on —
+        the session will meet the CLI's trust dialog); a malformed settings file or
+        a write fault escalates the unit (repair writes raise)."""
+        # spec -> the first declaring profile's binary, named in the remedy
+        specs: dict[WorkspaceTrustSpec, str] = {}
+        # Exact-path trust, so the path granted is the session cwd — the mount
+        # project — and the grant it inherits is the in-place cwd's, the main
+        # project (DW-484). Both are the checkout roots in the default config.
+        mount = self._mount_project(worktree)
+        for p in profiles:
+            if p.workspace_trust is not None:
+                specs.setdefault(p.workspace_trust, p.binary)
+        for spec, binary in specs.items():
+            try:
+                outcome, detail = workspace_trust.seed(spec, mount, trusted_root=self.paths.project)
+            except workspace_trust.WorkspaceTrustError as e:
+                self.escalate_unit(  # always raises RunPaused
+                    task,
+                    f"cannot seed workspace trust for {task.story_key} in "
+                    f"{spec.settings_path} ({spec.key}): {e}; resolve that fault, then "
+                    "re-arm this escalation with `bmad-loop resolve <run-id> "
+                    "--no-interactive`: ESCALATED is terminal",
+                )
+                raise  # unreachable: escalate_unit always raises RunPaused
+            if outcome == "seeded":
+                self.journal.append(
+                    "worktree-trust-seeded",
+                    story_key=task.story_key,
+                    key=spec.key,
+                    path=str(mount),
+                )
+            elif outcome == "root-untrusted":
+                self.journal.append(
+                    "worktree-trust-unseeded",
+                    story_key=task.story_key,
+                    key=spec.key,
+                    path=str(mount),
+                    reason=detail,
+                )
+                # The run goes on, but the session will sit on the CLI's trust
+                # dialog until timeout — tell the operator now, not after.
+                gates.notify(
+                    self.policy,
+                    self.run_dir,
+                    f"workspace trust not seeded: {task.story_key}",
+                    f"{detail}. The worktree session will block on the {binary} trust "
+                    f"dialog: run `{binary}` once in the project root and trust it — "
+                    "every later worktree (and a resumed in-flight one) is seeded "
+                    "from that grant.",
+                )
 
     def escalate_unit(self, task: StoryTask, reason: str) -> None:
         """Mark a unit ESCALATED, notify, and pause the run.
 
-        Callers escalate outside a legal transition, before dispatch or after a
-        completed merge attempt, so the phase is set directly rather than advanced.
+        Callers escalate outside a legal transition, so the phase is set directly
+        rather than advanced: before dispatch, after a completed merge attempt, at a
+        session launch (the Codex hook-trust gate, :meth:`gate_codex_hook_trust`,
+        which can fire mid-drive), and from :meth:`reopen_unit` for in-flight units.
+
+        An in-flight unit's code has not landed, so ``reopen_unlanded_close`` undoes
+        the writes that assumed it would (a sweep bundle's close in a shared-store
+        ledger, DW-569) before the phase is set. A task already terminal is left
+        alone: the resume replay reaches :meth:`reopen_unit` for a DONE unit whose
+        merge may already have landed, so its landing is unknown here.
+        :meth:`keep_branch_and_escalate`, which knows its DONE unit did not land,
+        makes that call itself.
         """
+        if not task.terminal:
+            self._reopen_unlanded_close(task)
         task.phase = Phase.ESCALATED
+        task.adopt_pending = False  # an escalation spends any adoption (DW-386)
         self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
+        # Persist ESCALATED before the notify, as `Engine._escalate` does: a host
+        # loss inside a slow notify command must not leave the previous save.
+        self._save()
         gates.notify(
             self.policy,
             self.run_dir,
-            f"CRITICAL escalation: {task.story_key}",
+            pause_title(reason, task.story_key),
             f"{reason} — resolve, then `bmad-loop resume {self.state.run_id}`",
         )
-        self._save()
         self._pause(reason, task.story_key)
 
     def merge_message(self, task: StoryTask) -> str:
@@ -4013,7 +5328,12 @@ class WorktreeFlow:
                             f"artifact publication incomplete; source retained at {task.worktree_path}",
                             task.story_key,
                         )
+                    # a resume does not replay finish_publication for every merged
+                    # unit, so this is where a pinned-config edit would be lost
+                    self._refuse_pinned_config_edits(task, wt)
                     discard_worktree(repo, task.worktree_path, task.branch, run_dir=self.run_dir)
+                # also once the operator removed a refused worktree by hand
+                self._drop_pinned_config_record(task)
             elif task.terminal and task.worktree_path and Path(task.worktree_path).is_dir():
                 # kept on purpose (keep_failed): leave it, but surface where.
                 self.journal.append(
@@ -4056,13 +5376,17 @@ class WorktreeFlow:
                 f"worktree for {task.story_key} is on {mounted_branch!r}, not recorded "
                 f"branch {task.branch!r}; cannot resume in place",
             )
-        # Spec paths are persisted relative to the worktree (model.to_dict) so
+        # Spec paths are persisted relative to the mount PROJECT (model.to_dict) so
         # state stays portable; re-absolutize both accepted/result ownership and
-        # the current/last attempt's dispatch ownership against the reopened tree.
+        # the current/last attempt's dispatch ownership against the reopened tree's
+        # project — the checkout root itself unless the project is nested (DW-379).
         # Absolute outside-worktree paths pass through unchanged. The rule itself
         # lives on the class that creates the relative spelling, so this and
         # `Engine._finish_inflight`'s pre-discard re-anchor cannot drift apart.
-        task.rebase_spec_paths_on(wt)
+        task.rebase_spec_paths_on(self._mount_project(wt))
+        # A unit first provisioned while the root was untrusted (or whose entry
+        # the operator pruned) must pick up the grant on resume (DW-390).
+        self.seed_workspace_trust(task, wt, self.worktree_profiles())
         return UnitWorkspace(
             workspace=Workspace(root=wt, paths=self.paths.rebased(wt)),
             repo_root=self.paths.repo_root,

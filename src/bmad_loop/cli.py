@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import time
+import warnings
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import IntEnum
 from pathlib import Path
 from stat import S_ISREG
@@ -25,6 +30,7 @@ from . import (
     events,
     frontmatter,
     gates,
+    initiativechain,
     install,
     machine,
     operatoractions,
@@ -34,12 +40,21 @@ from . import (
     resolve,
     runs,
     runsetup,
+    skill_locate,
     sprintstatus,
 )
 from . import stories as stories_mod
 from . import (
+    ticketlayout,
+    ticketmodel,
+    tickets_source,
+    ticketstore,
+    tickettree,
+    usagereset,
     verify,
+    worksource,
 )
+from .adapters.base import USAGE_LIMIT_BLOCKED, USAGE_LIMIT_WAIT
 
 # Re-exported for the test suite, which stubs `_platform_preflight` with
 # `cli.Finding(...)`; no longer referenced within this module (the preflight body
@@ -58,6 +73,7 @@ from .documents import CLEANUP_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import CONFIRM_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import DECISIONS_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import LIST_SCHEMA_VERSION  # noqa: F401 — re-export
+from .documents import PLUGINS_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import STATUS_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import VALIDATE_SCHEMA_VERSION  # noqa: F401 — re-export
 from .documents import (
@@ -66,21 +82,37 @@ from .documents import (
     confirm_document,
     decisions_document,
     list_document,
+    plugins_document,
     run_token_totals,
     status_document,
     validate_document,
 )
 from .engine import Engine, _publication_refusal
-from .escalation import display_pause_reason
+from .escalation import (
+    HOOK_CHANNEL_SILENT_PREFIX,
+    cleared_pause_escalation_keys,
+    critical_session_reason,
+    display_critical_reason,
+    display_pause_reason,
+    resume_skipped_escalation_keys,
+)
 from .journal import Journal, load_state, save_state, state_lock
-from .model import RunState
+from .model import (
+    PAUSE_EPIC_BOUNDARY,
+    PAUSE_ESCALATION,
+    PauseSnapshot,
+    Phase,
+    RunState,
+    StoryTask,
+)
 from .platform_util import (
     MAX_SEGMENT,
     LockUnavailableError,
+    atomic_write_text_confined,
     resolve_or_lexical,
     walk_files_unlinked,
 )
-from .process_host import ProcessHostError
+from .process_host import ProcessHostError, get_process_host
 
 # The run-composition helpers now live in runsetup.py (the library layer a non-CLI
 # frontend imports). They are re-exported under their historical private names —
@@ -94,24 +126,34 @@ from .runsetup import ROLES
 from .runsetup import make_adapters as _make_adapters
 from .runsetup import mux_reason_label as _mux_reason_label
 from .runsetup import platform_preflight as _platform_preflight
+from .skill_locate import SkillScope
 from .stories_engine import StoriesEngine
 from .sweep import (
     DW_ID_RE,
     SEVERITY_ORDER,
     SWEEP_OVERRIDE_KEYS,
+    TRIAGE_KEY_RE,
     SweepEngine,
+    TriageArtifact,
+    adopt_marker_path,
     decimal_digits_key,
     increment_decimal_digits,
+    read_triage_artifact,
     resolve_sweep_override,
     select_entries,
+    triage_artifact_path,
+    triage_attempt_id,
+    validate_triage,
 )
+from .tickets_engine import TicketsEngine
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     # Type-only: annotate the profile-lookup map without a module-level adapter
     # import (cli.py imports the adapter package lazily inside functions).
     from .adapters.profile import CLIProfile
+    from .plugins import GrantSet
 
 POLICY_FILE = policy_mod.POLICY_FILE
 
@@ -129,7 +171,8 @@ class ExitCode(IntEnum):
       backstop caught an unexpected exception; both print ``error: …`` to stderr.
     - ``USAGE`` — an argparse usage error (unknown subcommand, bad flag). argparse
       raises ``SystemExit(2)`` before dispatch, so this names its number rather than
-      being returned here.
+      being returned here. A handler returns it for a flag combination argparse
+      cannot express (`resolve --abandon` with `--resume`/`--no-resume`).
     - ``INTERRUPTED`` — Ctrl+C (SIGINT) escaped ``main()`` outside ``engine.run()``
       (config load, engine construction, a handler with no run loop). 130 = 128 +
       SIGINT(2), the shell's conventional code for an interrupt; uncaught this path
@@ -182,9 +225,10 @@ def _configure_mux(project: Path) -> None:
     keep-diagnostics-working rule as the policy read above.
 
     It also *overrides* an ambient ``PSMUX_DATA_DIR`` rather than honouring it —
-    the root is derived, always, so that two processes given one project cannot
+    the root is derived, so that two processes given one project cannot
     disagree about where its sessions live (the full argument is in that
-    function). Overriding an operator's variable silently is how someone loses an
+    function) — unless policy ``[mux] honor_ambient_psmux_data_dir`` says the
+    operator's value is a persistent pin (#729). Overriding an operator's variable silently is how someone loses an
     hour to `psmux ls` showing nothing, so it is said once, here, at the only
     point that runs ahead of every command. stderr, not stdout: the ``--json``
     contract is one object on stdout and nothing else, and this is the
@@ -193,10 +237,14 @@ def _configure_mux(project: Path) -> None:
 
     path = _policy_path(project)
     try:
-        name = policy_mod.load(path).mux.backend or None
+        # Incidental, and ahead of every command: the command's own load reports a
+        # deprecation (validate as a finding, everything else on stderr), once.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", policy_mod.PolicyDeprecationWarning)
+            mux_policy = policy_mod.load(path).mux
     except (policy_mod.PolicyError, OSError):
-        name = None
-    configure_multiplexer(name, origin=path)
+        mux_policy = policy_mod.MuxPolicy()
+    configure_multiplexer(mux_policy.backend or None, origin=path)
     # Automatic selection probes availability before returning its cached
     # instance. Give that probe the derived root first: psmux's version probe
     # reaches `_run`, which must reject an empty/relative ambient value, and a
@@ -237,12 +285,24 @@ def _configure_mux(project: Path) -> None:
                 os.environ[runs.PSMUX_DATA_DIR] = ambient
     if not namespaced:
         return
-    root = runs.export_psmux_registry_root(project)
+    root = runs.export_psmux_registry_root(
+        project, honor_ambient=mux_policy.honor_ambient_psmux_data_dir
+    )
     if root is not None:
+        # An honoured value is the operator's own stated preference, so it gets
+        # no note; `bmad-loop mux` still says which source won.
         if ambient is not None and ambient != root:
+            owner = (
+                # No promise that the registry is left untouched: a session tagged
+                # as this project's there is still swept (`prune_sessions`,
+                # `kill_displaced_session`), so the note says only whose the rest is.
+                f"is {runs.FOREIGN_REGISTRY}: {runs.FOREIGN_REGISTRY_HINT}"
+                if runs.foreign_registry_root(ambient, project)
+                else "is left for your own sessions"
+            )
             print(
                 f"note: using bmad-loop's own psmux registry {root} — your "
-                f"{runs.PSMUX_DATA_DIR}={ambient} is left for your own sessions "
+                f"{runs.PSMUX_DATA_DIR}={ambient} {owner} "
                 f"(`bmad-loop mux` prints the export that reaches these)",
                 file=sys.stderr,
             )
@@ -290,8 +350,10 @@ def _reject_bad_run_id(run_id: str | None) -> int | None:
 
 
 def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | None:
-    """Refuse `isolation = "worktree"` under a `repo_root` override (#414). Returns
-    1 to abort, None to proceed — the `_reject_bad_run_id` shape.
+    """Refuse `isolation = "worktree"` when the project is not inside `repo_root` — a
+    DISJOINT layout (#414, narrowed to that layout by DW-379; a project nested in
+    `repo_root` is supported). Returns 1 to abort, None to proceed — the
+    `_reject_bad_run_id` shape.
 
     Called from the four sites that return an rc to a human: `cmd_run`, `cmd_sweep`,
     `_resume_paused_run` — the shared helper behind both `resume` and `resolve`'s
@@ -317,6 +379,62 @@ def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | Non
         return None
     print(conflict, file=sys.stderr)
     return 1
+
+
+def _sweep_store_source(paths: bmadconfig.ProjectPaths, pol: policy_mod.Policy) -> str:
+    """:func:`ticketstore.sweep_store_source` under the policy's ``[stories]
+    source``."""
+    return ticketstore.sweep_store_source(paths, pol.stories.source)
+
+
+def _reject_store_topology(
+    project: Path,
+    pol,
+    source: str,
+    *,
+    recorded: dict[str, str | None] | None = None,
+    initiative: str | None = None,
+) -> int | None:
+    """Refuse a tickets run whose ticket store tickets runs cannot drive
+    (:func:`ticketstore.store_conflict`: a refused layout, or — given the run's
+    ``recorded`` ``RunState.store_topology`` — a store that changed since the run
+    started). Returns 1 to abort, None to proceed — the
+    :func:`_reject_isolation_conflict` sibling, called beside it from every
+    run-arming surface that returns an rc to a human; the surfaces without an rc
+    channel call the predicate itself. Outside tickets mode it is a no-op.
+    ``initiative`` names a chained run's child initiative, whose store is judged
+    on its own (:func:`ticketstore.store_conflict`); unset, the predicate is
+    called exactly as before chains existed."""
+    chained = {} if initiative is None else {"initiative": initiative}
+    conflict = ticketstore.store_conflict(
+        project, source, pol.scm.isolation, recorded=recorded, **chained
+    )
+    if conflict is None:
+        return None
+    print(f"error: {conflict}", file=sys.stderr)
+    return 1
+
+
+def _store_initiative(state: RunState) -> str | None:
+    """The ``initiative`` a recorded run's store is judged on
+    (:func:`_reject_store_topology`): a chained run's child (``state.initiative``
+    when ``state.parent_initiative`` is set — a child folder can have its own
+    topology), else None, so an unchained run is judged as before chains existed."""
+    return state.initiative if state.parent_initiative is not None else None
+
+
+def _store_extra_args_roles(pol, source: str) -> tuple[str, ...]:
+    """The roles a ``source`` run launches whose resolved adapter sets
+    ``extra_args`` — for the ``tickets.store-sandbox`` warning."""
+    roles = worksource.launch_roles(source, pol.gates.retrospective)
+    return tuple(role for role in roles if pol.adapter.resolved(role).extra_args)
+
+
+def _store_sandboxed_roles(pol, source: str) -> tuple[str, ...]:
+    """The roles a ``source`` run launches under a non-bypass
+    ``adapter.permission_mode`` — for the ``tickets.store-sandbox`` warning."""
+    roles = worksource.launch_roles(source, pol.gates.retrospective)
+    return tuple(role for role in roles if pol.adapter.resolved(role).permission_mode != "bypass")
 
 
 def _reject_under_floor_git(project: Path) -> int | None:
@@ -392,6 +510,85 @@ def _launch_profiles(pol, project: Path) -> dict[str, CLIProfile]:
         raise SystemExit(f"error: {e}") from e
 
 
+def _launch_plugin_grants(project: Path) -> GrantSet:
+    """Read the project's plugin grants ONCE, for a human-present launch (`cmd_run`,
+    `cmd_sweep`, resume) — #496/#497.
+
+    The returned set is frozen and threaded down: to the preflight, to `compose_*`
+    and the engine's registry build, and into the `_sweep_factory` closure, so the
+    auto-sweep child is judged against the grants this launch read and never
+    re-reads the store (a session could write it between launch and trigger as
+    easily as it writes the plugin dir). Nothing below a launch site reads the
+    store.
+
+    Observation, so it never raises: an unreadable or malformed store is warned
+    about and treated as no grants — which refuses every project plugin that
+    needs one (fail closed), never one that runs unverified."""
+    from .plugins import store
+
+    grants = store.load_grants(project)
+    if grants.fault is not None:
+        print(
+            f"warning: plugin grants could not be read ({grants.fault}); treating as none",
+            file=sys.stderr,
+        )
+    return grants
+
+
+def _fatal_trust_messages(verdicts, grants: GrantSet) -> list[str]:
+    """Every fatal plugin-trust refusal in a `registry.preflight` result: each fatal
+    per-manifest verdict, then each grant no discovered plugin claims
+    (`grants.unclaimed`). Shared by the launch preflight and the dry-run banner so
+    the preview refuses on exactly what the real launch does."""
+    from .plugins.grants import fatal_message, missing_message, unclaimed
+
+    fatal = [fatal_message(m.name, v) for m, v, _rel in verdicts if v.fatal]
+    fatal += [
+        missing_message(r.name, r.path) for r in unclaimed(grants, (v for _m, v, _rel in verdicts))
+    ]
+    return fatal
+
+
+def _reject_plugin_trust(paths: bmadconfig.ProjectPaths, pol, grants: GrantSet) -> int | None:
+    """Refuse a launch whose plugins the registry gate would refuse fatally, before
+    the launch's first side effect (#496/#497).
+
+    Judges every discovered plugin exactly as `PluginRegistry.build` will
+    (`registry.preflight`: manifests and hashing only, no plugin code runs). A fatal
+    verdict — a granted plugin that changed or vanished, a name in `[plugins]
+    enabled` with no grant, a granted dir that cannot be read — prints its fix and returns
+    FAILURE. A never-granted, un-enabled plugin is inert, not an error: it gets a
+    `note:` and the launch goes on without it. Never prompts.
+
+    This is a preflight, not the gate: the engine's build re-judges and raises on
+    its own, so a path that skips this (or a plugin that changes after it) is still
+    refused."""
+    from .plugins import PluginError
+    from .plugins.grants import TrustState
+    from .plugins.registry import preflight
+
+    try:
+        # materialize: a granted plugin's snapshot write fails HERE, not from the
+        # engine's registry build after a resume has re-armed its run.
+        verdicts = preflight(paths.repo_root, pol, grants, materialize=True)
+    except PluginError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return ExitCode.FAILURE
+    fatal = _fatal_trust_messages(verdicts, grants)
+    for message in fatal:
+        print(f"error: {message}", file=sys.stderr)
+    if fatal:
+        return ExitCode.FAILURE
+    for m, v, rel in verdicts:
+        if v.state is TrustState.REFUSED:
+            print(
+                f'note: plugin "{m.name}" ({rel}) is not granted and will not run; '
+                f"review it, then run `bmad-loop plugins enable {m.name}` to grant it",
+                file=sys.stderr,
+            )
+    return None
+
+
 def _trusted_config_digest(pol, project: Path, *, profiles=None) -> str:
     """The launch-time integrity baseline the auto-sweep child is held to (#461
     point 4). Thin wrapper over :func:`runsetup.config_digest` for the two
@@ -423,51 +620,370 @@ def _reconcile_stale(project: Path, paths: bmadconfig.ProjectPaths, pol) -> None
     runs, never anything resumable."""
     if not pol.cleanup.auto_clean_on_finish:
         return
-    freed = runs.reconcile_stale_worktrees(paths.repo_root, project)
+    freed, fault = runs.reconcile_stale_worktrees(paths.repo_root, project)
     if freed:
         print(f"reclaimed {len(freed)} stale worktree(s) from prior runs")
+    if fault is not None:
+        # DW-468/DW-470: an unread run, or a worktree list git would not give, was
+        # not reconciled; "reclaimed nothing" must not stand for it. Advisory — the
+        # new run does not depend on this sweep.
+        print(f"warning: stale-worktree reconcile incomplete: {fault}", file=sys.stderr)
 
 
 # ----------------------------------------------------------------- commands
 
 
-def cmd_validate(args: argparse.Namespace) -> int:
-    from .install import relay_registered
+def _validate_environment_probes(
+    pol: policy_mod.Policy, cwd: Path, report: ValidationReport, *, run: bool
+) -> None:
+    """The ``[environment] probes`` findings of ``validate`` (DW-526).
 
-    project = _project(args)
-    report = ValidationReport()
+    Opt-in, like ``--render-probe``: a probe is operator-authored shell, and plain
+    validate must stay non-executing for a fresh clone. Without ``run`` a
+    configured list is only noted — an ``ok`` severity on purpose (a warning on
+    every plain validate would teach operators to ignore warnings), and the
+    message plus ``detail.run: false`` say plainly that nothing ran. With no
+    probes and no flag, nothing is reported, so that output is unchanged.
 
-    try:
-        paths = bmadconfig.load_paths(project)
+    With ``run`` every probe runs (:func:`verify.check_environment_probes`, not
+    fail-fast) and each is one ``environment.probe`` finding. ``returncode`` is
+    None when no exit status exists — a timeout, a spawn fault, an interrupt —
+    because the runner's sentinels are not exit codes and the ``--json`` contract
+    must not publish them as one."""
+    probes = pol.environment.probes
+    timeout_s = pol.environment.probe_timeout_s
+    if not run:
+        if probes:
+            report.ok(
+                "environment.probes-not-run",
+                f"{len(probes)} [environment] probe(s) configured, not run "
+                "— pass --probes to execute them",
+                {"probes": list(probes), "run": False},
+            )
+        return
+    if not probes:
+        report.ok(
+            "environment.probes-none",
+            "no [environment] probes configured — nothing to run",
+        )
+        return
+    for index, check in enumerate(verify.check_environment_probes(pol, cwd)):
+        result = check.result
+        exited = check.status not in ("timeout", "interrupted") and result.spawn_error is None
+        detail = {
+            "command": result.command,
+            "index": index,
+            "status": check.status,
+            "returncode": result.returncode if exited else None,
+            "reason": check.reason,
+            "timeout_s": timeout_s,
+            "cwd": str(cwd),
+        }
+        if check.status == "pass":
+            report.ok("environment.probe", f"environment probe passed: {result.command}", detail)
+            continue
+        if check.status == "fail":
+            message = f"environment probe failed ({check.reason}): {result.command}"
+        else:  # timeout / interrupted: the reason already reads as the verdict
+            message = f"environment probe {check.reason}: {result.command}"
+        tail = next(
+            (line.strip() for line in reversed(result.output_tail.splitlines()) if line.strip()),
+            "",
+        )
+        if tail and tail not in check.reason:
+            message += f" — {tail}"
+        report.fail("environment.probe", message, detail)
+
+
+def _check_opencode_version(
+    report: ValidationReport, profile_name: str, resolved: str
+) -> tuple[int, int, int] | None:
+    """``adapter.opencode-version``: which OpenCode server API ``resolved`` would
+    run, judged by the same :func:`opencode_protocol.support_verdict` the adapter
+    refuses unsupported majors with. OK or a warning, never a problem. Returns the
+    parsed version (None when unreadable), which ``skills.user-root-unsupported``
+    reads.
+
+    Called only once ``binary_runs`` saw ``--version`` exit 0, so a read that
+    now fails, times out, or prints nothing is not ``adapter.binary-unrunnable``'s
+    finding: it is a warning here, because the run reads the same output and
+    refuses to start on it."""
+    from . import probe as probe_mod
+    from .adapters.opencode_protocol import (
+        parse_opencode_version,
+        support_verdict,
+        supported_ranges,
+    )
+
+    first_line = probe_mod.binary_version_text(resolved)
+    if first_line is None:
+        report.warn(
+            "adapter.opencode-version",
+            f"{profile_name}: `--version` exited 0 once, but a second read failed, "
+            f"timed out, or printed nothing — runs read it to pick the server API "
+            f"and refuse to start without one (supported: {supported_ranges()})",
+            {"profile": profile_name, "path": resolved, "output": None},
+        )
+        return None
+    detail: dict[str, object] = {"profile": profile_name, "path": resolved, "output": first_line}
+    version = parse_opencode_version(first_line)
+    if version is None:
+        report.warn(
+            "adapter.opencode-version",
+            f"{profile_name}: `--version` printed {first_line[:200]!r}, which names no "
+            f"OpenCode version — runs will refuse to start (supported: {supported_ranges()})",
+            detail,
+        )
+        return None
+    verdict, message = support_verdict(version)
+    detail["version"] = ".".join(str(part) for part in version)
+    detail["verdict"] = verdict
+    if verdict == "ok":
+        report.ok("adapter.opencode-version", f"{profile_name}: {message}", detail)
+    elif verdict == "unsupported-major":
+        report.warn(
+            "adapter.opencode-version",
+            f"{profile_name}: {message} — runs will refuse to start",
+            detail,
+        )
+    else:
+        report.warn(
+            "adapter.opencode-version",
+            f"{profile_name}: {message} — it may work; upgrade if sessions misbehave",
+            detail,
+        )
+    return version
+
+
+def _check_codex_version(report: ValidationReport, profile: CLIProfile, resolved: str) -> None:
+    """``adapter.codex-version``: whether ``resolved`` accepts ``--no-daemon``
+    (Codex >= :data:`codex_trust.CODEX_MIN_VERSION`) and whether ``profile``
+    passes it. Without it a session can attach to a shared app-server daemon that
+    runs tools and hooks with the daemon's env, so they never see BMAD_LOOP_*.
+    OK or a warning, never a problem: validate's rc is a compatibility contract.
+
+    Called only once ``binary_runs`` saw ``--version`` exit 0, like
+    :func:`_check_opencode_version`, so an unreadable second read warns here."""
+    from . import probe as probe_mod
+    from .codex_trust import CODEX_MIN_VERSION, NO_DAEMON_ARG, parse_codex_version
+
+    floor = ".".join(str(part) for part in CODEX_MIN_VERSION)
+    first_line = probe_mod.binary_version_text(resolved)
+    if first_line is None:
+        report.warn(
+            "adapter.codex-version",
+            f"{profile.name}: `--version` exited 0 once, but a second read failed, "
+            f"timed out, or printed nothing — sessions need Codex >= {floor} for "
+            f"{NO_DAEMON_ARG}",
+            {"profile": profile.name, "path": resolved, "output": None},
+        )
+        return
+    detail: dict[str, object] = {"profile": profile.name, "path": resolved, "output": first_line}
+    version = parse_codex_version(first_line)
+    if version is None:
+        report.warn(
+            "adapter.codex-version",
+            f"{profile.name}: `--version` printed {first_line[:200]!r}, which names no "
+            f"Codex version — sessions need Codex >= {floor} for {NO_DAEMON_ARG}",
+            detail,
+        )
+        return
+    found = ".".join(str(part) for part in version)
+    detail["version"] = found
+    if version < CODEX_MIN_VERSION:
+        detail["verdict"] = "below-floor"
+        report.warn(
+            "adapter.codex-version",
+            f"{profile.name}: codex {found} is older than {floor}: it rejects "
+            f"{NO_DAEMON_ARG} and every session exits at launch; upgrade Codex",
+            detail,
+        )
+    elif NO_DAEMON_ARG not in profile.launch_args:
+        detail["verdict"] = "no-daemon-missing"
+        report.warn(
+            "adapter.codex-version",
+            f"{profile.name}: launch_args lack {NO_DAEMON_ARG}, so sessions can attach "
+            "to a shared Codex app-server daemon whose tools and hooks never see the "
+            "BMAD_LOOP_* environment",
+            detail,
+        )
+    else:
+        detail["verdict"] = "ok"
+        report.ok(
+            "adapter.codex-version",
+            f"{profile.name}: codex {found} runs sessions with {NO_DAEMON_ARG}",
+            detail,
+        )
+
+
+def _check_hook_events_complete(
+    report: ValidationReport, profile: CLIProfile, parsed: dict, hook_config: Path
+) -> None:
+    """``hooks.events-incomplete``: once the Stop relay is registered, whether
+    every other native event the profile maps runs its relay too. A config written
+    before the profile mapped an event (claude's ``StopFailure``) still completes
+    sessions but never delivers that event. OK or a warning, never a problem:
+    validate's rc is a compatibility contract.
+
+    A missing event the version gate would leave out again names its floor and
+    the version found, not a bare "re-run init" that would change nothing. The
+    gate probes ``<binary> --version`` only when something is missing, the
+    profile has floors, and the profile is packaged: `binary` and `env` of an
+    overlay or entry-point profile are project-controlled, and validate never
+    executes them (#294). Such a profile's floored events are named with their
+    floor and no version."""
+    detail: dict[str, object] = {"profile": profile.name, "config_path": str(hook_config)}
+    missing = install.missing_relay_events(parsed, profile.hooks.dialect, profile.hooks.events)
+    if not missing:
+        report.ok(
+            "hooks.events-incomplete",
+            f"every {profile.name} hook event runs the bmad-loop relay",
+            detail,
+        )
+        return
+    if profile.packaged:
+        registrable, gate_notes = install.gated_hook_events(profile)
+    else:
+        floors = profile.hooks.event_min_versions
+        registrable = {n: c for n, c in profile.hooks.events.items() if n not in floors}
+        gate_notes = [
+            f"{native} hook needs {profile.binary} >= {floor} ({profile.name}; version "
+            f"not probed for a project-owned profile) — on such a version, re-run "
+            f"`bmad-loop init --cli {profile.name}`"
+            for native, floor in floors.items()
+        ]
+    rerun = [native for native in missing if native in registrable]
+    gated = [native for native in missing if native not in registrable]
+    detail["missing"] = missing
+    detail["gated"] = gated
+    parts: list[str] = []
+    if rerun:
+        parts.append(
+            f"{', '.join(rerun)} not registered for {profile.name} — re-run "
+            f"`bmad-loop init --cli {profile.name}`"
+        )
+    parts.extend(note for note in gate_notes if note.split(" ", 1)[0] in gated)
+    report.warn("hooks.events-incomplete", "; ".join(parts), detail)
+
+
+def _report_bmad_config(report: ValidationReport, paths: bmadconfig.ProjectPaths) -> None:
+    """The `bmad-config` ok line, plus the v7 warnings. A v6 config reports exactly
+    as it always has; a v7 one names the era and the active initiative, warns when
+    none is active (the artifact dirs fell back to `output_folder`), and names each
+    leftover v6 key a mixed install resolved past."""
+    if paths.era != "v7":
         report.ok(
             "bmad-config",
             f"BMAD config OK: artifacts at {paths.implementation_artifacts}",
             {"implementation_artifacts": str(paths.implementation_artifacts)},
         )
+        return
+    initiative = paths.active_initiative
+    report.ok(
+        "bmad-config",
+        f"BMAD v7 config OK: initiative {initiative or '(none)'}, "
+        f"artifacts at {paths.implementation_artifacts}",
+        {
+            "implementation_artifacts": str(paths.implementation_artifacts),
+            "era": paths.era,
+            "initiative": initiative,
+        },
+    )
+    if not initiative:
+        report.warn(
+            "bmad-config.initiative-unset",
+            "BMAD v7: no `[core] active_initiative` is set, so artifacts resolve to "
+            f"the output folder {paths.output_folder} — set one in "
+            "_bmad/custom/config.user.toml (or ask the `bmad` skill to switch it)",
+            {"output_folder": str(paths.output_folder)},
+        )
+    if paths.ignored_v6_keys:
+        report.warn(
+            "bmad-config.v6-keys-ignored",
+            "BMAD v7 resolved past leftover v6 keys: "
+            f"{'; '.join(paths.ignored_v6_keys)} — remove them (accept `bmad setup`'s "
+            "v6 cleanup) so every mode reads the same artifact home",
+            {"keys": list(paths.ignored_v6_keys)},
+        )
+
+
+def _relay_registration_problem(project: Path, profile: CLIProfile) -> str | None:
+    """Why a hooked ``profile``'s relay looks unregistered in the project hook
+    config, or None when it is registered. A hookless profile has no hook config;
+    the caller skips it, as validate does.
+
+    Unlike validate, an unreadable config is a problem to report, not a crash: the
+    launch warning that calls this must never abort a launch."""
+    try:
+        registration = install.read_relay_registration(project, profile)
+    except (OSError, ValueError) as error:
+        return f"{project / profile.hooks.config_path} could not be read ({type(error).__name__})"
+    if registration.registered:
+        return None
+    if registration.fault is not None:
+        return registration.fault
+    if not registration.config_path.is_file():
+        return f"{registration.config_path} does not exist"
+    return f"{registration.config_path} does not register the bmad-loop relay"
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+
+    project = _project(args)
+    report = ValidationReport()
+
+    # Policy is READ first — its [stories].source (or a --spec override) selects
+    # which story-queue gate runs below (the sprint-status file, the stories.yaml
+    # manifest, or the v7 ticket tree), and tickets mode resolves a mixed install
+    # as BMAD v7 — but REPORTED after the BMAD config, as it always was. Loaded
+    # before the queue gate so a stories-only project is not failed on a missing
+    # sprint-status.yaml.
+    loaded_pol = None
+    policy_error: policy_mod.PolicyError | None = None
+    with warnings.catch_warnings(record=True) as policy_warnings:
+        # the once-per-location default would drop a repeat
+        warnings.simplefilter("always", policy_mod.PolicyDeprecationWarning)
+        try:
+            loaded_pol = policy_mod.load(_policy_path(project))
+        except policy_mod.PolicyError as e:
+            policy_error = e
+    deprecations: list[str] = []
+    for w in policy_warnings:
+        if issubclass(w.category, policy_mod.PolicyDeprecationWarning):
+            deprecations.append(str(w.message))
+        else:
+            warnings.showwarning(w.message, w.category, w.filename, w.lineno, w.file, w.line)
+    source, spec_folder = _resolve_source(args, loaded_pol)
+
+    try:
+        paths = bmadconfig.load_paths(project, want_tickets=source == worksource.SOURCE_TICKETS)
+        _report_bmad_config(report, paths)
     except bmadconfig.BmadConfigError as e:
         report.fail("bmad-config", str(e))
         paths = None
 
-    # Policy first — its [stories].source (or a --spec override) selects which
-    # story-queue gate runs below: the sprint-status file (sprint mode) or the
-    # stories.yaml manifest (stories mode). Loaded before the queue gate so a
-    # stories-only project is not failed on a missing sprint-status.yaml.
     from .adapters import registry as adapter_registry
     from .adapters.profile import ProfileError, external_profile_errors, get_profile
 
     profiles = []
     profile_by_name: dict[str, CLIProfile] = {}
     pol = None
-    try:
-        pol = policy_mod.load(_policy_path(project))
+    if policy_error is not None:
+        report.fail("policy", str(policy_error))
+        for message in deprecations:
+            report.warn("policy.deprecated", message)
+    elif loaded_pol is not None:
+        pol = loaded_pol
         role_names = {role: pol.adapter.resolved(role).name for role in ROLES}
         report.ok(
             "policy",
             f"policy OK: gates={pol.gates.mode}, "
             f"adapter dev={role_names['dev']}, review={role_names['review']}, "
-            f"triage={role_names['triage']}",
+            f"triage={role_names['triage']}, retro={role_names['retro']}",
             {"gates_mode": pol.gates.mode, "adapters": dict(role_names)},
         )
+        for message in deprecations:
+            report.warn("policy.deprecated", message)
         for name in dict.fromkeys(role_names.values()):
             try:
                 profile = get_profile(name, project)
@@ -475,14 +991,14 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 profile_by_name[name] = profile
             except ProfileError as e:
                 report.fail("adapter.profile", str(e), {"profile": name})
-    except policy_mod.PolicyError as e:
-        report.fail("policy", str(e))
 
     # #414: the one configuration where every gate below reports on a surface the
-    # isolated run will never see. Reported only when it fires — there is no `ok`
-    # twin, because the supported case is "no such conflict", which would print a
-    # line about a coupling most projects have never configured either half of.
-    # Needs both halves loaded; either failing already has its own finding above.
+    # isolated run will never see — worktree isolation beside a `repo_root` the
+    # project does not lie inside (a disjoint layout; a nested one is supported since
+    # DW-379). Reported only when it fires — there is no `ok` twin, because the
+    # supported case is "no such conflict", which would print a line about a coupling
+    # most projects have never configured either half of. Needs both halves loaded;
+    # either failing already has its own finding above.
     if paths is not None and pol is not None:
         conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
         if conflict is not None:
@@ -491,12 +1007,31 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 conflict,
                 {"repo_root": str(paths.repo_root), "project": str(paths.project)},
             )
+        # DW-485: advisory, one per dir, and silent when nothing is shared — the
+        # same no-`ok`-twin reasoning as the gate above.
+        for key, shared in bmadconfig.shared_artifact_dirs(paths, pol.scm.isolation):
+            report.warn(
+                "policy.isolation-shared-artifact-dir",
+                f"{key} ({shared}) is inside repo_root ({paths.repo_root}) but outside "
+                f'the project ({paths.project}): under isolation = "worktree" it is '
+                "shared with the main checkout, not per-worktree — every isolated "
+                "session reads and writes the main checkout's copy. Move it inside the "
+                "project for a per-worktree copy, or keep it if sharing is intended.",
+                {
+                    "key": key,
+                    "path": str(shared),
+                    "repo_root": str(paths.repo_root),
+                    "project": str(paths.project),
+                },
+            )
 
     # The engine builds its registry from `paths.repo_root` (a `repo_root:` override
     # under isolation = "none" points it at another checkout), so read the manifests
     # that run will load. A failed BMAD config already failed above; fall back to
     # the project dir so the manifest check still reports something.
-    _validate_plugin_manifests(paths.repo_root if paths is not None else project, report)
+    plugin_root = paths.repo_root if paths is not None else project
+    _validate_plugin_manifests(plugin_root, report)
+    _validate_plugin_trust(plugin_root, project, pol, report)
 
     # Built exactly the way run/sweep's real preflight builds it, so validate's
     # verdict and their abort cannot disagree. Deliberately NOT `[p.skill_tree for p
@@ -505,32 +1040,25 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # `resolved` never raises, so the except above fires only on a policy that failed
     # to load, and an unguarded call would crash validate instead of reporting the
     # parse failure.
-    dev_trees = _skill_trees(project, pol) if pol is not None else []
+    from .plugins import store as plugin_store
 
-    stories_on, spec_folder = _stories_mode(args, pol)
+    dev_profiles = (
+        _scoped_profiles(project, pol, plugin_root, plugin_store.load_grants(project))
+        if pol is not None
+        else {}
+    )
+    dev_trees = list(dev_profiles)
+
     if paths:
-        if stories_on:
-            _validate_stories_queue(project, paths, spec_folder, dev_trees, report)
-            _validate_deferred_ledger(paths, report, spec_folder=spec_folder)
-        else:
-            _validate_deferred_ledger(paths, report)
-            _validate_operator_registry(project, paths, report)
-            try:
-                ss = sprintstatus.load(paths.sprint_status)
-                actionable = [s for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
-                report.ok(
-                    "queue.sprint-status",
-                    f"sprint-status OK: {len(ss.stories)} stories, {len(actionable)} actionable",
-                    {"stories": len(ss.stories), "actionable": len(actionable)},
-                )
-                if ss.unknown_keys:
-                    report.warn(
-                        "queue.sprint-status-unknown-keys",
-                        f"unknown keys ignored: {', '.join(ss.unknown_keys)}",
-                        {"unknown_keys": list(ss.unknown_keys)},
-                    )
-            except sprintstatus.SprintStatusError as e:
-                report.fail("queue.sprint-status", str(e))
+        _QUEUE_VALIDATORS[source](
+            project,
+            paths,
+            spec_folder,
+            dev_trees,
+            report,
+            bool(getattr(args, "probes", False)),
+            pol,
+        )
 
     # `git_answers` carries ONE fact from this probe to the two below it: not
     # whether the tree was clean, but whether the binary answered at all. A
@@ -542,14 +1070,30 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # going to return, and each further probe re-pays the entire `GIT_TIMEOUT_S` to
     # learn what this one already reported. Three probes against one hung git is
     # three deadlines — on the 120s default, six minutes to print one line.
+    #
+    # Probes the CODE root, as `cmd_run` and `cmd_sweep` do, so validate's verdict and
+    # their abort cannot disagree under a `repo_root:` override whose checkout is dirty
+    # outside the project (DW-379) — with the project's own policy.toml excluded at its
+    # offset there. A config that failed to load already failed above; the project is
+    # probed then, as before.
+    #
+    # The probed root is named (text and detail) only under a `repo_root` override,
+    # so the default config's output stays byte-identical.
     git_answers = True
+    clean_root = paths.repo_root if paths is not None else project
+    overridden = clean_root != project
+    where = f" ({clean_root})" if overridden else ""
     try:
-        if not verify.worktree_clean(project):
+        if not verify.worktree_clean(
+            clean_root, project=paths.project if paths is not None else None
+        ):
             report.fail(
-                "git.worktree-clean", "git worktree is not clean — commit or stash before running"
+                "git.worktree-clean",
+                f"git worktree is not clean{where} — commit or stash before running",
+                {"root": str(clean_root)} if overridden else None,
             )
         else:
-            report.ok("git.worktree-clean", "git worktree clean")
+            report.ok("git.worktree-clean", f"git worktree clean{where}")
     except verify.GitError as e:
         git_answers = not isinstance(e, (verify.GitSpawnError, verify.GitTimeoutError))
         report.fail("git.probe", f"git check failed: {e}")
@@ -594,6 +1138,13 @@ def cmd_validate(args: argparse.Namespace) -> int:
         except verify.GitError:
             pass
 
+    # Advisory, and gated on `git_answers` for the same reason as the probe above:
+    # `_validate_deferred_ledger` runs before the `git.worktree-clean` probe, so a
+    # git-backed check placed there would re-pay a hung git's full deadline.
+    if git_answers and paths is not None:
+        _validate_deferred_ledger_tracking(paths, report)
+        _validate_isolated_ledger_ignored(paths, pol, report)
+
     report.extend(_platform_preflight(project))
 
     # #231: notify.desktop defaults to true but only fires when a platform notifier
@@ -620,6 +1171,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
     from . import probe as probe_mod
 
     packaged_binaries = {p.binary for p in profiles if p.packaged}
+    # tool -> the path `which` returned, for packaged binaries whose `--version`
+    # exited 0 — the only ones a later check may execute again (see below).
+    runnable: dict[str, str] = {}
     for tool in dict.fromkeys(p.binary for p in profiles):
         resolved = shutil.which(tool)
         if resolved:
@@ -666,6 +1220,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             continue
         rc = probe_mod.binary_runs(resolved)
         if rc == 0:
+            runnable[tool] = resolved
             continue
         # Any nonzero code, never an allowlist: #294's own transcript reports rc 2
         # and a reproduction of the same shim exits 127, the code being a property
@@ -688,6 +1243,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
         )
 
     registered_relays: set[tuple[Path, str]] = set()
+    relay_interpreters: set[str] = set()
+    # the server version each probed opencode-http profile reports, for the
+    # user-root check below (`skills.user-root-unsupported`)
+    opencode_versions: dict[str, tuple[int, int, int] | None] = {}
     for profile in profiles:
         # Keyed on the adapter KIND, not on `hookless`. httpx is the bundled
         # opencode family's optional extra — a fact about one adapter class, which
@@ -713,6 +1272,45 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"run `pip install 'bmad-loop[opencode]'`",
                     {"profile": profile.name},
                 )
+            # The serve argv is `[binary, *launch_args, "serve", <owned flags>]`
+            # (`_serve_argv`). A shape it cannot serve would otherwise surface
+            # only at run start, as SPAWN_ATTEMPTS failed health polls. A pure
+            # shape check — never a probe: `binary` is project-controlled (#294).
+            # `warning`: validate's exit code is a compatibility contract.
+            # Imported here, not at the top of cmd_validate, so a project with no
+            # opencode-kind profile never imports the opencode module (the import
+            # itself is httpx-free: `_require_httpx` is lazy).
+            from .adapters.opencode_http import launch_args_unservable
+
+            unservable = launch_args_unservable(profile.binary, profile.launch_args)
+            if unservable is not None:
+                report.warn(
+                    "adapter.launch-args-unservable",
+                    f"{profile.name} (opencode-http): {unservable}",
+                    {
+                        "profile": profile.name,
+                        "binary": profile.binary,
+                        "launch_args": list(profile.launch_args),
+                    },
+                )
+            # The server API major the run would detect from `--version` (#847):
+            # 2.x replaced 1.x under the same binary name. Read only for a binary
+            # already proven runnable above — that is the packaged-provenance gate
+            # (#294), and a failed first `--version` is `adapter.binary-unrunnable`'s
+            # finding, not this one's. Never a problem: the run itself refuses an
+            # unsupported major with a clear error, and validate's rc is a
+            # compatibility contract.
+            resolved_binary = runnable.get(profile.binary)
+            if resolved_binary is not None:
+                opencode_versions[profile.name] = _check_opencode_version(
+                    report, profile.name, resolved_binary
+                )
+        if profile.hooks.dialect == "codex-hooks-json":
+            # The same packaged-provenance gate as the opencode read above; never
+            # a problem, for the same rc contract.
+            resolved_binary = runnable.get(profile.binary)
+            if resolved_binary is not None:
+                _check_codex_version(report, profile, resolved_binary)
         if profile.hookless:
             report.ok(
                 "adapter.hookless",
@@ -720,39 +1318,25 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 {"profile": profile.name},
             )
             continue
-        hook_config = project / profile.hooks.config_path
-        hooks_ok = False
-        parsed: dict = {}
-        if hook_config.is_file():
-            try:
-                parsed = json.loads(hook_config.read_text(encoding="utf-8"))
-                hooks_ok = isinstance(parsed, dict) and relay_registered(
-                    parsed, profile.hooks.dialect, profile.hooks.events
-                )
-                if isinstance(parsed, dict):
-                    container = install.hook_event_container(parsed, profile.hooks.dialect)
-                    malformed = [
-                        event
-                        for event in profile.hooks.events
-                        if event in container and not isinstance(container[event], list)
-                    ]
-                    if malformed:
-                        hooks_ok = False
-                        report.fail(
-                            "hooks.config-parse",
-                            f"{hook_config} has malformed handlers for {', '.join(malformed)}",
-                            {"profile": profile.name, "config_path": str(hook_config)},
-                        )
-            except json.JSONDecodeError:
-                report.fail(
-                    "hooks.config-parse",
-                    f"{hook_config} is not valid JSON",
-                    {"profile": profile.name, "config_path": str(hook_config)},
-                )
+        registration = install.read_relay_registration(project, profile)
+        hook_config = registration.config_path
+        hooks_ok = registration.registered
+        parsed = registration.parsed
+        if registration.fault is not None:
+            report.fail(
+                "hooks.config-parse",
+                registration.fault,
+                {"profile": profile.name, "config_path": str(hook_config)},
+            )
         if isinstance(parsed, dict):
             registered_relays.update(
                 install.registered_relay_paths(
                     parsed, profile.hooks.dialect, profile.hooks.events, project
+                )
+            )
+            relay_interpreters.update(
+                install.registered_relay_interpreters(
+                    parsed, profile.hooks.dialect, profile.hooks.events
                 )
             )
         if hooks_ok:
@@ -761,11 +1345,15 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 f"bmad-loop hooks registered for {profile.name}",
                 {"profile": profile.name, "config_path": str(hook_config)},
             )
+            assert isinstance(parsed, dict)  # `registered` is only ever True over a dict
+            _check_hook_events_complete(report, profile, parsed, hook_config)
         else:
             report.fail(
                 "hooks.registered",
-                f"bmad-loop hooks not registered for {profile.name} — "
-                f"run `bmad-loop init --cli {profile.name}`",
+                f"bmad-loop hooks not registered for {profile.name} in {hook_config} — "
+                f"run `bmad-loop init --cli {profile.name}` to register the relay there "
+                "(validate reads only the project hook config; a user- or local-scope "
+                "registration is not seen)",
                 {"profile": profile.name, "config_path": str(hook_config)},
             )
 
@@ -787,7 +1375,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
             elif pol is not None and pol.scm.isolation == "worktree":
                 trust_message = (
                     "hook trust unverifiable for future worktree sessions: each isolated "
-                    "directory needs its own Codex trust grant"
+                    "directory needs its own Codex trust grant (a run escalates an "
+                    "untrusted worktree before launching Codex there)"
                 )
             elif not hooks_ok:
                 trust_message = "hook trust cannot pass: Codex relay hooks are not registered"
@@ -797,8 +1386,33 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"discovery for {', '.join(unsafe_roles)}"
                 )
             else:
-                trust = project_hook_trust(project, profile)
-                trust_message = None if trust.status == "trusted" else trust.reason
+                # Query the profile each role launches: its permission_mode's
+                # args, as runsetup.make_adapters resolves them. Roles sharing
+                # a launch share one query; a role that cannot run its mode is
+                # adapter.permission-mode-unsupported's finding, not this one's.
+                launches: dict[tuple[object, ...], tuple[CLIProfile, list[str]]] = {}
+                if pol is not None:
+                    for role in ROLES:
+                        cfg = pol.adapter.resolved(role)
+                        if cfg.name != profile.name:
+                            continue
+                        resolved = _permission_profile(cfg, profile)
+                        if resolved is None:
+                            continue
+                        key = (resolved.launch_args, resolved.bypass_args)
+                        launches.setdefault(key, (resolved, []))[1].append(
+                            f"{role} ({cfg.permission_mode})"
+                        )
+                if not launches:
+                    launches[()] = (profile, [])
+                trust_message = None
+                for resolved, roles in launches.values():
+                    trust = project_hook_trust(project, resolved)
+                    if trust.status != "trusted":
+                        trust_message = trust.reason
+                        if len(launches) > 1:
+                            trust_message += f" (launch for {', '.join(roles)})"
+                        break
             if trust_message is None:
                 report.ok(
                     "hooks.trust",
@@ -831,7 +1445,30 @@ def cmd_validate(args: argparse.Namespace) -> int:
             # No current executable to compare. The registered path still gets
             # its own presence check below; do not call it stale by inference.
             pass
+    try:
+        quoting_host = get_process_host()
+    except ProcessHostError:
+        quoting_host = None  # the platform preflight's host.process check reports it
     for relay, spelling in sorted(registered_relays):
+        # DW-346: advisory, independent of presence — a metacharacter the host's
+        # hook quoting leaves exposed can split or expand the command in the hook
+        # shell whether or not the file exists. Warn only; `ok` is unaffected. A
+        # legacy copied script is skipped: its registration names it through
+        # `$CLAUDE_PROJECT_DIR`, so the substituted project path is never exposed.
+        unsafe_chars = (
+            quoting_host.unsafe_shell_chars(spelling)
+            if quoting_host and relay.name != "bmad_loop_hook.py"
+            else ()
+        )
+        if unsafe_chars:
+            report.warn(
+                "hooks.relay-path-unsafe",
+                f"registered hook executable {spelling} contains shell "
+                f"metacharacter(s) {' '.join(unsafe_chars)} this host's hook quoting "
+                "leaves unsafe — hook runs may fail; reinstall bmad-loop under a path "
+                "without them and re-run `bmad-loop init`",
+                {"path": spelling, "chars": list(unsafe_chars)},
+            )
         if not relay.is_file():
             report.fail(
                 "hooks.relay-present",
@@ -860,6 +1497,18 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     "to update the hook registration",
                     {"path": spelling, "expected_path": expected_text},
                 )
+    # A legacy copied-script relay runs through a PATH interpreter; one that
+    # cannot be found fails every hook run as surely as a missing script. Only
+    # the command's first token is looked up: after `uv run --no-project`, the
+    # `python` word is resolved by uv itself, not by the hook runner's PATH.
+    for interpreter in sorted(relay_interpreters):
+        if shutil.which(interpreter) is None:
+            report.fail(
+                "hooks.relay-present",
+                f"registered hook interpreter {interpreter} cannot be found — "
+                "re-run `bmad-loop init` to register the installed relay",
+                {"path": interpreter, "interpreter": interpreter},
+            )
 
     # Adapter-kind validity is enforced against the LIVE registry, never a
     # hardcoded set: a profile.adapter naming no registered kind is a config error
@@ -924,6 +1573,26 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"{prof.name} expects e.g. 'anthropic/claude-haiku-4-5'",
                     {"role": role, "model": cfg.model, "profile": prof.name},
                 )
+            # DW-483: `_serve_argv` appends extra_args AFTER the adapter-owned
+            # `--port`/`--hostname`/`--print-logs`, so a repeat overrides them and
+            # the health poll dials a port the server is not on. Per role, because
+            # extra_args resolve per stage; the launch_args twin above is per
+            # profile. Advisory, like `adapter.launch-args-unservable`: validate's
+            # exit code is a compatibility contract. Lazy import: a project with no
+            # opencode-kind profile never imports the opencode module.
+            if (
+                prof is not None
+                and prof.adapter == adapter_registry.OPENCODE_HTTP
+                and cfg.extra_args
+            ):
+                from .adapters.opencode_http import extra_args_unservable
+
+                if (unservable := extra_args_unservable(cfg.extra_args)) is not None:
+                    report.warn(
+                        "policy.extra-args-unservable",
+                        f"{role} adapter.extra_args for {prof.name} (opencode-http): {unservable}",
+                        {"role": role, "profile": prof.name, "extra_args": list(cfg.extra_args)},
+                    )
             # Reasoning effort (#643) has exactly one carrier: the opencode-http
             # kind sends it as the per-prompt `variant`. The tmux generic family
             # has no channel for it — no profile flag, no hook field — so a stage
@@ -940,6 +1609,32 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"only the opencode-http adapter carries a reasoning-effort value",
                     {"role": role, "effort": cfg.effort, "profile": prof.name},
                 )
+            # DW-349: an explicit extra_args REPLACES the profile's bypass_args, so
+            # an override that forgets them launches a session that stalls on a
+            # permission prompt. GENERIC-only for the reason above: it is the one
+            # bundled kind whose argv consumes bypass_args. Advisory, like the
+            # effort check — the run is still runnable, just likely to stall.
+            # Judged against the MODE-resolved profile: under a non-bypass
+            # permission_mode the args extra_args replaces are that mode's. An
+            # unmapped mode is not this check's finding (it fails the launch).
+            if (
+                prof is not None
+                and (mode_prof := _permission_profile(cfg, prof)) is not None
+                and (missing := _bypass_drops(cfg, mode_prof))
+            ):
+                report.warn(
+                    "policy.bypass-dropped",
+                    _bypass_dropped_message(role, mode_prof, missing, mode=cfg.permission_mode),
+                    {"role": role, "profile": prof.name, "missing": list(missing)},
+                )
+            if prof is not None:
+                _report_permission_mode(report, role, cfg, prof, pol.scm.isolation)
+        # Opt-in only, like the environment probes: it launches the coding CLI.
+        # Unlike `environment.probes-not-run` there is no "not run" line — the
+        # default claude profile declares parked-prompt patterns, so that line
+        # would print on every plain validate.
+        if getattr(args, "probes", False):
+            _report_launch_probes(report, pol, profile_by_name, project)
 
     base_findings = install.missing_base_skills(project, dev_trees)
     # gated on PROBLEMS, not on any finding: an advisory review layer (a `when`
@@ -958,25 +1653,83 @@ def cmd_validate(args: argparse.Namespace) -> int:
         resolved = list(
             dict.fromkeys(
                 name
-                for tree in dict.fromkeys(dev_trees)
+                for tree in dev_trees
                 if (name := install.resolve_dev_primitive(project, tree)) is not None
             )
         )
         report.ok(
             "skills.base",
             f"upstream skills present ({' + '.join(resolved)} + review layers)",
-            {"trees": list(dict.fromkeys(dev_trees)), "dev_primitive": resolved},
+            {"trees": _tree_names(dev_trees), "dev_primitive": resolved},
         )
     report.extend(base_findings)
+    _report_skill_roots(report, project, pol, dev_profiles, opencode_versions)
+    # The same probe `_require_base_skills` runs, against the same code root, so a
+    # skill linked out of the repo under worktree isolation fails both alike.
+    if dev_trees and pol is not None:
+        report.extend(
+            install.skill_trees_outside(project, clean_root, dev_trees, isolation=pol.scm.isolation)
+        )
     report.extend(install.dev_primitive_warnings(project, dev_trees))
+    # Opt-in only: the probe executes project-controlled content (the stub's argv and
+    # render_skill.py), and plain validate must stay non-executing for a fresh clone.
+    # Gated on `dev_trees` too, as `skills.base` is: an unloadable policy leaves it
+    # empty, and "nothing to render" would be a green line from an empty probe.
+    if dev_trees and getattr(args, "render_probe", False):
+        report.extend(install.dev_renderer_probe(project, dev_trees))
+
+    # The triage tree's `bmad-loop-sweep`, probed exactly as `_require_sweep_skill`
+    # probes it so validate and the sweep refusal agree. Only when a triage tree
+    # resolved: an unloadable triage profile is already reported above, and an ok
+    # line over an empty probe would be a green sentence about nothing.
+    triage_trees = _triage_trees(project, pol) if pol is not None else []
+    if triage_trees:
+        sweep_findings = install.missing_sweep_skill(project, triage_trees)
+        if not sweep_findings:
+            report.ok(
+                "skills.sweep",
+                f"{install.SWEEP_SKILL} present ({', '.join(triage_trees)})",
+                {"trees": triage_trees, "skill": install.SWEEP_SKILL},
+            )
+        report.extend(sweep_findings)
+
+    # DW-526. Probes run in `clean_root`, the run's code root (`repo_root`). That is
+    # where a run probes too, except under worktree isolation: there each unit
+    # probes its own mounted worktree, a fresh checkout validate cannot reproduce
+    # (gitignored/untracked files a probe relies on are absent from it). Skipped
+    # on an unloadable policy: the `policy` problem above already reports it.
+    if pol is not None:
+        _validate_environment_probes(
+            pol, clean_root, report, run=bool(getattr(args, "probes", False))
+        )
 
     if getattr(args, "json", False):
         # getattr, not args.json: cmd_validate is called directly by tests (and by
         # anything holding a hand-built Namespace) that predate the flag.
-        machine.emit(validate_document(report, stories_on, spec_folder))
+        machine.emit(
+            validate_document(
+                report,
+                worksource.validate_mode(source),
+                spec_folder,
+                initiative=paths.active_initiative if paths is not None else "",
+                era=paths.era if paths is not None else "",
+                ticket_store=_reported_ticket_store(report),
+            )
+        )
     else:
         report.render()
     return 0 if report.passed else 1
+
+
+def _reported_ticket_store(report: ValidationReport) -> dict[str, str | None] | None:
+    """The topology the ``tickets.store-topology`` ok finding classified, for
+    ``validate --json``'s ``ticket_store``; None when no store was classified."""
+    for finding in report.findings:
+        if finding.check == "tickets.store-topology" and finding.severity == "ok":
+            topology = (finding.detail or {}).get("topology")
+            if isinstance(topology, dict):
+                return {str(k): None if v is None else str(v) for k, v in topology.items()}
+    return None
 
 
 def cmd_mux(args: argparse.Namespace) -> int:
@@ -1040,6 +1793,11 @@ def cmd_mux(args: argparse.Namespace) -> int:
             # — nothing here sizes a column, and the diagnostic IS the payload.
             detail = " ".join(r.version_error.split())
             print(f"warning: {r.name} version probe failed: {detail}", file=sys.stderr)
+        # Same blindness one column over (DW-464): a PLATFORM or AVAILABLE of
+        # `no` that a raising probe forced, not the host's answer.
+        if r.probe_error:
+            detail = " ".join(r.probe_error.split())
+            print(f"warning: {r.name} backend probe failed: {detail}", file=sys.stderr)
     # A failed external package is invisible in the table (it never registered),
     # so name it here — the one place an operator looks when a backend is missing.
     for ep_name, reason in sorted(external_backend_errors().items()):
@@ -1101,17 +1859,30 @@ def _print_registry(project: Path) -> None:
         derived = str(runs.mux_registry_root(project))
     except (runs.StateRootError, OSError, RuntimeError):
         derived = None
-    # bmad-loop always derives, so a mismatch is not an operator's honoured
-    # export — that is not a thing any more — but the one case the export
-    # degrades on: an underivable state root, where it leaves whatever it found
-    # rather than inventing a root. Saying "derived" there would be a lie about
-    # the one situation an operator most needs told.
-    origin = (
-        "derived from the project"
-        if root == derived
-        else f"NOT bmad-loop's — ${runs.PSMUX_DATA_DIR} as found, "
-        "because no state root could be derived here"
-    )
+    # A root other than the derived one is either the operator's value honoured
+    # on their opt-in — asked of the same pure rule the export used — or the one
+    # case the export degrades on: an underivable state root, where it leaves
+    # whatever it found rather than inventing a root. Saying "derived" there
+    # would be a lie about the one situation an operator most needs told.
+    try:
+        honor = policy_mod.load(_policy_path(project)).mux.honor_ambient_psmux_data_dir
+    except (policy_mod.PolicyError, OSError):
+        honor = False
+    if root == derived:
+        origin = "derived from the project"
+    elif derived is not None and (
+        runs.resolve_psmux_registry_root(derived, root, honor_ambient=honor) == root
+    ):
+        origin = (
+            f"your own ${runs.PSMUX_DATA_DIR}, honoured by "
+            "[mux] honor_ambient_psmux_data_dir — the derived root would be "
+            f"{derived}"
+        )
+    else:
+        origin = (
+            f"NOT bmad-loop's — ${runs.PSMUX_DATA_DIR} as found, "
+            "because no state root could be derived here"
+        )
     print(f"registry: {root} ({origin})")
     # A single-quoted PowerShell literal, whose only escape is doubling the quote:
     # an unescaped `C:\Users\O'Brien\...` ends the string mid-path and the line
@@ -1179,8 +1950,332 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
     return 0
 
 
-def _skill_trees(project: Path, pol) -> list[str]:
-    """The skill trees this run's dev-primitive adapters read, one per distinct name.
+def cmd_plugins(args: argparse.Namespace) -> int:
+    """List discovered plugins with their trust grants, or grant/re-pin/revoke a
+    project plugin (#496/#497): `plugins [list]`, `plugins enable <name>`,
+    `plugins accept <name>`, `plugins revoke <name>`.
+
+    A grant is the operator's record of the sha256 of a project plugin's whole
+    directory, kept OUT of the tree (`runs.plugin_grants_path`) because the tree
+    and its policy.toml are agent-writable. For a project plugin the grant
+    subsumes `[plugins] enabled`, so this verb never writes policy.toml; a
+    builtin's in-process module is still enabled there. Discovery reads the code
+    root a run loads (`paths.repo_root`); the store is keyed by the project.
+    Never prompts. `list` exits 0 whatever it finds — `validate` owns the verdict
+    (`plugins.trust`)."""
+    project = _project(args)
+    action = args.action or "list"
+    if action != "list":
+        if getattr(args, "json", False):
+            print(
+                f"error: --json applies to `bmad-loop plugins list`, not `plugins {action}`",
+                file=sys.stderr,
+            )
+            return ExitCode.USAGE
+        if not args.name:
+            print(
+                f"error: `plugins {action}` requires a plugin name "
+                "(run `bmad-loop plugins` to list)",
+                file=sys.stderr,
+            )
+            return ExitCode.FAILURE
+    elif args.name:
+        print("error: `plugins list` takes no plugin name", file=sys.stderr)
+        return ExitCode.FAILURE
+
+    if action == "revoke":
+        return _plugins_revoke(project, args.name)
+    root = bmadconfig.load_paths(project).repo_root
+    if action in ("enable", "accept"):
+        return _plugins_grant(project, root, args.name, accept=action == "accept")
+    return _plugins_list(project, root, args)
+
+
+def _plugin_roster(root: Path, pol, grants: GrantSet):
+    """((manifest, verdict, row) per discovered plugin, missing rows): the verdict
+    a launch would reach (`registry.preflight`) plus the digests `plugins --json`
+    reports, then a ``missing`` row per grant no discovered plugin claims
+    (`grants.unclaimed`; a launch refuses on each). Manifests and hashing only —
+    no plugin code runs. Raises `PluginError` on a discovery fault."""
+    from .documents import PluginRow
+    from .plugins import PluginError
+    from .plugins.digest import read_tree
+    from .plugins.grants import TRUSTED_SOURCES, grant_status, needs_grant, unclaimed
+    from .plugins.registry import preflight
+    from .plugins.trust import enabled_names
+
+    enabled = enabled_names(pol)
+    roster = []
+    verdicts = preflight(root, pol, grants)
+    for m, v, rel in verdicts:
+        required = needs_grant(m)
+        record = grants.get(v.grant) if v.grant is not None else None
+        current = None
+        if required:
+            try:
+                current = read_tree(Path(m.scripts_dir)).digest
+            except PluginError:
+                current = None  # the verdict (or the status column) names the fault
+        row = PluginRow(
+            name=m.name,
+            origin=m.source,
+            # the grant key for a project plugin; the install location for a builtin
+            path=Path(m.scripts_dir).as_posix() if m.source in TRUSTED_SOURCES else rel,
+            hooks=bool(m.hooks),
+            workflows=bool(m.workflows),
+            python=m.python is not None,
+            seeds=bool(m.seed_files or m.seed_globs),
+            grant_required=required,
+            status=grant_status(m, v),
+            enabled=m.name in enabled,
+            active=v.active,
+            pinned_digest=record.digest if record is not None else None,
+            current_digest=current,
+            changed=v.changed,
+        )
+        roster.append((m, v, row))
+    missing = [
+        PluginRow(
+            name=r.name,
+            origin="project",
+            path=r.path,
+            hooks=False,
+            workflows=False,
+            python=False,
+            seeds=False,
+            grant_required=True,
+            status="missing",
+            enabled=r.name in enabled,
+            active=False,
+            pinned_digest=r.digest,
+            current_digest=None,
+        )
+        for r in unclaimed(grants, (v for _m, v, _rel in verdicts))
+    ]
+    return roster, missing
+
+
+def _plugins_list(project: Path, root: Path, args: argparse.Namespace) -> int:
+    from .plugins import store
+
+    pol = policy_mod.load(_policy_path(project))
+    grants = store.load_grants(project)
+    roster, missing = _plugin_roster(root, pol, grants)
+    rows = [row for _m, _v, row in roster] + missing
+    if getattr(args, "json", False):
+        machine.emit(plugins_document(rows, grants.fault))
+        return ExitCode.OK
+    if grants.fault is not None:
+        print(
+            f"warning: plugin grants could not be read ({grants.fault}); "
+            "every project plugin is listed as ungranted",
+            file=sys.stderr,
+        )
+    header = ("NAME", "ORIGIN", "SURFACE", "GRANT", "ENABLED", "PATH")
+    table = [
+        (
+            r.name,
+            r.origin,
+            ",".join(
+                s
+                for s, on in (
+                    ("hooks", r.hooks),
+                    ("workflows", r.workflows),
+                    ("python", r.python),
+                    ("seeds", r.seeds),
+                )
+                if on
+            )
+            or "-",
+            r.status,
+            "yes" if r.enabled else "no",
+            r.path,
+        )
+        for r in rows
+    ]
+    if not table:
+        print("no plugins discovered")
+        return ExitCode.OK
+    widths = [max(len(str(c)) for c in col) for col in zip(header, *table, strict=False)]
+    for line in (header, *table):
+        print("  ".join(str(c).ljust(w) for c, w in zip(line, widths, strict=True)).rstrip())
+    return ExitCode.OK
+
+
+def _load_grants_for_write(project: Path) -> GrantSet | None:
+    """The store a grant verb rewrites, or None (after the error line) when it
+    exists but cannot be read: rewriting it then would silently discard every
+    grant it holds, so the operator fixes or removes it first."""
+    from .plugins import store
+
+    grants = store.load_grants(project)
+    if grants.fault is not None:
+        print(
+            f"error: plugin grants could not be read ({grants.fault}); fix or remove "
+            "the grant store, then re-run — rewriting it now would discard every grant "
+            "it holds",
+            file=sys.stderr,
+        )
+        return None
+    return grants
+
+
+def _save_grants_or_report(project: Path, grants: GrantSet, *, seen: GrantSet) -> bool:
+    """Write ``grants`` unless the store moved off ``seen``, the store this verb
+    read and decided against (a concurrent mutation would otherwise be erased)."""
+    from .plugins import store
+
+    try:
+        store.save_grants(project, grants.records, expected=seen)
+    except store.GrantStoreChanged as e:
+        print(f"error: {e}", file=sys.stderr)
+        return False
+    except (OSError, runs.StateRootError) as e:
+        print(
+            f"error: could not write the plugin grants to {runs.plugin_grants_path(project)}: {e}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _plugins_grant(project: Path, root: Path, name: str, *, accept: bool) -> int:
+    """`plugins enable <name>` (first grant) / `plugins accept <name>` (re-pin a
+    changed one). Hashes the plugin dir — never imports or runs it — and records
+    the digest in the out-of-tree store. Never writes policy.toml."""
+    from .plugins import store
+    from .plugins.digest import diff_files
+    from .plugins.grants import TRUSTED_SOURCES, GrantRecord, TrustState, needs_grant
+    from .plugins.registry import preflight, read_bound_tree
+
+    grants = _load_grants_for_write(project)
+    if grants is None:
+        return ExitCode.FAILURE
+    found = [(m, v, rel) for m, v, rel in preflight(root, None, grants) if m.name == name]
+    if not found:
+        print(
+            f'error: no plugin named "{name}" discovered under {root} '
+            "(run `bmad-loop plugins` to list)",
+            file=sys.stderr,
+        )
+        return ExitCode.FAILURE
+    [(m, verdict, rel)] = found
+    if not needs_grant(m):
+        if m.source in TRUSTED_SOURCES:
+            why = (
+                f"is a {m.source} plugin, trusted by provenance and never granted; "
+                "its in-process module is enabled by naming it in [plugins] enabled "
+                "(.bmad-loop/policy.toml) or toggling it in the TUI settings screen"
+            )
+        else:
+            why = (
+                "has no executable surface (no hooks, workflows, [python] or seeds), "
+                "so it loads without a grant"
+            )
+            if verdict.grant is not None:
+                why += f"; drop the grant it had with `bmad-loop plugins revoke {verdict.grant}`"
+        print(f'error: plugin "{name}" {why}', file=sys.stderr)
+        return ExitCode.FAILURE
+
+    record = grants.get(verdict.grant) if verdict.grant is not None else None
+    if accept and record is None:
+        print(
+            f'error: plugin "{name}" has no grant to accept; review it, then run '
+            f"`bmad-loop plugins enable {name}`",
+            file=sys.stderr,
+        )
+        return ExitCode.FAILURE
+    if record is not None and verdict.state is TrustState.GRANTED:
+        print(f'plugin "{name}" unchanged: sha256:{record.digest[:12]} is already granted')
+        return ExitCode.OK
+    if not accept and record is not None:
+        print(
+            f'error: plugin "{name}" changed since it was granted ({verdict.reason}); '
+            f"review it, then run `bmad-loop plugins accept {name}`",
+            file=sys.stderr,
+        )
+        return ExitCode.FAILURE
+
+    tree = read_bound_tree(m)  # a PluginError is main()'s `error:` rc 1
+    base = grants
+    if record is not None:
+        if record.name != name:
+            # re-key a grant whose manifest was renamed in place
+            print(f"renamed: {record.name} -> {name}")
+            base = store.remove(grants, record.name)
+        if record.path != rel:
+            print(f"moved: {record.path} -> {rel}")
+        added, removed, changed = diff_files(record.file_map(), tree.file_map())
+        for label, rels in (("added", added), ("removed", removed), ("changed", changed)):
+            for r in rels:
+                print(f"{label}: {r}")
+    granted_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    new = store.upsert(base, GrantRecord.from_tree(name, rel, tree, granted_at))
+    if not _save_grants_or_report(project, new, seen=grants):
+        return ExitCode.FAILURE
+    print(
+        f'plugin "{name}" granted: sha256:{tree.digest[:12]} ({len(tree.files)} files) '
+        f"in {runs.plugin_grants_path(project)}"
+    )
+    return ExitCode.OK
+
+
+def _plugins_revoke(project: Path, name: str) -> int:
+    """`plugins revoke <name>`: drop the grant, so the plugin is inert again (or,
+    still named in `[plugins] enabled`, fails the next launch). Needs no plugin
+    dir — a deleted plugin's grant can still be revoked."""
+    from .plugins import store
+
+    grants = _load_grants_for_write(project)
+    if grants is None:
+        return ExitCode.FAILURE
+    if grants.get(name) is None:
+        print(f'error: plugin "{name}" has no grant to revoke', file=sys.stderr)
+        return ExitCode.FAILURE
+    if not _save_grants_or_report(project, store.remove(grants, name), seen=grants):
+        return ExitCode.FAILURE
+    print(f'plugin "{name}" grant revoked in {runs.plugin_grants_path(project)}')
+    return ExitCode.OK
+
+
+def _review_tree_gated(pol, root: Path, grants: GrantSet) -> bool:
+    """Whether a review-role session can be spawned this run, judged statically
+    (DW-380): ``[review]`` is on, or some statically-active plugin binds a
+    still-enabled ``role = "review"`` workflow at any stage.
+
+    `root` is the run's code root the plugin manifests are read from (a launch's
+    ``paths.repo_root``; validate's ``plugin_root``). `grants` is the caller's
+    frozen set — a launch passes the one `_launch_plugin_grants` read, so the
+    skills preflight and the trust preflight judge the same snapshot; this never
+    reads the store itself. `registry.static_workflow_roles` walks
+    `registry.preflight` verdicts — discovery and hashing only, never the
+    exec-bearing registry build. A discovery
+    fault answers True (keep gating): it is reported loudly by the trust preflight
+    / ``plugins.manifests``, never swallowed into a narrower answer. Manifest-skip
+    warnings are suppressed here for the same reason `_validate_plugin_trust`
+    suppresses them — ``plugins.manifests`` reports them."""
+    if pol.review.enabled:
+        return True
+    import warnings
+
+    from .plugins import PluginError
+    from .plugins.registry import static_workflow_roles
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            roles = static_workflow_roles(root, pol, grants)
+        except PluginError:
+            return True
+    return "review" in roles
+
+
+def _skill_scopes(
+    project: Path, pol, root: Path, grants: GrantSet, *, review_owed: bool = False
+) -> list[SkillScope]:
+    """The skill scopes this run's dev-primitive adapters load from, one per distinct
+    scope (:func:`skill_locate.scope_for`: the profile's project trees, plus its
+    declared user roots resolved under ``[skills] user_roots``).
 
     Shared by the real preflight and `cmd_validate` so the two cannot drift:
     validate's verdict has to key on exactly what makes run abort. Profiles that
@@ -1189,33 +2284,126 @@ def _skill_trees(project: Path, pol) -> list[str]:
 
     Scoped to :data:`install.DEV_PRIMITIVE_ROLES`, not :data:`ROLES`: every skill
     these trees are asked about is one only a dev or review session dispatches, and
-    triage's whole prompt surface ships in this wheel. It is also the set
-    `WorktreeFlow.worktree_profiles` provisions, so what is gated and what is carried
-    into a worktree stay one decision.
+    triage's whole prompt surface ships in this wheel.
 
-    Deliberately does NOT consult `review.enabled`. Disabling review does not retire
-    the review ADAPTER: a plugin workflow may declare `role = "review"` and dispatch
-    on `adapters["review"]` with review disabled, and `worktree_profiles` drives
-    per-CLI Stop-signal hook registration as well as seeding — a worktree
-    provisioned without the review profile has no completion signal for those
-    sessions and stalls rather than merely missing a skill. See #424 for the narrow
-    residue that IS real."""
+    The review role's tree is dropped when no review session can be spawned
+    (`_review_tree_gated`): ``[review]`` is off and no statically-active plugin
+    under `root`, judged against `grants`, binds a still-enabled
+    ``role = "review"`` workflow. The predicate may over-approximate only toward
+    keeping the tree gated. ``review_owed`` is a resume's persisted evidence that
+    a review session can run regardless of policy: a latched
+    ``salvage_refile_pending`` re-enters the review loop with ``[review]`` off, and
+    a salvage that no longer applies retries as a fresh review pass. Gating stays a subset
+    of what `WorktreeFlow.worktree_profiles` provisions, never equal by force:
+    provisioning keeps both dev-primitive profiles regardless, since it drives
+    per-CLI Stop-signal hook registration as well as seeding, and a worktree
+    without the review profile would stall a review-role session on a missing
+    completion signal rather than merely miss a skill."""
+    return list(_scoped_profiles(project, pol, root, grants, review_owed=review_owed))
+
+
+def _scoped_profiles(
+    project: Path, pol, root: Path, grants: GrantSet, *, review_owed: bool = False
+) -> dict[SkillScope, list[str]]:
+    """:func:`_skill_scopes` with the profile names behind each scope, in order —
+    validate names them on its user-root findings."""
     from .adapters.profile import ProfileError, get_profile
 
-    trees = []
-    for name in dict.fromkeys(
-        pol.adapter.resolved(role).name for role in install.DEV_PRIMITIVE_ROLES
-    ):
+    roles = install.DEV_PRIMITIVE_ROLES
+    if not review_owed and not _review_tree_gated(pol, root, grants):
+        roles = tuple(role for role in roles if role != "review")
+    scopes: dict[SkillScope, list[str]] = {}
+    for name in dict.fromkeys(pol.adapter.resolved(role).name for role in roles):
         try:
-            trees.append(get_profile(name, project).skill_tree)
+            profile = get_profile(name, project)
         except ProfileError:
             continue
-    return trees
+        scope = skill_locate.scope_for(profile, resolve_user=pol.skills.user_roots)
+        scopes.setdefault(scope, []).append(name)
+    return scopes
+
+
+def _tree_names(scopes: list[SkillScope]) -> list[str]:
+    """The distinct primary tree spellings of ``scopes``, for a finding's detail —
+    a scope is not JSON, and two CLIs sharing a tree read it once."""
+    return list(dict.fromkeys(scope.tree for scope in scopes))
+
+
+def _report_skill_roots(
+    report: ValidationReport,
+    project: Path,
+    pol,
+    dev_profiles: dict[SkillScope, list[str]],
+    opencode_versions: Mapping[str, tuple[int, int, int] | None],
+) -> None:
+    """validate's user-root lines, over the same scopes the preflight gates on.
+
+    - ``skills.root`` (ok): where each driven skill resolved, named per profile.
+      Validate only, never routed through ``missing_base_skills``: the run
+      preflight prints every non-problem finding there as ``warning:``.
+    - ``skills.user-root-unsupported``: an opencode-http profile whose binary
+      reports a 1.x server while a skill it needs resolves from a user root — the
+      session spawn refuses exactly that pair.
+    - ``skills.user-root-sandboxed``: a role launched with ``permission_mode =
+      "sandboxed"`` whose skills resolve from a user root outside the project,
+      which a sandbox may not let the session read.
+
+    Warnings only: validate's exit code is a compatibility contract."""
+    from .adapters import registry as adapter_registry
+    from .adapters.profile import ProfileError, get_profile
+
+    for scope, names in dev_profiles.items():
+        label = ", ".join(names)
+        for finding in install.skill_root_findings(project, [scope]):
+            report.add(
+                finding.check,
+                finding.severity,
+                f"{label}: {finding.message}",
+                {"profile": label, **(finding.detail or {})},
+            )
+        if not scope.resolve_user:
+            continue
+        user_ids = install.user_root_skill_ids(project, scope)
+        if not user_ids:
+            continue
+        for name in names:
+            try:
+                profile = get_profile(name, project)
+            except ProfileError:
+                continue
+            # Keyed by the loaded profile's canonical name: a policy alias
+            # (`opencode` → `opencode-http`) is what `names` carries.
+            version = opencode_versions.get(profile.name)
+            if (
+                profile.adapter == adapter_registry.OPENCODE_HTTP
+                and version is not None
+                and version[0] < 2
+            ):
+                shown = ".".join(str(part) for part in version)
+                report.warn(
+                    "skills.user-root-unsupported",
+                    f"{name}: opencode {shown} cannot load skills from user roots "
+                    f"({', '.join(user_ids)}) — its sessions will refuse to start; "
+                    f"install them per project (`npx skills add` without -g) or "
+                    f"upgrade to opencode 2.x",
+                    {"profile": name, "version": shown, "skills": list(user_ids)},
+                )
+        for role in install.DEV_PRIMITIVE_ROLES:
+            cfg = pol.adapter.resolved(role)
+            if cfg.name in names and cfg.permission_mode == "sandboxed":
+                report.warn(
+                    "skills.user-root-sandboxed",
+                    f'{role} ({cfg.name}) runs with permission_mode = "sandboxed" but '
+                    f"loads {', '.join(user_ids)} from a user root outside the project, "
+                    f"which the sandbox may not let it read — install them per project "
+                    f"(`npx skills add` without -g) if sessions cannot load them",
+                    {"profile": cfg.name, "role": role, "skills": list(user_ids)},
+                )
 
 
 def _dev_skill_for_role(pol, project: Path, role: str) -> str:
     """The dev-primitive skill name ``role``'s adapter would invoke, for dry-run
-    previews. Mirrors `_require_base_skills`' profile→skill_tree lookup so the
+    previews. Mirrors `_require_base_skills`' profile→scope lookup so the
     preview and the real dispatch (``Engine._dev_skill``) resolve identically —
     a pre-rename project previews ``/bmad-dev-auto``, a post-rename one
     ``/bmad-build-auto``. An unloadable profile falls back to the legacy name;
@@ -1223,10 +2411,13 @@ def _dev_skill_for_role(pol, project: Path, role: str) -> str:
     from .adapters.profile import ProfileError, get_profile
 
     try:
-        tree = get_profile(pol.adapter.resolved(role).name, project).skill_tree
+        scope = skill_locate.scope_for(
+            get_profile(pol.adapter.resolved(role).name, project),
+            resolve_user=pol.skills.user_roots,
+        )
     except ProfileError:
-        tree = None
-    return install.dev_primitive_or_default(project, tree)
+        scope = None
+    return install.dev_primitive_or_default(project, scope)
 
 
 def _unknown_adapter_kinds(project: Path, pol) -> list[str]:
@@ -1261,8 +2452,441 @@ def _unknown_adapter_kinds(project: Path, pol) -> list[str]:
     return problems
 
 
+def _permission_profile(cfg, profile: CLIProfile) -> CLIProfile | None:
+    """``profile`` resolved for ``cfg.permission_mode`` (its ``bypass_args`` become
+    the mode's launch args, as ``runsetup.make_adapters`` launches them), or None
+    when the profile cannot run that mode — the launch refuses that itself."""
+    from .adapters.profile import ProfileError
+
+    try:
+        return profile.for_permission_mode(cfg.permission_mode)
+    except ProfileError:
+        return None
+
+
+def _report_permission_mode(
+    report: ValidationReport, role: str, cfg, profile: CLIProfile, isolation: str
+) -> None:
+    """One `validate` finding per role for its ``adapter.permission_mode`` (#727).
+
+    A profile that cannot run the mode on this platform FAILS
+    (``adapter.permission-mode-unsupported``): the launch refuses it in
+    ``runsetup.make_adapters``. Otherwise an ok posture line
+    (``adapter.permission-mode``) whose isolation coupling is advisory only: a
+    bypass role with no worktree isolation is pointed at the sandboxed mode when
+    its profile maps one here. A Codex-family role sandboxed under worktree
+    isolation needs the mode's ``linked_worktree_args`` grant: its sandbox keeps the
+    linked worktree's gitdir (under the main repo's ``.git/worktrees/``) and the
+    common dir read-only otherwise, so the dev skill's preflight and commit fail.
+    The role is ok when its launch carries that grant (the resolved profile
+    declares it, naming both ``{gitdir}`` and ``{common_dir}``, and
+    ``cfg.extra_args`` is None). It warns when the grant cannot ride: the resolved
+    profile declares none, or a non-None ``extra_args`` (``()`` included) replaces
+    the mode's args, and the grant with them, as
+    ``GenericAdapter.interactive_argv`` does. It also warns when the grant omits
+    either placeholder: Codex needs both paths writable to commit, while profile
+    validation accepts one, as other CLIs may need less."""
+    from .adapters.profile import LINKED_WORKTREE_PLACEHOLDERS, ProfileError
+
+    mode = cfg.permission_mode
+    detail: dict[str, object] = {
+        "role": role,
+        "profile": profile.name,
+        "mode": mode,
+        "isolation": isolation,
+        "platform": sys.platform,
+    }
+    try:
+        resolved = profile.for_permission_mode(mode, platform=sys.platform)
+    except ProfileError as e:
+        report.fail(
+            "adapter.permission-mode-unsupported",
+            f"{profile.name} {role}: permission_mode {mode!r} cannot run on {sys.platform} "
+            f"without prompts: {e}",
+            {**detail, "error": str(e)},
+        )
+        return
+    if mode == "bypass":
+        message = f"{profile.name} {role}: bypass, unsandboxed (scm.isolation={isolation})"
+        if isolation != "worktree":
+            try:
+                profile.for_permission_mode("sandboxed", platform=sys.platform)
+            except ProfileError:
+                pass
+            else:
+                message += '; consider adapter.permission_mode = "sandboxed"'
+        report.ok("adapter.permission-mode", message, detail)
+    elif isolation == "worktree" and profile.hooks.dialect == "codex-hooks-json":
+        fallback = 'use scm.isolation = "none" or permission_mode = "bypass"'
+        gitdir_ro = "the linked worktree's gitdir (under the main repo's .git/worktrees/)"
+        common_ro = "the main repo's .git"
+        read_only = f"{gitdir_ro} and {common_ro}"
+        unnamed = [
+            p
+            for p in LINKED_WORKTREE_PLACEHOLDERS
+            if not any(p in arg for arg in resolved.linked_worktree_args)
+        ]
+        if not resolved.linked_worktree_args:
+            why = f"its [permission_modes.{mode}] declares no linked_worktree_args grant"
+            fix = fallback
+        elif unnamed:
+            why = (
+                f"its [permission_modes.{mode}] linked_worktree_args grant names no "
+                f"{' or '.join(unnamed)}"
+            )
+            fix = f"grant both {{gitdir}} and {{common_dir}}, or {fallback}"
+            if unnamed == ["{common_dir}"]:
+                read_only = common_ro
+            elif unnamed == ["{gitdir}"]:
+                read_only = gitdir_ro
+        elif cfg.extra_args is not None:
+            why = (
+                "adapter.extra_args replaces the mode's args, dropping their "
+                "linked_worktree_args grant"
+            )
+            fix = f"drop extra_args, or {fallback}"
+        else:
+            report.ok(
+                "adapter.permission-mode",
+                f"{profile.name} {role}: {mode} under scm.isolation=worktree, with write "
+                "grants for the linked worktree's gitdir and the main repo's .git",
+                detail,
+            )
+            return
+        report.warn(
+            "adapter.permission-mode",
+            f"{profile.name} {role}: {mode} under scm.isolation=worktree — {why}, so the "
+            f"sandbox keeps {read_only} read-only and git add/commit fail in isolated "
+            f"sessions; {fix} for this role",
+            detail,
+        )
+    else:
+        report.ok("adapter.permission-mode", f"{profile.name} {role}: {mode}", detail)
+
+
+def _report_launch_probes(
+    report: ValidationReport,
+    pol: policy_mod.Policy,
+    profile_by_name: dict[str, CLIProfile],
+    project: Path,
+) -> None:
+    """``validate --probes``: one ``adapter.launch-probe`` finding per distinct
+    launch (#727).
+
+    Each role is probed with the argv its session launches: a non-None
+    ``extra_args`` REPLACES the mode-resolved profile's ``bypass_args``, exactly
+    as ``GenericAdapter.interactive_argv`` does (``()`` launches no permission
+    args at all; ``None`` inherits them), so the probe gets the profile with its
+    ``bypass_args`` swapped for them. Roles launching the same effective argv
+    (profile, model, ``launch_args``, effective args) share one
+    :func:`probe.launch_screen_probe` call. A role whose mode is unmapped is skipped —
+    ``adapter.permission-mode-unsupported`` is its finding — as is any adapter
+    kind but GENERIC, the one family whose first screen is a tmux pane.
+
+    Only a dialog actually seen fails validate (``parked``). A probe that could
+    not see the screen (died, launch-failed, capture-failed, unavailable) is a
+    warning: no proof of a dialog, and validate's exit code is a contract."""
+    from dataclasses import replace
+
+    from . import probe as probe_mod
+    from .adapters import registry as adapter_registry
+
+    launches: dict[
+        tuple[object, ...], tuple[CLIProfile, str | None, list[dict[str, str]], list[str]]
+    ] = {}
+    for role in ROLES:
+        cfg = pol.adapter.resolved(role)
+        prof = profile_by_name.get(cfg.name)
+        if prof is None or prof.adapter != adapter_registry.GENERIC:
+            continue
+        resolved = _permission_profile(cfg, prof)
+        if resolved is None:
+            continue
+        if cfg.extra_args is not None:
+            resolved = replace(resolved, bypass_args=tuple(cfg.extra_args))
+        model = cfg.model or None
+        key = (resolved.name, model, resolved.launch_args, resolved.bypass_args)
+        _, _, roles, from_extra = launches.setdefault(key, (resolved, model, [], []))
+        roles.append({"role": role, "mode": cfg.permission_mode})
+        if cfg.extra_args is not None:
+            from_extra.append(role)
+
+    isolation = pol.scm.isolation
+    for resolved, model, roles, from_extra in launches.values():
+        result = probe_mod.launch_screen_probe(
+            resolved, binary=resolved.binary, project=project, model=model
+        )
+        named = ", ".join(
+            f"{r['role']} {r['mode']}" + (" via extra_args" if r["role"] in from_extra else "")
+            for r in roles
+        )
+        label = f"{resolved.name} ({named})"
+        detail: dict[str, object] = {
+            "profile": resolved.name,
+            "roles": roles,
+            # The args the probe launched in the permission slot, and which of
+            # `roles` got them from `adapter.extra_args` rather than the mode.
+            "args": list(resolved.bypass_args),
+            "extra_args_roles": from_extra,
+            "verdict": result.verdict,
+            "reason": result.detail,
+            "evidence": result.evidence,
+            "line": result.line,
+            "log_tail": result.log_tail,
+            "cwd": str(project),
+            "isolation": isolation,
+        }
+        where = (
+            "; launched at the project root, not inside a session worktree"
+            if isolation == "worktree"
+            else ""
+        )
+        if result.verdict == probe_mod.LAUNCH_PARKED:
+            report.fail(
+                "adapter.launch-probe",
+                f"{label}: the CLI showed a startup dialog an unattended session would "
+                f"park on ({result.evidence!r}) — accept or configure it once by hand{where}",
+                detail,
+            )
+        elif result.verdict == probe_mod.LAUNCH_CLEAN:
+            report.ok("adapter.launch-probe", f"{label}: launch screen clean{where}", detail)
+        elif result.verdict == probe_mod.LAUNCH_SKIPPED:
+            report.ok(
+                "adapter.launch-probe",
+                f"{label}: no parked_prompt_patterns declared — nothing launched",
+                detail,
+            )
+        else:
+            tail = next(
+                (ln.strip() for ln in reversed((result.log_tail or "").splitlines()) if ln.strip()),
+                "",
+            )
+            report.warn(
+                "adapter.launch-probe",
+                f"{label}: launch probe could not see the screen ({result.verdict}): "
+                f"{result.detail}" + (f" — {tail}" if tail else "") + where,
+                detail,
+            )
+
+
+def _bypass_drops(cfg, profile: CLIProfile) -> tuple[str, ...]:
+    """The permission tokens ``cfg.extra_args`` drops from ``profile``'s argv
+    (DW-349). ``profile`` is the mode-resolved one (:func:`_permission_profile`).
+
+    The one home of the predicate `validate` and every dry-run share: scoped to
+    the bundled GENERIC kind — the only one whose argv consumes ``bypass_args``
+    (an out-of-tree kind's consumption is unknowable, so it stays silent) — and
+    delegating the replace rule to ``CLIProfile.missing_bypass_tokens``."""
+    from .adapters import registry as adapter_registry
+
+    if profile.adapter != adapter_registry.GENERIC:
+        return ()
+    return profile.missing_bypass_tokens(cfg.extra_args)
+
+
+def _bypass_dropped_message(
+    role: str, profile: CLIProfile, missing: tuple[str, ...], *, mode: str = "bypass"
+) -> str:
+    """One wording for the DW-349 warning, shared by `validate` and every dry-run.
+
+    Names the dropped tokens AND the full permission sequence to include: on a
+    partial drop (e.g. ``--permission-mode acceptEdits``) adding only the missing
+    token would leave a still-broken argv. ``profile`` is mode-resolved, so under
+    a non-bypass ``mode`` the sequence named is that mode's args."""
+    if mode == "bypass":
+        replaced, keep = f"{profile.name}'s bypass_args", "the bypass"
+    else:
+        replaced, keep = f"{profile.name}'s {mode} permission args", f"the {mode} mode"
+    return (
+        f"{role} adapter.extra_args replaces {replaced} and drops "
+        f"{' '.join(missing)} — unattended sessions may stall on permission prompts; "
+        f"include `{' '.join(profile.bypass_args)}` in extra_args to keep {keep}"
+    )
+
+
+def _sprint_launch_roles(pol) -> tuple[str, ...]:
+    """The roles a SPRINT-mode story run launches: dev + review, plus the auto
+    retrospective's ``retro`` session when ``gates.retrospective = "auto"``
+    (DW-389). Stories mode never crosses an epic boundary, so it stays dev + review."""
+    return worksource.launch_roles(worksource.SOURCE_SPRINT, pol.gates.retrospective)
+
+
+def _warn_bypass_dropped(
+    pol,
+    project: Path,
+    roles: tuple[str, ...],
+    *,
+    profiles: Mapping[str, CLIProfile] | None = None,
+    journal: Journal | None = None,
+) -> None:
+    """Stderr twin of validate's ``policy.bypass-dropped`` finding (DW-349, DW-410),
+    for every dry-run AND every real launch (run, sweep — auto-sweep children
+    included — and resume).
+
+    Prints one ``warning:`` line to stderr for each of ``roles`` (the roles the
+    calling run type launches) whose resolved ``extra_args`` drops profile bypass
+    tokens — before the schedule is printed on a dry-run, before ``engine.run()``
+    on a launch. ``profiles`` (role → profile, as ``_launch_profiles`` /
+    ``runsetup.resolve_profiles`` return) is the launch's frozen resolution; when
+    given it is used instead of re-reading ``get_profile``, so the warning speaks
+    about the bytes the run actually launches. Without it, a profile that will not
+    parse is skipped silently: the renderer/composer raises the ``ProfileError``
+    itself. ``journal`` (a launch only) also records one ``bypass-dropped`` event
+    per hit. stderr only, rc unchanged — stdout stays the preview/render."""
+    from .adapters.profile import ProfileError, get_profile
+
+    for role in roles:
+        cfg = pol.adapter.resolved(role)
+        profile = profiles.get(role) if profiles is not None else None
+        if profile is None:
+            try:
+                profile = get_profile(cfg.name, project)
+            except ProfileError:
+                continue
+        # The mode-resolved profile; an unmapped mode is skipped here like an
+        # unparseable profile — the composer refuses it itself.
+        profile = _permission_profile(cfg, profile)
+        if profile is None:
+            continue
+        if missing := _bypass_drops(cfg, profile):
+            print(
+                f"warning: "
+                f"{_bypass_dropped_message(role, profile, missing, mode=cfg.permission_mode)}",
+                file=sys.stderr,
+            )
+            if journal is not None:
+                journal.append(
+                    "bypass-dropped", role=role, profile=profile.name, missing=list(missing)
+                )
+
+
+def _warn_hook_relay_unregistered(
+    pol,
+    project: Path,
+    roles: tuple[str, ...],
+    *,
+    profiles: Mapping[str, CLIProfile] | None = None,
+    journal: Journal | None = None,
+    after_silent_pause: bool = False,
+) -> None:
+    """Launch-time twin of validate's ``hooks.registered`` check (#752), for every
+    real launch (run, sweep, resume); never a dry run.
+
+    A session whose relay never reports a hook event runs to
+    ``session_timeout_min`` instead of completing. This warns before
+    that happens, once per hooked profile the launched ``roles`` resolve to (the
+    same resolution as :func:`_warn_bypass_dropped`), with one stderr ``warning:``
+    line naming the roles. ``journal`` also records one ``hook-relay-unregistered``
+    event per affected role. It never refuses and never touches stdout or the rc.
+
+    The wording hedges ("may be unregistered") because the check reads only the
+    project hook config (:func:`install.read_relay_registration`) — the documented
+    contract — while the CLI may merge hooks from user- or local-scope settings
+    too.
+
+    Under ``scm.isolation = "worktree"`` the dev primitives
+    (:data:`install.DEV_PRIMITIVE_ROLES`) run in provisioned worktrees that register
+    the relay themselves, so only the main-checkout roles (triage, retro) are
+    checked. ``after_silent_pause`` (a resume of a run paused on a silent hook
+    channel) adds that resuming will hit the same silent channel."""
+    from .adapters.profile import ProfileError, get_profile
+
+    if pol.scm.isolation == "worktree":
+        roles = tuple(role for role in roles if role not in install.DEV_PRIMITIVE_ROLES)
+    by_profile: dict[str, tuple[CLIProfile, list[str]]] = {}
+    for role in roles:
+        profile = profiles.get(role) if profiles is not None else None
+        if profile is None:
+            try:
+                profile = get_profile(pol.adapter.resolved(role).name, project)
+            except ProfileError:
+                continue
+        if profile.hookless:
+            continue
+        by_profile.setdefault(profile.name, (profile, []))[1].append(role)
+    for name, (profile, profile_roles) in by_profile.items():
+        problem = _relay_registration_problem(project, profile)
+        if problem is None:
+            continue
+        message = (
+            f"{', '.join(profile_roles)} ({name}): the bmad-loop hook relay may be "
+            f"unregistered — {problem}. A session whose hook events never arrive runs "
+            "to session_timeout_min instead of completing. This check reads only the project "
+            "hook config, not user- or local-scope settings: run `bmad-loop validate`, or "
+            f"register the relay in the project config with `bmad-loop init --cli {name}`."
+        )
+        if after_silent_pause:
+            message += (
+                " This run paused on a silent hook channel; resuming will hit the same"
+                " silent channel unless the relay is registered."
+            )
+        print(f"warning: {message}", file=sys.stderr)
+        if journal is not None:
+            for role in profile_roles:
+                journal.append("hook-relay-unregistered", role=role, profile=name, problem=problem)
+
+
+def _warn_prior_sweep_closes(project: Path, run_id: str, journal: Journal) -> None:
+    """Warn at a sweep's start about earlier runs that still hold sweep ledger
+    closes whose code never landed (``runs.prior_sweep_closes``). Such a close
+    reads ``done`` in the shared ticket store, so this sweep cannot re-bundle it.
+    Only the held run can land or reopen it.
+
+    Writes one journal row and one stderr ``warning:`` line per finding:
+    ``sweep-prior-run-holds-closes`` for a held run, and
+    ``sweep-prior-run-closes-unknown`` when a run or the runs dir could not be
+    checked. Read-only. It never blocks or changes the new sweep, and the new
+    run and live runs are skipped."""
+    for row in runs.prior_sweep_closes(project, exclude=run_id):
+        if row.run_id is None:
+            journal.append("sweep-prior-run-closes-unknown", error=row.fault)
+            print(
+                "warning: could not check earlier runs for sweep ledger closes whose code "
+                f"never landed: {row.fault}",
+                file=sys.stderr,
+            )
+        elif row.fault is not None:
+            journal.append("sweep-prior-run-closes-unknown", run_id=row.run_id, error=row.fault)
+            print(
+                f"warning: could not check run {row.run_id} for sweep ledger closes whose "
+                f"code never landed: {row.fault}. If it holds any, `bmad-loop resume "
+                f"{row.run_id}` lands or reopens them",
+                file=sys.stderr,
+            )
+        else:
+            journal.append(
+                "sweep-prior-run-holds-closes", run_id=row.run_id, dw_ids=list(row.dw_ids)
+            )
+            print(
+                f"warning: run {row.run_id} holds sweep ledger closes whose code never "
+                f"landed ({', '.join(row.dw_ids)}). They read `done` in the shared ticket "
+                f"store, so this sweep will not re-bundle them; run `bmad-loop resume "
+                f"{row.run_id}` to land or reopen them",
+                file=sys.stderr,
+            )
+
+
+def _fatal_plugin_problems(paths: bmadconfig.ProjectPaths, pol) -> list[str]:
+    """The fatal plugin-trust refusals `_reject_plugin_trust` would print, as
+    banner lines for `_warn_preflight_would_abort` (no stderr, never raises)."""
+    from .plugins import PluginError, store
+    from .plugins.registry import preflight
+
+    grants = store.load_grants(paths.project)
+    try:
+        verdicts = preflight(paths.repo_root, pol, grants)
+    except PluginError as e:
+        return [str(e)]
+    return _fatal_trust_messages(verdicts, grants)
+
+
 def _warn_preflight_would_abort(
-    paths: bmadconfig.ProjectPaths, pol, *, require_stories: bool = False
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    *,
+    require_stories: bool = False,
+    require_tickets: bool = False,
+    require_sweep: bool = False,
 ) -> None:
     """Dry-run honesty banner: say so when the real command would refuse to run.
 
@@ -1275,7 +2899,7 @@ def _warn_preflight_would_abort(
 
     Mirrors the refusals the dry-run's early return skips past, and only those:
     the under-floor git `_reject_under_floor_git` refuses first, the finding list
-    `_require_base_skills` gates on, the #414 isolation conflict
+    `_require_base_skills` gates on (``skills.tree-outside`` included), the #414 isolation conflict
     `_reject_isolation_conflict` refuses ahead of it, and the unregistered adapter
     kind `make_adapters` aborts on (`_unknown_adapter_kinds` — a preview reads none
     of the fields that would give the misconfiguration away).
@@ -1300,14 +2924,77 @@ def _warn_preflight_would_abort(
     The exit code deliberately stays 0. A dry-run is a diagnostic — refusing to
     print the schedule would withhold the very thing the operator asked for, and
     every existing caller reads rc 0 as "the preview rendered", not as "the
-    project is ready". The banner goes to stderr so stdout stays the preview."""
-    trees = _skill_trees(paths.project, pol)
+    project is ready". The banner goes to stderr so stdout stays the preview.
+
+    ``require_sweep`` (the sweep dry-run) also mirrors `_require_sweep_skill`:
+    the triage tree's ``bmad-loop-sweep`` is a sweep-only gate, so a story-run
+    preview must not promise an abort over it. ``require_tickets`` (the tickets
+    dry-run) mirrors `_require_base_skills`' ``require_tickets`` finding set and
+    the tickets preflight's refusal of a parent initiative
+    (`install.tickets_parent_problems`: one the isolation or retrospective setting
+    cannot chain, or a child store it refuses).
+    Both mirror the store-topology refusal (`_reject_store_topology`) the real
+    command applies: a tickets run's store, and the store of the source a sweep
+    works.
+
+    The plugin trust preflight (`_reject_plugin_trust`, #496/#497) is mirrored too,
+    fatal verdicts only: an inert never-granted plugin does not abort the launch.
+    It reads the grant store the way the launch would, without its warning."""
+    from .plugins import store
+
+    trees = _skill_scopes(paths.project, pol, paths.repo_root, store.load_grants(paths.project))
+    # Under `[skills] user_roots` a run drives a copy outside the project; say so,
+    # runnable or not, so the preview names what the sessions will load.
+    for found in install.skill_root_findings(paths.project, trees):
+        if (found.detail or {}).get("origin") == "user":
+            print(
+                f"note: {found.message} — `[skills] user_roots = true` in policy.toml",
+                file=sys.stderr,
+            )
     problems = [
         p.message
         for p in install.missing_base_skills(paths.project, trees)
-        + (install.missing_stories_support(paths.project, trees) if require_stories else [])
+        + (
+            install.missing_stories_support(paths.project, trees, skip_unresolved=True)
+            if require_stories
+            else []
+        )
+        + (
+            install.missing_tickets_support(paths.project, trees, skip_unresolved=True)
+            if require_tickets
+            else []
+        )
+        + (
+            install.missing_sweep_skill(paths.project, _triage_trees(paths.project, pol))
+            if require_sweep
+            else []
+        )
         if p.severity == "problem"
     ]
+    problems += [
+        p.message
+        for p in install.skill_trees_outside(
+            paths.project, paths.repo_root, trees, isolation=pol.scm.isolation
+        )
+        if p.severity == "problem"
+    ]
+    if require_tickets:
+        problems += [
+            p.message
+            for p in install.tickets_parent_problems(
+                paths, pol.scm.isolation, pol.gates.retrospective
+            )
+        ]
+    # the store the launch judges: a tickets run's, or the one a sweep works
+    store_source = (
+        worksource.SOURCE_TICKETS
+        if require_tickets
+        else _sweep_store_source(paths, pol) if require_sweep else None
+    )
+    if store_source is not None and (
+        store := ticketstore.store_conflict(paths.project, store_source, pol.scm.isolation)
+    ):
+        problems.insert(0, store)
     conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
     if conflict is not None:
         problems.insert(0, conflict)
@@ -1317,6 +3004,7 @@ def _warn_preflight_would_abort(
     except verify.GitError as e:
         problems.insert(0, f"git is required but could not be run: {e}")
     problems += _unknown_adapter_kinds(paths.project, pol)
+    problems += _fatal_plugin_problems(paths, pol)
     if not problems:
         return
     print(
@@ -1386,7 +3074,16 @@ def cmd_adapters(args: argparse.Namespace) -> int:
     return 0
 
 
-def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -> bool:
+def _require_base_skills(
+    project: Path,
+    pol,
+    root: Path,
+    grants: GrantSet,
+    *,
+    require_stories: bool = False,
+    require_tickets: bool = False,
+    review_owed: bool = False,
+) -> bool:
     """Preflight the upstream skills the orchestrator drives (the dev primitive —
     bmad-build-auto, or a complete pre-rename bmad-dev-auto — plus the review layers
     it invokes inline).
@@ -1401,11 +3098,22 @@ def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -
     ``require_stories`` additionally content-probes the resolved primitive for
     folder+id dispatch — stories mode needs a newer skill than sprint mode, so an
     older install must fail loudly here rather than HALT `no stories.yaml`-style at
-    dispatch time."""
-    skill_trees = _skill_trees(project, pol)
+    dispatch time. ``require_tickets`` likewise probes it for the ticket-tree
+    route tickets mode dispatches through. ``review_owed`` keeps the review tree
+    gated (`_skill_scopes`).
+
+    Every question is asked of the same scopes ``cmd_validate`` builds, so a skill
+    resolved from a user root under ``[skills] user_roots`` passes both alike."""
+    skill_trees = _skill_scopes(project, pol, root, grants, review_owed=review_owed)
     findings = install.missing_base_skills(project, skill_trees)
+    # A skill linked out of the repo is refused here rather than escalated mid-run,
+    # where worktree seeding would skip it.
+    findings += install.skill_trees_outside(project, root, skill_trees, isolation=pol.scm.isolation)
     if require_stories:
-        findings += install.missing_stories_support(project, skill_trees)
+        # missing_base_skills above reports (and refuses) an unresolved primitive
+        findings += install.missing_stories_support(project, skill_trees, skip_unresolved=True)
+    if require_tickets:
+        findings += install.missing_tickets_support(project, skill_trees, skip_unresolved=True)
     # Severity decides. A review layer we can't statically resolve (a `when` gate,
     # an unrecognized handoff phrasing, an unparseable override) is reported and
     # then stepped over: aborting on it would be the false FAIL of #260, only now
@@ -1421,19 +3129,63 @@ def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -
     return True
 
 
-def _stories_mode(args: argparse.Namespace, pol) -> tuple[bool, str]:
-    """Resolve whether this run is stories mode and its spec folder.
+def _triage_trees(project: Path, pol) -> list[str]:
+    """The skill tree the triage adapter reads — where a sweep dispatches
+    ``/bmad-loop-sweep``. A list (empty or one entry) so it composes with the
+    ``Sequence[str]`` probes; an unloadable profile is skipped exactly as
+    :func:`_skill_scopes` skips one, since an unknown adapter name is the policy
+    loader's problem, not the skill probe's.
+
+    Separate from :func:`_skill_scopes` on purpose, not a widening of it: that
+    helper's role set is the one `WorktreeFlow.worktree_profiles` provisions and
+    every question it answers is a dev-primitive one (see its docstring)."""
+    from .adapters.profile import ProfileError, get_profile
+
+    try:
+        return [get_profile(pol.adapter.resolved("triage").name, project).skill_tree]
+    except ProfileError:
+        return []
+
+
+def _require_sweep_skill(project: Path, pol) -> bool:
+    """Preflight the triage tree for the complete bundled ``bmad-loop-sweep`` skill.
+
+    Returns True when it is in place; otherwise prints each problem as a ``FAIL:``
+    line plus the validate hint to stderr and returns False, so every entrypoint
+    that is about to dispatch ``/bmad-loop-sweep`` can refuse before any side
+    effect instead of stalling each triage session at ``Unknown command``."""
+    problems = install.missing_sweep_skill(project, _triage_trees(project, pol))
+    if not problems:
+        return True
+    for problem in problems:
+        print(f"FAIL: {problem.message}", file=sys.stderr)
+    print("run `bmad-loop validate` for details", file=sys.stderr)
+    return False
+
+
+def _resolve_source(args: argparse.Namespace, pol) -> tuple[str, str]:
+    """Resolve the work source this run dispatches from and its spec folder.
 
     ``run --spec <folder>`` forces stories mode (overrides policy); otherwise the
-    run follows ``[stories].source``. Returns ``(is_stories, spec_folder)`` — the
-    folder is "" in sprint mode. ``pol`` may be None (e.g. a policy that failed to
-    load in ``validate``): then only an explicit ``--spec`` can force stories mode."""
+    run follows ``[stories].source``. Returns ``(source, spec_folder)`` — the
+    folder is "" for a source without one. ``pol`` may be None (e.g. a policy that
+    failed to load in ``validate``): then only an explicit ``--spec`` can move the
+    run off the sprint source."""
     spec = getattr(args, "spec", None)
     if spec:
-        return True, spec
-    if pol is not None and pol.stories.source == "stories":
-        return True, pol.stories.spec_folder
-    return False, ""
+        return worksource.SOURCE_STORIES, spec
+    if pol is None:
+        return worksource.SOURCE_SPRINT, ""
+    source = pol.stories.source
+    if worksource.traits_for(source).has_spec_folder:
+        return source, pol.stories.spec_folder
+    return source, ""
+
+
+def _stories_mode(args: argparse.Namespace, pol) -> tuple[bool, str]:
+    """:func:`_resolve_source` as ``(is_stories, spec_folder)``."""
+    source, spec_folder = _resolve_source(args, pol)
+    return source == worksource.SOURCE_STORIES, spec_folder
 
 
 def _validate_stories_folder(
@@ -1464,11 +3216,17 @@ def _validate_stories_folder(
     return None
 
 
+def _all_resolve(project: Path, trees: list[SkillScope]) -> bool:
+    """Every tree resolves a dev primitive — the precondition for a dispatch-probe ok
+    line, since the probes skip an unresolved tree rather than report it."""
+    return all(install.resolve_dev_primitive(project, tree) is not None for tree in trees)
+
+
 def _validate_stories_queue(
     project: Path,
     paths: bmadconfig.ProjectPaths,
     spec_folder: str,
-    skill_trees: list[str],
+    skill_trees: list[SkillScope],
     report: ValidationReport,
 ) -> None:
     """Stories-mode counterpart of ``cmd_validate``'s sprint-status gate: validate
@@ -1494,8 +3252,10 @@ def _validate_stories_queue(
                 f"stories mode: {e} (spec folder: {folder})",
                 {"spec_folder": str(folder)},
             )
-    stories_probs = install.missing_stories_support(project, skill_trees)
-    if skill_trees and not stories_probs:
+    # cmd_validate's skills.base check reports an unresolved primitive on these same
+    # trees; such a tree is skipped here, so it must also withhold the ok line.
+    stories_probs = install.missing_stories_support(project, skill_trees, skip_unresolved=True)
+    if skill_trees and not stories_probs and _all_resolve(project, skill_trees):
         # The total form, not `resolve_dev_primitive`: this ok line only renders when
         # the probe passed, and the probe ran against exactly this name — so an
         # unresolvable tree that somehow satisfied it is still reported as what was
@@ -1509,7 +3269,7 @@ def _validate_stories_queue(
         report.ok(
             "skills.stories-dispatch",
             f"{' + '.join(probed)} supports folder+id dispatch (stories mode)",
-            {"trees": list(dict.fromkeys(skill_trees)), "dev_primitive": probed},
+            {"trees": _tree_names(skill_trees), "dev_primitive": probed},
         )
     report.extend(stories_probs)
 
@@ -1565,6 +3325,280 @@ def _validate_plugin_manifests(root: Path, report: ValidationReport) -> None:
             f"plugin manifests OK: {len(names)} loaded ({', '.join(names) or 'none'})",
             {"plugins": names},
         )
+
+
+def _validate_plugin_trust(root: Path, project: Path, pol, report: ValidationReport) -> None:
+    """Judge every discovered plugin against the operator's grants, as a launch
+    will (#496/#497) — `plugins.trust`.
+
+    `root` is the same code root `_validate_plugin_manifests` read; the grant
+    store is keyed by `project`. Uses `registry.preflight`, the verdict the
+    registry build reaches, so validate and a launch cannot disagree — and it
+    never builds the registry: manifests and hashing only, no plugin code runs.
+
+    A project plugin a launch would refuse is a problem whether the refusal is
+    fatal (changed since its grant, granted but no longer discovered, named in
+    `[plugins] enabled` without one, a granted dir that cannot be read) or inert (never granted: it silently would
+    not run). An unreadable store is a problem too — a launch treats it as no
+    grants. A discovery fault is skipped here: `plugins.manifests` already failed
+    on it, and the manifest warnings it reports are not repeated."""
+    import warnings
+
+    from .plugins import PluginError, store
+    from .plugins.grants import TrustState, fatal_message, missing_message
+
+    grants = store.load_grants(project)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # plugins.manifests reports a skipped manifest
+        try:
+            roster, missing = _plugin_roster(root, pol, grants)
+        except PluginError:
+            return  # plugins.manifests already failed on this discovery fault
+    failed = False
+    if grants.fault is not None:
+        failed = True
+        report.fail(
+            "plugins.trust",
+            f"plugin grants could not be read ({grants.fault}); a launch treats this as "
+            "no grants and refuses every project plugin that needs one — fix or remove "
+            "the grant store",
+            {"fault": grants.fault},
+        )
+    for m, v, row in roster:
+        if not v.fatal and (not row.grant_required or v.state is TrustState.GRANTED):
+            continue
+        failed = True
+        if v.fatal:
+            msg = fatal_message(m.name, v)
+        else:
+            msg = (
+                f'plugin "{m.name}" ({row.path}) is not granted and will not run; review '
+                f"it, then run `bmad-loop plugins enable {m.name}` to grant it"
+            )
+        report.fail(
+            "plugins.trust",
+            msg,
+            {
+                "plugin": m.name,
+                "origin": row.origin,
+                "path": row.path,
+                "status": row.status,
+                "pinned": row.pinned_digest,
+                "current": row.current_digest,
+                "changed": list(row.changed),
+            },
+        )
+    for row in missing:
+        failed = True
+        report.fail(
+            "plugins.trust",
+            missing_message(row.name, row.path),
+            {
+                "plugin": row.name,
+                "origin": row.origin,
+                "path": row.path,
+                "status": row.status,
+                "pinned": row.pinned_digest,
+                "current": None,
+                "changed": [],
+            },
+        )
+    if not failed:
+        granted = sorted(row.name for _m, _v, row in roster if row.status == "granted")
+        report.ok(
+            "plugins.trust",
+            f"plugin grants OK: {len(granted)} granted ({', '.join(granted) or 'none'})",
+            {"plugins": granted},
+        )
+
+
+def _nested_spec_files(impl: Path) -> tuple[list[Path], list[tuple[Path, str]]]:
+    """Spec-like files ONE level below `impl` (#780): `*.md` in an immediate,
+    non-symlinked subdirectory whose frontmatter carries a non-empty `status:`.
+
+    Sprint mode's dev read-back globs only `impl` itself, so a spec kept in, say,
+    `impl/stories/` is never found and the session rides to timeout. Deliberately
+    broader than the adapter's `devcontract.find_nested_result_hints` (any status,
+    no launch floor): this is a preflight over the layout, not a judgment about one
+    session's result. Returns `(spec_like, unreadable)`: a nested `*.md` whose read
+    raised, or a subdirectory that could not be listed, is returned with its fault
+    rather than dropped, since it may hold the very spec the layout hides. An
+    OSError while listing `impl` itself propagates, so the caller reports the fault
+    instead of an empty answer."""
+    if not impl.is_dir():
+        return [], []
+    found: list[Path] = []
+    unreadable: list[tuple[Path, str]] = []
+    for child in sorted(impl.iterdir()):
+        if child.is_symlink() or not child.is_dir():
+            continue
+        # `Path.glob` swallows a listing fault and yields nothing, so an
+        # unlistable subdirectory would pass as empty: list it explicitly.
+        try:
+            os.listdir(child)
+        except OSError as e:
+            unreadable.append((child, f"{type(e).__name__}: {e}"))
+            continue
+        for path in sorted(child.glob("*.md")):
+            try:
+                fm = frontmatter.read_frontmatter(path)
+            except OSError as e:
+                unreadable.append((path, f"{type(e).__name__}: {e}"))
+                continue
+            if frontmatter.status_of(fm):
+                found.append(path)
+    return found, unreadable
+
+
+def _validate_nested_specs(impl: Path, report: ValidationReport) -> None:
+    """Warn on a nested spec layout in sprint mode (#780). Never a failure — nothing
+    here gates a run — and silent when nothing is nested, the same no-`ok`-twin
+    reasoning as `policy.isolation-shared-artifact-dir`. A nested `*.md` that could
+    not be read is its own warning: silence would claim a clean layout the scan
+    never checked."""
+    try:
+        nested, unreadable = _nested_spec_files(impl)
+    except OSError as e:
+        report.warn(
+            "queue.nested-specs",
+            f"could not list subdirectories of {impl}: {type(e).__name__}: {e}",
+            {"path": str(impl), "error": f"{type(e).__name__}: {e}"},
+        )
+        return
+    if unreadable:
+        shown = unreadable[:3]
+        report.warn(
+            "queue.nested-specs",
+            f"could not read {len(unreadable)} path(s) in subdirectories of "
+            f"{impl}, so they were not checked for a nested spec layout (e.g. "
+            f"{'; '.join(f'{p}: {err}' for p, err in shown)})",
+            {
+                "path": str(impl),
+                "count": len(unreadable),
+                "unreadable": [{"path": str(p), "error": err} for p, err in shown],
+            },
+        )
+    if not nested:
+        return
+    examples = nested[:3]
+    report.warn(
+        "queue.nested-specs",
+        f"{len(nested)} spec-like file(s) in subdirectories of {impl} (e.g. "
+        f"{', '.join(str(p) for p in examples)}); sprint-mode dev sessions only read "
+        "specs directly under it — move them up, or use stories mode ([stories] "
+        "source) for a stories/ layout",
+        {"count": len(nested), "examples": [str(p) for p in examples]},
+    )
+
+
+def _validate_sprint_mode_queue(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    spec_folder: str,
+    dev_trees: list[SkillScope],
+    report: ValidationReport,
+    probes: bool,
+    pol,
+) -> None:
+    """``validate``'s queue checks for a sprint-status run: the ledger, the park
+    records, and the sprint board itself."""
+    _validate_deferred_ledger(paths, report)
+    _validate_operator_registry(project, paths, report)
+    try:
+        ss = sprintstatus.load(paths.sprint_status)
+        actionable = [s for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+        report.ok(
+            "queue.sprint-status",
+            f"sprint-status OK: {len(ss.stories)} stories, {len(actionable)} actionable",
+            {"stories": len(ss.stories), "actionable": len(actionable)},
+        )
+        if ss.unknown_keys:
+            report.warn(
+                "queue.sprint-status-unknown-keys",
+                f"unknown keys ignored: {', '.join(ss.unknown_keys)}",
+                {"unknown_keys": list(ss.unknown_keys)},
+            )
+        _validate_nested_specs(paths.implementation_artifacts, report)
+    except sprintstatus.SprintStatusError as e:
+        report.fail("queue.sprint-status", str(e))
+
+
+def _validate_stories_mode_queue(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    spec_folder: str,
+    dev_trees: list[SkillScope],
+    report: ValidationReport,
+    probes: bool,
+    pol,
+) -> None:
+    """``validate``'s queue checks for a stories run: the manifest and the
+    ledger, read against the spec folder."""
+    _validate_stories_queue(project, paths, spec_folder, dev_trees, report)
+    _validate_deferred_ledger(
+        paths, report, source=worksource.SOURCE_STORIES, spec_folder=spec_folder
+    )
+
+
+def _validate_tickets_mode_queue(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    spec_folder: str,
+    dev_trees: list[SkillScope],
+    report: ValidationReport,
+    probes: bool,
+    pol,
+) -> None:
+    """``validate``'s queue checks for a tickets run: the initiative's
+    deferred-work ledger (its ``gate:`` lines read as ticket refs), the v7 ticket
+    tree's preflight (:func:`install.tickets_preflight`; the script's capability
+    probe only under ``--probes``, since it executes the project's script) and the
+    dev primitive's ticket route."""
+    _validate_deferred_ledger(paths, report, source=worksource.SOURCE_TICKETS)
+    report.extend(
+        install.tickets_preflight(
+            paths,
+            dev_trees,
+            probe_capability=probes,
+            branch_per=pol.scm.branch_per if pol is not None else None,
+            isolation=pol.scm.isolation if pol is not None else "none",
+            extra_args_roles=(
+                _store_extra_args_roles(pol, worksource.SOURCE_TICKETS) if pol is not None else ()
+            ),
+            sandboxed_roles=(
+                _store_sandboxed_roles(pol, worksource.SOURCE_TICKETS) if pol is not None else ()
+            ),
+            retrospective=pol.gates.retrospective if pol is not None else None,
+        )
+    )
+    tickets_probs = install.missing_tickets_support(project, dev_trees, skip_unresolved=True)
+    if dev_trees and not tickets_probs and _all_resolve(project, dev_trees):
+        probed = list(
+            dict.fromkeys(
+                install.dev_primitive_or_default(project, tree) for tree in dict.fromkeys(dev_trees)
+            )
+        )
+        report.ok(
+            "skills.tickets-dispatch",
+            f"{' + '.join(probed)} dispatches from the ticket tree (tickets mode)",
+            {"trees": _tree_names(dev_trees), "dev_primitive": probed},
+        )
+    report.extend(tickets_probs)
+
+
+# `validate`'s queue checks, one entry per work source (held exhaustive over
+# `worksource.SOURCES` by tests/test_worksource.py). The last argument is
+# `validate --probes`.
+_QUEUE_VALIDATORS: dict[
+    str,
+    Callable[
+        [Path, bmadconfig.ProjectPaths, str, list[SkillScope], ValidationReport, bool, Any], None
+    ],
+] = {
+    worksource.SOURCE_SPRINT: _validate_sprint_mode_queue,
+    worksource.SOURCE_STORIES: _validate_stories_mode_queue,
+    worksource.SOURCE_TICKETS: _validate_tickets_mode_queue,
+}
 
 
 def _validate_operator_registry(
@@ -1668,6 +3702,7 @@ def _validate_deferred_ledger(
     paths: bmadconfig.ProjectPaths,
     report: ValidationReport,
     *,
+    source: str = worksource.SOURCE_SPRINT,
     spec_folder: str | None = None,
 ) -> None:
     """Read the deferred-work ledger once, then run every check that needs it.
@@ -1734,8 +3769,106 @@ def _validate_deferred_ledger(
             {"ledger": str(ledger), "error": str(e)},
         )
         return
-    _validate_hard_gates(paths, text, report, spec_folder=spec_folder)
+    _validate_hard_gates(paths, text, report, source=source, spec_folder=spec_folder)
     _validate_closes_deferred(paths, text, report, spec_folder=spec_folder)
+
+
+def _validate_deferred_ledger_tracking(
+    paths: bmadconfig.ProjectPaths, report: ValidationReport
+) -> None:
+    """WARN when the ledger exists but git neither tracks nor ignores it (DW-361).
+
+    Tracked and gitignored are both decisions a project made; the third setting is
+    one nobody made, and it does not stay put. `git add` takes an untracked,
+    non-ignored path, so since #460 the first isolated merge that carries a ledger
+    write (`_carry_story_deferred_closes`, the harvest carry) commits the whole file,
+    and a non-isolated story commit's `git add -A` sweeps it up the same way. Not
+    wrong, exactly — but a file entering git should not be the first anyone hears
+    of the setting.
+
+    Under git's defaults the same file also fails ``git.worktree-clean``, and
+    ``run``/``sweep`` refuse a dirty tree — so there this line adds the WHICH and the
+    WHY that "commit or stash" does not (and a plain `git stash` leaves an untracked
+    file where it is). Where untracked files are hidden from `git status`
+    (`status.showUntrackedFiles=no`) the tree reads clean, the run starts, and this is
+    the only line that speaks before the commit lands.
+
+    A warning, never a problem: nothing is lost either way.
+    Silent on an absent ledger (nothing to commit yet, and every fresh project would
+    otherwise print it), on one outside ``paths.repo_root`` (``commit_paths`` skips
+    such a path too), and on a git fault — ``git.probe`` owns that report, and an
+    advisory must not fabricate an answer git did not give. An unreadable ledger is
+    already ``deferred.ledger-unreadable``; the presence probe here stays silent on
+    it rather than reporting the one fault twice.
+    """
+    ledger = paths.deferred_work
+    repo = paths.repo_root
+    try:
+        if not S_ISREG(ledger.stat().st_mode):
+            return
+        rel = ledger.resolve().relative_to(repo.resolve()).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return
+    try:
+        if verify.path_tracked(repo, rel) or verify.path_ignored(repo, ledger):
+            return
+    except verify.GitError:
+        return
+    report.warn(
+        "deferred.ledger-untracked",
+        f"{ledger} is neither committed nor gitignored, so nothing has decided whether it "
+        "belongs in git — left that way, bmad-loop's own commits decide (the first isolated "
+        "merge that carries a ledger write, or a non-isolated story commit's `git add -A`, "
+        "takes it in); commit it or add it to .gitignore to decide on purpose",
+        {"ledger": str(ledger), "path": rel},
+    )
+
+
+def _validate_isolated_ledger_ignored(
+    paths: bmadconfig.ProjectPaths, pol: policy_mod.Policy | None, report: ValidationReport
+) -> None:
+    """WARN when worktree isolation meets a gitignored ledger (DW-375).
+
+    Under ``scm.isolation = "worktree"`` a gitignored ledger reaches each unit only
+    as a seeded copy, shielded from the unit commit, and the post-merge carry brings
+    back only the writes the engine recorded (harvested deferrals, story and bundle
+    closes). Anything a session appends to that copy itself is lost at teardown;
+    the run journals ``isolated-ledger-writes-uncarried`` when it happens, and this
+    says so before the first run.
+
+    The ledger need not exist yet: the hazard applies to the file the first harvest
+    creates. A warning, never a problem. Silent under ``isolation = "none"``, on a
+    ledger outside ``paths.repo_root`` (the worktree then shares the main file), on a
+    path that exists but is not a regular file, and on a git fault (``git.probe``
+    owns that report).
+    """
+    if pol is None or pol.scm.isolation != "worktree":
+        return
+    ledger = paths.deferred_work
+    repo = paths.repo_root
+    try:
+        try:
+            st = ledger.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            st = None
+        if st is not None and not S_ISREG(st.st_mode):
+            return
+        rel = (ledger.parent.resolve() / ledger.name).relative_to(repo.resolve()).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return
+    try:
+        if verify.path_tracked(repo, rel) or not verify.path_ignored(repo, ledger):
+            return
+    except verify.GitError:
+        return
+    report.warn(
+        "deferred.ledger-ignored-isolated",
+        f'{ledger} is gitignored and scm.isolation is "worktree", so each unit works on a '
+        "seeded copy and only the engine's own recorded ledger writes are carried back — "
+        "entries a session writes to that copy itself are lost at teardown (journaled as "
+        "isolated-ledger-writes-uncarried); track the ledger in git to keep them",
+        {"ledger": str(ledger), "path": rel},
+    )
 
 
 def _validate_hard_gates(
@@ -1743,6 +3876,7 @@ def _validate_hard_gates(
     text: str,
     report: ValidationReport,
     *,
+    source: str = worksource.SOURCE_SPRINT,
     spec_folder: str | None = None,
 ) -> None:
     """FAIL when the queue would dispatch a story an unlanded ledger entry gates.
@@ -1773,27 +3907,105 @@ def _validate_hard_gates(
     Once a gate exists the passing case reports itself — a gate that only ever
     speaks when it fires is indistinguishable, on the day it matters, from one
     nobody remembered to write.
+
+    Tickets mode reads ``gate:`` tokens as ticket refs and its queue through the
+    project's ``tickets.py next``. That spawn is the one exception to plain
+    ``validate`` executing no project code, and it happens only when an unlanded
+    entry carries a ticket-grammar or v6 story-key token; a ledger whose gates
+    have all landed reports its ``ok`` without it.
+
+    A v6 story-key token (``3-2``, a migrated ledger's) is resolved first through
+    the ``v6_key`` the migration wrote into each ticket's ``tickets.toml`` entry,
+    with the same reader (``tickettree.read_v6_key_claims``) and resolver
+    (``deferredwork.partition_legacy_tokens``) the engine's gate check uses. One
+    that exactly one ticket claims gates that ticket as its ``E.M`` ref would,
+    reported under the token as written; any other fails as a legacy gate before
+    every ticket. The claims are read only when an unlanded entry carries such a
+    token and a ticket is actionable, and a tree that cannot be read for them
+    fails ``probe-failed``.
     """
-    declared = [(entry, deferredwork.gates(entry)) for entry in deferredwork.parse_ledger(text)]
+    grammar: deferredwork.GateGrammar = "ticket" if source == worksource.SOURCE_TICKETS else "story"
+    noun = "ticket" if grammar == "ticket" else "story"
+    declared = [
+        (entry, deferredwork.gates(entry, grammar=grammar))
+        for entry in deferredwork.parse_ledger(text)
+    ]
+    # v6 story keys in a ticket queue's ledger (a migrated ledger keeps them). One
+    # that a single ticket's `v6_key` claims resolves to that ticket below; any
+    # other pauses the run before every ticket while it stands
+    # (`TicketsEngine._legacy_gate_tokens`), so it fails here rather than warns.
+    legacy = {
+        entry.id: stale
+        for entry, _ in declared
+        if grammar == "ticket" and not entry.done
+        for stale in (deferredwork.legacy_story_tokens(entry),)
+        if stale
+    }
     for entry, entry_gates in declared:
         if entry.done:
             continue  # a landed entry gates nothing; that is what closing it means
-        _report_unstructured_gate(entry, entry_gates, report)
+        _report_unstructured_gate(
+            entry, entry_gates, report, grammar=grammar, legacy=legacy.get(entry.id, ())
+        )
     # Keyed on enforceable tokens, not on `gate:` lines: a ledger whose only gate is
     # malformed enforced nothing, and an `ok` there would be the same false all-clear
     # the warning above exists to break. Closed entries still count, deliberately —
     # the passing case has to keep speaking after the gate lands, or `ok` and "nobody
     # ever wrote a gate" become the same silence. Reading the queue sits behind this
     # test so a project that gates nothing pays neither the walk nor its failure modes.
-    if not any(entry_gates.tokens for _, entry_gates in declared):
+    if not any(entry_gates.tokens for _, entry_gates in declared) and not legacy:
         return
-    story_keys = _actionable_story_keys(paths, spec_folder)
-    if story_keys is None:
+    # Tickets mode reads its queue by executing the project's `tickets.py next`, and
+    # plain `validate` otherwise executes no project code. So only an UNLANDED gate
+    # pays for that spawn; landed ones still get their `ok`, from the ledger alone.
+    if grammar == "ticket" and not any(
+        not e.done and (g.tokens or e.id in legacy) for e, g in declared
+    ):
+        report.ok(
+            "deferred.hard-gate",
+            "deferred-work gates OK: no unlanded entry declares a gate, so the ticket "
+            "queue was not read",
+            {"gating_ids": []},
+        )
+        return
+    try:
+        targets = _actionable_story_keys(paths, source, spec_folder or "")
+    except tickettree.TicketsError as e:
+        # No `queue.*` check runs `tickets.py next`, so this one owns the outage:
+        # the gates were declared and never compared, which is no all-clear.
+        report.fail(
+            "deferred.hard-gate",
+            f"tickets.py next could not be read ({e.kind}: {e}), so the `gate:` lines in "
+            f"{paths.deferred_work.name} were not compared against the startable tickets "
+            f"— fix the ticket tree, then re-run `bmad-loop validate`",
+            {"error": str(e), "kind": e.kind},
+        )
+        return
+    if targets is None:
         # The queue could not be read, so nothing was compared. `queue.sprint-status`
         # and `queue.stories-manifest` already fail for it; adding an `ok` here would
         # say "no story is gated" about a queue this check never saw.
         return
-    gating = [e.id for e, g in declared if not e.done and g.tokens]
+    # v6 tokens one ticket's `v6_key` claims resolve to its ref; the rest stay legacy.
+    # Read only when a ticket is actionable: the run reads the claims only while
+    # gate-checking a picked ticket, and with no target the legacy fail is moot.
+    resolved: dict[str, tuple[tuple[str, str], ...]] = {}
+    unresolved: dict[str, tuple[str, ...]] = dict(legacy)
+    if legacy and targets:
+        try:
+            claims = tickettree.read_v6_key_claims(paths.initiative_folder)
+        except tickettree.TicketsV6KeyUnreadable as e:
+            report.fail(
+                "deferred.hard-gate",
+                f"{e.path} cannot be read ({e.detail}), so the v6 story-key `gate:` tokens "
+                f"in {paths.deferred_work.name} could not be resolved to tickets through "
+                f"their `v6_key` — fix the file, then re-run `bmad-loop validate`",
+                {"error": str(e), "kind": e.kind},
+            )
+            return
+        for dw_id, stale in legacy.items():
+            resolved[dw_id], unresolved[dw_id] = deferredwork.partition_legacy_tokens(stale, claims)
+    gating = [e.id for e, g in declared if not e.done and (g.tokens or e.id in legacy)]
     gated = False
     for entry, entry_gates in declared:
         # `done`, not `not open` — the tri-state is the whole point. An entry whose
@@ -1803,15 +4015,46 @@ def _validate_hard_gates(
         # retires a gate; everything else holds until someone writes that word.
         if entry.done:
             continue
-        for story_key in story_keys:
-            hits = [t for t in entry_gates.tokens if deferredwork.gates_story(t, story_key)]
-            if not hits:
-                continue
+        stale = unresolved.get(entry.id, ())
+        if stale and targets:
             gated = True
             report.fail(
                 "deferred.hard-gate",
+                f"{entry.id} ({entry.title}) {_gate_status_clause(entry)} and declares v6 "
+                f"story-key gate tokens that no single ticket's `v6_key` claims (none "
+                f"does, or more than one) ({', '.join(stale)}) — no ticket ref matches "
+                f"them, so a tickets run pauses before every ticket while it stands, "
+                f"starting with {targets[0].key}. Rewrite the tokens as ticket refs "
+                f"(`E.M`, an epic id or `epic-<slug>`) or as the full v6 key of one "
+                f"ticket, or close the entry in {paths.deferred_work.name} "
+                f"(`status: done <date>`)",
+                {
+                    "dw_id": entry.id,
+                    "title": entry.title,
+                    "story_key": targets[0].key,
+                    "tokens": list(stale),
+                },
+            )
+        for target in targets:
+            story_key = target.key
+            hits = [t for t in entry_gates.tokens if _gate_matches(t, target, grammar)]
+            # A resolved v6 token matches through its ticket's ref, reported as written.
+            via = [
+                (token, ref)
+                for token, ref in resolved.get(entry.id, ())
+                if _gate_matches(ref, target, grammar)
+            ]
+            hits += [token for token, _ in via]
+            if not hits:
+                continue
+            gated = True
+            resolution = "".join(
+                f"; {token} resolves to {ref} through its `v6_key`" for token, ref in via
+            )
+            report.fail(
+                "deferred.hard-gate",
                 f"{entry.id} ({entry.title}) {_gate_status_clause(entry)} and gates "
-                f"{story_key} (gate: {', '.join(hits)}) — that story must not run until "
+                f"{story_key} (gate: {', '.join(hits)}{resolution}) — that {noun} must not run until "
                 f"the entry lands. Close it in {paths.deferred_work.name} "
                 f"(`status: done <date>`), or drop the token from its `gate:` line if it "
                 f"no longer blocks this work",
@@ -1825,10 +4068,31 @@ def _validate_hard_gates(
     if not gated:
         report.ok(
             "deferred.hard-gate",
-            f"deferred-work gates OK: no actionable story is gated by an unlanded entry "
+            f"deferred-work gates OK: no actionable {noun} is gated by an unlanded entry "
             f"({', '.join(gating) if gating else 'no unlanded gated entries'})",
-            {"gating_ids": gating, "actionable": list(story_keys)},
+            {"gating_ids": gating, "actionable": [t.key for t in targets]},
         )
+
+
+@dataclass(frozen=True)
+class _GateTarget:
+    """One key a queue could dispatch, as :func:`_validate_hard_gates` matches
+    ``gate:`` tokens against it: the key, plus a ticket's epic (its initiative id,
+    ``""`` when unlisted, and its folder) for the ticket grammar's epic arms."""
+
+    key: str
+    epic_id: str = ""
+    epic_slug: str = ""
+
+
+def _gate_matches(token: str, target: _GateTarget, grammar: deferredwork.GateGrammar) -> bool:
+    """The dispatch-side predicate for ``grammar`` (``Engine._gate_hits`` and its
+    ``TicketsEngine`` override), so preflight and dispatch refuse the same keys."""
+    if grammar == "ticket":
+        return deferredwork.gates_ticket(
+            token, target.key, epic_id=target.epic_id, epic_slug=target.epic_slug
+        )
+    return deferredwork.gates_story(token, target.key)
 
 
 def _gate_status_clause(entry: deferredwork.DWEntry) -> str:
@@ -1851,6 +4115,9 @@ def _report_unstructured_gate(
     entry: deferredwork.DWEntry,
     entry_gates: deferredwork.EntryGates,
     report: ValidationReport,
+    *,
+    grammar: deferredwork.GateGrammar = "story",
+    legacy: tuple[str, ...] = (),
 ) -> None:
     """Warn about a hard gate the mechanical check cannot enforce.
 
@@ -1875,22 +4142,27 @@ def _report_unstructured_gate(
     Runs for every entry that is not ``done``, which is the same set the refusal
     holds against. Keying it on ``open`` instead would have left an entry with an
     unreadable status silent about a malformed token as well as about its gate.
+
+    Under the ticket ``grammar`` the wording names ticket refs, and ``legacy`` (the
+    entry's v6 story-key tokens) is left out of ``malformed``: those fail
+    ``deferred.hard-gate`` instead, because the run pauses on them.
     """
+    ticket = grammar == "ticket"
+    noun, shape = ("ticket", "a ticket ref (`E.M`)") if ticket else ("story", "a story")
+    malformed = [t for t in entry_gates.malformed if t not in legacy]
     reasons: list[str] = []
-    if entry_gates.malformed:
-        reasons.append(
-            f"declares `gate:` tokens that cannot name a story: {', '.join(entry_gates.malformed)}"
-        )
+    if malformed:
+        reasons.append(f"declares `gate:` tokens that cannot name {shape}: {', '.join(malformed)}")
     if entry_gates.empty == 1:
-        reasons.append("declares an empty `gate:` line, which names no story")
+        reasons.append(f"declares an empty `gate:` line, which names no {noun}")
     elif entry_gates.empty:
-        reasons.append(f"declares {entry_gates.empty} empty `gate:` lines, which name no story")
+        reasons.append(f"declares {entry_gates.empty} empty `gate:` lines, which name no {noun}")
     if entry_gates.near_miss:
         reasons.append(
             f"spells {entry_gates.near_miss} `gate:` line(s) in a form the field does not "
             f"read (the field is a lowercase `gate:` at the very start of a line)"
         )
-    prose_only = not entry_gates.tokens and not reasons
+    prose_only = not entry_gates.tokens and not legacy and not reasons
     if prose_only and deferredwork.declares_prose_gate(entry):
         reasons.append("declares a `HARD GATE:` in prose but carries no `gate:` line")
     if not reasons:
@@ -1898,11 +4170,12 @@ def _report_unstructured_gate(
     report.warn(
         "deferred.hard-gate-unstructured",
         f"{entry.id} ({entry.title}) {' and '.join(reasons)} — so `validate` cannot refuse "
-        f"the gated story and nothing holds it back; name the blocked stories on a `gate:` "
-        f"line (comma-separated) to make the gate enforceable",
+        f"the gated {noun} and nothing holds it back; name the blocked "
+        f"{'ticket refs' if ticket else 'stories'} on a `gate:` line (comma-separated) to "
+        f"make the gate enforceable",
         {
             "dw_id": entry.id,
-            "malformed": list(entry_gates.malformed),
+            "malformed": malformed,
             "empty": entry_gates.empty,
             "near_miss": entry_gates.near_miss,
         },
@@ -1910,9 +4183,10 @@ def _report_unstructured_gate(
 
 
 def _actionable_story_keys(
-    paths: bmadconfig.ProjectPaths, spec_folder: str | None
-) -> list[str] | None:
-    """The story keys this queue could dispatch, in queue order, in either mode.
+    paths: bmadconfig.ProjectPaths, source: str, spec_folder: str
+) -> list[_GateTarget] | None:
+    """The story keys ``source``'s queue could dispatch, in queue order — one
+    reader per work source in ``_ACTIONABLE_KEY_READERS``.
 
     ``None`` when the queue could not be read, which is not the same answer as an
     empty list: ``queue.sprint-status`` and ``queue.stories-manifest`` own queue
@@ -1947,23 +4221,66 @@ def _actionable_story_keys(
     resolution first is the cheaper wrong answer, and dispatch still refuses
     independently.
     """
-    if spec_folder is not None:
-        keys: list[str] = []
-        try:
-            folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
-            for entry in stories_mod.load_stories(folder).entries:
-                state = stories_mod.resolve_story_spec(folder, entry.id)
-                if stories_mod._classify(state) != "actionable":
-                    continue
-                keys.append(entry.id)
-        except (OSError, UnicodeDecodeError, stories_mod.StoriesError):
-            return None
-        return keys
+    return _ACTIONABLE_KEY_READERS[source](paths, spec_folder)
+
+
+def _actionable_sprint_keys(
+    paths: bmadconfig.ProjectPaths, spec_folder: str
+) -> list[_GateTarget] | None:
+    """Sprint half of :func:`_actionable_story_keys`: the board's actionable keys."""
     try:
         ss = sprintstatus.load(paths.sprint_status)
     except (sprintstatus.SprintStatusError, OSError, UnicodeDecodeError):
         return None
-    return [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+    return [_GateTarget(s.key) for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+
+
+def _actionable_stories_keys(
+    paths: bmadconfig.ProjectPaths, spec_folder: str
+) -> list[_GateTarget] | None:
+    """Stories half of :func:`_actionable_story_keys`: the manifest entries the
+    scheduler's per-entry predicate calls actionable."""
+    keys: list[_GateTarget] = []
+    try:
+        folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
+        for entry in stories_mod.load_stories(folder).entries:
+            state = stories_mod.resolve_story_spec(folder, entry.id)
+            if stories_mod._classify(state) != "actionable":
+                continue
+            keys.append(_GateTarget(entry.id))
+    except (OSError, UnicodeDecodeError, stories_mod.StoriesError):
+        return None
+    return keys
+
+
+def _actionable_ticket_keys(
+    paths: bmadconfig.ProjectPaths, spec_folder: str
+) -> list[_GateTarget] | None:
+    """Tickets half of :func:`_actionable_story_keys`: the refs of the active
+    initiative's ``ready_to_start`` and ``in_progress`` rows, in ``next`` order,
+    each with its epic. ``ready_to_refine`` and hitl-free checks are the pick's
+    business; backlog rows are never dispatched. Runs the project's ``tickets.py
+    next`` (unpinned: ``validate`` reads the live initiative), so it is reached
+    only when the ledger declares a gate; a fault raises
+    :class:`~bmad_loop.tickettree.TicketsError` for the caller to report, since no
+    ``queue.*`` check reads ``next``."""
+    view = tickettree.TicketTree(paths.project).next()
+    targets: list[_GateTarget] = []
+    for row in (*view.ready_to_start, *view.in_progress):
+        if not row.ref:
+            continue
+        epic_id, dot, _ = row.ref.partition(".")
+        targets.append(_GateTarget(row.ref, epic_id if dot else "", row.epic))
+    return targets
+
+
+_ACTIONABLE_KEY_READERS: dict[
+    str, Callable[[bmadconfig.ProjectPaths, str], list[_GateTarget] | None]
+] = {
+    worksource.SOURCE_SPRINT: _actionable_sprint_keys,
+    worksource.SOURCE_STORIES: _actionable_stories_keys,
+    worksource.SOURCE_TICKETS: _actionable_ticket_keys,
+}
 
 
 def _validate_closes_deferred(
@@ -2097,15 +4414,99 @@ def _warn_unknown_keys(ss: sprintstatus.SprintStatus) -> None:
         )
 
 
+def _preflight_sprint_queue(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
+) -> int | None:
+    """``run``'s queue preflight for a sprint-status run: the board parses and the
+    ``--epic`` / ``--story`` selection resolves. An exit code refuses the run."""
+    try:
+        ss = sprintstatus.load(paths.sprint_status)
+        _warn_unknown_keys(ss)
+        sprintstatus.select_actionable(ss, args.epic, args.story)
+    except sprintstatus.SprintStatusError as e:
+        print(e, file=sys.stderr)
+        return 1
+    return None
+
+
+def _preflight_stories_queue(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
+) -> int | None:
+    """``run``'s queue preflight for a stories run: the manifest and SPEC.md pass
+    and the ``--story`` selector names an entry. An exit code refuses the run."""
+    problem = _validate_stories_folder(paths, spec_folder, selector=args.story)
+    if problem:
+        print(problem, file=sys.stderr)
+        return 1
+    return None
+
+
+def _preflight_tickets_queue(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
+) -> int | None:
+    """``run``'s queue preflight for a tickets run: :func:`_check_tickets_preflight`."""
+    del args, spec_folder
+    return _check_tickets_preflight(paths, pol)
+
+
+def _check_tickets_preflight(paths: bmadconfig.ProjectPaths, pol) -> int | None:
+    """The v7 tree's checks for a tickets run, at launch and on resume
+    (:func:`install.tickets_preflight`, the script's capability probe included —
+    the run executes the script anyway). Warnings print; a problem refuses the
+    run."""
+    findings = install.tickets_preflight(
+        paths,
+        [],
+        probe_capability=True,
+        branch_per=pol.scm.branch_per,
+        isolation=pol.scm.isolation,
+        extra_args_roles=_store_extra_args_roles(pol, worksource.SOURCE_TICKETS),
+        sandboxed_roles=_store_sandboxed_roles(pol, worksource.SOURCE_TICKETS),
+        retrospective=pol.gates.retrospective,
+    )
+    for warning in (f for f in findings if f.severity == "warning"):
+        print(f"warning: {warning.message}", file=sys.stderr)
+    problems = [f for f in findings if f.severity == "problem"]
+    if not problems:
+        return None
+    for problem in problems:
+        print(f"FAIL: {problem.message}", file=sys.stderr)
+    print("run `bmad-loop validate --probes` for details", file=sys.stderr)
+    return 1
+
+
+# `run`'s queue preflight, one entry per work source (held exhaustive over
+# `worksource.SOURCES` by tests/test_worksource.py).
+_RUN_PREFLIGHTS: dict[
+    str, Callable[[bmadconfig.ProjectPaths, Any, argparse.Namespace, str], int | None]
+] = {
+    worksource.SOURCE_SPRINT: _preflight_sprint_queue,
+    worksource.SOURCE_STORIES: _preflight_stories_queue,
+    worksource.SOURCE_TICKETS: _preflight_tickets_queue,
+}
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if (rc := _reject_bad_run_id(args.run_id)) is not None:
         return rc
     project = _project(args)
-    paths = bmadconfig.load_paths(project)
     pol = policy_mod.load(_policy_path(project))
-    stories_on, spec_folder = _stories_mode(args, pol)
+    source, spec_folder = _resolve_source(args, pol)
+    traits = worksource.traits_for(source)
+    tickets = source == worksource.SOURCE_TICKETS
+    if not tickets and isinstance(args.epic, str):
+        # `_epic_selector` lets a non-integer through for tickets mode only; every
+        # other source keeps the exit code argparse's `type=int` gave it, ahead of
+        # any project read as argparse's was.
+        print(
+            f"error: argument --epic: invalid int value: {args.epic!r} "
+            "(an epic slug selects only in tickets mode)",
+            file=sys.stderr,
+        )
+        return ExitCode.USAGE
+    paths = bmadconfig.load_paths(project, want_tickets=tickets)
 
-    if stories_on and args.epic is not None:
+    if not tickets and not traits.has_epics and args.epic is not None:
         # stories mode dispatches the manifest's single flat schedule; StoriesEngine
         # nulls epic_filter, so --epic has no effect. Warn rather than silently drop
         # it, so a caller who passed both (e.g. `run --spec ... --epic 3`) isn't
@@ -2116,7 +4517,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
 
     if args.dry_run:
-        return _dry_run(paths, pol, args, stories_on, spec_folder)
+        return _dry_run(paths, pol, args, source, spec_folder)
 
     # The HOST refusal leads the configuration ones: an under-floor git is a fact
     # about the machine that no edit to policy.toml can answer, so telling the
@@ -2132,29 +4533,115 @@ def cmd_run(args: argparse.Namespace) -> int:
     # same abort.
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
+    if (rc := _reject_store_topology(project, pol, source)) is not None:
+        return rc
 
-    if stories_on:
-        problem = _validate_stories_folder(paths, spec_folder, selector=args.story)
-        if problem:
-            print(problem, file=sys.stderr)
+    if (rc := _RUN_PREFLIGHTS[source](paths, pol, args, spec_folder)) is not None:
+        return rc
+    parent = _chain_parent(paths) if tickets else None
+    if isinstance(parent, int):
+        return parent
+    scope = tickets_source.EVERYTHING
+    launch_paths = paths
+    plugin_grants: GrantSet | None = None
+    start_log = _ChainStartLog()
+    if parent is not None:
+        # A parent initiative has no tickets of its own: the run builds its children,
+        # one run each, starting with the first one `next <parent>` can start.
+        if args.epic is not None or args.story:
+            print(_chain_selector_refusal(parent), file=sys.stderr)
             return 1
-    else:
+        # The launch gates that do not depend on the child run ahead of the start
+        # close, so a run they refuse has written and committed nothing.
+        gated = _launch_gates(project, paths, pol, source)
+        if isinstance(gated, int):
+            return gated
+        plugin_grants = gated
         try:
-            ss = sprintstatus.load(paths.sprint_status)
-            _warn_unknown_keys(ss)
-            sprintstatus.select_actionable(ss, args.epic, args.story)
-        except sprintstatus.SprintStatusError as e:
-            print(e, file=sys.stderr)
+            # A child a stopped, interrupted or crashed chain left drained and open,
+            # or one drained outside the chain, is closed first so its dependents
+            # are ready for the pick.
+            owed = _close_drained_children(project, paths, pol, parent, start_log)
+            pick = None if owed is not None else _chain_pick(project, paths, parent)
+        except (tickettree.TicketsError, ValueError) as e:
+            print(f"tickets mode: initiative chain {parent}: {e}", file=sys.stderr)
             return 1
+        if pick is None:
+            print(
+                f"initiative chain {parent}: ends (store-commit-failed): {owed} — commit "
+                "it, then run again",
+                file=sys.stderr,
+            )
+            return 1
+        if pick.child is None:
+            print(_chain_end_line(parent, pick.end or "", pick))
+            return 0
+        print(f"initiative chain {parent}: building {pick.child.slug}{_passed_over_note(pick)}")
+        launch_paths = paths.with_initiative(pick.child.slug)
+    elif tickets:
+        resolved = _resolve_ticket_scope(_selector_ticket_tree(paths.project), args)
+        if isinstance(resolved, int):
+            return resolved
+        scope = resolved
 
-    if not verify.worktree_clean(paths.repo_root):
-        print("git worktree is not clean — commit or stash first", file=sys.stderr)
-        return 1
+    launched = _launch_run(
+        project,
+        launch_paths,
+        pol,
+        args,
+        source=source,
+        spec_folder=spec_folder,
+        scope=scope,
+        parent_initiative=parent,
+        plugin_grants=plugin_grants,
+    )
+    if isinstance(launched, int):
+        return launched
+    start_log.replay(launched.journal)
+    summary = launched.engine.run()
+    print(summary.render())
+    return _drive_initiative_chain(project, paths, pol, launched)
 
-    if not _require_base_skills(project, pol, require_stories=stories_on):
-        return 1
 
-    _reconcile_stale(project, paths, pol)
+def _launch_run(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    args: argparse.Namespace,
+    *,
+    source: str,
+    spec_folder: str,
+    scope: tickets_source.PickScope,
+    parent_initiative: str | None = None,
+    plugin_grants: GrantSet | None = None,
+) -> runsetup.ComposedRun | int:
+    """Launch one run whose gates :func:`cmd_run` already passed (git floor,
+    isolation, store topology, the source preflight, the ticket scope): the
+    :func:`_launch_gates`, the config pin, and :func:`runsetup.compose_run`.
+    Returns the composed run, ready for ``engine.run()``, or an rc to abort with.
+
+    ``parent_initiative`` is set only for a chained child run: ``paths`` are then
+    the child's (``ProjectPaths.with_initiative``), whose store is judged on its
+    own here, first — each child folder can have its own topology — and the
+    parent is recorded on the run and armed on its run-end sweep. Unset, the store
+    was judged by the caller and is not judged again.
+
+    ``plugin_grants`` is what a caller that already ran :func:`_launch_gates` got
+    from them (``run`` on a parent, ahead of its start close): the gates are not
+    run again and those grants are used. None runs the gates here."""
+    tickets = source == worksource.SOURCE_TICKETS
+    if (
+        parent_initiative is not None
+        and (rc := _reject_store_topology(project, pol, source, initiative=paths.active_initiative))
+        is not None
+    ):
+        return rc
+
+    if plugin_grants is None:
+        gated = _launch_gates(project, paths, pol, source)
+        if isinstance(gated, int):
+            return gated
+        plugin_grants = gated
 
     # The launch baseline for the auto-sweep child's config re-read (#461 point 4).
     # Taken ONCE, from the same `pol` the engine is about to freeze, and used for
@@ -2178,30 +4665,629 @@ def cmd_run(args: argparse.Namespace) -> int:
         paths=paths,
         policy=pol,
         run_id=args.run_id,
-        epic_filter=args.epic,
-        story_filter=args.story,
+        # a tickets run's selectors are resolved: an epic slug and a ticket ref
+        epic_filter=None if tickets else args.epic,
+        story_filter=(scope.ref or None) if tickets else args.story,
+        ticket_epic_filter=scope.epic,
         max_stories=args.max_stories,
-        stories_on=stories_on,
+        source=source,
         spec_folder=spec_folder,
-        sweep_factory=_sweep_factory(project, paths, trusted_digest),
+        # a chained child's run-end sweep works the child's ledger and pins the parent
+        sweep_factory=_sweep_factory(
+            project,
+            paths,
+            trusted_digest,
+            plugin_grants=plugin_grants,
+            parent_initiative=parent_initiative,
+        ),
         make_adapters=_make_adapters,
         engine_cls=Engine,
         stories_engine_cls=StoriesEngine,
+        tickets_engine_cls=TicketsEngine,
         trusted_config_digest=trusted_digest,
         profiles=profiles,
+        plugin_grants=plugin_grants,
+        parent_initiative=parent_initiative,
+    )
+    launched_roles = worksource.launch_roles(source, pol.gates.retrospective)
+    _warn_bypass_dropped(pol, project, launched_roles, profiles=profiles, journal=composed.journal)
+    _warn_hook_relay_unregistered(
+        pol, project, launched_roles, profiles=profiles, journal=composed.journal
     )
     print(f"run {composed.run_id} starting (attach: bmad-loop attach)")
-    summary = composed.engine.run()
-    print(summary.render())
-    return 0
+    return composed
+
+
+def _launch_gates(
+    project: Path, paths: bmadconfig.ProjectPaths, pol, source: str
+) -> GrantSet | int:
+    """The launch gates no child initiative changes, in order: the worktree-clean
+    check, the plugin grants read, the skills preflight, the stale reconcile and
+    plugin trust. Each reads ``paths.repo_root``/``paths.project`` alone, which
+    ``ProjectPaths.with_initiative`` keeps, so a parent's paths and its child's
+    answer alike. Returns the grants, or an rc to abort with.
+
+    #496/#497: the plugin grants are read ONCE, here, and refused against before
+    the run dir exists; the same frozen set reaches the skills preflight, the
+    engine's registry build and the auto-sweep factory's closure, so no later
+    layer reads the store."""
+    traits = worksource.traits_for(source)
+    if not verify.worktree_clean(paths.repo_root, project=paths.project):
+        print("git worktree is not clean — commit or stash first", file=sys.stderr)
+        return 1
+
+    plugin_grants = _launch_plugin_grants(project)
+    if not _require_base_skills(
+        project,
+        pol,
+        paths.repo_root,
+        plugin_grants,
+        require_stories=traits.stories_primitive,
+        require_tickets=source == worksource.SOURCE_TICKETS,
+    ):
+        return 1
+
+    _reconcile_stale(project, paths, pol)
+
+    if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
+        return rc
+    return plugin_grants
+
+
+def _chain_parent(paths: bmadconfig.ProjectPaths) -> str | int | None:
+    """The active initiative when it is a parent initiative — its ``tickets.toml``
+    lists ``[[initiative]]`` children, read as the tickets preflight reads it
+    (``install._initiative_children``) — else None; exit 1 when the read faults."""
+    folder = paths.initiative_folder
+    if paths.era != "v7" or folder is None or not paths.active_initiative:
+        return None
+    children, breakdown, fault = install._initiative_children(folder)
+    if fault:
+        print(f"tickets mode: cannot read {breakdown}: {fault}", file=sys.stderr)
+        return 1
+    return None if children is None else paths.active_initiative
+
+
+def _chain_selector_refusal(parent: str) -> str:
+    """Why ``run`` (and its dry run) refuses ``--epic``/``--story`` on the parent
+    initiative ``parent``."""
+    return (
+        f"error: initiative {parent!r} is a parent initiative: --epic and --story "
+        "select within one initiative — set `[core] active_initiative` to the "
+        "child to scope a run"
+    )
+
+
+def _chain_ticket_tree(
+    project: Path, parent: str, folder: Path | None = None
+) -> tickettree.TicketTree:
+    """A main-checkout tree pinned to the parent initiative ``parent`` (the live
+    ``[core] active_initiative``), reading through a child's ``folder`` when given."""
+    return tickettree.TicketTree(project, pinned_initiative=parent, folder=folder)
+
+
+def _fresh_pick(
+    next_view: ticketmodel.NextView,
+    status_view: ticketmodel.StatusView,
+    scope: tickets_source.PickScope = tickets_source.EVERYTHING,
+) -> tickets_source.PickDecision:
+    """The pick a fresh tickets run makes first: no ticket touched, no closure,
+    approval or acknowledgement recorded. The dry run previews it; the initiative
+    chain reads a ``Skip`` as a child with nothing left to dispatch."""
+    return tickets_source.decide_pick(next_view, status_view, {}, {}, (), scope)
+
+
+def _chain_pick(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    parent: str,
+    view: ticketmodel.ParentView | None = None,
+    *,
+    after_close: bool = False,
+) -> initiativechain.ChildPick:
+    """The next child of the parent initiative ``parent`` (``paths`` are the
+    parent's): :func:`initiativechain.next_child` over ``next <parent>`` (``view``
+    when the caller already read it), passing over as ``drained`` a ready child
+    whose fresh pick (:func:`_fresh_pick`) finds nothing to dispatch. Reads only.
+    ``after_close`` (the dry run) re-judges the pick as if
+    :func:`_close_drained_children` had closed each drained child whose fresh pick
+    finds nothing (:func:`initiativechain.next_child_after_close`). Raises
+    :class:`tickettree.TicketsError` on a tree fault and ValueError on a child
+    slug that is no folder name."""
+    folder = paths.initiative_folder
+    assert folder is not None  # _chain_parent
+    if view is None:
+        view = _chain_ticket_tree(project, parent).parent_next(folder)
+    empty: dict[str, bool] = {}
+
+    def nothing_left(child: ticketmodel.ChildInitiative) -> bool:
+        if child.slug not in empty:
+            tree = _chain_ticket_tree(
+                project, parent, paths.with_initiative(child.slug).initiative_folder
+            )
+            decision = _fresh_pick(tree.next(), tree.status())
+            empty[child.slug] = isinstance(decision, tickets_source.Skip)
+        return empty[child.slug]
+
+    def drained(child: ticketmodel.ChildInitiative) -> str | None:
+        return initiativechain.DRAINED if nothing_left(child) else None
+
+    if after_close:
+        return initiativechain.next_child_after_close(view, drained, nothing_left)
+    return initiativechain.next_child(view, drained)
+
+
+def _passed_over_note(pick: initiativechain.ChildPick) -> str:
+    """`` (passed over: a (drained), b (no-folder))``, or ``""``."""
+    if not pick.passed_over:
+        return ""
+    return " (passed over: " + ", ".join(f"{p.slug} ({p.why})" for p in pick.passed_over) + ")"
+
+
+def _waiting_note(pick: initiativechain.ChildPick) -> str:
+    """`` — waiting: b on a (in-progress); c on a (in-progress), d (no-folder)``:
+    each waiting child and the prerequisites it waits on, with their status; or
+    ``""``."""
+    if not pick.waiting:
+        return ""
+    parts: list[str] = []
+    for slug in pick.waiting:
+        on = [f"{w.prerequisite} ({w.status})" for w in pick.waiting_on if w.slug == slug]
+        parts.append(f"{slug} on {', '.join(on)}" if on else slug)
+    return " — waiting: " + "; ".join(parts)
+
+
+def _chain_end_line(parent: str, end: str, pick: initiativechain.ChildPick | None) -> str:
+    """The human line for a chain that ends: why, what still waits and on what,
+    what was passed over."""
+    line = f"initiative chain {parent}: ends ({end})"
+    return line + ("" if pick is None else _waiting_note(pick) + _passed_over_note(pick))
+
+
+def _journal_chain_end(
+    journal: Journal,
+    parent: str,
+    end: str,
+    pick: initiativechain.ChildPick | None = None,
+    error: str | None = None,
+) -> None:
+    """``initiative-chain-end`` in the finished run's journal. ``end`` is a
+    :data:`initiativechain.ChainEnd`, ``stalled``, ``stop-requested``,
+    ``max-stories``, ``store-commit-failed``, ``launch-refused`` or ``fault``.
+    Each prerequisite a
+    waiting child waits on is one row of three parallel lists: the child
+    (``waiting_child``), the prerequisite (``waiting_on``) and its status
+    (``waiting_on_status``, :func:`initiativechain.prerequisite_status`)."""
+    extras = {} if error is None else {"error": error}
+    waits = () if pick is None else pick.waiting_on
+    journal.append(
+        "initiative-chain-end",
+        parent=parent,
+        end=end,
+        waiting=[] if pick is None else list(pick.waiting),
+        waiting_child=[w.slug for w in waits],
+        waiting_on=[w.prerequisite for w in waits],
+        waiting_on_status=[w.status for w in waits],
+        passed_over=[] if pick is None else [p.slug for p in pick.passed_over],
+        passed_over_why=[] if pick is None else [p.why for p in pick.passed_over],
+        **extras,
+    )
+
+
+def _chain_end(
+    finished: runsetup.ComposedRun,
+    parent: str,
+    end: str,
+    pick: initiativechain.ChildPick | None = None,
+    *,
+    error: str | None = None,
+) -> int:
+    """End the chain after ``finished``: journal it there, print why, and return
+    the rc (0 for an orderly end, 1 for a fault)."""
+    _journal_chain_end(finished.journal, parent, end, pick, error)
+    if error is None:
+        print(_chain_end_line(parent, end, pick))
+        return 0
+    print(f"initiative chain {parent}: ends ({end}): {error}", file=sys.stderr)
+    return 1
+
+
+def _chain_stop_requested(finished: runsetup.ComposedRun) -> bool:
+    """Whether a stop was asked of the finished run: a request still lodged
+    (``runs.graceful_stop_requested``, what ``bmad-loop stop`` writes), or one the
+    engine discarded because the run had nothing left to stop
+    (``stop-request-discarded``) since it last started — fresh, or resumed
+    (``run-resume``), so the request was made while it built and was meant for
+    the chain. A discard before the last resume was a request the operator's
+    resume overrode (the engine discards one pending when it pauses, too)."""
+    if runs.graceful_stop_requested(finished.run_dir):
+        return True
+    entries = finished.journal.entries()
+    since = max((i for i, e in enumerate(entries) if e.get("kind") == "run-resume"), default=-1)
+    return any(e.get("kind") == "stop-request-discarded" for e in entries[since + 1 :])
+
+
+def _landed_a_ticket(state: RunState) -> bool:
+    """Whether the run landed at least one ticket (a unit DONE or AWAITING_OPERATOR)."""
+    landed = (Phase.DONE, Phase.AWAITING_OPERATOR)
+    return any(task.phase in landed for task in state.tasks.values())
+
+
+class _ChainStartLog(Journal):
+    """Where the closes before a chain's first run journal: no run dir exists yet
+    (the start pick journals nothing either), so the rows are kept in memory, while
+    each close and skip is printed — the :class:`_ConfirmMarkLog` shape. Once the
+    first child's run is composed, :meth:`replay` appends them, in order, to its
+    journal; a start that composes no run (no child to pick, a close that could
+    not be committed, a refused launch) leaves them printed only."""
+
+    def __init__(self) -> None:  # no run dir: nothing is written
+        self.rows: list[dict[str, object]] = []
+
+    def append(self, kind: str, **fields: Any) -> None:
+        self.rows.append({"kind": kind, **fields})
+
+    def replay(self, journal: Journal) -> None:
+        """Append every kept row to ``journal``, in order, with its fields as kept."""
+        for row in self.rows:
+            fields = dict(row)
+            kind = fields.pop("kind")
+            journal.append(str(kind), **fields)
+
+
+def _child_runs_holding(project: Path) -> tuple[dict[str, tuple[str, str, str]], str | None]:
+    """The child initiatives a recorded run of ``project`` still holds, as ``{slug:
+    (why, run_id, status)}`` with the first such run (oldest first), and what of
+    the runs dir could not be read, or None.
+
+    A run holds its initiative while it is not finished: ``run-live`` when its
+    engine is running or may be (``runs.RUNNING``, ``runs.UNKNOWN``), else
+    ``run-unfinished`` — a paused, stopped, crashed or interrupted run, which a
+    resume drives on (and a chained one's resume closes its child itself). A sweep
+    holds its initiative only while live: it works the child's ledger, writes no
+    ticket or initiative status, and its resume does not go on with the chain. A
+    run whose state cannot be read joins the fault: it may hold any child."""
+    infos, fault = runs.discover_runs(project)
+    faults = [] if fault is None else [fault]
+    held: dict[str, tuple[str, str, str]] = {}
+    for info in infos:
+        if info.status == runs.FINISHED:
+            continue
+        live = info.status in (runs.RUNNING, runs.UNKNOWN)
+        if info.run_type == "sweep" and not live:
+            continue
+        try:
+            state = load_state(info.run_dir)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            faults.append(f"run {info.run_id}: cannot read its state ({type(e).__name__}: {e})")
+            continue
+        if state.initiative and state.initiative not in held:
+            why = "run-live" if live else "run-unfinished"
+            held[state.initiative] = (why, info.run_id, info.status)
+    return held, "; ".join(faults) or None
+
+
+def _child_store(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    slug: str,
+    built: RunState | None,
+) -> ticketstore.StoreTopology | str | None:
+    """The store topology a close of child ``slug`` commits in: the one the run
+    ``built`` recorded when it built ``slug``, else ``slug``'s store classified now
+    (``ticketstore.assess_store``, as a chained launch judges it). None when there
+    is nothing to classify; the refusal message for a store tickets runs refuse."""
+    if built is not None and built.initiative == slug:
+        recorded = runs.live_store_topology(built, project)
+        return ticketstore.StoreTopology.from_dict(recorded) if recorded else None
+    result = ticketstore.assess_store(paths.with_initiative(slug), pol.scm.isolation, chained=True)
+    if isinstance(result, ticketstore.StoreRefusal):
+        return ticketstore.store_topology_conflict(result) or result.code
+    return result
+
+
+def _close_drained_children(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    parent: str,
+    journal: Journal,
+    built: RunState | None = None,
+) -> str | None:
+    """Mark every child of the parent initiative ``parent`` that ``next <parent>``
+    reads drained (``initiativechain.drained``) ``status: done``, so its
+    dependents become ready before the chain picks (``paths`` are the parent's).
+    ``built`` is the finished child run the driver closes after, or None before a
+    chain's first run.
+
+    Each close goes through ``TicketTree.mark_initiative_done`` on a main-checkout
+    tree pinned to ``parent``, journaled into ``journal``; then the file is
+    committed where its store is versioned (the code repo for T1, the store's own
+    repo for T3/T4), through ``ticketstore.StoreCommitter`` and journaled as the
+    engine's store commits are. A drained child is left open, journaled as
+    ``initiative-close-skipped`` (``parent``, ``slug``, ``why``, ``blocking_run``,
+    ``detail``) and printed, when:
+
+    * ``run-live`` / ``run-unfinished``: a recorded run still holds it
+      (:func:`_child_runs_holding`), or ``runs-unread``: the runs dir could not be
+      read whole, so one may;
+    * ``work-left``: it is not the child ``built`` built and its fresh pick
+      (:func:`_fresh_pick`) still finds work — an epic awaiting closure or not yet
+      broken down, which a run of the child does; a finished run vouches for its
+      own child;
+    * ``store-refused``: its store is one tickets runs refuse;
+    * ``uncommitted-edit``: its store is versioned and the child's file holds a
+      change git reports (``verify.path_clean``). The close commits the whole
+      file, so it would carry a person's edit in progress into its bookkeeping
+      commit.
+
+    Returns None, or why the chain cannot go on: a close that could not be
+    committed (``store-commit-failed`` / ``store-commit-foreign-dirt`` journaled).
+    Tree faults raise."""
+    parent_folder = paths.initiative_folder
+    assert parent_folder is not None  # _chain_parent
+    tree = _chain_ticket_tree(project, parent)
+    drained = [c for c in tree.parent_next(parent_folder).initiatives if initiativechain.drained(c)]
+    if not drained:
+        return None
+    held, fault = _child_runs_holding(project)
+    label = built.run_id if built is not None else f"chain {parent}"
+    for child in drained:
+        slug = child.slug
+        skip: tuple[str, str, str] | None = None
+        if fault is not None:
+            skip = ("runs-unread", "", fault)
+        elif slug in held:
+            why, run_id, status = held[slug]
+            skip = (why, run_id, f"run {run_id} is {status}")
+        elif built is None or built.initiative != slug:
+            child_tree = _chain_ticket_tree(
+                project, parent, paths.with_initiative(slug).initiative_folder
+            )
+            decision = _fresh_pick(child_tree.next(), child_tree.status())
+            if not isinstance(decision, tickets_source.Skip):
+                skip = ("work-left", "", "its first pick still finds work")
+        topology = None
+        if skip is None:
+            store = _child_store(project, paths, pol, slug, built)
+            if isinstance(store, str):
+                skip = ("store-refused", "", store)
+            else:
+                topology = store
+                edited = _child_file_edited(paths, parent_folder, slug, topology)
+                if edited is not None:
+                    skip = ("uncommitted-edit", "", edited)
+        if skip is not None:
+            why, run_id, detail = skip
+            journal.append(
+                "initiative-close-skipped",
+                parent=parent,
+                slug=slug,
+                why=why,
+                blocking_run=run_id,
+                detail=detail,
+            )
+            print(f"initiative chain {parent}: leaves {slug} open ({why}: {detail})")
+            continue
+        mark = tree.mark_initiative_done(parent_folder, slug, journal=journal)
+        if mark.outcome != "written":
+            continue
+        print(f"initiative chain {parent}: closed {slug} (drained)")
+        if topology is None or topology.versioning == "none":
+            continue
+        repo = topology.store_repo if topology.store_repo is not None else paths.repo_root
+        committer = ticketstore.StoreCommitter(repo, paths.repo_root)
+        message = f"chore(tickets): {slug} done [bmad-loop {label}]"
+        try:
+            result = committer.commit(slug, [mark.file], message)
+        except ticketstore.StoreCommitError as e:
+            journal.append("store-commit-failed", story_key=slug, error=str(e))
+            return f"closing {slug} could not be committed: {e}"
+        if result.foreign:
+            journal.append("store-commit-foreign-dirt", story_key=slug, count=len(result.foreign))
+            return (
+                f"closing {slug} could not be committed: {len(result.foreign)} path(s) "
+                "hold changes staged by someone else"
+            )
+        journal.append("store-committed", story_key=slug, commit=result.sha)
+    return None
+
+
+def _child_file_edited(
+    paths: bmadconfig.ProjectPaths,
+    parent_folder: Path,
+    slug: str,
+    topology: ticketstore.StoreTopology | None,
+) -> str | None:
+    """Why closing child ``slug`` would commit a change the chain does not own:
+    its file ``<parent_folder>/../<slug>/<slug>.md`` (the one
+    ``TicketTree.mark_initiative_done`` writes) differs from HEAD in the repo
+    its close commits in, or None. An unversioned store commits nothing, and a
+    file outside that repo is one ``StoreCommitter`` does not stage."""
+    if topology is None or topology.versioning == "none":
+        return None
+    repo = topology.store_repo if topology.store_repo is not None else paths.repo_root
+    file = parent_folder.parent / slug / f"{slug}.md"
+    try:
+        rel = file.resolve().relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        return None
+    if verify.path_clean(repo, rel):
+        return None
+    return f"{rel} has uncommitted changes in {repo} — commit or stash them"
+
+
+def _chain_budget(state: RunState) -> int | None:
+    """What is left of the chain's ``--max-stories`` after the child run ``state``:
+    its own cap (the budget left when it launched) less the units it dispatched,
+    counted as the engine counts against the cap (``Engine._dispatched_count``:
+    every task the run recorded). None when the chain has no cap."""
+    if state.max_stories is None:
+        return None
+    return state.max_stories - len(state.tasks)
+
+
+def _drive_initiative_chain(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    finished: runsetup.ComposedRun,
+) -> int:
+    """Build a parent initiative's children one run after another, after the run
+    ``finished`` — launched by ``run`` or driven by a resume of a recorded run
+    (``resume``, ``resolve``, and the TUI gestures that spawn them). ``paths`` are
+    the parent's, as the caller loaded them; ``pol`` is the policy it loaded.
+    Goes on only while the run just built finished (``RunState.finished``: not
+    paused, escalated, stopped or crashed), is a chained child run
+    (``parent_initiative`` set, and not a sweep: a chained child's run-end sweep
+    carries the parent too) and replays nothing (``replay_of`` empty); otherwise
+    returns 0 at once.
+
+    Per switch, in order: a stop asked of the finished run ends the chain
+    (:func:`_chain_stop_requested`); every drained child — the one just built, and
+    any other a stopped chain or a hand left open — is marked done
+    (:func:`_close_drained_children`, which ``run`` also calls before its first
+    pick) so its dependents become ready; the next child
+    is picked (:func:`_chain_pick`); a spent ``--max-stories`` budget
+    (:func:`_chain_budget`) ends the chain as ``max-stories``; picking the child
+    just built again when its run landed no ticket ends it as ``stalled``, since
+    another run would do the same. The finished run's journal gets
+    ``initiative-chain-next`` (``parent``, ``from_child``, ``to_child``, the
+    passed-over slugs and why) or ``initiative-chain-end`` (``parent``, ``end``,
+    the waiting slugs and what each waits on); the next run, once composed,
+    ``initiative-chain`` (``parent``, ``previous_run``, ``previous_child``). One
+    line per switch is printed. A next launch a gate refuses (a dirty tree, the
+    skills, plugin trust, the child's store) leaves ``initiative-chain-next``
+    followed by ``initiative-chain-end`` ``launch-refused`` (the pick, and an
+    ``error`` naming the child and the rc), so the journal shows no switch to a
+    child that never got a run.
+
+    Each next run launches with no ``--run-id`` (it mints its own; ``run``'s names
+    the first child's run alone), the budget left as its ``--max-stories``, and
+    the finished run's spec folder. It runs in this process, so in the control
+    window the TUI opened for the first run, named for that run: once composed,
+    the next run renames that window for itself and claims it
+    (``_claim_ctl_window`` with ``renamed``), so the TUI's attach and stop on the
+    next run reach the window and those on the finished run no longer do. A
+    claim that does not land is printed and journaled ``ctl-window-claim-failed``
+    in the next run, which goes on regardless. The claim's ``launched`` is
+    ``_ctl_minted``, this process's own ``--ctl-launch``, whichever command
+    started the chain: a launched ``run`` sets no ``_ctl_launch``, so a session
+    probe gone unanswered at its switch is reported as a launched resume's is
+    (#925), while an operator's shell still claims nothing in silence.
+
+    Returns 0, 1 for a tree fault or a close that could not be committed, or the
+    refusal rc of the next launch."""
+    while True:
+        state = finished.state
+        parent = state.parent_initiative
+        if parent is None or state.run_type == "sweep" or state.replay_of or not state.finished:
+            if parent is not None and not state.finished:
+                print(
+                    f"initiative chain {parent}: stops at {state.initiative} — run "
+                    f"{state.run_id} did not finish"
+                )
+            return 0
+        if _chain_stop_requested(finished):
+            return _chain_end(finished, parent, "stop-requested")
+        try:
+            owed = _close_drained_children(project, paths, pol, parent, finished.journal, state)
+            if owed is not None:
+                return _chain_end(
+                    finished,
+                    parent,
+                    "store-commit-failed",
+                    error=f"{owed} (see the journal of run {state.run_id}) — commit it, "
+                    "then run again",
+                )
+            pick = _chain_pick(project, paths, parent)
+        except (tickettree.TicketsError, ValueError, bmadconfig.BmadConfigError) as e:
+            return _chain_end(finished, parent, "fault", error=str(e))
+        if pick.child is None:
+            return _chain_end(finished, parent, pick.end or "", pick)
+        budget = _chain_budget(state)
+        if budget is not None and budget <= 0:
+            return _chain_end(finished, parent, "max-stories", pick)
+        child = pick.child.slug
+        if child == state.initiative and not _landed_a_ticket(state):
+            return _chain_end(finished, parent, "stalled", pick)
+        finished.journal.append(
+            "initiative-chain-next",
+            parent=parent,
+            from_child=state.initiative,
+            to_child=child,
+            passed_over=[p.slug for p in pick.passed_over],
+            passed_over_why=[p.why for p in pick.passed_over],
+        )
+        print(f"initiative chain {parent}: {state.initiative} -> {child}{_passed_over_note(pick)}")
+        launched = _launch_run(
+            project,
+            paths.with_initiative(child),
+            pol,
+            argparse.Namespace(run_id=None, epic=None, story=None, max_stories=budget),
+            source=worksource.SOURCE_TICKETS,
+            spec_folder=state.spec_folder,
+            scope=tickets_source.EVERYTHING,
+            parent_initiative=parent,
+        )
+        if isinstance(launched, int):
+            _journal_chain_end(
+                finished.journal,
+                parent,
+                "launch-refused",
+                pick,
+                f"the launch of {child} was refused (exit {launched})",
+            )
+            print(
+                f"initiative chain {parent}: ends (launch-refused): the launch of {child} "
+                "was refused",
+                file=sys.stderr,
+            )
+            return launched
+        launched.journal.append(
+            "initiative-chain",
+            parent=parent,
+            previous_run=state.run_id,
+            previous_child=state.initiative,
+        )
+        # Under the run's state lock, as every claim is: the record's writers
+        # and cleanup's removal of the run serialize on it. The claim's other
+        # precondition, no live engine but this one, holds by construction:
+        # compose_run published this process's pid under the same lock, so no
+        # rival resume can accept the new run.
+        try:
+            with state_lock(launched.run_dir):
+                _claim_ctl_window(
+                    project,
+                    launched.run_dir,
+                    launched.state,
+                    renamed=True,
+                    launched=_ctl_minted,
+                )
+        except OSError as exc:
+            _report_ctl_window_fault(
+                launched.run_dir,
+                f"could not lock run {launched.run_id} to claim this window as its "
+                f"control window: {exc}",
+                launched.state,
+            )
+        print(launched.engine.run().render())
+        finished = launched
 
 
 def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
     from .adapters import registry as adapter_registry
-    from .adapters.profile import get_profile
+    from .adapters.profile import ProfileError, get_profile
 
     cfg = pol.adapter.resolved(role)
     profile = get_profile(cfg.name, project)
+    # The profile `make_adapters` launches: resolved for the role's
+    # permission_mode, refused in the same words when the profile has no mapping.
+    try:
+        profile = profile.for_permission_mode(cfg.permission_mode)
+    except ProfileError as e:
+        raise SystemExit(f"error: adapter {role} session: {e}") from e
     # Keyed on the adapter KIND, not on `hookless`: the registry decoupled the two
     # axes, so an `opencode-http` profile carrying a hook dialect still launches
     # the HTTP adapter (and sends effort), while a hookless profile of another
@@ -2211,12 +5297,17 @@ def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
         # the real sequence (per-session server spawn + API prompt) instead of
         # a fake argv that run would never execute.
         model = f" model={cfg.model}" if cfg.model else ""
-        # effort rides the prompt_async body as `variant` (#643); shown under the
-        # policy's own key so the preview distinguishes the configurations.
+        # effort is sent as the model `variant` (#643: per prompt on 1.x, on the
+        # session's model ref on 2.x); shown under the policy's own key so the
+        # preview distinguishes the configurations. Protocol-neutral: the server
+        # API major is detected from `--version` at spawn, which a preview never
+        # runs.
         effort = f" effort={cfg.effort}" if cfg.effort else ""
+        # launch_args sits between binary and `serve`, as `_serve_argv` builds it.
+        launcher = " ".join((profile.binary, *profile.launch_args))
         return (
-            f"{profile.binary} serve --hostname 127.0.0.1 --port <auto> "
-            f'(cwd=<worktree>) → POST /session → prompt_async "{profile.render_prompt(prompt)}"'
+            f"{launcher} serve --hostname 127.0.0.1 --port <auto> "
+            f'(cwd=<worktree>) → create session → prompt "{profile.render_prompt(prompt)}"'
             f"{model}{effort}"
         )
     extra = cfg.extra_args if cfg.extra_args is not None else profile.bypass_args
@@ -2224,10 +5315,17 @@ def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
         profile.binary,
         *profile.launch_args,
         f'"{profile.render_prompt(prompt)}"',
-        *extra,
+        # Shell-quoted like `build_command` launches them, so a token carrying
+        # spaces or JSON (a sandboxed mode's `--settings {...}`) previews as the
+        # one argument it is; plain flags print unchanged.
+        *(shlex.quote(a) for a in extra),
     ]
     if cfg.model:
         argv += [profile.model_flag, cfg.model]
+    # The launch mints a fresh UUID4 per session (DW-505) and appends it last,
+    # as `build_command` does; a preview has none, so it shows the placeholder.
+    if profile.session_id_flag:
+        argv += [profile.session_id_flag, "<auto>"]
     return " ".join(argv)
 
 
@@ -2253,13 +5351,20 @@ def _dry_run(
     paths: bmadconfig.ProjectPaths,
     pol,
     args: argparse.Namespace,
-    stories_on: bool = False,
+    source: str = worksource.SOURCE_SPRINT,
     spec_folder: str = "",
 ) -> int:
-    if stories_on:
-        return _dry_run_stories(paths, pol, args, spec_folder)
+    """``run --dry-run``: print what ``source``'s queue would dispatch, spawning
+    nothing — one printer per work source in ``_DRY_RUNNERS``."""
+    return _DRY_RUNNERS[source](paths, pol, args, spec_folder)
 
+
+def _dry_run_sprint(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
+) -> int:
+    """Print the sprint-status queue ``run`` would process, one story per block."""
     _warn_preflight_would_abort(paths, pol)
+    _warn_bypass_dropped(pol, paths.project, _sprint_launch_roles(pol))
 
     def render(role: str, prompt: str) -> str:
         return _render_invocation(pol, paths.project, role, prompt)
@@ -2306,6 +5411,7 @@ def _dry_run_stories(
     """Print the linear stories-mode schedule (list order, checkpoints, live
     on-disk state) — no topo waves, one story per line, spawns nothing."""
     _warn_preflight_would_abort(paths, pol, require_stories=True)
+    _warn_bypass_dropped(pol, paths.project, ("dev", "review"))
     folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
     # The real dispatch always uses the project-relative folder (the engine
     # relativizes it); render the identical string here so dry-run and run agree —
@@ -2353,6 +5459,332 @@ def _dry_run_stories(
     return 0
 
 
+def _epic_selector(text: str) -> int | str:
+    """``run --epic``'s argparse type: an int whenever ``int()`` reads one (sprint
+    mode's epic number, unchanged), else the text — an epic id, slug or
+    ``epic-<slug>`` that only tickets mode accepts (``cmd_run`` refuses it with
+    ``ExitCode.USAGE`` elsewhere)."""
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
+class _TicketSelectorError(Exception):
+    """A ``--epic``/``--story`` selector that names no ticket a tickets run can start."""
+
+
+def _ticket_epic_slug(status_view: ticketmodel.StatusView, selector: int | str) -> str:
+    """The epic slug ``selector`` names in the initiative: an epic id (numbers
+    compare as numbers), a slug, or a slug without its ``epic-`` prefix."""
+    text = str(selector).strip()
+    hits: list[str] = []
+    for epic in status_view.epics:
+        by_id = epic.id is not None and (
+            epic.id == text or (text.isdigit() and epic.id.isdigit() and int(epic.id) == int(text))
+        )
+        if by_id or epic.slug in (text, f"epic-{text}"):
+            hits.append(epic.slug)
+    hits = list(dict.fromkeys(hits))
+    if not hits:
+        known = ", ".join(e.slug for e in status_view.epics) or "none"
+        raise _TicketSelectorError(
+            f"--epic {text!r} names no epic of the initiative (epics: {known})"
+        )
+    if len(hits) > 1:
+        raise _TicketSelectorError(f"--epic {text!r} names more than one epic: {', '.join(hits)}")
+    return hits[0]
+
+
+def _ticket_story_ref(
+    tree: tickettree.TicketTreeLike, next_view: ticketmodel.NextView, selector: str, epic: str
+) -> str:
+    """The ref of the one startable ticket ``selector`` names, through ``find``:
+    a ticket ``next`` lists as ready to start or to refine (in ``epic`` when one
+    is selected). ``find``'s no-match and ambiguity faults propagate."""
+    row = tree.find(selector).row
+    ref = row.ref
+    label = tickets_source.row_label(row)
+    if ref is None:
+        raise _TicketSelectorError(
+            f"--story {selector!r} names {label}, which has no ref: a tickets run never "
+            "dispatches a backlog ticket"
+        )
+    if epic and row.epic != epic:
+        raise _TicketSelectorError(f"--story {selector!r} names {ref}, which is not in {epic}")
+    ready = (*next_view.ready_to_refine, *next_view.ready_to_start)
+    if not any(r.ref == ref for r in ready):
+        status = row.status or "no plan"
+        raise _TicketSelectorError(
+            f"--story {selector!r} names {ref}, which is not startable "
+            f"(state {row.state}, plan {status})"
+        )
+    return ref
+
+
+def _selector_ticket_tree(project: Path) -> tickettree.TicketTreeLike:
+    """The tree ``run`` resolves a tickets run's selectors against: the project's
+    installed ``tickets.py``, unpinned — no run exists yet."""
+    return tickettree.TicketTree(project)
+
+
+def _resolve_ticket_scope(
+    tree: tickettree.TicketTreeLike,
+    args: argparse.Namespace,
+    views: tuple[ticketmodel.NextView, ticketmodel.StatusView] | None = None,
+) -> tickets_source.PickScope | int:
+    """A tickets run's ``--epic``/``--story`` selectors resolved against the active
+    initiative (``views`` when the caller already read them), or exit 1 with the
+    reason on stderr: no match, an ambiguous match, a ticket that is not
+    startable, or a tree that cannot be read."""
+    if args.epic is None and not args.story:
+        return tickets_source.EVERYTHING
+    try:
+        next_view, status_view = views if views is not None else (tree.next(), tree.status())
+        epic = _ticket_epic_slug(status_view, args.epic) if args.epic is not None else ""
+        ref = _ticket_story_ref(tree, next_view, args.story, epic) if args.story else ""
+    except _TicketSelectorError as e:
+        print(f"tickets mode: {e}", file=sys.stderr)
+        return 1
+    except tickettree.TicketsError as e:
+        print(f"tickets mode: tickets.py {e.kind}: {e}", file=sys.stderr)
+        return 1
+    return tickets_source.PickScope(epic, ref)
+
+
+def _ticket_badge(row: ticketmodel.TicketRow) -> str:
+    """`` [hitl, refine, plan-checkpoint, done-checkpoint]`` for the flags a tickets
+    run pauses on, or ``""`` when it sets none. Shared spelling for the dry-run
+    schedule and status."""
+    marks = []
+    if row.hitl:
+        marks.append("hitl")
+    if tickets_source.needs_refine(row):
+        marks.append("refine")
+    if row.plan_checkpoint:
+        marks.append("plan-checkpoint")
+    if row.done_checkpoint:
+        marks.append("done-checkpoint")
+    return f" [{', '.join(marks)}]" if marks else ""
+
+
+def _predicted_pause(decision: tickets_source.PickDecision, max_stories: int | None) -> str:
+    """The first pause a fresh tickets run would reach, as one line. A
+    ``--max-stories 1`` run skips the first ticket's done checkpoint, as the
+    engine's skip-if-last does once the cap is spent. A cap of 0 or less stops
+    the run before its first pick, so it predicts no ticket at all."""
+    if max_stories is not None and max_stories <= 0:
+        return f"run would stop: --max-stories {max_stories} dispatches no ticket"
+    if isinstance(decision, tickets_source.Halt):
+        where = f" before {decision.key}" if decision.key else ""
+        return f"run would pause{where} ({decision.stage}): {decision.detail}"
+    if isinstance(decision, tickets_source.Skip):
+        if decision.reason == tickets_source.SKIP_PARKED:
+            return f"run would end: {', '.join(decision.waiting)} wait behind parked tickets"
+        return "run would finish: no ticket is ready to start"
+    row = decision.row
+    if tickets_source.is_plan_halt_leg(row):
+        return (
+            f"run would pause after planning {decision.ref} (plan-checkpoint): "
+            "approve the plan, then resume"
+        )
+    if row.done_checkpoint and max_stories != 1:
+        return f"run would pause after {decision.ref} (story-checkpoint): done checkpoint"
+    return f"no pause predicted before {decision.ref} finishes"
+
+
+def _dry_run_tickets(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
+) -> int:
+    """Print what a tickets run would dispatch from the active initiative
+    (:func:`_dry_run_ticket_block`), or, on a parent initiative, the chain it
+    would build (:func:`_dry_run_chain`). Reads only — it never marks a ticket."""
+    _warn_preflight_would_abort(paths, pol, require_tickets=True)
+    _warn_bypass_dropped(pol, paths.project, ("dev", "review"))
+    parent = _chain_parent(paths)
+    if isinstance(parent, int):
+        return parent
+    if parent is not None:
+        return _dry_run_chain(paths, pol, args, parent)
+    return _dry_run_ticket_block(paths, pol, args, tickettree.TicketTree(paths.project))
+
+
+def _chain_child_tag(child: ticketmodel.ChildInitiative, pick: initiativechain.ChildPick) -> str:
+    """The dry run's tag for one child of a parent initiative, read from the
+    re-judged child (``pick.children``): ``next`` (the child the run builds
+    first), ``drained (the run closes it first)`` (in ``pick.closed``),
+    ``done``/``dropped``, ``waiting``, ``no folder``, or ``ready`` (with why the
+    pick passed it over, when it did)."""
+    if pick.child is not None and child.slug == pick.child.slug:
+        return "next"
+    if child.slug in pick.closed:
+        return "drained (the run closes it first)"
+    if child.status in ("done", "dropped"):
+        return child.status
+    if not child.ready:
+        return "waiting"
+    if child.folder is None:
+        return "no folder"
+    why = next((p.why for p in pick.passed_over if p.slug == child.slug), None)
+    return "ready" if why is None else f"ready, passed over ({why})"
+
+
+def _dry_run_chain(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, parent: str
+) -> int:
+    """Print the chain a run of the parent initiative ``parent`` would build: its
+    children in build order, each with its status, ticket counts, what it waits on
+    and its tag (:func:`_chain_child_tag`); the first child's tickets block
+    (:func:`_dry_run_ticket_block`, read through that child's folder); and the
+    chain's predicted line. When no child can start, the line ``cmd_run`` ends the
+    chain with stands in for the block.
+
+    Never writes: the run's first step, closing drained children
+    (:func:`_close_drained_children`), is not taken but re-judged — the pick is
+    the one the tree would read once each drained child whose fresh pick finds
+    nothing is closed (``_chain_pick(after_close=True)``), and the predicted line
+    names those children. Each child's tag and waits come from that re-judged
+    view (``pick.children``); its status and counts are the tree as it reads
+    now. A close the run skips for a live or unfinished run or
+    a refused store is not predicted. ``--max-stories`` caps the first child's
+    listing; the cap's spend across later children is not predicted."""
+    if args.epic is not None or args.story:
+        print(_chain_selector_refusal(parent), file=sys.stderr)
+        return 1
+    project = paths.project
+    folder = paths.initiative_folder
+    assert folder is not None  # _chain_parent
+    try:
+        view = _chain_ticket_tree(project, parent).parent_next(folder)
+        pick = _chain_pick(project, paths, parent, view, after_close=True)
+        child_paths = None if pick.child is None else paths.with_initiative(pick.child.slug)
+    except tickettree.TicketsError as e:
+        print(f"tickets mode: tickets.py {e.kind}: {e}", file=sys.stderr)
+        return 1
+    except ValueError as e:
+        print(f"tickets mode: initiative chain {parent}: {e}", file=sys.stderr)
+        return 1
+    print(
+        f"tickets mode: parent initiative {parent} — {len(view.initiatives)} children "
+        "in build order:"
+    )
+    for position, child in enumerate(pick.children, 1):
+        status = initiativechain.prerequisite_status(view, child.slug)
+        if child.folder is not None:
+            closed, total = initiativechain.closed_tickets(child), child.counts.get("total", 0)
+            status += f"; {closed} of {total} tickets closed"
+        waits = ", ".join(
+            f"{p} ({initiativechain.prerequisite_status(view, p)})" for p in child.waiting_on
+        )
+        line = f"  {position}. {child.slug}  ({status})  [{_chain_child_tag(child, pick)}]"
+        print(line + (f"  waits on: {waits}" if waits else ""))
+    closes = (
+        f"; the run closes drained {', '.join(pick.closed)} before its first pick"
+        if pick.closed
+        else ""
+    )
+    if pick.child is None or child_paths is None:
+        print(f"\npredicted: {_chain_end_line(parent, pick.end or '', pick)}{closes}")
+        return 0
+    print()
+    tree = _chain_ticket_tree(project, parent, child_paths.initiative_folder)
+    if (rc := _dry_run_ticket_block(child_paths, pol, args, tree)) != 0:
+        return rc
+    print(
+        f"predicted: chain starts with {pick.child.slug}; later children are chosen "
+        f"as each finishes{closes}"
+    )
+    return 0
+
+
+def _dry_run_ticket_block(
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    args: argparse.Namespace,
+    tree: tickettree.TicketTreeLike,
+) -> int:
+    """Print what a tickets run of ``paths``' active initiative would dispatch,
+    read through ``tree``: the startable tickets in build order with their
+    dispatch lines, the pause a fresh run would reach first, the group counts and
+    the tree's problems. Reads the tree with ``tickets.py next``/``status`` only."""
+    try:
+        next_view = tree.next()
+        status_view = tree.status()
+    except tickettree.TicketsError as e:
+        print(f"tickets mode: tickets.py {e.kind}: {e}", file=sys.stderr)
+        return 1
+    scope = _resolve_ticket_scope(tree, args, (next_view, status_view))
+    if isinstance(scope, int):
+        return scope
+    decision = _fresh_pick(next_view, status_view, scope)
+    rank = tickets_source.build_order(status_view)
+    last = len(rank)
+    ready = sorted(
+        (
+            row
+            for row in (*next_view.ready_to_refine, *next_view.ready_to_start)
+            if row.ref is not None and scope.admits(row)
+        ),
+        key=lambda row: rank.get(tickets_source.row_label(row), last),
+    )
+    if args.max_stories is not None:
+        ready = ready[: args.max_stories]
+    print(
+        f"tickets mode: initiative {paths.active_initiative or next_view.folder} — "
+        f"{len(ready)} ready of {len(status_view.tickets)} tickets (gates={pol.gates.mode})"
+    )
+    if (events_dir := _events_dir_preview(paths.project)) is not None:
+        print(f"  env (every session): BMAD_LOOP_EVENTS_DIR={events_dir}")
+    print("build order (initiative epic table, then entry order):")
+    dev_skill = _dev_skill_for_role(pol, paths.project, "dev")
+    for position, row in enumerate(ready, 1):
+        status = row.status or "no plan"
+        print(f"\n  {position}. {row.ref}  ({status}){_ticket_badge(row)}  {row.title}")
+        plan_halt = tickets_source.is_plan_halt_leg(row)
+        dispatch = tickets_source.dispatch_invocation(
+            dev_skill,
+            tickets_source.row_label(row),
+            thorough=tickets_source.wants_thorough(pol.tickets.thorough_review, row.risk),
+            plan_halt=plan_halt,
+        )
+        print(f"    dev:    {_render_invocation(pol, paths.project, 'dev', dispatch)}")
+        env = f"BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY={row.ref}"
+        if plan_halt:
+            env += " BMAD_LOOP_PLAN_HALT=1"
+        print(f"    env:    {env}")
+    print(f"\npredicted: {_predicted_pause(decision, args.max_stories)}")
+    if next_view.backlog is not None:
+        backlog = str(sum(len(next_view.backlog.group(g)) for g in ticketmodel.NEXT_GROUPS))
+    else:
+        backlog = "unreadable" if next_view.backlog_error is not None else "0"
+    counts = " ".join(f"{g}={len(next_view.group(g))}" for g in ticketmodel.NEXT_GROUPS)
+    print(f"groups: {counts} backlog={backlog}")
+    for problem in dict.fromkeys((*next_view.problems, *status_view.problems)):
+        print(f"problem: {problem}")
+    return 0
+
+
+# `run --dry-run`'s queue printer, one entry per work source (held exhaustive over
+# `worksource.SOURCES` by tests/test_worksource.py).
+_DRY_RUNNERS: dict[str, Callable[[bmadconfig.ProjectPaths, Any, argparse.Namespace, str], int]] = {
+    worksource.SOURCE_SPRINT: _dry_run_sprint,
+    worksource.SOURCE_STORIES: _dry_run_stories,
+    worksource.SOURCE_TICKETS: _dry_run_tickets,
+}
+
+
+def _print_sprint_status(state: RunState, project: Path) -> None:
+    """``status``'s queue footer for a sprint-status run: the board's remaining
+    actionable stories, or nothing when the config or board cannot be read."""
+    try:
+        paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
+        ss = sprintstatus.load(paths.sprint_status)
+        remaining = [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+        print(f"sprint backlog remaining: {len(remaining)}")
+    except (bmadconfig.BmadConfigError, sprintstatus.SprintStatusError):
+        pass
+
+
 def _print_stories_status(state: RunState, project: Path) -> None:
     """The stories-mode board for `status`: id, live on-disk state, checkpoint
     markers and title, read from the run's pinned spec folder. Mode-aware
@@ -2373,6 +5805,109 @@ def _print_stories_status(state: RunState, project: Path) -> None:
         )
 
 
+def _owed_post_landing_label(task: StoryTask) -> str:
+    if task.ticket_park_pending:
+        return "blocked"
+    return "done" if task.ticket_done_pending else "built"
+
+
+def _status_ticket_tree(
+    project: Path, pinned_initiative: str | None, *, folder: Path | None = None
+) -> tickettree.TicketTreeLike:
+    """The tree ``status`` reads a tickets run's board from: the project's
+    installed ``tickets.py``, pinned to the run's initiative (a chained run's
+    parent), so a board for another initiative is never shown under this run;
+    ``folder`` is a parent's child folder to read through
+    (:func:`runs.recorded_tree_pin`)."""
+    return tickettree.TicketTree(project, pinned_initiative=pinned_initiative, folder=folder)
+
+
+def _print_tickets_status(state: RunState, project: Path) -> None:
+    """``status``'s queue footer for a tickets run: the initiative's board, read
+    live through ``tickets.py status`` (pinned to the run's initiative) — the
+    state counts, then one block per epic in build order with each ticket's plan
+    status, flags and this run's phase for the tickets it touched. A tree that
+    cannot be read is printed as such, never dropped (``status`` still exits 0).
+    Then every shared-store write still owed after its code landed: a latched
+    mark, or a store-repository commit that failed (the latch is kept until it
+    lands)."""
+    folder = f"  ({state.initiative_folder})" if state.initiative_folder else ""
+    print(f"tickets: initiative {state.initiative or '(none)'}{folder}")
+    if state.ticket_epic_filter or state.story_filter:
+        selected = " ".join(
+            f"{flag} {value}"
+            for flag, value in (
+                ("--epic", state.ticket_epic_filter),
+                ("--story", state.story_filter),
+            )
+            if value
+        )
+        print(f"tickets: this run is limited to {selected}")
+    try:
+        pin, tree_folder = runs.recorded_tree_pin(state, project, project)
+        status_view = _status_ticket_tree(project, pin, folder=tree_folder).status()
+    except bmadconfig.BmadConfigError as e:
+        print(f"tickets board unavailable: {e}")
+    except tickettree.TicketsError as e:
+        print(f"tickets board unavailable: tickets.py {e.kind}: {e}")
+    else:
+        _print_tickets_board(state, status_view)
+    owed = [
+        f"{key} ({_owed_post_landing_label(task)})"
+        for key, task in state.tasks.items()
+        if task.ticket_park_pending or task.ticket_done_pending or task.ticket_commit_pending
+    ]
+    if owed:
+        print(
+            f"tickets: mark or store commit owed after landing: {', '.join(owed)} "
+            "— see the journal's store-commit-* rows; a resume retries"
+        )
+
+
+def _print_tickets_board(state: RunState, status_view: ticketmodel.StatusView) -> None:
+    """The board body: counts by derived state, then the tickets grouped by epic
+    in the initiative's build order (tickets of no listed epic last)."""
+    rows = status_view.tickets
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row.state] = counts.get(row.state, 0) + 1
+    tally = " · ".join(f"{n} {name}" for name, n in counts.items()) or "no tickets"
+    print(f"tickets: {tally}  ({len(rows)} total)")
+    groups: dict[str, list[ticketmodel.TicketRow]] = {e.slug: [] for e in status_view.epics}
+    for row in rows:
+        groups.setdefault(row.epic, []).append(row)
+    # An epic the initiative declares and nobody sliced yet has no folder.
+    epic_status = {
+        e.slug: "not sliced yet" if e.folder is None else e.status for e in status_view.epics
+    }
+    for slug, members in groups.items():
+        done = sum(1 for r in members if r.state in ("done", "dropped"))
+        closure = state.ticket_epic_closures.get(slug)
+        notes = [epic_status.get(slug) or "not in the initiative table"]
+        if closure:
+            notes.append(f"closure {closure}")
+        print(f"  {slug}  {done}/{len(members)} done  ({', '.join(notes)})")
+        for row in members:
+            label = tickets_source.row_label(row)
+            task = state.tasks.get(label)
+            mine = f"  [run: {task.phase}]" if task is not None else ""
+            plan = row.status or "no plan"
+            print(
+                f"    {label:8s} {row.state:12s} {plan:14s}{_ticket_badge(row)}  {row.title}{mine}"
+            )
+    for problem in status_view.problems:
+        print(f"tickets: problem: {problem}")
+
+
+# `status`'s queue footer, one entry per work source (held exhaustive over
+# `worksource.SOURCES` by tests/test_worksource.py).
+_STATUS_PRINTERS: dict[str, Callable[[RunState, Path], None]] = {
+    worksource.SOURCE_SPRINT: _print_sprint_status,
+    worksource.SOURCE_STORIES: _print_stories_status,
+    worksource.SOURCE_TICKETS: _print_tickets_status,
+}
+
+
 def _start_sweep(
     project: Path,
     paths: bmadconfig.ProjectPaths,
@@ -2389,6 +5924,8 @@ def _start_sweep(
     run_id: str | None = None,
     profiles=None,
     on_started: Callable[[], None] | None = None,
+    plugin_grants: GrantSet,
+    parent_initiative: str | None = None,
 ) -> int:
     # The composition (run dir + state + pid + sweep.json + adapters + engine)
     # lives in runsetup; this stays compose -> render. SweepEngine and
@@ -2403,6 +5940,14 @@ def _start_sweep(
     # `on_started` is the auto-sweep parent's latch, likewise absent for
     # `cmd_sweep`; `compose_sweep` fires it at the boundary where this child owns a
     # published, resumable run dir.
+    #
+    # `plugin_grants` is required, with no default, for the reason `_sweep_factory`
+    # requires it: the launch's frozen read (#496/#497). A default would let a new
+    # caller silently refuse every granted plugin — or tempt one to read the store
+    # here, below the launch.
+    #
+    # `parent_initiative` is a chained child's parent, for its run-end sweep
+    # (`_sweep_factory`); `paths` are then the child's. None for every other sweep.
     composed = runsetup.compose_sweep(
         project=project,
         paths=paths,
@@ -2421,14 +5966,38 @@ def _start_sweep(
         trusted_config_digest=_trusted_config_digest(pol, project, profiles=profiles),
         profiles=profiles,
         on_started=on_started,
+        plugin_grants=plugin_grants,
+        parent_initiative=parent_initiative,
     )
+    _warn_bypass_dropped(
+        pol,
+        project,
+        ("triage", "dev", "review"),
+        profiles=profiles,
+        journal=composed.journal,
+    )
+    _warn_hook_relay_unregistered(
+        pol,
+        project,
+        ("triage", "dev", "review"),
+        profiles=profiles,
+        journal=composed.journal,
+    )
+    _warn_prior_sweep_closes(project, composed.run_id, composed.journal)
     print(f"sweep {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
     print(summary.render())
     return ExitCode.FAILURE if summary.crashed and only_ids is not None else ExitCode.OK
 
 
-def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest: str):
+def _sweep_factory(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    trusted_digest: str,
+    *,
+    plugin_grants: GrantSet,
+    parent_initiative: str | None = None,
+):
     """Child-sweep launcher injected into story-run engines. Auto-triggered
     sweeps are unattended: never prompt, never run decision bundles.
 
@@ -2441,7 +6010,23 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
     Required, with no default: an omitted baseline would silently disable the
     refusal, which is the failure mode a security gate can least afford. The
     re-read happens once and is frozen, so the gate validates the bytes the child
-    actually launches from rather than a separate read of the same files."""
+    actually launches from rather than a separate read of the same files.
+
+    ``plugin_grants`` is the launch's plugin grant set (#496/#497), read once by the
+    human-present caller (`_launch_plugin_grants`) and held here, in the closure,
+    beside ``trusted_digest`` — required and keyword-only for the same reason.
+    Unlike policy.toml it is NEVER re-read in ``factory``: the grant store is what
+    vouches for plugin bytes, and a session that can write a plugin dir mid-run can
+    wait for the next trigger; a store read here would let a grant recorded after
+    launch (by anyone) bless code no human launched. The child's registry build
+    judges the plugins on disk against these launch grants, so a plugin swapped
+    after launch raises out of the engine build — before ``started`` — and the
+    parent records ``sweep-auto-not-started``.
+
+    ``parent_initiative`` is the launching run's ``RunState.parent_initiative``:
+    for a chained child it is the parent, ``paths`` are re-rooted on the child
+    (``runs.paths_for_state``), and the child sweep works the child's ledger and
+    records the parent as its pin (``runsetup.compose_sweep``). None otherwise."""
 
     def factory(trigger: str, *, started: Callable[[], None]) -> None:
         pol = policy_mod.load(_policy_path(project))
@@ -2487,12 +6072,34 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
         conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
         if conflict is not None:
             raise RuntimeError(conflict)
+        # a chained child's sweep works the child's store: `paths` are re-rooted on it
+        chained: dict[str, Any] = (
+            {} if parent_initiative is None else {"initiative": paths.active_initiative}
+        )
+        store = ticketstore.store_conflict(
+            project, _sweep_store_source(paths, pol), pol.scm.isolation, **chained
+        )
+        if store is not None:
+            raise RuntimeError(store)
         # Same refusal as the three rc-returning sites, same raise-not-return reason
         # as the two above it. A `GitError` here needs no arm of its own: it is
         # already an exception, and this factory's contract is that any raise before
         # `started` leaves the parent's trigger unspent.
         if (found := verify.git_below_floor(paths.project)) is not None:
             raise RuntimeError(verify.under_floor_git_message(found))
+        # The child's triage sessions dispatch `/bmad-loop-sweep` from this `pol`'s
+        # triage tree; a deleted or partial skill would stall each one at `Unknown
+        # command`. Raise, not return, for the reason above. The tree comes off the
+        # frozen `profiles` read, not `_triage_trees`' fresh one, so the probe asks
+        # about the exact tree the child is about to launch into.
+        triage_tree = profiles["triage"].skill_tree
+        if sweep_problems := install.missing_sweep_skill(project, [triage_tree]):
+            raise RuntimeError("; ".join(p.message for p in sweep_problems))
+        # The launch's grants, from the closure — never `store.load_grants` here.
+        # ABLATION GUARDS: re-reading the store in this factory must fail
+        # test_auto_sweep_holds_the_launch_grants_not_the_store, and deleting the
+        # registry's fatal gate must fail
+        # test_auto_sweep_refuses_a_plugin_swapped_after_launch, in tests/test_cli.py.
         _start_sweep(
             project,
             paths,
@@ -2505,6 +6112,8 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
             min_severity=None,
             profiles=profiles,
             on_started=started,
+            plugin_grants=plugin_grants,
+            parent_initiative=parent_initiative,
         )
 
     return factory
@@ -2562,15 +6171,26 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
+    # a sweep works its ledger's store: the ticket store on v7
+    if (rc := _reject_store_topology(project, pol, _sweep_store_source(paths, pol))) is not None:
+        return rc
 
-    if not verify.worktree_clean(paths.repo_root):
+    if not verify.worktree_clean(paths.repo_root, project=paths.project):
         print("git worktree is not clean — commit or stash first", file=sys.stderr)
         return 1
 
-    if not _require_base_skills(project, pol):
+    # #496/#497: read once and refuse before the run dir exists, as in `cmd_run`.
+    plugin_grants = _launch_plugin_grants(project)
+    if not _require_base_skills(project, pol, paths.repo_root, plugin_grants):
+        return 1
+
+    if not _require_sweep_skill(project, pol):
         return 1
 
     _reconcile_stale(project, paths, pol)
+
+    if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
+        return rc
 
     return _start_sweep(
         project,
@@ -2585,6 +6205,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         min_severity=min_severity,
         trigger="cli",
         run_id=args.run_id,
+        plugin_grants=plugin_grants,
+        # a human-started sweep works the active initiative's ledger, never a child's
+        parent_initiative=None,
     )
 
 
@@ -2717,7 +6340,7 @@ def _sweep_dry_run(
 ) -> int:
     # Before the no-ledger early return below: a broken install is worth saying so
     # about whether or not there is anything to sweep.
-    _warn_preflight_would_abort(paths, pol)
+    _warn_preflight_would_abort(paths, pol, require_sweep=True)
     ledger = paths.deferred_work
     # OBSERVATION arm of the ledger-read contract (DW-146): this listing writes
     # nothing, but it is an OPERATOR SURFACE, so degrading to an empty document
@@ -2836,6 +6459,9 @@ def _sweep_dry_run(
             for dw_id, entry in projected_missing_severity:
                 print(f"  {dw_id:8s} {entry.title}  [pre-migration projection]")
     if selection.selected or projected_selected:
+        # Before the projected-legacy early return below: a sweep launches triage
+        # and then dev + review for its bundles, whichever preview branch prints.
+        _warn_bypass_dropped(pol, paths.project, ("triage", "dev", "review"))
         print("a sweep would triage the open entries in one LLM session, then run bundles")
         if projected_selected and (only_ids is not None or min_severity is not None):
             print(
@@ -2857,8 +6483,12 @@ def _sweep_dry_run(
     return 0
 
 
-def _prepare_resume_locked(project: Path, run_dir: Path):
-    """Publish resume state while the caller holds this run's state lock."""
+def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: bool = False):
+    """Publish resume state while the caller holds this run's state lock.
+
+    ``accept_baseline`` is `resume --accept-baseline` (DW-371). It is written onto
+    ``state.accept_baseline`` on EVERY resume — False included — so a plain, TUI,
+    or `resolve` resume clears a latch a paused `--accept-baseline` resume left."""
     # An id that aliases a control session (`ctl` / `ctl-<16hex>` —
     # runs.run_id_aliases_control_session; NOT the mint's broader reservation,
     # since a historical `ctl-foo` run has a genuine agent session and resumes
@@ -2884,11 +6514,19 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
             file=sys.stderr,
         )
         return 1
-    paths = bmadconfig.load_paths(project)
     state = load_state(run_dir)
     if state.finished:
         print(f"run {run_dir.name} already finished", file=sys.stderr)
         return 1
+    # A story run resumes only from a source this version can drive: one a newer
+    # bmad-loop persisted is refused rather than rebuilt as a sprint run, and a
+    # registered source whose runs land later is refused the way `run` refuses it.
+    # Ahead of every side effect below. A sweep's `source` is its launch default and
+    # never selects its engine.
+    if (refusal := _unresumable_source(state)) is not None:
+        print(f"cannot resume {run_dir.name}: {refusal}", file=sys.stderr)
+        return 1
+    paths = bmadconfig.load_paths(project, want_tickets=runs.resolves_as_tickets(state))
     sweep_options = None
     if state.run_type == "sweep":
         try:
@@ -2905,6 +6543,21 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
         except runsetup.SweepOptionsError as exc:
             print(f"cannot resume {run_dir.name}: {exc}", file=sys.stderr)
             return 1
+        # v7: a sweep resumes only on the initiative it started on (a chained
+        # child's sweep: while its parent is active), judged on the loaded paths
+        # ahead of the re-root below, so that refusal names the sweep's pin. Ahead
+        # of every side effect below; `compose_resume` judges the re-rooted paths
+        # as a backstop.
+        if (conflict := runsetup.sweep_initiative_conflict(state, paths)) is not None:
+            print(f"cannot resume {run_dir.name}: {conflict}", file=sys.stderr)
+            return 1
+    # A chained run's engine works on its child initiative's paths; the gates below
+    # judge the loaded (parent's) paths as `run` does, since the tickets preflight
+    # classifies a parent and its children itself — except the store refusal, which
+    # judges the child's own store (`_store_initiative`), as its launch did. Ahead of
+    # every side effect: a config that no longer names the parent refuses here
+    # (BmadConfigError).
+    run_paths = runs.paths_for_state(paths, state)
     pol = policy_mod.load(_policy_path(project))
     # Resume re-reads config.yaml and policy.toml from disk, so it is a second
     # entrypoint into the same engine and gets the same refusal — a run started
@@ -2915,9 +6568,51 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
         return rc
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
-    if not _require_base_skills(project, pol, require_stories=state.source == "stories"):
+    # A sweep persists no source; on v7 its store is judged as a tickets run's,
+    # as at launch (`_sweep_store_source`), against the topology it recorded.
+    store_source = runs.judged_store_source(state, _sweep_store_source(paths, pol))
+    if (
+        rc := _reject_store_topology(
+            project,
+            pol,
+            store_source,
+            recorded=runs.live_store_topology(state, project) or None,
+            initiative=_store_initiative(state),
+        )
+    ) is not None:
+        return rc
+    # A tickets run re-reads the tree it dispatches from, so the tree's own
+    # refusals (script, layout, store, capability) apply on resume as at launch.
+    tickets = state.run_type != "sweep" and state.source == worksource.SOURCE_TICKETS
+    if tickets and (rc := _check_tickets_preflight(paths, pol)) is not None:
+        return rc
+    plugin_grants = _launch_plugin_grants(project)  # read ONCE; see the trust gate below
+    if not _require_base_skills(
+        project,
+        pol,
+        paths.repo_root,
+        plugin_grants,
+        require_stories=worksource.resumed_traits_for(state.source).stories_primitive,
+        require_tickets=tickets,
+        review_owed=any(t.salvage_refile_pending for t in state.tasks.values()),
+    ):
         return 1
-    journal = Journal(run_dir)
+    # A resumed sweep re-dispatches `/bmad-loop-sweep`; a story run never does, so
+    # only the sweep arm is gated. Same placement constraint as the gate above:
+    # ahead of every journal/pin/stop-request side effect below.
+    if state.run_type == "sweep" and not _require_sweep_skill(project, pol):
+        return 1
+    # #496/#497: the resume's plugin grants, read ONCE and refused against here —
+    # the last gate ahead of `Journal(run_dir)` and every pin/pause/pid/state side
+    # effect below, because `compose_resume` has no unwind: a plugin the registry
+    # build would refuse must not leave a `run-resume` row, a re-stamped pin or a
+    # cleared pause behind for a resume that never armed. The engine build still
+    # re-judges (the gate); this only moves the refusal ahead of the side effects.
+    # ABLATION GUARD: moving this below `Journal(run_dir)` must fail
+    # test_resume_refuses_a_mismatched_plugin_before_any_side_effect.
+    if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
+        return rc
+    journal = Journal(run_dir, pin=state)
     # Read the outgoing weight BEFORE the re-stamp below replaces it: the
     # session-end entries this run already wrote were weighted at it, so without
     # recording it here they stop being reconstructible from the (now newer)
@@ -3001,7 +6696,22 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # so the fallback fires only for those runs, and the re-stamp below migrates
     # them on this very resume. Empty either way keeps its meaning: no prior pin,
     # no warning.
-    pinned = runs.read_trusted_config_digest(project, run_dir.name)
+    #
+    # A `None` that is a read FAULT rather than absence (DW-467) takes the same
+    # fallback — the decision is unchanged — but not silently: the fallback is the
+    # session-writable copy, so a planted FIFO or garbage bytes at the out-of-tree
+    # path would otherwise quietly hand the comparison back to the tree it polices.
+    # Printed ahead of the fallback's own verdict, so an operator who sees no
+    # config-change warning below knows what that silence was measured against.
+    pinned, digest_fault = runs.read_trusted_config_digest(project, run_dir.name)
+    if digest_fault is not None:
+        print(
+            f"warning: run {run_dir.name}: the trusted host-exec config baseline could"
+            f" not be read ({digest_fault}); falling back to the copy in state.json,"
+            " which the driven session can rewrite — a changed-config warning may be"
+            " missing below",
+            file=sys.stderr,
+        )
     if pinned is None:
         pinned = state.trusted_config_digest
     security_config_changed = bool(pinned) and new_digest != pinned
@@ -3057,8 +6767,9 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # Discharge an OWED record FIRST — before the `run-resume` row, before the pin
     # re-baseline below, and before `state.repo_root` is overwritten. The twin of
     # `runs.restamp_code_root`'s own discharge, same shape and same field names, and
-    # the same at-least-once bargain: this is the FIRST fallible write of the resume,
-    # so an append that raises here leaves journal, pin and run state intact — no
+    # the same at-least-once bargain: this is the first fallible write of the resume
+    # past the identity reconcile above (whose rows are informational and re-recorded
+    # on a retry), so an append that raises here leaves pin and run state intact — no
     # resume row to duplicate, no re-baselined pin to silence the host-exec advisory
     # on the retry, and a root and marker still exactly as the retry needs them.
     # First also puts it in
@@ -3070,6 +6781,20 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # residual is the twin's: a `save_state` that fails after a successful append
     # costs a duplicate — but TRUE — record on the retry, and a duplicate is
     # recoverable from the journal where a missing or a false record is not.
+    # DW-446: reconcile the mint-time root identities — past every refusal above,
+    # and ahead of this resume's FIRST journal row, because `journal` is pinned to
+    # this `state` and reads `run_dir_identity` live per append: reconciled any
+    # later, the rows above it would be written through a missing record (one
+    # `journal-unpinned` notice) or a renumbered device. A state.json written before
+    # the records existed records them (one `root-identity-recorded` per record); a
+    # record whose root still lstats as a real directory with the same inode but a
+    # renumbered `st_dev` (a reboot or remount) is re-bound (one
+    # `root-identity-rebound`). An inode mismatch is never re-recorded — its pinned
+    # writes keep refusing. Persisted by the `save_state` below, so a resume that
+    # fails after this point can leave one informational `root-identity-*` row whose
+    # record lands only with a later `save_state`; the retry records it again. That
+    # is at-least-once, the same bargain the `run-resume` row already makes.
+    runs.reconcile_root_identities(state, run_dir, journal, project)
     if state.code_root_restamp_pending:
         journal.append(
             "rearm-code-root-restamped",
@@ -3130,7 +6855,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # ...and the in-tree secondary is re-stamped in the same breath, for the same
     # reason it is written at launch: the state root is keyed by the project's
     # RESOLVED PATH (`runs.project_tag`), so moving or renaming the project — a
-    # documented operation, FEATURES.md states the GC half of it — keys the run
+    # documented operation, docs/reference/run-state.md states the GC half of it — keys the run
     # somewhere new and the file above becomes unreachable. Leaving only that copy
     # made a move silently retire the pin, and the advisory this whole guard exists
     # to raise never fired again. Writing both keeps the warning alive across a move
@@ -3152,6 +6877,22 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # the run owing a record it has already written, or clear the marker for a record
     # that never landed.
     state.code_root_restamp_pending = False
+    # The one-resume `--accept-baseline` latch (DW-371): overwritten, never merged,
+    # and only here — past every refusal above — on the write that persists this
+    # resume, so a refused resume cannot arm it and a plain one always clears it.
+    state.accept_baseline = accept_baseline
+    # A tickets run paused for a refined ticket's story-file approval: this resume
+    # is that approval, recorded while the pause still names the ticket and past
+    # every refusal above, so a refused resume approves nothing.
+    approved = tickets_source.approve_paused_story_file(state)
+    if approved is not None:
+        journal.append("ticket-story-approved", ref=approved)
+    # Likewise a tickets run paused for an epic's closure: this resume answers that
+    # pause, so the engine acknowledges the closure instead of pausing for it again.
+    tickets_source.resume_epic_closure(state)
+    # What clear_pause() is about to clear, so _resume_paused_run can put it back
+    # if the resume fails before its engine starts (see _restore_aborted_resume).
+    pause = state.pause_snapshot()
     state.clear_pause()
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever
@@ -3165,11 +6906,237 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # SweepEngine and _make_adapters are handed in from this module's namespace so
     # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
     # still applies.
-    return paths, state, pol, journal, new_digest, profiles, sweep_options
+    return (
+        run_paths,
+        state,
+        pol,
+        journal,
+        new_digest,
+        profiles,
+        sweep_options,
+        plugin_grants,
+        pause,
+        paths,
+    )
 
 
-def _resume_paused_run(project: Path, run_dir: Path) -> int:
-    """Resume a paused/interrupted run without holding its lock across execution."""
+class _CtlLaunch:
+    """A TUI-launched resume/resolve in flight (`--ctl-launch`, see
+    `_drive_ctl_launch`): whether it has accepted its run yet, and the lines it
+    wrote to stderr before that — the refusal, when it exits before accepting.
+    Every line, not the last: a gate prints its `FAIL:` lines and then a generic
+    hint. A pass-through for every other stream attribute."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+        self.accepted = False
+        self.lines: list[str] = []
+
+    def write(self, text: str) -> int:
+        if not self.accepted:
+            # ponytail: capped so a chatty refusal cannot bloat the journal entry;
+            # one huge line is bounded by `_CTL_REFUSAL_MAX_CHARS` instead.
+            self.lines.extend(line.strip() for line in text.splitlines() if line.strip())
+            del self.lines[:-20]
+        return self._stream.write(text)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+# ponytail: process-wide, which is what the flag is — one command per process.
+_ctl_launch: _CtlLaunch | None = None
+
+# Whether this process was started with the hidden `--ctl-launch`: the launcher's
+# word that it minted the window this process runs in (`tui.launch.start_detached`,
+# for every kind it starts, a `run` included). Set by `main` from the parsed flag
+# for the command's lifetime. Unlike `_ctl_launch`, which only a resume/resolve
+# sets and which tracks its acceptance, it reaches every command, so a chain's
+# window claims read it whichever command drives the chain.
+_ctl_minted = False
+
+# The most of a refused launch's reason one journal entry keeps: the line trim
+# bounds the count, not a line (a validator echoing one huge policy scalar), and
+# an exception's message skips it.
+_CTL_REFUSAL_MAX_CHARS = 4000
+
+
+def _claim_ctl_window(
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+    *,
+    renamed: bool = False,
+    launched: bool | None = None,
+) -> None:
+    """Publish the control window this process runs in as the run's, once this
+    process has accepted the run (`tui.launch.claim_ctl_window`). The caller holds
+    the run's state lock and has just found no live engine under it (#920).
+
+    ``renamed`` claims it for the next run of a parent-initiative chain
+    (:func:`_drive_initiative_chain`), whose window still carries the name of the
+    run before: the window is renamed for this run first
+    (`tui.launch.claim_renamed_ctl_window`). That leaves the launch's accepted
+    flag alone: it is the launched command's acceptance of its own run, settled
+    before any chain switch.
+
+    ``launched`` is the claim's word that the TUI minted this window
+    (`tui.launch.claim_ctl_window`). The chain passes ``_ctl_minted``, the parsed
+    ``--ctl-launch``, since a launched ``run`` sets no ``_ctl_launch``; None reads
+    it off ``_ctl_launch``, which a resume/resolve sets exactly when it was given
+    the flag (:func:`_drive_ctl_launch`).
+
+    A claim that did not land is journaled as well as printed: a TUI-launched
+    resume prints into a detached window nobody is looking at, while the
+    journal is the run's durable record, written through a journal pinned to the
+    run's ``state``.
+
+    Never raises: the caller has already published this process's pid and the
+    resumed state, so a fault here (a backend that cannot be selected, a record
+    or journal write that fails) must not abort a resume past that point. It is
+    said instead."""
+    from .adapters.multiplexer import MultiplexerError
+    from .tui import launch  # import-safe: launch.py has no textual imports
+
+    ctl = _ctl_launch
+    if ctl is not None and not renamed:
+        ctl.accepted = True
+    if launched is None:
+        launched = ctl is not None
+    claim = launch.claim_renamed_ctl_window if renamed else launch.claim_ctl_window
+    try:
+        warning = claim(project, run_dir.name, launched=launched)
+    except (MultiplexerError, OSError) as exc:
+        warning = f"could not record this window as run {run_dir.name}'s control window: {exc}"
+    if warning is not None:
+        _report_ctl_window_fault(run_dir, warning, state)
+
+
+def _report_ctl_window_fault(run_dir: Path, warning: str, state: RunState) -> None:
+    """Print a control-window record fault and journal it as
+    `ctl-window-claim-failed`. Never raises."""
+    print(f"warning: {warning}", file=sys.stderr)
+    try:
+        Journal(run_dir, pin=state).append("ctl-window-claim-failed", error=warning)
+    except OSError as exc:
+        print(f"warning: could not journal it: {exc}", file=sys.stderr)
+
+
+def _drive_ctl_launch(args: argparse.Namespace) -> int:
+    """Run a TUI-launched resume/resolve, and journal it when it exits non-zero
+    before accepting the run (#925). Such a child refuses into a detached window
+    nobody is watching, and leaves the record with an older window, so without
+    this its refusal is on no durable record. Acceptance is `_claim_ctl_window`,
+    the point every drive path passes under the run's state lock; a child that
+    accepted and then failed is the run's own story, already journaled."""
+    global _ctl_launch
+    ctl = _ctl_launch = _CtlLaunch(sys.stderr)
+    rc: int = ExitCode.FAILURE
+    try:
+        with contextlib.redirect_stderr(ctl):
+            rc = args.func(args)
+    except BaseException as e:
+        ctl.lines.append(str(e) or type(e).__name__)
+        raise
+    finally:
+        _ctl_launch = None
+        if rc != ExitCode.OK and not ctl.accepted:
+            _journal_unaccepted_launch(args, "; ".join(ctl.lines) or f"exit {rc}")
+    return rc
+
+
+def _journal_unaccepted_launch(args: argparse.Namespace, reason: str) -> None:
+    """Journal why a TUI-launched child did not drive its run, under the run's
+    state lock and only into a run that still exists (cleanup removes one under
+    the same hold). Best-effort, and loudly so: the child is already exiting.
+
+    Re-resolved through `resolve_run_dir`, which never recomposes a ref that
+    could escape the runs dir (a command can refuse its ref before normalizing
+    `args.run_id`), and kept only on an exact-name hit: the command normalized
+    `args.run_id` to the run it resolved, and a removed run's id would otherwise
+    fall back to a suffix match and journal into another run.
+
+    The resolve sits inside the guard too: this runs in `_drive_ctl_launch`'s
+    `finally`, so a raise from it would replace the child's own exception or
+    return code. A `RunRefError` is said like any other fault, never read as
+    absence: an incomplete run listing raises one for a run that is still
+    there, and a silent return would strand the refusal again. A partial match is
+    said too: it is not journaled into, so the refusal is on no record. So is a run
+    cleanup removed between the resolve and the lock.
+
+    The reason is cut to `_CTL_REFUSAL_MAX_CHARS`, so a huge refusal cannot bloat
+    every failed resume's journal row."""
+    # A finished-run reverify switches this process to the replay run it
+    # minted (`_resolve_reverify_finished`); a refusal after that is the replay
+    # run's, not the finished run's.
+    run_id = getattr(args, "ctl_launch_run_id", None) or args.run_id
+    if len(reason) > _CTL_REFUSAL_MAX_CHARS:
+        cut = len(reason) - _CTL_REFUSAL_MAX_CHARS
+        reason = f"{reason[:_CTL_REFUSAL_MAX_CHARS]}… [{cut} more chars cut]"
+    try:
+        run_dir = runs.resolve_run_dir(_project(args), run_id)
+        if run_dir.name != run_id:
+            # a partial match, not the run this command resolved
+            print(
+                f"warning: could not journal this refused launch: run {run_id!r} "
+                f"is gone; its id only matches run {run_dir.name!r}",
+                file=sys.stderr,
+            )
+            return
+        with state_lock(run_dir):
+            if not runs.is_run(run_dir):
+                # cleanup removed it after the resolve: said, never recreated
+                print(
+                    f"warning: could not journal this refused launch: run {run_id!r} "
+                    "was removed before its journal could be written",
+                    file=sys.stderr,
+                )
+                return
+            # Read under the same hold, for the pin. A state that cannot be read
+            # may BE the refusal (resume and resolve both load it first), so it
+            # never costs the row: the append goes confined but unpinned, and
+            # the row names the read fault.
+            state: RunState | None = None
+            unread = ""
+            try:
+                state = load_state(run_dir)
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                unread = f" (its state.json could not be read for the journal pin: {e})"
+            Journal(run_dir, pin=state).append(
+                "ctl-window-claim-failed",
+                error=f"a TUI-launched {args.command} exited before driving the run: "
+                f"{reason} — the run's control-window record still names the window "
+                f"of the launch before it{unread}",
+            )
+    except Exception as e:
+        print(f"warning: could not journal this refused launch: {e}", file=sys.stderr)
+
+
+def _unresumable_source(state: RunState) -> str | None:
+    """Why this version cannot drive a story run's persisted source, or None: one a
+    newer bmad-loop persisted, or a registered source whose runs land later. A
+    sweep's `source` is its launch default and never selects its engine."""
+    if state.run_type == "sweep":
+        return None
+    try:
+        if not worksource.resumable_traits_for(state.source).runnable:
+            worksource.refuse_unrunnable(state.source)
+    except (worksource.UnknownSource, worksource.SourceNotRunnable) as e:
+        return str(e)
+    return None
+
+
+def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = False) -> int:
+    """Resume a paused/interrupted run without holding its lock across execution.
+
+    Also resolve's re-arm path, which never passes ``accept_baseline`` — its re-arm
+    (`runs.rearm_escalation`) already advances the baseline to HEAD. Every path
+    that drives a recorded run's engine comes through here, so a chained child
+    resumed to finished continues its parent's chain here
+    (:func:`_drive_initiative_chain`)."""
     with state_lock(run_dir):
         # Cleanup removes the run under this same hold. A resume that resolved the
         # path before cleanup won must not let Journal/save_state recreate it after
@@ -3186,36 +7153,119 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
                 file=sys.stderr,
             )
             return 1
-        prepared = _prepare_resume_locked(project, run_dir)
-    if isinstance(prepared, int):
-        return prepared
-    paths, state, pol, journal, new_digest, profiles, sweep_options = prepared
+        prepared = _prepare_resume_locked(project, run_dir, accept_baseline=accept_baseline)
+        if isinstance(prepared, int):
+            return prepared
+        (
+            paths,
+            state,
+            pol,
+            journal,
+            new_digest,
+            profiles,
+            sweep_options,
+            plugin_grants,
+            pause,
+            loaded_paths,
+        ) = prepared
+        _claim_ctl_window(project, run_dir, state)
 
     # Adapter construction and the engine lifetime are deliberately outside the
     # state hold.  The pid/state publication above makes a rival control command
     # observe this process as live while these unbounded operations proceed.
-    composed = runsetup.compose_resume(
-        project=project,
-        paths=paths,
-        run_dir=run_dir,
-        state=state,
-        policy=pol,
-        journal=journal,
-        sweep_factory=_sweep_factory(project, paths, new_digest),
-        make_adapters=_make_adapters,
-        engine_cls=Engine,
-        stories_engine_cls=StoriesEngine,
-        sweep_engine_cls=SweepEngine,
-        profiles=profiles,
-        sweep_options=sweep_options,
-    )
+    try:
+        composed = runsetup.compose_resume(
+            project=project,
+            paths=paths,
+            run_dir=run_dir,
+            state=state,
+            policy=pol,
+            journal=journal,
+            # a chained child's run-end sweep works the child's ledger (`paths` are
+            # re-rooted on it) and pins the parent
+            sweep_factory=_sweep_factory(
+                project,
+                paths,
+                new_digest,
+                plugin_grants=plugin_grants,
+                parent_initiative=state.parent_initiative,
+            ),
+            make_adapters=_make_adapters,
+            engine_cls=Engine,
+            stories_engine_cls=StoriesEngine,
+            tickets_engine_cls=TicketsEngine,
+            sweep_engine_cls=SweepEngine,
+            profiles=profiles,
+            sweep_options=sweep_options,
+            plugin_grants=plugin_grants,
+        )
+        resumed_roles = (
+            ("triage", "dev", "review")
+            if state.run_type == "sweep"
+            else worksource.launch_roles(
+                worksource.resumed_traits_for(state.source).name, pol.gates.retrospective
+            )
+        )
+        _warn_bypass_dropped(
+            pol, project, resumed_roles, profiles=profiles, journal=composed.journal
+        )
+        _warn_hook_relay_unregistered(
+            pol,
+            project,
+            resumed_roles,
+            profiles=profiles,
+            journal=composed.journal,
+            after_silent_pause=(pause.paused_reason or "").startswith(HOOK_CHANNEL_SILENT_PREFIX),
+        )
+    except BaseException as e:
+        # make_adapters raises SystemExit for every refusal; anything escaping
+        # before the engine starts must not strand the pause cleared above. A
+        # restore that fails is reported, never raised: the resume's own failure
+        # is the one the operator has to act on.
+        try:
+            _restore_aborted_resume(run_dir, journal, pause, e)
+        except Exception as restore_error:
+            print(
+                f"warning: run {run_dir.name}: could not restore the pause this resume"
+                f" cleared ({type(restore_error).__name__}); the run is left unpaused",
+                file=sys.stderr,
+            )
+        raise
     summary = composed.engine.run()
     print(summary.render())
-    return (
-        ExitCode.FAILURE
-        if summary.crashed and sweep_options is not None and sweep_options.only_ids is not None
-        else ExitCode.OK
-    )
+    if summary.crashed and sweep_options is not None and sweep_options.only_ids is not None:
+        return ExitCode.FAILURE
+    # A chained child resumed to finished goes on to its parent's next child, as
+    # after `run`; `loaded_paths` are the parent's, which `paths` were re-rooted from.
+    return _drive_initiative_chain(project, loaded_paths, pol, composed)
+
+
+def _restore_aborted_resume(
+    run_dir: Path, journal: Journal, pause: PauseSnapshot, error: BaseException
+) -> None:
+    """Put back the pause a resume cleared when it fails before its engine starts.
+
+    `_prepare_resume_locked` clears the pause fields and saves before the adapters
+    are built, and only the engine writes them back (on its `RunPaused`). An
+    adapter build that raises — `make_adapters` turns every refusal into a
+    `SystemExit` — therefore stranded a run paused at an escalation with no
+    pause stage and its story still escalated (#958). Restoring exactly the fields `clear_pause()` cleared returns the run to the
+    pause it was in.
+
+    Only when nothing moved in between: the run still exists, has not finished,
+    and carries no pause of its own (a concurrent re-pause wins). Through
+    resolve's re-arm the escalated task is already PENDING, so the restored pause
+    plus a plain `resume` re-drives it. The journal row names the exception class
+    only: its text can carry profile or adapter content (see `run-resume`)."""
+    with state_lock(run_dir):
+        if not runs.is_run(run_dir):
+            return
+        fresh = load_state(run_dir)
+        if fresh.finished or fresh.paused_reason is not None:
+            return
+        fresh.restore_pause(pause)
+        save_state(run_dir, fresh)
+        journal.append("resume-aborted", error=type(error).__name__)
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
@@ -3260,7 +7310,34 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
         print(refusal, file=sys.stderr)
         return ExitCode.FAILURE
-    return _resume_paused_run(project, run_dir)
+    # A story still escalated is skipped and re-paused on (DW-386), and a resume
+    # that ends early leaves it escalated behind a run that reads as not paused
+    # (#958) — so name it, and the resolve that clears it. A warning, never a
+    # refusal, and HERE rather than in `_resume_paused_run` for the reason the
+    # gates above give: resolve's re-arm reaches that helper with the story already
+    # re-armed. An unreadable state skips the warning; the resume below reports it.
+    try:
+        skipped = resume_skipped_escalation_keys(load_state(run_dir))
+    except (OSError, KeyError, ValueError):
+        skipped = []
+    for key in skipped:
+        print(
+            f"warning: run {args.run_id}: story '{key}' is still escalated — resume skips "
+            f"it; resolve it with bmad-loop resolve {args.run_id}",
+            file=sys.stderr,
+        )
+    # No `verify.worktree_clean` gate here, unlike cmd_run / cmd_sweep — on purpose
+    # (DW-360). Those gates prove a run LAUNCHES from a clean tree; resume continues
+    # a run that already passed one. A dirty tree at resume is often the
+    # sanctioned recovery itself: when a CRITICAL resolution's `redrive_base_ref`
+    # is `HEAD`, the operator re-applies the corrected spec in the main checkout
+    # UNCOMMITTED, because the re-drive reads that working tree as-is (see the
+    # bmad-loop-resolve skill). A clean-tree gate would refuse exactly that resume.
+    # Anything else the operator changed while the run sat paused is theirs to
+    # commit or stash first.
+    return _resume_paused_run(
+        project, run_dir, accept_baseline=bool(getattr(args, "accept_baseline", False))
+    )
 
 
 def _confirm(question: str) -> bool:
@@ -3360,10 +7437,21 @@ def _resolve_restore_patch(
     # bmad-build-auto saves the patch under implementation_artifacts, and artifact
     # dirs configured OUTSIDE the project tree are a supported layout — a bare
     # is_relative_to(project) check would reject every legitimate restore there.
+    tickets = state.source == worksource.SOURCE_TICKETS
     try:
-        paths = bmadconfig.load_paths(project)
+        paths = runs.paths_for_state(bmadconfig.load_paths(project, want_tickets=tickets), state)
     except bmadconfig.BmadConfigError as e:
         return None, f"cannot validate the restore patch path against the project config: {e}"
+    # tickets mode: an earlier re-arm moved the plan's intent-gap patch to the run dir
+    # (`runs.evacuated_patch_path`), so a later cycle naming the original latches the
+    # moved copy, and that copy is trusted by its own location.
+    evacuated = runs.evacuated_patch_path(run_dir, story_key).resolve()
+    if tickets and not patch.exists() and task.spec_file:
+        plan = runs.live_spec_path(task, state, project)
+        if patch == runs.plan_patch_path(plan).resolve() and evacuated.is_file():
+            patch = evacuated
+    if tickets and patch == evacuated and patch.is_file():
+        return str(patch), None
     if not patch.is_file() or not verify.spec_within_roots(patch, paths):
         return None, (
             f"restore patch {raw!r} is not a file under the project or its "
@@ -3428,9 +7516,168 @@ def _echo_rearm_notices(notices: tuple[runs.RearmNotice, ...]) -> None:
         print(f"{notice.severity}: {notice.message}{tail}", file=sys.stderr)
 
 
-def cmd_resolve(args: argparse.Namespace) -> int:
-    from .model import PAUSE_ESCALATION, Phase
+def _hand_back_ctl_window(
+    project: Path, run_dir: Path, state: RunState, predecessor: str | None, claimed: str | None
+) -> None:
+    """This window is about to exit without a usable session, so the window the
+    record named before its claim is the run's again (#937)."""
+    from .tui import launch  # import-safe: launch.py has no textual imports
 
+    if claimed is not None and claimed != predecessor:
+        with state_lock(run_dir):
+            fault = launch.restore_ctl_window(project, run_dir.name, predecessor, claimed)
+            if fault is not None:
+                _report_ctl_window_fault(run_dir, fault, state)
+
+
+def _bypass_permission_policy(pol):
+    """``pol`` with every stage's ``adapter.permission_mode`` set back to bypass."""
+    from dataclasses import replace
+
+    adapter = pol.adapter
+    return replace(
+        pol,
+        adapter=replace(
+            adapter,
+            permission_mode="bypass",
+            **{
+                stage: replace(getattr(adapter, stage), permission_mode=None)
+                for stage in policy_mod.STAGES
+            },
+        ),
+    )
+
+
+def _resolve_config_refusal(
+    project: Path, pol: policy_mod.Policy, state: RunState, paths: bmadconfig.ProjectPaths
+) -> int | None:
+    """The configuration refusals a resolve takes on ``paths`` before it arms
+    anything: the isolation conflict, then the ticket-store topology. Returns the rc
+    to abort with, or None to proceed. ``cmd_resolve`` takes it twice, before the
+    interactive session and again after the confirm on the re-read config."""
+    if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
+    if (
+        rc := _reject_store_topology(
+            project,
+            pol,
+            runs.judged_store_source(state, _sweep_store_source(paths, pol)),
+            recorded=runs.live_store_topology(state, project) or None,
+            initiative=_store_initiative(state),
+        )
+    ) is not None:
+        return rc
+    return None
+
+
+def _resolve_pre_session_gates(
+    args: argparse.Namespace, project: Path, run_dir: Path, state: RunState
+) -> int | None:
+    """The entry refusals every resuming resolve takes before any side effect.
+    Returns the rc ``cmd_resolve`` must return, or None to continue. Shared with
+    the epic-close branch, so no session is spent on a resume that would refuse."""
+    # DW-204/DW-229: the same probe `cmd_resume` takes, taken here at resolve's own
+    # entry. `_resume_paused_run` cannot carry this gate for resolve — by the time
+    # this flow reaches it the interactive session has run and `runs.rearm_escalation`
+    # has spent the escalation, so a refusal there is a refusal after the side
+    # effects. LAST in this gate block, not first: the refusals above answer "this
+    # gesture does not apply to this run at all" (alias, live engine, not paused at an
+    # escalation, no escalated story) and must not be displaced by a ledger-repair
+    # steer that would not help. Mirrors `cmd_resume`, where the live-engine refusal
+    # also wins outright and the ledger gate follows it.
+    if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
+        print(refusal, file=sys.stderr)
+        return ExitCode.FAILURE
+
+    # v7: a sweep resolves only on the initiative it started on — the resume's
+    # refusal (`_prepare_resume_locked`), judged ahead of every dispatch below:
+    # reverify, adopt and the re-arm each persist a transition before the resume
+    # that would refuse it, and the interactive session would be spent first.
+    # Re-judged after the confirm against the config the re-arm reads. An
+    # unreadable config skips this early exit only, as the trust gate below
+    # does; the resume's own config read refuses it.
+    # Judged on the loaded paths, as the resume judges them, so a chained child's
+    # sweep whose parent is no longer active is refused here too.
+    if state.run_type == "sweep":
+        try:
+            pin_paths = bmadconfig.load_paths(project)
+        except (bmadconfig.BmadConfigError, OSError):
+            pin_paths = None
+        if (
+            pin_paths is not None
+            and (conflict := runsetup.sweep_initiative_conflict(state, pin_paths)) is not None
+        ):
+            print(f"cannot resolve {run_dir.name}: {conflict}", file=sys.stderr)
+            return 1
+
+    # #496/#497: every resolve that resumes ends in the resume's plugin-trust refusal,
+    # so judge it here — ahead of the reverify/adopt dispatches (each persists its
+    # transition before resuming) and of the interactive session (a refusal after it
+    # throws the conversation away). The post-confirm re-check below stays: a plugin
+    # dir can change during the conversation. A re-arm-only resolve (`--no-resume`)
+    # and an abandon (DW-535: it closes the run) launch nothing, so they are not
+    # judged. An unreadable config skips this early exit only; the resume's own
+    # config read refuses it, as before.
+    if args.resume is not False and not getattr(args, "abandon", False):
+        try:
+            trust_paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
+        except (bmadconfig.BmadConfigError, OSError):
+            trust_paths = None
+        if (
+            trust_paths is not None
+            and (
+                rc := _reject_plugin_trust(
+                    trust_paths,
+                    policy_mod.load(_policy_path(project)),
+                    _launch_plugin_grants(project),
+                )
+            )
+            is not None
+        ):
+            return rc
+
+    # The resume's ticket-store refusal, judged ahead of the reverify/adopt
+    # dispatches for the same reason: each persists its transition before the
+    # resume that would refuse a changed store. The re-arm path judges it below.
+    early = getattr(args, "reverify", False) or getattr(args, "adopt_branch", False)
+    if (
+        early
+        and state.source == worksource.SOURCE_TICKETS
+        and (
+            rc := _reject_store_topology(
+                project,
+                policy_mod.load(_policy_path(project)),
+                state.source,
+                recorded=runs.live_store_topology(state, project) or None,
+                initiative=_store_initiative(state),
+            )
+        )
+        is not None
+    ):
+        return rc
+    return None
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    from .model import Phase
+
+    # DW-535: `--abandon` closes the run, so "resume after this?" has no meaning —
+    # pairing it with either answer is a usage error, refused before even the run lookup.
+    if getattr(args, "abandon", False) and args.resume is not None:
+        print(
+            "error: --abandon closes the run, so there is nothing to resume — drop "
+            "--resume/--no-resume (use --no-interactive to skip the confirm)",
+            file=sys.stderr,
+        )
+        return ExitCode.USAGE
+    # DW-591: `--at-reset` is `--no-interactive --resume` on a timer, so every flag
+    # that answers otherwise is a usage error, refused before the run lookup too.
+    if (usage := _at_reset_usage_error(args)) is not None:
+        print(f"error: {usage}", file=sys.stderr)
+        return ExitCode.USAGE
+    if getattr(args, "at_reset", False):
+        args.interactive = False
+        args.resume = True
     project = _project(args)
     try:
         run_dir = runs.resolve_run_dir(project, args.run_id)
@@ -3457,13 +7704,20 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         )
         return 1
     state = load_state(run_dir)
-    if state.paused_stage != PAUSE_ESCALATION:
-        print(
-            f"run {args.run_id} is not paused at an escalation "
-            f"(stage: {state.paused_stage or 'none'})",
-            file=sys.stderr,
-        )
+    # Ahead of every side effect, for `_resume_paused_run`'s source gate: re-arming
+    # (or even `--no-resume`) a run this version cannot drive mutates it, and the
+    # resolve session would be spent before the resume refused.
+    if (refusal := _unresumable_source(state)) is not None:
+        print(f"cannot resolve {run_dir.name}: {refusal}", file=sys.stderr)
         return 1
+    # DW-525: a FINISHED run has no resume to replay on, so `--reverify` there mints a
+    # replay run for the named kept worktree unit instead. Routed ahead of the pause
+    # gate (a finished run is not paused); every paused-run branch below is untouched.
+    if getattr(args, "reverify", False) and state.finished:
+        return _resolve_reverify_finished(args, project, run_dir, state)
+    # Liveness comes ahead of the pause gate below: a resume clears the pause before
+    # its engine starts (#958), so a resumed engine that is still running reads as
+    # unpaused, and the true refusal is "still live", not "not paused".
     # Not a cleanup path, so the "unknown must not block" invariant does not apply:
     # an unverifiable-but-live pid must not be re-driven. A provably-live engine
     # always blocks (--force never bypasses it); unknown blocks unless the operator
@@ -3487,24 +7741,85 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             "proceeding anyway (--force)",
             file=sys.stderr,
         )
-    story_key = args.story or state.paused_story_key
+    # A tickets run's epic-boundary pause, answered by closing the epic: routed ahead
+    # of the escalation gate, which refuses it. Only a resolve with no mode flag takes
+    # it (interactive or not); a mode flag on that pause keeps the refusal below.
+    if (
+        args.restore_patch is None
+        and not getattr(args, "adopt_branch", False)
+        and not getattr(args, "adopt_result", False)
+        and not getattr(args, "reverify", False)
+        and not getattr(args, "abandon", False)
+        and not getattr(args, "at_reset", False)
+    ):
+        target = tickets_source.epic_close_target(state)
+        if not (
+            isinstance(target, tickets_source.EpicCloseRefusal)
+            and target.code == tickets_source.EPIC_CLOSE_NOT_APPLICABLE
+        ):
+            return _resolve_epic_close(args, project, run_dir, state, target)
+    # DW-522: `--reverify --story <key>` may name a worktree unit under ANY pause
+    # stage (an isolated defer never pauses the run); `reverify_refusal` decides
+    # whether the named story qualifies. Everything else needs the escalation pause,
+    # or no pause with the story still escalated (`runs.escalation_resolvable`, #958).
+    reverify_named = bool(getattr(args, "reverify", False) and args.story)
+    if not _resolve_pause_admits(state, reverify_named=reverify_named):
+        print(
+            runs.not_escalation_pause_message(args.run_id, state.paused_stage),
+            file=sys.stderr,
+        )
+        return 1
+    story_key = args.story or runs.default_escalation_key(state)
     task = state.tasks.get(story_key) if story_key else None
-    if story_key is None or task is None or task.phase != Phase.ESCALATED:
+    reverify = getattr(args, "reverify", False)
+    if story_key is not None and task is not None and task.phase == Phase.DEFERRED and not reverify:
+        # DW-522: a deferred story has nothing to resolve, but its kept work may be
+        # re-verifiable — point at the flag instead of a bare refusal.
+        print(
+            f"story {story_key} is deferred, not escalated — to re-verify its kept "
+            f"work: bmad-loop resolve {args.run_id} --reverify",
+            file=sys.stderr,
+        )
+        return 1
+    # Unpaused (#958), only an unresolved escalation is resolvable: a named stories
+    # attempt-0 wedge is lifted by fixing its disk state and resuming, never re-armed.
+    if (
+        story_key is None
+        or task is None
+        or task.phase not in ((Phase.ESCALATED, Phase.DEFERRED) if reverify else (Phase.ESCALATED,))
+        or (not reverify_named and not runs.escalation_story_admitted(state, story_key))
+    ):
         print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
         return 1
 
-    # DW-204/DW-229: the same probe `cmd_resume` takes, taken here at resolve's own
-    # entry. `_resume_paused_run` cannot carry this gate for resolve — by the time
-    # this flow reaches it the interactive session has run and `runs.rearm_escalation`
-    # has spent the escalation, so a refusal there is a refusal after the side
-    # effects. LAST in this gate block, not first: the refusals above answer "this
-    # gesture does not apply to this run at all" (alias, not paused at an escalation,
-    # live engine, no escalated story) and must not be displaced by a ledger-repair
-    # steer that would not help. Mirrors `cmd_resume`, where the live-engine refusal
-    # also wins outright and the ledger gate follows it.
-    if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
-        print(refusal, file=sys.stderr)
-        return ExitCode.FAILURE
+    if (rc := _resolve_pre_session_gates(args, project, run_dir, state)) is not None:
+        return rc
+
+    # DW-522: re-verify the kept attempt instead of re-arming. Behind the same gates
+    # as --adopt-branch, and likewise ahead of the interactive session it never runs.
+    if reverify:
+        return _resolve_reverify(args, project, run_dir, state, task, story_key)
+
+    # DW-386: adopt the kept branch instead of re-arming. Behind every gate above —
+    # the same gates, in the same order, as the re-arm path — and ahead of the
+    # interactive session, which adopting never runs.
+    if getattr(args, "adopt_branch", False):
+        return _resolve_adopt(args, project, run_dir, state, task, story_key)
+
+    # DW-642: adopt a silent-channel triage attempt's surviving result.json. Behind
+    # the same gates, and likewise ahead of the interactive session it never runs.
+    if getattr(args, "adopt_result", False):
+        return _resolve_adopt_result(args, project, run_dir, state, task, story_key)
+
+    # DW-535: close an escalated replay run without merging its unit. Behind the same
+    # gates, and likewise ahead of the interactive session it never runs.
+    if getattr(args, "abandon", False):
+        return _resolve_abandon(args, project, run_dir, state, task, story_key)
+
+    # DW-591: wait out a usage-limit reset, then take this same path again. Behind
+    # every entry refusal above, so an operator is refused now, not hours later.
+    if getattr(args, "at_reset", False):
+        return _resolve_at_reset(args, project, run_dir, state)
 
     pol = policy_mod.load(_policy_path(project))
 
@@ -3542,7 +7857,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # only, no new failure mode: `load_paths` is a read, and the arm that cannot
         # read degrades exactly as it did when it sat lower.
         try:
-            pre_session_paths = bmadconfig.load_paths(project)
+            pre_session_paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
         except (bmadconfig.BmadConfigError, OSError):
             pre_session_code_root = state.code_root
         else:
@@ -3566,49 +7881,89 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             # config, which is the authority for the re-arm and is the only check the
             # `--no-interactive` path reaches. This is a strictly earlier exit on the
             # same predicate, so an operator who declines still gets no config lecture.
-            if (rc := _reject_isolation_conflict(pre_session_paths, pol)) is not None:
+            if (rc := _resolve_config_refusal(project, pol, state, pre_session_paths)) is not None:
                 return rc
-        adapters = _make_adapters(project, run_dir, pol)
-        dev_cfg = pol.adapter.resolved("dev")
-        model = dev_cfg.model
-        effort = dev_cfg.effort
-        _ctx_path, withheld, unreadable = resolve.build_context(
-            state,
-            run_dir,
-            story_key,
-            isolation=pol.scm.isolation,
-            project_root=project,
-            code_root=pre_session_code_root,
-        )
-        if pre_session_code_root != project:
-            print(
-                f"warning: resolve session stays project-rooted at {project.as_posix()!r}; "
-                "code fixes and commits belong in the run's code root at "
-                f"{pre_session_code_root.as_posix()!r}",
-                file=sys.stderr,
-            )
-        print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
+        # Past every entry refusal, this window now hosts the resolve session, so
+        # it becomes the run's control window (#920). Under the lock a driving
+        # resume publishes its pid in, and the liveness gate above is re-taken
+        # there: a resume that accepted after it keeps the record. The other paths
+        # claim when they resume (`_resume_paused_run`), or drive nothing.
+        from .tui import launch  # import-safe: launch.py has no textual imports
+
+        with state_lock(run_dir):
+            live = runs.engine_liveness(run_dir)
+            if live == "alive":
+                print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+                return 1
+            if live == "unknown" and not args.force:
+                print(
+                    f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                    "refusing to re-arm; re-run with --force once it is gone",
+                    file=sys.stderr,
+                )
+                return 1
+            # Captured around the claim, so a session that cannot start can hand
+            # the record back (#937).
+            predecessor = launch.recorded_ctl_window(project, run_dir.name)
+            _claim_ctl_window(project, run_dir, state)
+            claimed = launch.recorded_ctl_window(project, run_dir.name)
+        # From the claim on, any exit without a usable session hands the record
+        # back: adapter and context setup can fail too, not just the session.
         try:
-            produced = resolve.run_session(
-                adapters["dev"],
-                project,
+            # A human is present in a resolve session and its skill asks them
+            # questions, so it keeps the profile's bypass args whatever the
+            # run's `adapter.permission_mode`: a sandboxed mode that denies
+            # AskUserQuestion would cripple it, and prompts here get answered.
+            adapters = _make_adapters(project, run_dir, _bypass_permission_policy(pol))
+            dev_cfg = pol.adapter.resolved("dev")
+            model = dev_cfg.model
+            effort = dev_cfg.effort
+            _ctx_path, withheld, unreadable = resolve.build_context(
+                state,
                 run_dir,
                 story_key,
-                # This CALL precedes the re-arm below, so the generation it passes is
-                # the one still on disk — the pre-bump value. Not an ordering of the
-                # read: `rearm_escalation` reloads state and bumps its own copy, so
-                # this `task` object reads the same either way.
-                generation=task.generation,
-                model=model,
-                effort=effort,
+                isolation=pol.scm.isolation,
+                project_root=project,
+                code_root=pre_session_code_root,
             )
-        except NotImplementedError:
-            print(
-                "the dev adapter has no interactive session mode — fix the spec by hand, "
-                f"then: bmad-loop resolve {args.run_id} --no-interactive",
-                file=sys.stderr,
-            )
-            return 1
+            if pre_session_code_root != project:
+                print(
+                    f"warning: resolve session stays project-rooted at {project.as_posix()!r}; "
+                    "code fixes and commits belong in the run's code root at "
+                    f"{pre_session_code_root.as_posix()!r}",
+                    file=sys.stderr,
+                )
+            print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
+            # Only the session call answers "no interactive mode": a
+            # NotImplementedError out of adapter or context setup is a setup
+            # failure, and propagates through the hand-back below.
+            try:
+                produced = resolve.run_session(
+                    adapters["dev"],
+                    project,
+                    run_dir,
+                    story_key,
+                    # This CALL precedes the re-arm below, so the generation it passes is
+                    # the one still on disk — the pre-bump value. Not an ordering of the
+                    # read: `rearm_escalation` reloads state and bumps its own copy, so
+                    # this `task` object reads the same either way.
+                    generation=task.generation,
+                    model=model,
+                    effort=effort,
+                )
+            except NotImplementedError:
+                print(
+                    "the dev adapter has no interactive session mode — fix the spec by hand, "
+                    f"then: bmad-loop resolve {args.run_id} --no-interactive",
+                    file=sys.stderr,
+                )
+                _hand_back_ctl_window(project, run_dir, state, predecessor, claimed)
+                return 1
+        except BaseException:
+            # Setup failed, the dev CLI could not be spawned, or the session
+            # died: the window exits all the same, so hand the record back first.
+            _hand_back_ctl_window(project, run_dir, state, predecessor, claimed)
+            raise
         # DW-11, second half. `produced` alone is not enough to record coverage,
         # because the watermark `rearm_escalation` stamps is `len(task.sessions)` — it
         # covers every recorded session, INCLUDING the ones whose artifacts this walk
@@ -3703,7 +8058,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # AFTER the confirm, deliberately: a cancelled resolve writes nothing, so the
     # divergence is still there for `resume` to report on its own terms.
     try:
-        paths = bmadconfig.load_paths(project)
+        paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
     except (bmadconfig.BmadConfigError, OSError) as e:
         paths = None
         # An observation, so it degrades: without the config this process cannot NAME
@@ -3730,8 +8085,9 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # The SAME refusal `_resume_paused_run` makes, hoisted ahead of both writes
         # below — because aiming the mirror at the tree config.yaml names is only
         # correct for a configuration the orchestrator will actually run, and this is
-        # not one. `worktree_isolation_conflict` fires exactly when `repo_root` is an
-        # override beside `isolation = "worktree"`, so on that config the re-stamp
+        # not one. `worktree_isolation_conflict` fires exactly when `repo_root` does
+        # not contain the project beside `isolation = "worktree"` (a disjoint layout;
+        # DW-379 supports the nested one), so on that config the re-stamp
         # persisted the unsupported root and `rearm_escalation` then advanced the
         # attempt baseline (and re-stamped the spec's `baseline_revision`) against it
         # — all of it before `_resume_paused_run` at the bottom of this function
@@ -3742,16 +8098,32 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # requires an escalation — could not re-run to correct it. The escalation was
         # burned on a gesture the orchestrator had already decided it would not honor.
         #
-        # It also falsified the premise the baseline advance is built on. `runs`
-        # reasons that `repo_root == project` "in every reachable configuration"
-        # BECAUSE this refusal exists, and reads the code tree's HEAD on that basis;
-        # a path that mutates first and refuses second made the unreachable
-        # configuration reachable, in the one function that had ruled it out.
+        # It also reached a configuration the baseline advance is not built for:
+        # `runs` reads the code tree's HEAD, which is right in place and superseded
+        # under isolation, but a disjoint isolated layout never runs at all — a path
+        # that mutates first and refuses second made that configuration reachable, in
+        # the one function that had ruled it out.
         #
         # Ordered after the confirm with the re-stamp, not before it: a cancelled
         # resolve still writes nothing, and an operator who declines is not owed a
         # config lecture about a gesture they did not make.
-        if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        if (rc := _resolve_config_refusal(project, pol, state, paths)) is not None:
+            return rc
+        # The sweep's initiative pin, re-judged: the active initiative can change
+        # during the resolve session, and the re-arm below precedes the resume.
+        # `paths` are re-rooted (`runs.paths_for_state`).
+        if (
+            conflict := runsetup.sweep_initiative_conflict(state, paths, rerooted=True)
+        ) is not None:
+            print(f"cannot resolve {args.run_id}: {conflict}", file=sys.stderr)
+            return 1
+        # #496/#497: the resume's plugin-trust refusal, hoisted ahead of the re-arm
+        # for the same reason — a refusal after it has already spent the escalation.
+        # A re-arm-only resolve (`--no-resume`) launches nothing, so it is not judged.
+        if (
+            args.resume is not False
+            and (rc := _reject_plugin_trust(paths, pol, _launch_plugin_grants(project))) is not None
+        ):
             return rc
     before_entries = runs.journal_entries_or_none(run_dir)
     outcome: runs.RearmOutcome | None = None
@@ -3760,11 +8132,19 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             # The pre-session checks intentionally stay lock-free; this is the
             # mutation boundary, so repeat every state/liveness precondition from
             # the snapshot left by the preceding writer before restamping anything.
-            fresh_state = load_state(run_dir)
-            if fresh_state.paused_stage != PAUSE_ESCALATION:
+            fresh_state = load_state(run_dir, pin=state)
+            if not runs.escalation_resolvable(fresh_state):
                 print(
-                    f"run {args.run_id} is not paused at an escalation "
-                    f"(stage: {fresh_state.paused_stage or 'none'})",
+                    runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
+                    file=sys.stderr,
+                )
+                return 1
+            waited_on = getattr(args, "at_reset_pause", None)
+            if waited_on is not None and _at_reset_pause_identity(fresh_state) != waited_on:
+                print(
+                    f"the pause on run {args.run_id} changed while --at-reset was waiting "
+                    f"(now: story {fresh_state.paused_story_key!r}, paused_limit_class "
+                    f"{fresh_state.paused_limit_class!r}) — not re-arming",
                     file=sys.stderr,
                 )
                 return 1
@@ -3854,6 +8234,1288 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     return _resume_paused_run(project, run_dir)
 
 
+class _EpicCloseUnverifiable(Exception):
+    """The epic-close verify cannot run at all: the run recorded no store to read
+    dirt from, the epic folder cannot be located in that store's repo, or the tree
+    cannot be read. ``resolve`` exits 1 and the run stays paused."""
+
+
+@dataclass(frozen=True)
+class _EpicCloseLocation:
+    """Where the epic-close of a paused tickets run works, located once before the
+    session so the session's prompt and the verify read the same folders: the
+    run's tree pin (``pin``, ``folder``), its rebased ``initiative`` folder, the
+    epic's folder, the recorded store ``versioning`` and the ``repo`` it commits in
+    (None for ``none``), and ``prefix``, the epic folder relative to that repo."""
+
+    pin: str | None
+    folder: Path | None
+    initiative: Path
+    epic_folder: Path
+    versioning: str
+    repo: Path | None
+    prefix: str
+
+
+def _locate_epic_close(
+    project: Path, state: RunState, paths: bmadconfig.ProjectPaths, slug: str
+) -> _EpicCloseLocation:
+    """Locate epic ``slug`` of the paused tickets run ``state`` for its close.
+    Raises :class:`_EpicCloseUnverifiable` for what no closure answers: a chained
+    run whose config no longer names its parent, an unrecorded or unknown
+    versioning (a tickets run with no initiative folder at its start records
+    none), no recorded initiative folder, or an epic folder that cannot be located
+    or sits outside the repo whose dirt is read."""
+    try:
+        pin, folder = runs.recorded_tree_pin(state, project, project)
+    except bmadconfig.BmadConfigError as e:
+        raise _EpicCloseUnverifiable(str(e)) from e
+    topology = runs.live_store_topology(state, project)
+    versioning = topology.get("versioning")
+    repo: Path | None
+    if versioning == "code-repo":
+        repo = paths.repo_root
+    elif versioning == "store-repo":
+        store_repo = topology.get("store_repo")
+        if not store_repo:
+            raise _EpicCloseUnverifiable(
+                f"run {state.run_id} recorded a store-repo ticket store with no repository"
+            )
+        repo = Path(store_repo)
+    elif versioning == "none":
+        repo = None
+    else:
+        raise _EpicCloseUnverifiable(
+            f"run {state.run_id} recorded no ticket-store versioning ({versioning!r}), so "
+            "there is no repo to check the epic folder in"
+        )
+    if not state.initiative_folder:
+        raise _EpicCloseUnverifiable(f"run {state.run_id} recorded no initiative folder")
+    initiative = runs.rebase_recorded_project_path(Path(state.initiative_folder), state, project)
+    try:
+        epic_folder = ticketlayout.epic_folder(initiative, slug)
+    except OSError as e:
+        raise _EpicCloseUnverifiable(f"cannot locate epic {slug} in {initiative}: {e}") from e
+    prefix = ""
+    if repo is not None:
+        # `dirty_paths` keys are relative to the repo it reads, as the tickets
+        # engine's dirty-initiative gate reads them: a folder outside that repo has
+        # no prefix there, and comparing anyway would read unrelated paths as clean.
+        try:
+            prefix = epic_folder.resolve().relative_to(repo.resolve()).as_posix()
+        except (OSError, RuntimeError, ValueError) as e:
+            raise _EpicCloseUnverifiable(
+                f"epic folder {epic_folder.as_posix()} is not inside the repo at "
+                f"{repo.as_posix()} whose changes it is checked against ({e})"
+            ) from e
+    return _EpicCloseLocation(pin, folder, initiative, epic_folder, versioning, repo, prefix)
+
+
+def _epic_close_check(
+    project: Path, located: _EpicCloseLocation, slug: str
+) -> tuple[str, list[str]]:
+    """``(status, missing)`` for epic ``slug`` at ``located``: the epic file's
+    status from the run's pinned tree (``"absent"`` when the tree lists no such
+    epic) and :func:`resolve.epic_close_missing` over the dirt of the repo the
+    run's recorded store topology versions — the epic folder only, never the rest
+    of that repo. Each missing line names the epic; empty means verified.
+
+    A git status that cannot be read is one missing line, not clean. A tree read
+    fault raises :class:`_EpicCloseUnverifiable`."""
+    try:
+        view = _status_ticket_tree(project, located.pin, folder=located.folder).status()
+    except tickettree.TicketsError as e:
+        raise _EpicCloseUnverifiable(
+            f"cannot read the ticket tree: tickets.py {e.kind}: {e}"
+        ) from e
+    row = next((epic for epic in view.epics if epic.slug == slug), None)
+    status = row.status if row is not None else "absent"
+    dirty: list[str] = []
+    git_fault: str | None = None
+    if located.repo is not None:
+        try:
+            dirty = list(verify.dirty_paths(located.repo))
+        except verify.GitError as e:
+            git_fault = f"cannot read the git status of {located.repo.as_posix()}: {e}"
+    missing = resolve.epic_close_missing(status, dirty, located.prefix, located.versioning)
+    if git_fault is not None:
+        missing.append(git_fault)
+    return status, [f"epic {slug}: {line}" for line in missing]
+
+
+def _epic_pause_moved(state: RunState, slug: str) -> bool:
+    """Whether ``state`` (re-read under the run lock) is no longer paused at epic
+    ``slug``'s closure: a rival resume took the run, or it paused elsewhere."""
+    return state.paused_stage != PAUSE_EPIC_BOUNDARY or state.paused_story_key != slug
+
+
+def _resolve_epic_close(
+    args: argparse.Namespace,
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+    target: tickets_source.EpicCloseTarget | tickets_source.EpicCloseRefusal,
+) -> int:
+    """``resolve`` on a tickets run's ``epic-boundary`` pause: an interactive
+    resolve first opens bmad-agent-po for the person to close and commit the epic
+    (:func:`resolve.run_epic_close_session`); either gesture then verifies that the
+    epic is closed (:func:`_epic_close_check`), journals the outcome and resumes the
+    run. ``cmd_resolve`` has run the alias, source and liveness gates; this takes
+    the classification's refusal causes, the shared pre-session and configuration
+    gates, then the skill probe, the locate and the session (interactive only, the
+    configuration gates again after it), the verify, the confirm, a locked re-check
+    of the pause and the post-confirm plugin-trust refusal. The session's exit code
+    is journaled, never trusted. An unverified epic stays paused with only its
+    journal rows written."""
+    run_id = args.run_id
+    if isinstance(target, tickets_source.EpicCloseRefusal):
+        print(f"cannot resolve {run_id}: {target.step}", file=sys.stderr)
+        if target.paused_reason:
+            print(f"  paused: {target.paused_reason}", file=sys.stderr)
+        return 1
+    slug = target.slug
+    if args.story and args.story != slug:
+        print(f"run {run_id} is paused at epic {slug}'s closure, not {args.story}", file=sys.stderr)
+        return 1
+    if (rc := _resolve_pre_session_gates(args, project, run_dir, state)) is not None:
+        return rc
+    pol = policy_mod.load(_policy_path(project))
+    # Read as tickets, as the resume reads it (`_prepare_resume_locked`): a mixed
+    # install's leftover v6 keys must not resolve this run's config as v6.
+    want_tickets = runs.resolves_as_tickets(state)
+    try:
+        paths = runs.paths_for_state(
+            bmadconfig.load_paths(project, want_tickets=want_tickets), state
+        )
+    except (bmadconfig.BmadConfigError, OSError) as e:
+        print(f"cannot resolve {run_id}: cannot read the BMAD config: {e}", file=sys.stderr)
+        return 1
+    if (rc := _resolve_config_refusal(project, pol, state, paths)) is not None:
+        return rc
+    if args.interactive:
+        # The skill probe the tickets engine takes before its retrospective session,
+        # taken before anything is claimed: a session with no bmad-agent-po skill
+        # is a conversation that cannot close the epic.
+        from .adapters.profile import ProfileError, get_profile
+
+        try:
+            # located as the session will load it: a user-root copy counts under
+            # `[skills] user_roots`, exactly as the run's own sessions resolve one
+            epic_scope = skill_locate.scope_for(
+                get_profile(pol.adapter.resolved("dev").name, project),
+                resolve_user=pol.skills.user_roots,
+            )
+        except ProfileError as e:
+            print(
+                f"cannot resolve {run_id}: cannot load the dev adapter profile: {e}",
+                file=sys.stderr,
+            )
+            return 1
+        skill = project / epic_scope.tree / resolve.EPIC_CLOSE_SKILL / "SKILL.md"
+        if epic_scope.tree and (
+            skill_locate.locate(project, epic_scope, resolve.EPIC_CLOSE_SKILL) is None
+        ):
+            print(
+                f"cannot resolve {run_id}: the dev adapter's skill tree has no "
+                f"{skill.as_posix()} — close epic {slug} by hand and commit it, then: "
+                f"bmad-loop resolve {run_id} --no-interactive",
+                file=sys.stderr,
+            )
+            return 1
+    # Located before the session, so no conversation is spent on a run the verify
+    # cannot judge, and the session's prompt names the folders the verify reads.
+    try:
+        located = _locate_epic_close(project, state, paths, slug)
+    except _EpicCloseUnverifiable as e:
+        print(f"cannot resolve {run_id}: {e} — run is still paused at epic {slug}", file=sys.stderr)
+        return 1
+    if args.interactive:
+        try:
+            prompt = resolve.epic_close_prompt(
+                slug=slug,
+                initiative=state.initiative,
+                initiative_folder=located.initiative,
+                epic_file=ticketlayout.epic_file(located.initiative, slug),
+                retrospective=ticketlayout.retrospective_doc(located.initiative, slug),
+                verdict=target.verdict,
+                parent=state.parent_initiative,
+                rejected=target.rejected,
+                versioning=located.versioning,
+                repo=located.repo,
+            )
+        except (OSError, ValueError) as e:
+            print(
+                f"cannot resolve {run_id}: cannot build the epic-close prompt for {slug}: {e}",
+                file=sys.stderr,
+            )
+            return 1
+        # This window now hosts the epic-close session, so it becomes the run's
+        # control window (#920), claimed as `cmd_resolve`'s escalation arm claims it.
+        from .tui import launch  # import-safe: launch.py has no textual imports
+
+        with state_lock(run_dir):
+            live = runs.engine_liveness(run_dir)
+            if live == "alive":
+                print(f"run {run_id} is still live — stop it first", file=sys.stderr)
+                return 1
+            if live == "unknown" and not args.force:
+                print(
+                    f"run {run_id}: engine may still be live (unverifiable pid) — "
+                    "refusing to resolve; re-run with --force once it is gone",
+                    file=sys.stderr,
+                )
+                return 1
+            predecessor = launch.recorded_ctl_window(project, run_dir.name)
+            _claim_ctl_window(project, run_dir, state)
+            claimed = launch.recorded_ctl_window(project, run_dir.name)
+        try:
+            # A human is present and the skill asks them questions, so the session
+            # keeps the profile's bypass args, as the resolve session does.
+            adapter = _make_adapters(project, run_dir, _bypass_permission_policy(pol))["dev"]
+            dev_cfg = pol.adapter.resolved("dev")
+            cli_name = getattr(getattr(adapter, "profile", None), "name", None) or getattr(
+                adapter, "name", ""
+            )
+            with state_lock(run_dir):
+                Journal(run_dir, pin=state).append(
+                    "epic-close-session-start", epic_ref=slug, verdict=target.verdict, cli=cli_name
+                )
+            print(f"launching bmad-agent-po for epic {slug} — close and commit it, then exit…")
+            # Only the session call answers "no interactive mode", as in the
+            # escalation arm.
+            try:
+                session_rc = resolve.run_epic_close_session(
+                    adapter,
+                    project,
+                    run_dir,
+                    slug,
+                    prompt,
+                    model=dev_cfg.model,
+                    effort=dev_cfg.effort,
+                    skill_dir=skill_locate.prompt_skill_dir(project, epic_scope, prompt),
+                )
+            except NotImplementedError:
+                print(
+                    f"the dev adapter has no interactive session mode — close {slug} with "
+                    f"bmad-agent-po and commit it, then: bmad-loop resolve {run_id} "
+                    "--no-interactive",
+                    file=sys.stderr,
+                )
+                _hand_back_ctl_window(project, run_dir, state, predecessor, claimed)
+                return 1
+        except BaseException:
+            _hand_back_ctl_window(project, run_dir, state, predecessor, claimed)
+            raise
+        with state_lock(run_dir):
+            # `delete --force` can remove the run during the conversation: said,
+            # never recreated by the journal write.
+            if not runs.is_run(run_dir):
+                print(f"no such run: {run_dir.name}", file=sys.stderr)
+                return 1
+            Journal(run_dir, pin=state).append(
+                "epic-close-session-end", epic_ref=slug, rc=session_rc
+            )
+        # The conversation may have edited the config: judge it again, as
+        # `cmd_resolve` does after its session.
+        pre_session_root = paths.repo_root
+        pol = policy_mod.load(_policy_path(project))
+        try:
+            paths = runs.paths_for_state(
+                bmadconfig.load_paths(project, want_tickets=want_tickets), state
+            )
+        except (bmadconfig.BmadConfigError, OSError) as e:
+            print(f"cannot resolve {run_id}: cannot read the BMAD config: {e}", file=sys.stderr)
+            return 1
+        # The epic folder was located in the pre-session tree, so a moved code root
+        # would verify one tree and resume in another (the escalation arm's refusal).
+        if paths.repo_root != pre_session_root:
+            print(
+                f"cannot resolve {run_id}: the code root changed during the epic-close "
+                f"session from {pre_session_root.as_posix()!r} to "
+                f"{paths.repo_root.as_posix()!r} — run is still paused at epic {slug}",
+                file=sys.stderr,
+            )
+            return 1
+        if (rc := _resolve_config_refusal(project, pol, state, paths)) is not None:
+            return rc
+    try:
+        status, missing = _epic_close_check(project, located, slug)
+    except _EpicCloseUnverifiable as e:
+        print(f"cannot resolve {run_id}: {e} — run is still paused at epic {slug}", file=sys.stderr)
+        return 1
+    with state_lock(run_dir):
+        if not runs.is_run(run_dir):
+            print(f"no such run: {run_dir.name}", file=sys.stderr)
+            return 1
+        # The verify ran lock-free (it spawns tickets.py and git), so a rival resume
+        # may have taken the run meanwhile: a verdict on a pause that is gone is not
+        # this run's record. The resume below re-checks again after the confirm.
+        if _epic_pause_moved(load_state(run_dir, pin=state), slug):
+            print(
+                f"the pause for {slug} changed while resolve was in progress — not resuming",
+                file=sys.stderr,
+            )
+            return 1
+        if missing:
+            Journal(run_dir, pin=state).append(
+                "epic-close-unverified", epic_ref=slug, missing=missing
+            )
+        else:
+            Journal(run_dir, pin=state).append("epic-close-verified", epic_ref=slug, status=status)
+    if missing:
+        for line in missing:
+            print(line, file=sys.stderr)
+        print(f"close it and commit, then: bmad-loop resolve {run_id} --no-interactive")
+        return 1
+    print(f"epic {slug} reads {status} with a clean epic folder")
+    if args.resume is False:
+        print(f"resume when ready: bmad-loop resume {run_id}")
+        return 0
+    if args.resume is None and not _confirm(f"resume run {run_id}?"):
+        print(f"cancelled — run is still paused at epic {slug}")
+        return 0
+    with state_lock(run_dir):
+        # The checks above ran lock-free: repeat them against the last writer's state.
+        if _epic_pause_moved(load_state(run_dir, pin=state), slug):
+            print(
+                f"the pause for {slug} changed while resolve was in progress — not resuming",
+                file=sys.stderr,
+            )
+            return 1
+        fresh_live = runs.engine_liveness(run_dir)
+        if fresh_live == "alive":
+            print(f"run {run_id} is still live — stop it first", file=sys.stderr)
+            return 1
+        if fresh_live == "unknown" and not args.force:
+            print(
+                f"run {run_id}: engine may still be live (unverifiable pid) — "
+                "refusing to resume. Confirm the engine process is gone, then re-run "
+                "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                file=sys.stderr,
+            )
+            return 1
+    # #496/#497: the plugin dir can change while the confirm waits, so judge the
+    # resume's plugin-trust refusal again on the re-read policy.
+    pol = policy_mod.load(_policy_path(project))
+    if (rc := _reject_plugin_trust(paths, pol, _launch_plugin_grants(project))) is not None:
+        return rc
+    from .tui import launch  # import-safe: launch.py has no textual imports
+
+    if launch.in_ctl_session():
+        print(
+            f"✓ resuming run {run_id} in the background — "
+            f"watch it in the TUI, or: bmad-loop attach {run_id}"
+        )
+        launch.detach_client()
+    return _resume_paused_run(project, run_dir)
+
+
+# `resolve --at-reset`'s default margin past the reset (DW-591): long enough for the
+# provider's usage window to have rolled over when the resume's first session starts.
+AT_RESET_DEFAULT_MARGIN_MIN = 2
+# The longest one sleep of the wait runs, so Ctrl-C ends it promptly.
+_AT_RESET_SLICE_S = 1.0
+
+
+def _at_reset_now() -> datetime:
+    """The wall clock `resolve --at-reset` waits against (a test seam)."""
+    return datetime.now(timezone.utc)
+
+
+_at_reset_sleep = time.sleep  # a test seam, beside `_at_reset_now`
+
+
+def _at_reset_usage_error(args: argparse.Namespace) -> str | None:
+    """Why ``resolve``'s ``--at-reset``/``--margin-min`` flags cannot go together
+    with the rest of the command line, or None (DW-591)."""
+    margin = getattr(args, "margin_min", None)
+    if not getattr(args, "at_reset", False):
+        return "--margin-min applies only with --at-reset" if margin is not None else None
+    if margin is not None and margin < 0:
+        return f"--margin-min must be >= 0: got {margin}"
+    for flag, given in (
+        ("--no-resume", args.resume is False),
+        ("--abandon", getattr(args, "abandon", False)),
+        ("--restore-patch", args.restore_patch is not None),
+        ("--adopt-branch", getattr(args, "adopt_branch", False)),
+        ("--adopt-result", getattr(args, "adopt_result", False)),
+        ("--reverify", getattr(args, "reverify", False)),
+    ):
+        if given:
+            return (
+                f"--at-reset re-arms and resumes with no resolve agent once the reset "
+                f"passes, so it cannot be combined with {flag}"
+            )
+    return None
+
+
+def _at_reset_refusal(state: RunState, pol: policy_mod.Policy, now: datetime) -> str | None:
+    """Why ``resolve --at-reset`` cannot wait on this run's pause, or None. Read from
+    the facts the pause recorded (``paused_limit_class``, ``paused_reset_at``),
+    never from the pause reason's prose."""
+    run_id = state.run_id
+    limit_class = state.paused_limit_class
+    if limit_class is None:
+        return f"run {run_id} is not paused on a usage limit (no paused_limit_class recorded)"
+    if limit_class == USAGE_LIMIT_BLOCKED:
+        return (
+            f"run {run_id} is paused on a blocking usage limit (paused_limit_class: "
+            f"{USAGE_LIMIT_BLOCKED}) — credit exhaustion never auto-resumes; add credits "
+            f"or switch model, then: bmad-loop resolve {run_id} --no-interactive"
+        )
+    if limit_class != USAGE_LIMIT_WAIT:
+        return f"run {run_id} has an unrecognized paused_limit_class {limit_class!r}"
+    reset = usagereset.resolved_reset(state.paused_reset_at)
+    if reset is None:
+        return (
+            f"run {run_id}'s usage-limit reset did not resolve to a time (no "
+            "paused_reset_at recorded; the pause reason carries the raw text) — wait it "
+            f"out, then: bmad-loop resolve {run_id} --no-interactive"
+        )
+    cap = pol.limits.quota_wait_max_min
+    ahead = datetime.fromisoformat(reset) - now
+    if cap and ahead > timedelta(minutes=cap):
+        return (
+            f"run {run_id}'s usage-limit reset {reset} is {ahead.total_seconds() / 60:.0f} "
+            f"min away, past the {cap}-min cap ([limits] quota_wait_max_min)"
+        )
+    return None
+
+
+def _resolve_at_reset(
+    args: argparse.Namespace, project: Path, run_dir: Path, state: RunState
+) -> int:
+    """``resolve --at-reset`` (DW-591), past every entry refusal ``cmd_resolve``
+    makes: refuse a pause it cannot time, wait in this foreground process until
+    the recorded reset plus ``--margin-min`` (no wait once that has passed), then
+    run ``cmd_resolve`` again as ``--no-interactive --resume`` so every check is
+    re-taken on the state after the wait. The wait writes nothing but its two
+    journal rows; Ctrl-C leaves the run paused and exits ``INTERRUPTED``."""
+    now = _at_reset_now()
+    if (
+        refusal := _at_reset_refusal(state, policy_mod.load(_policy_path(project)), now)
+    ) is not None:
+        print(f"cannot resolve {args.run_id} --at-reset: {refusal}", file=sys.stderr)
+        return 1
+    margin_min = AT_RESET_DEFAULT_MARGIN_MIN if args.margin_min is None else args.margin_min
+    reset_at = state.paused_reset_at
+    assert reset_at is not None  # `_at_reset_refusal` refused an unresolved reset
+    wake = datetime.fromisoformat(reset_at) + timedelta(minutes=margin_min)
+    if wake > now:
+        print(
+            f"waiting for the usage-limit reset: resolving run {args.run_id} at "
+            f"{wake.astimezone():%Y-%m-%d %H:%M:%S %Z} ({wake.isoformat()}); "
+            "Ctrl-C leaves it paused",
+            file=sys.stderr,
+        )
+        # Under the hold cleanup removes a run in, so a removed run is not recreated.
+        with state_lock(run_dir):
+            if not runs.is_run(run_dir):
+                print(f"no such run: {run_dir.name}", file=sys.stderr)
+                return 1
+            Journal(run_dir, pin=state).append(
+                "at-reset-wait-start",
+                reset_at=reset_at,
+                margin_min=margin_min,
+                wake_at=wake.isoformat(),
+            )
+        interrupted = False
+        try:
+            while (left := (wake - _at_reset_now()).total_seconds()) > 0:
+                _at_reset_sleep(min(left, _AT_RESET_SLICE_S))
+        except KeyboardInterrupt:
+            interrupted = True
+        with state_lock(run_dir):
+            if runs.is_run(run_dir):
+                Journal(run_dir, pin=state).append(
+                    "at-reset-wait-end",
+                    wake_at=wake.isoformat(),
+                    interrupted=interrupted,
+                    waited_s=round((_at_reset_now() - now).total_seconds(), 3),
+                )
+        if interrupted:
+            print(
+                f"interrupted — run {args.run_id} is still paused; nothing was re-armed",
+                file=sys.stderr,
+            )
+            return ExitCode.INTERRUPTED
+    else:
+        print(
+            f"the usage-limit reset {reset_at} (+{margin_min} min margin) has passed — "
+            f"resolving run {args.run_id} now",
+            file=sys.stderr,
+        )
+    args.at_reset = False
+    args.margin_min = None
+    # The pause this process waited on. Another resolve or resume during the wait can
+    # leave a different pause in its place (another story, a later reset, a blocking
+    # limit), so the post-wait pass re-arms only when the pause is still this one.
+    args.at_reset_pause = _at_reset_pause_identity(state)
+    return cmd_resolve(args)
+
+
+def _at_reset_pause_identity(state: RunState) -> tuple[str | None, str | None, str | None]:
+    """The facts that name the usage-limit pause ``resolve --at-reset`` waits on."""
+    return (state.paused_story_key, state.paused_limit_class, state.paused_reset_at)
+
+
+def _resolve_adopt(
+    args: argparse.Namespace,
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+    task: StoryTask,
+    story_key: str,
+) -> int:
+    """`resolve --adopt-branch` (DW-386): finish an escalated story from its kept
+    worktree branch instead of re-driving it from scratch.
+
+    `cmd_resolve` has already run the shared gates (alias, paused-at-escalation,
+    liveness, ESCALATED story, sweep ledger). This adds the kept-work preconditions,
+    confirms, re-checks everything under the run lock and hands the state
+    transaction to `runs.adopt_escalated_branch`; the resumed engine then commits
+    and merges the branch through its COMMITTING recovery arm. No interactive
+    session runs, and review, the `[verify]` commands and `pre_commit_gate`
+    workflows are NOT re-run."""
+    from .model import Phase
+
+    if (refusal := runs.adopt_refusal(state, task, story_key)) is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 1
+    print(
+        f"warning: adopting {task.branch} bypasses automated checks for {story_key} — "
+        "review, the [verify] commands and pre_commit_gate workflows are not re-run; the "
+        "kept branch is committed and merged as-is on your word that it is finished",
+        file=sys.stderr,
+    )
+    if args.resume is None and not _confirm(
+        f"adopt kept branch {task.branch} of {story_key} and resume run {args.run_id}?"
+    ):
+        print("cancelled — run is still paused at the escalation")
+        return 0
+    try:
+        with state_lock(run_dir):
+            # Same mutation-boundary re-check as the re-arm path: the checks above
+            # ran lock-free, so repeat them against the state left by the last writer.
+            fresh_state = load_state(run_dir, pin=state)
+            if not runs.escalation_resolvable(fresh_state):
+                print(
+                    runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_live = runs.engine_liveness(run_dir)
+            if fresh_live == "alive":
+                print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+                return 1
+            if fresh_live == "unknown" and not args.force:
+                print(
+                    f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                    "refusing to adopt. Confirm the engine process is gone, then re-run "
+                    "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_task = fresh_state.tasks.get(story_key)
+            if fresh_task is None or fresh_task.phase != Phase.ESCALATED:
+                print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
+                return 1
+            if fresh_task.generation != task.generation:
+                print(
+                    f"the escalation for {story_key} changed while resolve was in progress "
+                    "— not adopting",
+                    file=sys.stderr,
+                )
+                return 1
+            branch = runs.adopt_escalated_branch(run_dir, story_key)
+    except runs.RearmError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"adopted {branch} for {story_key} — it commits and merges on resume")
+    if args.resume is False:
+        print(f"resume when ready: bmad-loop resume {args.run_id}")
+        return 0
+    from .tui import launch  # import-safe: launch.py has no textual imports
+
+    if launch.in_ctl_session():
+        print(
+            f"✓ resuming run {args.run_id} in the background — "
+            f"watch it in the TUI, or: bmad-loop attach {args.run_id}"
+        )
+        launch.detach_client()
+    return _resume_paused_run(project, run_dir)
+
+
+def _adopt_result_refusal(state: RunState, task: StoryTask, story_key: str) -> str | None:
+    """Why ``resolve --adopt-result`` (DW-642) cannot apply to this run, or None:
+    a sweep paused at the escalation on a triage task whose pause reason is a
+    silent hook channel. Read from the pause fields, which the engine wrote."""
+    if state.run_type != "sweep":
+        return f"--adopt-result applies only to sweep runs (run {state.run_id} is a {state.run_type} run)"
+    if not TRIAGE_KEY_RE.match(story_key):
+        return (
+            f"--adopt-result adopts a triage attempt's result.json; {story_key} is not a "
+            "triage task (migration and bundle tasks are not adoptable)"
+        )
+    if state.paused_stage != PAUSE_ESCALATION or state.paused_story_key != story_key:
+        return (
+            f"run {state.run_id} is not paused at the escalation of {story_key} "
+            f"(stage: {state.paused_stage or 'none'}, story: {state.paused_story_key or 'none'})"
+        )
+    if not (state.paused_reason or "").startswith(HOOK_CHANNEL_SILENT_PREFIX):
+        return (
+            f"run {state.run_id} is not paused on a silent hook channel — --adopt-result "
+            "applies only to a `hook channel silent:` pause"
+        )
+    if task.phase != Phase.ESCALATED:
+        return f"{story_key} is not escalated (phase: {task.phase})"
+    return None
+
+
+def _adopt_marker_document(
+    story_key: str, task: StoryTask, task_id: str, artifact: TriageArtifact
+) -> str:
+    """The ``adopt-<key>.json`` marker `SweepEngine._consume_triage_adoption` reads."""
+    return json.dumps(
+        {
+            "story_key": story_key,
+            "task_id": task_id,
+            "attempt": task.attempt,
+            "generation": task.generation,
+            "sha256": artifact.sha256,
+            "mtime_ns": artifact.mtime_ns,
+            "size": artifact.size,
+            "adopted_at": datetime.now(timezone.utc).isoformat(),
+        },
+        indent=2,
+    )
+
+
+def _resolve_adopt_result(
+    args: argparse.Namespace,
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+    task: StoryTask,
+    story_key: str,
+) -> int:
+    """``resolve --adopt-result`` (DW-642): use the result.json a silent-channel
+    triage attempt left behind as the sweep's triage plan, on the operator's word.
+
+    `cmd_resolve` has already run the shared gates. This refuses anything but a
+    sweep paused ``hook channel silent:`` on a triage task, reads the attempt's
+    artifact once (hashing and parsing the same bytes), refuses one that carries a
+    CRITICAL escalation, validates it structurally on a copy, and shows it in full. Only an explicit ``y`` continues: no flag
+    skips the confirm, and EOF declines. Under the run lock it re-checks the
+    pause, the engine's liveness, the task's phase/attempt/generation and the
+    artifact's sha256, then writes ``adopt-<key>.json`` and journals
+    ``sweep-triage-adopt-confirmed``. The resumed engine re-validates the artifact
+    against the live ledger before using it. Nothing here completes the session or
+    touches the ledger."""
+    if (refusal := _adopt_result_refusal(state, task, story_key)) is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 1
+    task_id = triage_attempt_id(task)
+    relaunch = f"`bmad-loop resume {args.run_id}` relaunches triage instead"
+    try:
+        artifact = read_triage_artifact(run_dir, task_id)
+    except (OSError, ValueError, RecursionError) as e:
+        print(
+            f"error: cannot adopt the result.json of {task_id}: {type(e).__name__}: {e} "
+            f"— {relaunch}",
+            file=sys.stderr,
+        )
+        return 1
+    if artifact is None:
+        print(
+            f"error: triage attempt {task_id} left no result.json "
+            f"({triage_artifact_path(run_dir, task_id)}) — {relaunch}",
+            file=sys.stderr,
+        )
+        return 1
+    # The session path escalates on a CRITICAL before it validates a plan; a
+    # session that asked for a human is not overruled by adopting its document.
+    if (critical := critical_session_reason("triage", artifact.doc)) is not None:
+        print(
+            f"error: the result.json of {task_id} carries a {display_critical_reason(critical)}"
+            f" — adopting it would bypass that escalation; {relaunch}",
+            file=sys.stderr,
+        )
+        return 1
+    # `validate_triage` normalizes its argument in place; the operator is shown
+    # the document as written.
+    plan, errors = validate_triage(json.loads(json.dumps(artifact.doc)), None)
+    if plan is None:
+        print(
+            f"error: the result.json of {task_id} is not a valid triage plan: "
+            + "; ".join(errors)
+            + f" — {relaunch}",
+            file=sys.stderr,
+        )
+        return 1
+    mtime = datetime.fromtimestamp(artifact.mtime_ns / 1e9, tz=timezone.utc).astimezone()
+    print(f"triage attempt {task_id} of {story_key} left this result.json before its pause:")
+    print(f"  path:   {artifact.path}")
+    print(f"  mtime:  {mtime.isoformat()}")
+    print(f"  size:   {artifact.size} bytes")
+    print(f"  sha256: {artifact.sha256}")
+    print(
+        f"  plan:   {len(plan.bundles)} bundle(s), {len(plan.decisions)} decision(s), "
+        f"{len(plan.already_resolved)} already resolved, {len(plan.blocked)} blocked, "
+        f"{len(plan.skip)} skipped, over {len(plan.open_ids)} open entr(ies)"
+    )
+    # ASCII-escaped: the document is session-written, and every control or
+    # non-ASCII character reaches the terminal as a \u escape, never raw.
+    print("----- result.json -----")
+    print(json.dumps(artifact.doc, indent=2, ensure_ascii=True))
+    print("----- end result.json -----")
+    print(
+        f"warning: the triage session of {story_key} never completed (its hook channel "
+        "was silent), so nothing vouches for this document but you; adopting it uses it "
+        "as the sweep's triage plan without a new session. The resumed sweep re-checks "
+        "it against the live ledger and pauses if it no longer fits",
+        file=sys.stderr,
+    )
+    marker = adopt_marker_path(run_dir, story_key)
+    recorded = os.path.lexists(marker)
+    if recorded:
+        print(
+            f"an adoption is already recorded ({marker}): declining below withdraws it, "
+            "so a plain resume relaunches triage"
+        )
+    # Never skipped: not by --resume, --no-interactive or --force. The confirm is
+    # the human gesture that stands in for the session completion.
+    if not _confirm(f"adopt this result.json as the triage plan of run {args.run_id}?"):
+        # A marker an earlier confirm left would otherwise still be adopted by the
+        # next plain resume: the decline is the operator's latest word.
+        if recorded:
+            with state_lock(run_dir):
+                # Cleanup removes the run under this same hold: a run removed while
+                # the operator read the document has nothing left to withdraw, and
+                # the Journal below must not recreate its directory.
+                if not runs.is_run(run_dir):
+                    print(f"no such run: {run_dir.name}", file=sys.stderr)
+                    return 1
+                try:
+                    marker.unlink(missing_ok=True)
+                except OSError as e:
+                    print(
+                        f"error: cannot withdraw the recorded adoption {marker}: {e} — "
+                        "delete it before resuming",
+                        file=sys.stderr,
+                    )
+                    return 1
+                Journal(run_dir, pin=state).append(
+                    "sweep-triage-adopt-withdrawn", story_key=story_key, task_id=task_id
+                )
+            print(f"the earlier adoption of {task_id}'s result.json was withdrawn")
+        print("cancelled — run is still paused at the escalation")
+        return 0
+    with state_lock(run_dir):
+        # The checks above ran lock-free: repeat them against the last writer's
+        # state — first that cleanup has not removed the run during the confirm.
+        if not runs.is_run(run_dir):
+            print(f"no such run: {run_dir.name}", file=sys.stderr)
+            return 1
+        fresh_state = load_state(run_dir, pin=state)
+        if (
+            fresh_state.paused_stage,
+            fresh_state.paused_story_key,
+            fresh_state.paused_reason,
+        ) != (state.paused_stage, state.paused_story_key, state.paused_reason):
+            print(
+                f"the pause of run {args.run_id} changed while resolve was in progress "
+                "— not adopting",
+                file=sys.stderr,
+            )
+            return 1
+        fresh_live = runs.engine_liveness(run_dir)
+        if fresh_live == "alive":
+            print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+            return 1
+        if fresh_live == "unknown" and not args.force:
+            print(
+                f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                "refusing to adopt. Confirm the engine process is gone, then re-run "
+                "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                file=sys.stderr,
+            )
+            return 1
+        fresh_task = fresh_state.tasks.get(story_key)
+        if fresh_task is None or fresh_task.phase != Phase.ESCALATED:
+            print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
+            return 1
+        if (fresh_task.generation, fresh_task.attempt) != (task.generation, task.attempt):
+            print(
+                f"the escalation for {story_key} changed while resolve was in progress "
+                "— not adopting",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            current = read_triage_artifact(run_dir, task_id)
+        except (OSError, ValueError, RecursionError) as e:
+            current = None
+            changed = f"it can no longer be read ({type(e).__name__}: {e})"
+        else:
+            changed = "it is gone" if current is None else "its bytes changed"
+        if current is None or current.sha256 != artifact.sha256:
+            print(
+                f"error: the result.json of {task_id} changed after it was shown — "
+                f"{changed}; not adopting (re-run resolve to see it again)",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            atomic_write_text_confined(
+                marker,
+                _adopt_marker_document(story_key, fresh_task, task_id, current),
+                confine_root=runs._project_of_run_dir(run_dir),
+            )
+        except OSError as e:
+            print(f"error: cannot write the adoption marker {marker}: {e}", file=sys.stderr)
+            return 1
+        Journal(run_dir, pin=fresh_state).append(
+            "sweep-triage-adopt-confirmed",
+            story_key=story_key,
+            task_id=task_id,
+            sha256=current.sha256,
+        )
+    print(
+        f"adoption of {task_id}'s result.json recorded ({marker}) — the resumed sweep "
+        "re-validates it against the live ledger and uses it instead of launching triage"
+    )
+    if args.resume is False:
+        print(f"resume when ready: bmad-loop resume {args.run_id}")
+        return 0
+    from .tui import launch  # import-safe: launch.py has no textual imports
+
+    if launch.in_ctl_session():
+        print(
+            f"✓ resuming run {args.run_id} in the background — "
+            f"watch it in the TUI, or: bmad-loop attach {args.run_id}"
+        )
+        launch.detach_client()
+    return _resume_paused_run(project, run_dir)
+
+
+def _resolve_abandon(
+    args: argparse.Namespace,
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+    task: StoryTask,
+    story_key: str,
+) -> int:
+    """`resolve <replay-run> --abandon` (DW-535): close an escalated replay run whose
+    unit is superseded, keeping its branch and removing its worktree.
+
+    `cmd_resolve` has already run the shared gates (alias, paused-at-escalation,
+    liveness, ESCALATED story, sweep ledger). This adds `unitreplay.abandon_refusal`,
+    confirms (skipped by `--no-interactive`; `--resume`/`--no-resume` were refused as
+    a usage error), re-checks pause, liveness, phase and generation under the run lock
+    and hands the transaction to `unitreplay.abandon_replay_run`. No session and no
+    engine run; the board, the ledger and the origin run are never written."""
+    from .model import Phase
+    from .unitreplay import AbandonError, abandon_refusal, abandon_replay_run
+
+    if (refusal := abandon_refusal(state, task, story_key)) is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 1
+    try:
+        paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
+    except (bmadconfig.BmadConfigError, OSError) as e:
+        print(
+            f"error: cannot read the BMAD config to abandon run {args.run_id}: {e}", file=sys.stderr
+        )
+        return 1
+    print(
+        f"warning: abandoning replay run {args.run_id} removes the kept worktree of "
+        f"{story_key} ({task.worktree_path}) and closes the run unmerged; branch "
+        f"{task.branch} is kept. Uncommitted tracked and untracked changes (plus the "
+        "run's own spec/board/ledger copies), or commits on a detached HEAD the branch "
+        "lacks, are parked on a refs/attempt-preserve-dirty/*-abandon ref first; other "
+        "git-ignored files are removed with the worktree",
+        file=sys.stderr,
+    )
+    if args.interactive and not _confirm(
+        f"abandon replay run {args.run_id} ({story_key}, branch {task.branch})?"
+    ):
+        print("cancelled — run is still paused at the escalation")
+        return 0
+    try:
+        with state_lock(run_dir):
+            # The checks above ran lock-free: repeat them against the last writer's state.
+            fresh_state = load_state(run_dir, pin=state)
+            if not runs.escalation_resolvable(fresh_state):
+                print(
+                    runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_live = runs.engine_liveness(run_dir)
+            if fresh_live == "alive":
+                print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+                return 1
+            if fresh_live == "unknown" and not args.force:
+                print(
+                    f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                    "refusing to abandon. Confirm the engine process is gone, then re-run "
+                    "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_task = fresh_state.tasks.get(story_key)
+            if fresh_task is None or fresh_task.phase != Phase.ESCALATED:
+                print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
+                return 1
+            if fresh_task.generation != task.generation:
+                print(
+                    f"the escalation for {story_key} changed while resolve was in progress "
+                    "— not abandoning",
+                    file=sys.stderr,
+                )
+                return 1
+            outcome = abandon_replay_run(run_dir, story_key, paths=paths)
+    except AbandonError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if outcome.branch_kept:
+        print(f"abandoned replay run {args.run_id}: {story_key} kept on branch {outcome.branch}")
+    else:
+        print(
+            f"abandoned replay run {args.run_id}: branch {outcome.branch} of {story_key} "
+            "no longer exists"
+        )
+    if outcome.ref is not None and outcome.ref_pruned:
+        print(
+            f"warning: an earlier abandon attempt parked the worktree's unmerged work on "
+            f"{outcome.ref}, but that ref has since been pruned (scm.preserve_keep); the "
+            "work is no longer recoverable from it",
+            file=sys.stderr,
+        )
+    elif outcome.ref is not None:
+        print(
+            f"unmerged work from its worktree is parked on {outcome.ref} (kept within "
+            "scm.preserve_keep; copy it to a branch to keep it longer)"
+        )
+    return 0
+
+
+def _resolve_pause_admits(state: RunState, *, reverify_named: bool) -> bool:
+    """Whether `resolve` may act on ``state``'s pause: `runs.escalation_resolvable`
+    (the escalation pause, or no pause with a story still escalated, #958); any
+    pause for `--reverify --story <key>` (DW-522), whose `runs.reverify_refusal`
+    then admits only a worktree unit off the escalation pause. One rule for
+    `cmd_resolve`'s entry gate and `_resolve_reverify`'s locked re-check."""
+    if reverify_named:
+        return state.paused_stage is not None
+    return runs.escalation_resolvable(state)
+
+
+def _resolve_reverify(
+    args: argparse.Namespace,
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+    task: StoryTask,
+    story_key: str,
+) -> int:
+    """`resolve --reverify` (DW-522): re-verify a DEFERRED or environment-fault
+    ESCALATED story's kept attempt instead of re-driving it.
+
+    `cmd_resolve` has already run the shared gates (alias, paused-at-escalation — or
+    paused at all for a named `--story`, `_resolve_pause_admits` — liveness,
+    deferred-or-escalated story, sweep ledger). This adds the kept-work
+    preconditions (`runs.reverify_refusal`), states what the replay will claim,
+    confirms, re-checks everything under the run lock and hands the state
+    transaction to `runs.rearm_for_reverify`; the resumed engine's reverify arm then
+    replays verify on the tree and reviews and commits it on a pass. No dev session
+    and no resolve agent run. The code root is deliberately NOT re-stamped: a moved
+    root means the kept attempt lives in the other tree, which the refusal names."""
+    from .model import Phase
+
+    explicit_story = bool(args.story)
+    refusal = runs.reverify_refusal(
+        state,
+        task,
+        story_key,
+        run_dir=run_dir,
+        project_root=project,
+        explicit_story=explicit_story,
+    )
+    if refusal is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 1
+    mounted = bool(task.worktree_path)
+    root = Path(task.worktree_path) if mounted else Path(state.code_root)
+    try:
+        head = verify.rev_parse_head(root)
+    except verify.GitError as e:
+        print(f"error: cannot read HEAD of {root} ({e})", file=sys.stderr)
+        return 1
+    where = (
+        f"in its kept worktree: the attempt is branch {task.branch} at {root}"
+        if mounted
+        else f"in place: the attempt is the tree at {root}"
+    )
+    lands = (
+        "the unit merges into the target branch on a pass"
+        if mounted
+        else "the story commits on a pass"
+    )
+    print(
+        f"re-verifying {story_key} {where} — HEAD "
+        f"{head[:12]} above baseline {(task.baseline_commit or '')[:12]}, plus any "
+        "uncommitted changes. Commits/changes made since the pause are included in the "
+        "story's squashed commit. No dev session and no resolve agent run: the [verify] "
+        f"commands are replayed, then review follows policy and {lands}",
+        file=sys.stderr,
+    )
+    if args.resume is None and not _confirm(
+        f"re-verify the kept work of {story_key} and resume run {args.run_id}?"
+    ):
+        print("cancelled — run is still paused")
+        return 0
+    before_entries = runs.journal_entries_or_none(run_dir)
+    outcome: runs.RearmOutcome | None = None
+    try:
+        with state_lock(run_dir):
+            # Same mutation-boundary re-check as the re-arm path: the checks above
+            # ran lock-free, so repeat them against the state left by the last writer.
+            fresh_state = load_state(run_dir, pin=state)
+            if not _resolve_pause_admits(fresh_state, reverify_named=explicit_story):
+                print(
+                    runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_live = runs.engine_liveness(run_dir)
+            if fresh_live == "alive":
+                print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+                return 1
+            if fresh_live == "unknown" and not args.force:
+                print(
+                    f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                    "refusing to re-verify. Confirm the engine process is gone, then re-run "
+                    "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                    file=sys.stderr,
+                )
+                return 1
+            fresh_task = fresh_state.tasks.get(story_key)
+            if (
+                fresh_task is None
+                or fresh_task.phase != task.phase
+                or fresh_task.phase not in (Phase.DEFERRED, Phase.ESCALATED)
+            ):
+                print(
+                    f"no deferred or escalated story to re-verify in run {args.run_id}",
+                    file=sys.stderr,
+                )
+                return 1
+            if fresh_task.generation != task.generation:
+                print(
+                    f"story {story_key} changed while resolve was in progress — not re-arming",
+                    file=sys.stderr,
+                )
+                return 1
+            outcome = runs.rearm_for_reverify(
+                run_dir, story_key, project_root=project, explicit_story=explicit_story
+            )
+    except runs.RearmError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        # as the re-arm path: a re-arm that aborted after journaling still owes its
+        # records to the operator
+        if outcome is None:
+            _echo_rearm_events(run_dir, before_entries)
+    assert outcome is not None
+    _echo_rearm_notices(outcome.notices)
+    print(f"re-armed {story_key} for re-verification — verify replays on resume")
+    if args.resume is False:
+        print(f"resume when ready: bmad-loop resume {args.run_id}")
+        return 0
+    from .tui import launch  # import-safe: launch.py has no textual imports
+
+    if launch.in_ctl_session():
+        print(
+            f"✓ resuming run {args.run_id} in the background — "
+            f"watch it in the TUI, or: bmad-loop attach {args.run_id}"
+        )
+        launch.detach_client()
+    return _resume_paused_run(project, run_dir)
+
+
+def _resolve_reverify_finished(
+    args: argparse.Namespace,
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+) -> int:
+    """`resolve <finished-run> --reverify --story <key>` (DW-525): replay a finished
+    run's kept DEFERRED worktree unit in a NEW replay run (`unitreplay`).
+
+    `_resolve_reverify`'s shape: liveness gate → `runs.standalone_replay_refusal` →
+    the resume preflights the replay run will face (git floor, isolation conflict,
+    base skills) plus a clean main checkout on the run's target branch, which the
+    unit merges into → HEAD read → printed claim → `_confirm` (skipped when
+    `--resume`/`--no-resume` is given) → `unitreplay.mint_replay_run`, whose locked
+    re-check repeats the refusal → `--no-resume` hint or `_resume_paused_run` on the
+    replay run. The finished run stays finished; its state.json is never written."""
+    from .unitreplay import ReplayError, mint_replay_run
+
+    story_key = args.story
+    if not story_key:
+        print(
+            f"error: run {args.run_id} is finished — name the deferred worktree unit to "
+            f"replay with `bmad-loop resolve {args.run_id} --reverify --story <key>`",
+            file=sys.stderr,
+        )
+        return 1
+    live = runs.engine_liveness(run_dir)
+    if live == "alive":
+        print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+        return 1
+    if live == "unknown":
+        if not args.force:
+            print(
+                f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                "refusing to replay. Confirm the engine process is gone, then re-run "
+                "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+            "proceeding anyway (--force)",
+            file=sys.stderr,
+        )
+    task = state.tasks.get(story_key)
+    if task is None:
+        print(f"error: run {args.run_id} has no task for story {story_key}", file=sys.stderr)
+        return 1
+    refusal = runs.standalone_replay_refusal(
+        state, task, story_key, run_dir=run_dir, project_root=project
+    )
+    if refusal is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 1
+    try:
+        paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
+    except bmadconfig.BmadConfigError as e:
+        print(f"error: cannot read the BMAD config ({e})", file=sys.stderr)
+        return 1
+    pol = policy_mod.load(_policy_path(project))
+    # The resume preflights the replay run will face, taken BEFORE anything is minted
+    # so a refusal there cannot strand a replay run that owns the moved worktree.
+    if (rc := _reject_under_floor_git(paths.project)) is not None:
+        return rc
+    if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
+    if (
+        rc := _reject_store_topology(
+            project,
+            pol,
+            state.source,
+            recorded=runs.live_store_topology(state, project) or None,
+            initiative=_store_initiative(state),
+        )
+    ) is not None:
+        return rc
+    plugin_grants = _launch_plugin_grants(project)  # read ONCE, for both preflights
+    if not _require_base_skills(
+        project, pol, paths.repo_root, plugin_grants, review_owed=task.salvage_refile_pending
+    ):
+        return 1
+    # #496/#497: the resume's plugin-trust preflight, mirrored ahead of the mint.
+    if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
+        return rc
+    target = state.target_branch
+    try:
+        clean = verify.worktree_clean(paths.repo_root, project=paths.project)
+        on = verify.current_branch(paths.repo_root)
+    except verify.GitError as e:
+        print(f"error: cannot inspect the main checkout ({e})", file=sys.stderr)
+        return 1
+    if on != target:
+        print(
+            f"error: the main checkout is on {on!r}, not run {args.run_id}'s target "
+            f"branch {target!r}, which the unit merges into — `git checkout {target}` "
+            "first",
+            file=sys.stderr,
+        )
+        return 1
+    if not clean:
+        print(
+            "error: the main checkout is not clean — commit or stash first (the unit "
+            "merges into it)",
+            file=sys.stderr,
+        )
+        return 1
+    # Located on the live project, as `standalone_replay_refusal` checked it.
+    wt = runs.rebase_recorded_project_path(Path(task.worktree_path), state, project)
+    try:
+        head = verify.rev_parse_head(wt)
+    except verify.GitError as e:
+        print(f"error: cannot read HEAD of {wt} ({e})", file=sys.stderr)
+        return 1
+    print(
+        f"replaying {story_key} from finished run {args.run_id} in a NEW replay run — run "
+        f"{args.run_id} stays finished. The attempt is branch {task.branch} in its kept "
+        f"worktree {wt}, HEAD {head[:12]} above baseline "
+        f"{(task.baseline_commit or '')[:12]}, plus any uncommitted changes; the "
+        "worktree moves into the replay run's directory. No dev session and no resolve "
+        "agent run: the [verify] commands are replayed, then review follows policy and "
+        f"the unit merges into target branch {target} on a pass",
+        file=sys.stderr,
+    )
+    if args.resume is None and not _confirm(
+        f"create a replay run for {story_key} from finished run {args.run_id} and resume it?"
+    ):
+        print("cancelled — nothing was created; the run is still finished")
+        return 0
+    profiles = _launch_profiles(pol, project)
+    digest = _trusted_config_digest(pol, project, profiles=profiles)
+    try:
+        replay_dir = mint_replay_run(
+            project=project,
+            paths=paths,
+            policy=pol,
+            finished_run_dir=run_dir,
+            story_key=story_key,
+            expected_generation=task.generation,
+            trusted_config_digest=digest,
+            force=bool(args.force),
+        )
+    except ReplayError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    replay_id = replay_dir.name
+    # From here a refused launch is the replay run's (`_journal_unaccepted_launch`).
+    args.ctl_launch_run_id = replay_id
+    print(
+        f"minted replay run {replay_id} for {story_key} (replay of {args.run_id}) — "
+        "verify replays on resume"
+    )
+    # From here the command drives the replay run, so a TUI-launched child refused
+    # before accepting it journals there (`_journal_unaccepted_launch`), not into
+    # the finished run.
+    args.run_id = replay_id
+    if args.resume is False:
+        print(f"resume when ready: bmad-loop resume {replay_id}")
+        return 0
+    from .tui import launch  # import-safe: launch.py has no textual imports
+
+    if launch.in_ctl_session():
+        print(
+            f"✓ resuming run {replay_id} in the background — "
+            f"watch it in the TUI, or: bmad-loop attach {replay_id}"
+        )
+        launch.detach_client()
+    return _resume_paused_run(project, replay_dir)
+
+
 def _print_parked(parked: list[operatoractions.ParkedStory]) -> int:
     if not parked:
         print("no stories are awaiting operator actions")
@@ -3875,6 +9537,10 @@ def _print_parked(parked: list[operatoractions.ParkedStory]) -> int:
         print(f"  {p.story_key} (parked {p.parked_at}{provenance}){suffix}")
         for i, action in enumerate(p.actions, 1):
             print(f"      {i}. {action}")
+        # `is True`, not truthiness: None is a record that predates the field,
+        # which owes nothing we know of and so shows nothing.
+        if p.followup_review_recommended is True:
+            print("      follow-up review recommended at park time: run it after confirming")
         print("")
     print("confirm one when its actions are done: bmad-loop confirm <story-key>")
     return 0
@@ -3893,15 +9559,66 @@ def _reverify(project: Path, cwd: Path) -> str | None:
     if not pol.verify.commands:
         print("note: --reverify: no [verify] commands are configured — nothing to re-run")
         return None
+    # The environment preflight (DW-523), same gate as every other composition:
+    # a failed probe means the environment, not the story, so no command runs.
+    probe = verify.run_environment_probes(pol, cwd)
+    if probe.failed is not None:
+        return (
+            f"environment probe {probe.failed.command!r} failed ({probe.reason}) — the run "
+            "environment, not the story; fix it and re-run"
+        )
     print(f"re-running {len(pol.verify.commands)} verify command(s)...")
+    env_fault_rc = pol.verify.env_fault_rc
     for result in verify.run_verify_commands(pol, cwd):
-        fault = verify.env_fault_reason(result, cwd)
+        fault = verify.env_fault_reason(result, cwd, env_fault_rc=env_fault_rc)
         if fault is not None:
+            if result.spawn_error is None and env_fault_rc and result.returncode == env_fault_rc:
+                # The command RAN and said so on purpose; "could not run" would
+                # misreport it (same order as verify's cause: spawn, then declared).
+                return (
+                    f"{result.command!r} reported an environment fault "
+                    f"(rc={result.returncode}, [verify] env_fault_rc)"
+                )
             return f"{result.command!r} could not run: {fault}"
+        if verify._timed_out_leg(result):
+            # Operator-facing, unlike the engine's neutral reason: naming the key
+            # here is the point — only the operator decides the gate is slow.
+            return (
+                f"{result.command!r} timed out after {pol.verify.command_timeout_min} min — "
+                "raise [verify] command_timeout_min in policy.toml if this gate is "
+                "legitimately this slow"
+            )
         if result.returncode != 0:
             return f"{result.command!r} failed (rc {result.returncode}):\n{result.output_tail}"
     print("  verify commands passed")
     return None
+
+
+def _confirm_policy(project: Path) -> policy_mod.Policy | None:
+    """The project's policy for ``confirm``, None when it cannot be read."""
+    try:
+        return policy_mod.load(_policy_path(project))
+    except (policy_mod.PolicyError, OSError):
+        return None
+
+
+def _confirm_ticket_tree(project: Path) -> tickettree.TicketTreeLike:
+    """The tree ``confirm`` marks a ticket park's plan through: the project's
+    installed ``tickets.py``, unpinned — ``confirm`` runs outside any run, and the
+    park record's plan path is the cross-check ``mark`` holds the write to."""
+    return tickettree.TicketTree(project)
+
+
+class _ConfirmMarkLog(Journal):
+    """Where the ticket chokepoint's ``ticket-mark`` row goes during ``confirm``,
+    which runs outside any run and so has no run journal: kept in memory (nothing
+    is written), while the outcome itself is printed."""
+
+    def __init__(self) -> None:  # no run dir: `confirm` writes no journal
+        self.rows: list[dict[str, object]] = []
+
+    def append(self, kind: str, **fields: Any) -> None:
+        self.rows.append({"kind": kind, **fields})
 
 
 def cmd_confirm(args: argparse.Namespace) -> int:
@@ -3917,8 +9634,12 @@ def cmd_confirm(args: argparse.Namespace) -> int:
     stayed outside the repo. `--reverify` is there for the case that matters —
     the external action may have changed what the tests see."""
     project = _project(args)
+    pol = _confirm_policy(project)
     try:
-        paths = bmadconfig.load_paths(project)
+        paths = bmadconfig.load_paths(
+            project,
+            want_tickets=pol is not None and pol.stories.source == worksource.SOURCE_TICKETS,
+        )
     except bmadconfig.BmadConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -4015,9 +9736,13 @@ def _resume_confirmation(
     advanced", since the confirmation itself already happened."""
     spec = story.spec_path
     assert spec is not None  # resumable requires a spec that read back as done
+    left = (
+        f"its plan is signed off and reads {story.spec_status}, but the park entry was"
+        if story.ticket
+        else "its spec is signed off and reads done, but the board and the park entry were"
+    )
     print(
-        f"{story.story_key} was already confirmed — its spec is signed off and reads "
-        f"done, but the board and the park entry were left behind. Finishing that; "
+        f"{story.story_key} was already confirmed — {left} left behind. Finishing that; "
         f"you will not be asked to acknowledge anything again.\n"
     )
     if args.reverify:
@@ -4086,6 +9811,10 @@ def _apply_confirmation(
             file=sys.stderr,
         )
         return 1
+    if story.ticket:
+        # A ticket plan's status is written only by the ticket chokepoint: the
+        # `confirm` mark is the landing half's, which a resume re-enters too.
+        return _land_confirmation(project, paths, story, spec, today)
     try:
         frontmatter.set_frontmatter_status(spec, "done", confine_root=project)
     except frontmatter.FrontmatterWriteError as e:
@@ -4127,12 +9856,40 @@ def _land_confirmation(
     Split out because it is exactly what an interrupted confirmation still owes.
     The spec half is already on disk in that case — audit section appended, status
     at `done` — and re-running it would append a second section for one event, so
-    the resume path enters here instead of at :func:`_apply_confirmation`."""
+    the resume path enters here instead of at :func:`_apply_confirmation`.
+
+    A board row the writer refuses (``SprintStatusWriteRefused``) and one that
+    otherwise did not reach ``done`` both exit 1 with the park entry kept, so a
+    re-run after the operator repairs the board resumes here.
+
+    A ticket park has no board: its plan is marked instead
+    (:func:`_mark_ticket_confirmed`), and the commit carries the record's
+    deletion and — when the code checkout tracks the store — the plan
+    (:func:`_confirmed_plan_operands`)."""
+    if story.ticket:
+        target = _mark_ticket_confirmed(project, story, spec)
+        if target is None:
+            return 1
+        files = _confirmed_plan_operands(project, story, spec)
+        return _commit_confirmation(project, paths, story, files, f"plan is {target}")
     # The sole write path to the board, and an ordinary FORWARD move:
     # `awaiting-operator` sits immediately below `done` in STATUS_ORDER, so
     # confirming needs no exception to never-regress. Idempotent at `done`, which
     # is what lets a resume run it after a human fixed the board by hand.
-    landed = sprintstatus.advance(paths.sprint_status, story.story_key, "done", now=today)
+    try:
+        landed = sprintstatus.advance(paths.sprint_status, story.story_key, "done", now=today)
+    except sprintstatus.SprintStatusWriteRefused as e:
+        # The row is there and the writer cannot rewrite its shape (#842): name the
+        # repair, and keep the park entry so the re-run below finishes the job.
+        print(
+            f"error: {spec} was updated but the board write was refused: {e}\n"
+            f"The spec is already correct and signed off, and the park entry has been "
+            f"left in place: after fixing that row, re-run "
+            f"`bmad-loop confirm {story.story_key}` to finish without acknowledging "
+            f"anything twice.",
+            file=sys.stderr,
+        )
+        return 1
     if landed != "done":
         print(
             f"error: {spec} was updated but {paths.sprint_status} did not advance "
@@ -4143,13 +9900,6 @@ def _land_confirmation(
             file=sys.stderr,
         )
         return 1
-    # Resolve the record path BEFORE dropping it: the drop unlinks the file, and
-    # a committed record's deletion must ride the confirm commit (#356) — the
-    # record arrived in the park's commit, so leaving its removal uncommitted
-    # would dirty the tree the next run's preflight refuses. `commit_paths`
-    # skips the path when no record was ever committed (a legacy-index park).
-    record = operatoractions.record_path(project, story.story_key)
-    operatoractions.drop(project, story.story_key)
     # A GITIGNORED board is left OUT of the list rather than handed over and
     # forgiven (#577). `commit_paths` forces every operand literal, so `git add`
     # refuses an ignored one with rc 1 — and refuses the whole operand list with
@@ -4157,12 +9907,127 @@ def _land_confirmation(
     # of the other two. That is right for the board (a file git will not track has
     # no commit to ride; the status on disk is the value) and wrong for the spec
     # and the record, whose deletion in particular MUST land per the #356 note
-    # above. #350's board carry makes a gitignored board an ordinary shape, so
-    # this is the common park's exit and not an exotic one.
+    # in `_commit_confirmation`. #350's board carry makes a gitignored board an
+    # ordinary shape, so this is the common park's exit and not an exotic one.
     try:
         board_ignored = verify.path_ignored(paths.repo_root, paths.sprint_status)
     except verify.GitError:
         board_ignored = False  # uncertainty keeps the board in: the older behavior
+    files = [spec] if board_ignored else [spec, paths.sprint_status]
+    return _commit_confirmation(project, paths, story, files, "spec and board are done")
+
+
+def _mark_ticket_confirmed(
+    project: Path, story: operatoractions.ParkedStory, spec: Path
+) -> str | None:
+    """Mark a confirmed ticket park's plan through the ticket chokepoint: reason
+    ``confirm``, to ``done`` under ``[tickets] mark_done = "auto"``, else to
+    ``built`` for a person to accept. ``mark`` clears the plan's ``blocked_*``
+    fields, holds the write to the record's plan, and reads it back; a plan
+    already at the target (an interrupted confirmation) is a no-op. Returns the
+    target, or None after printing why nothing was marked — the park entry stays,
+    so a re-run finishes the job."""
+    pol = _confirm_policy(project)
+    if pol is None:
+        print(
+            f"error: cannot read {_policy_path(project)}, so whether {story.story_key} "
+            f"lands done or built (`[tickets] mark_done`) is unknown — its plan was NOT "
+            f"marked and the park entry has been left in place. Repair the policy, then "
+            f"re-run `bmad-loop confirm {story.story_key}`. {_SECOND_SECTION_NOTE}",
+            file=sys.stderr,
+        )
+        return None
+    target = "done" if pol.tickets.mark_done == "auto" else "built"
+    try:
+        _confirm_ticket_tree(project).mark(
+            story.ref, target, reason="confirm", expected_plan=spec, journal=_ConfirmMarkLog()
+        )
+    except tickettree.TicketsError as e:
+        print(
+            f"error: marking ticket {story.ref} {target} failed (tickets.py {e.kind}: {e}), so "
+            f"{story.story_key} was NOT confirmed. The audit section was appended to {spec}; "
+            f"the plan and the park entry are untouched. Fix the ticket tree, then re-run "
+            f"`bmad-loop confirm {story.story_key}`. {_SECOND_SECTION_NOTE}",
+            file=sys.stderr,
+        )
+        return None
+    return target
+
+
+def _confirmed_plan_operands(
+    project: Path, story: operatoractions.ParkedStory, spec: Path
+) -> list[Path]:
+    """The confirm commit's operands for a ticket's marked plan, by store layout:
+    ``[spec]`` when the code checkout tracks the store (T1, or no initiative to
+    classify), else nothing. A store with its own repository (T3/T4) gets the plan
+    committed there first, through :class:`~bmad_loop.ticketstore.StoreCommitter`;
+    an unversioned store (T2/T6) has nothing to commit. Handed to the code
+    repository, a store plan is skipped as outside it (T4) or fails ``git add`` as
+    ignored (T2/T3) — sinking the record's deletion with it.
+
+    A store that cannot be classified or committed is warned about on stderr and
+    left out: the mark already landed, so ``confirm`` still finishes."""
+    try:
+        tpaths = bmadconfig.load_paths(project, want_tickets=True)
+    except bmadconfig.BmadConfigError as e:
+        return _plan_left_uncommitted(
+            spec, f"cannot read the BMAD config to classify the ticket store: {e}"
+        )
+    # `none`: only the layout matters here; worktree isolation's extra refusals are
+    # about arming a run, and `confirm` arms none.
+    result = ticketstore.assess_store(tpaths, "none")
+    if result is None:
+        return [spec]
+    if isinstance(result, ticketstore.StoreRefusal):
+        # The code, not the refusal text: that text is a run-arming refusal
+        # (`STORE_TOPOLOGY_CALLERS`), and `confirm` only needs to say why it stopped.
+        return _plan_left_uncommitted(
+            spec, f"the ticket store layout is refused: {result.code} at {result.path}"
+        )
+    if result.per_worktree():
+        return [spec]
+    if result.store_repo is None:
+        return []
+    committer = ticketstore.StoreCommitter(result.store_repo, tpaths.repo_root)
+    try:
+        commit = committer.commit(
+            story.story_key, [spec], f"chore(operator): confirm {story.story_key}"
+        )
+    except ticketstore.StoreCommitError as e:
+        return _plan_left_uncommitted(spec, str(e))
+    if commit.foreign:
+        return _plan_left_uncommitted(
+            spec, f"the store's index holds a staged version of {', '.join(commit.foreign)}"
+        )
+    return []
+
+
+def _plan_left_uncommitted(spec: Path, why: str) -> list[Path]:
+    """Warn that a confirmed plan's mark landed uncommitted; no operands."""
+    print(
+        f"warning: {spec} was marked but not committed ({' '.join(why.split())}) — "
+        "commit it in its ticket store by hand.",
+        file=sys.stderr,
+    )
+    return []
+
+
+def _commit_confirmation(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    story: operatoractions.ParkedStory,
+    files: list[Path],
+    landed: str,
+) -> int:
+    """Drop the park record and commit ``files`` with the record's deletion: the
+    shared tail of a board and a ticket confirmation."""
+    # Resolve the record path BEFORE dropping it: the drop unlinks the file, and
+    # a committed record's deletion must ride the confirm commit (#356) — the
+    # record arrived in the park's commit, so leaving its removal uncommitted
+    # would dirty the tree the next run's preflight refuses. `commit_paths`
+    # skips the path when no record was ever committed (a legacy-index park).
+    record = operatoractions.record_path(project, story.story_key)
+    operatoractions.drop(project, story.story_key)
     # THE PUBLISHABLE-TARGET GUARD (DW-237), per operand and before any git runs.
     # `commit_paths` forces every operand LITERAL, so an operand replaced by a
     # DIRECTORY is handed to `git add` as a pathspec and staged RECURSIVELY —
@@ -4173,7 +10038,7 @@ def _land_confirmation(
     # PER OPERAND, like `decisions.apply_pre_answer`'s GATE TWO: a dropped one must
     # not sink its siblings, which is the whole point of the `board_ignored` drop
     # this joins.
-    operands: list[Path] = [spec, record] if board_ignored else [spec, paths.sprint_status, record]
+    operands: list[Path] = [*files, record]
     survivors: list[Path] = []
     for path in operands:
         # The SAME resolve-then-guard the four carries take, imported rather than
@@ -4210,7 +10075,19 @@ def _land_confirmation(
             )
         except verify.GitError:
             pass  # files are written; git history is best effort (as `decisions`)
-    print(f"✓ {story.story_key} confirmed — spec and board are done")
+    print(f"✓ {story.story_key} confirmed — {landed}")
+    if story.followup_review_recommended is True:
+        # The park skipped the pass; the now-done (or built) spec is one the build
+        # skill routes to a fresh review, which a parked spec is not.
+        # Named as the review session would spell it (a pre-rename project still
+        # drives `bmad-dev-auto`); an unreadable policy leaves it generic.
+        target = story.spec_path if story.spec_path is not None else "the story's spec"
+        pol = _confirm_policy(project)
+        skill = "the build skill" if pol is None else _dev_skill_for_role(pol, project, "review")
+        print(
+            f"  follow-up review still owed: invoke {skill} on {target} "
+            "(it routes a done or built spec to a fresh review pass)"
+        )
     return 0
 
 
@@ -4223,7 +10100,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     project = _project(args)
     try:
         paths = bmadconfig.load_paths(project)
-        pending = decisions.pending_missed_decisions(project)
+        pending = decisions.pending_missed_decisions(project, paths)
     except bmadconfig.BmadConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -4252,6 +10129,15 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             "no pending decisions could be resolved from it",
             file=sys.stderr,
         )
+    # Same reasoning for the run listing the triage caches are read from (DW-468):
+    # a run dir that cannot be read contributes no decisions, and says so here.
+    _, listing_fault = runs.list_run_dirs(project)
+    if listing_fault is not None:
+        print(
+            f"note: run listing incomplete ({listing_fault}) — "
+            "decisions from those runs' triage could not be read",
+            file=sys.stderr,
+        )
     if args.json:
         # Before the empty-set early return (nothing pending is a valid empty
         # document, not the text line), and regardless of --list: --json *is*
@@ -4278,7 +10164,9 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     for decision in pending:
         option = prompter.ask(decision)
         try:
-            result = decisions.apply_pre_answer(project, decision, option, date=today)
+            result = decisions.apply_pre_answer(
+                project, decision, option, date=today, listed_ledger=paths.deferred_work
+            )
         except (
             OSError,
             bmadconfig.BmadConfigError,
@@ -4428,6 +10316,17 @@ def _sweep_options_line(run_dir: Path, state: RunState) -> str:
     return f"sweep options: {', '.join(parts)}{legacy}"
 
 
+def _latest_run_dir(project: Path) -> Path | None:
+    """:func:`runs.latest_run_dir` for a command that falls back to the newest run,
+    with the listing fault on stderr (DW-468): over an unreadable runs dir the
+    "no runs found" that follows is not the answer, and over an unreadable run
+    dir the pick is only the newest readable run."""
+    run_dir, fault = runs.latest_run_dir(project)
+    if fault is not None:
+        print(f"warning: run listing incomplete: {fault}", file=sys.stderr)
+    return run_dir
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     project = _project(args)
     if args.run_id:
@@ -4437,7 +10336,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(str(e), file=sys.stderr)
             return 1
     else:
-        run_dir = runs.latest_run_dir(project)
+        run_dir = _latest_run_dir(project)
     if run_dir is None or not (run_dir / "state.json").is_file():
         print("no runs found", file=sys.stderr)
         return 1
@@ -4467,6 +10366,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("status: in progress — graceful stop pending (will stop after the current item)")
     else:
         print("status: in progress (or interrupted)")
+    # #958: a story left escalated behind a run that reads as not paused — the
+    # same predicate as resolve's admission, so the hint never names a refusal.
+    for key in cleared_pause_escalation_keys(state):
+        print(f"escalated: story '{key}' awaiting resolve — bmad-loop resolve {state.run_id}")
     if state.run_type == "sweep":
         print(_sweep_options_line(run_dir, state))
     if state.sweeps_refused:
@@ -4490,23 +10393,19 @@ def cmd_status(args: argparse.Namespace) -> int:
         extra = task.defer_reason or task.commit_sha or ""
         if task.preserve_ref:
             extra = f"{extra} [{task.preserve_ref}]".lstrip()
+        # The story's uncharged usage-limit relaunches (#959), only when nonzero
+        # — why dev×N / review×N can exceed their caps. Same `↻N` glyph and
+        # nonzero gate as the TUI counter cell (tui/screens/dashboard.py
+        # _counter_cell, not importable here: the TUI is an optional extra).
+        relaunched = f" ↻{task.usage_relaunches}" if task.usage_relaunches > 0 else ""
         # 17 = len("awaiting-operator"), the longest Phase token; a narrower
         # field does not truncate, it shifts every following column on that one
         # row, which reads as corrupt output rather than as a long status.
         print(
-            f"  {key:40s} {task.phase:17s} dev×{task.attempt} review×{task.review_cycle} "
-            f"{tokens} {extra}"
+            f"  {key:40s} {task.phase:17s} dev×{task.attempt} review×{task.review_cycle}"
+            f"{relaunched} {tokens} {extra}"
         )
-    if state.source == "stories":
-        _print_stories_status(state, project)
-    else:
-        try:
-            paths = bmadconfig.load_paths(project)
-            ss = sprintstatus.load(paths.sprint_status)
-            remaining = [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
-            print(f"sprint backlog remaining: {len(remaining)}")
-        except (bmadconfig.BmadConfigError, sprintstatus.SprintStatusError):
-            pass
+    _STATUS_PRINTERS[worksource.resumed_traits_for(state.source).name](state, project)
     try:
         missed = decisions.pending_missed_decisions(project)
         if missed:
@@ -4520,17 +10419,84 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_list(args: argparse.Namespace) -> int:
     project = _project(args)
-    infos = runs.discover_runs(project)  # oldest first
+    infos, fault = runs.discover_runs(project)  # oldest first
     if args.json:
-        machine.emit(list_document(infos))
+        machine.emit(list_document(infos, listing_fault=fault))
         return 0
+    if fault is not None:
+        # DW-468: an unreadable runs dir (or run dir) is not "no runs".
+        print(f"warning: run listing incomplete: {fault}", file=sys.stderr)
     if not infos:
-        print("no runs found")
+        if fault is None:
+            print("no runs found")
         return 0
     print(f"{'REF':6} {'TYPE':6} {'STATUS':10} RUN ID")
     for ri in infos:
         print(f"{runs.short_ref(ri.run_id):6} {ri.run_type:6} {ri.status:10} {ri.run_id}")
     return 0
+
+
+def _note_superseded_ctl_for_attach(
+    project: Path, where: str = "this run's window may be there"
+) -> None:
+    """After "nothing to attach" (or "no runs found", whose runs may have been
+    archived while their windows stay parked, with a ``where`` that names no
+    run): name each pre-upgrade control session still standing in this
+    project's registry (#733), with the command that attaches to it, because a
+    run window parked there is one attach cannot see.
+
+    Named, not adopted. attach, stop and the parked-window sweep address
+    ``runs.ctl_session_for`` only (see ``runs.is_ctl_session_name``); finding
+    a window here would land the operator in a session `stop` cannot then
+    close the window of, and a decision answered there would hand its client
+    back to nowhere. So the operator is pointed at it and the session ends when
+    they end it (`cleanup` prints how).
+
+    The verb is the one attach itself would run here: inside a multiplexer
+    client a nested attach is refused, so the backend switches the client
+    instead (``attach_target_argv``). A listing that could not be taken is said,
+    not passed off as "no such session" after "nothing to attach".
+
+    A paste-ready command only on psmux (``_is_psmux``); another backend's
+    session is named without one, and so is a name a run may
+    own (``runs.superseded_ctl_may_be_run``, #915)."""
+    from .adapters.multiplexer import MultiplexerError, get_multiplexer
+
+    def _fault(msg: str) -> None:
+        print(
+            f"note: could not check this project's registry for a pre-upgrade control "
+            f"session: {msg}",
+            file=sys.stderr,
+        )
+
+    try:
+        mux = get_multiplexer()
+        stale = runs.superseded_ctl_sessions(project, mux, on_fault=_fault)
+    except MultiplexerError as exc:
+        _fault(str(exc))
+        return
+    psmux = _is_psmux(mux)
+    for name in stale:
+        if runs.superseded_ctl_may_be_run(
+            project, name, mux, on_fault=lambda msg: print(f"note: {msg}", file=sys.stderr)
+        ):
+            # #915: no attach command into what may be a run's own session.
+            print(
+                f"note: pre-upgrade control session {name} is still running in this "
+                f"project's registry, and attach does not look inside it; {_MAY_BE_RUN} "
+                "and no command is printed for it",
+                file=sys.stderr,
+            )
+            continue
+        how = where
+        if psmux:
+            verb = mux.attach_target_argv(f"={name}")[1]
+            how += ": " + _psmux_command(mux.registry_root(), f"{verb} -t '={name}'")
+        print(
+            f"note: pre-upgrade control session {name} is still running in this "
+            f"project's registry, and attach does not look inside it; {how}",
+            file=sys.stderr,
+        )
 
 
 def cmd_attach(args: argparse.Namespace) -> int:
@@ -4541,16 +10507,39 @@ def cmd_attach(args: argparse.Namespace) -> int:
         try:
             run_dir = runs.resolve_run_dir(project, args.run_id)
         except runs.RunRefError as e:
+            # The run dir may be archived or cleaned while its window stays
+            # parked in a pre-upgrade control session (#915).
             print(str(e), file=sys.stderr)
+            _note_superseded_ctl_for_attach(project, "a run's window may be there")
             return 1
     else:
-        run_dir = runs.latest_run_dir(project)
+        run_dir = _latest_run_dir(project)
     if run_dir is None:
         print("no runs found", file=sys.stderr)
+        _note_superseded_ctl_for_attach(project, "a run's window may be there")
         return 1
-    plan = launch.attach_plan(project, run_dir.name)
+    # A ctl listing that could not be read is said, then the attach carries on
+    # to the agent session rather than failing on a window it could not check.
+    ctl_faults: list[str] = []
+
+    def ctl_fault(msg: str) -> None:
+        ctl_faults.append(msg)
+        print(f"warning: could not check the run's control window: {msg}", file=sys.stderr)
+
+    plan, unproven = launch.attach_plan(project, run_dir.name, on_fault=ctl_fault)
+    if unproven:
+        # A window under this run's name was refused for an empty tag (#750):
+        # say so before attaching elsewhere — or reporting nothing — so the
+        # refusal is not mistaken for an absence. Before the attach, which takes
+        # over the terminal.
+        notice = launch.unproven_ctl_window_notice(project, run_dir.name, unproven)
+        print(f"warning: {notice}", file=sys.stderr)
     if plan is None:
-        print(f"nothing to attach for run {run_dir.name}", file=sys.stderr)
+        if not ctl_faults:
+            # Not after a ctl fault: "nothing to attach" would claim the
+            # unchecked ctl window absent (#750). The warning above stands.
+            print(f"nothing to attach for run {run_dir.name}", file=sys.stderr)
+            _note_superseded_ctl_for_attach(project)
         return 1
     argv, return_window = plan
     # Record where to send the client once the sweep finishes this cycle's
@@ -4701,12 +10690,23 @@ def cmd_delete(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr)
         return 1
     args.run_id = run_dir.name
+    if args.force:
+        try:
+            # Before `--force` can hard-stop a live engine: a held run is refused
+            # anyway, and stopping it first would leave it stopped with nothing
+            # deleted. Without `--force` a live run gets the live-engine refusal
+            # first. `delete_run` re-checks under the lock.
+            runs.refuse_held_sweep_closes(project, run_dir)
+        except runs.HeldSweepClosesError as e:
+            print(str(e), file=sys.stderr)
+            return 1
     rc = _stop_or_block_live_engine(run_dir, args.run_id, args.force)
     if rc is not None:
         return rc
     try:
         runs.delete_run(project, run_dir, force=args.force)
-    except runs.LiveEngineError as e:
+    except (runs.LiveEngineError, runs.HeldSweepClosesError) as e:
+        # `--force` waives neither: the held-closes refusal names its own remedy.
         print(str(e), file=sys.stderr)
         return 1
     except runs.LiveSessionError as e:
@@ -4724,12 +10724,20 @@ def cmd_archive(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr)
         return 1
     args.run_id = run_dir.name
+    if args.force:
+        try:
+            # As on `delete`: refuse a held run before `--force` can stop it.
+            runs.refuse_held_sweep_closes(project, run_dir, "archive")
+        except runs.HeldSweepClosesError as e:
+            print(str(e), file=sys.stderr)
+            return 1
     rc = _stop_or_block_live_engine(run_dir, args.run_id, args.force)
     if rc is not None:
         return rc
     try:
         dest = runs.archive_run(project, run_dir, force=args.force)
-    except runs.LiveEngineError as e:
+    except (runs.LiveEngineError, runs.HeldSweepClosesError) as e:
+        # `--force` waives neither, as on `delete`.
         print(str(e), file=sys.stderr)
         return 1
     except runs.LiveSessionError as e:
@@ -4739,7 +10747,135 @@ def cmd_archive(args: argparse.Namespace) -> int:
     return 0
 
 
-def _warn_legacy_leftovers(leftovers: dict[str, list[str]]) -> None:
+def _is_psmux(mux: object) -> bool:
+    """Whether ``mux`` is the bundled psmux backend, the one transport whose
+    commands :func:`_psmux_command` can spell. ponytail: no generic renderer;
+    an out-of-tree registry-namespaced backend gets its sessions named, not a
+    command, until one needs more."""
+    from .adapters.psmux_backend import PsmuxMultiplexer
+
+    return isinstance(mux, PsmuxMultiplexer)
+
+
+def _psmux_command(registry: str | None, verb: str) -> str:
+    """A paste-ready PowerShell line running ``psmux <verb>`` against
+    ``registry`` (psmux's own default when ``None``). Quoted the way
+    ``_mux_info`` quotes its export line. psmux only (:func:`_is_psmux`)."""
+    run = f"psmux {verb}"
+    if registry is None:
+        return run
+    quoted = registry.replace("'", "''")
+    return f"$env:{runs.PSMUX_DATA_DIR} = '{quoted}'; {run}"
+
+
+def _superseded_ctl_kill_commands(
+    project: Path, superseded: list[str], on_fault: Callable[[str], None]
+) -> tuple[dict[str, str | None], list[str], list[str]]:
+    """``({name: command that ends it}, ambiguous, withheld)`` for each control session
+    in the registry in force under the name an earlier release minted for this
+    project there (#733, ``runs.superseded_ctl_name``), picked out of
+    ``superseded`` (``runs.legacy_registry_leftovers``' own-registry answer)
+    rather than listed a second time.
+
+    A command here and none for the legacy leftovers, because this session is
+    ours beyond doubt — its name is a digest of this project's derived root —
+    and nothing else will ever end it: no bmad-loop command addresses it. The
+    caveat travels with the command: ending it kills whatever its windows
+    still run. ``None`` for the command when the backend is not psmux
+    (:func:`_is_psmux`): the session is named, and no command is advertised
+    that could not run there.
+
+    ``ambiguous`` holds each such name a run may own
+    (``runs.superseded_ctl_may_be_run``, #915): it gets no command at all, so
+    it is left out of the dict (and of ``--json`` ``legacy_kill_commands``)
+    while ``superseded_ctl_sessions`` still names it. A check that could not
+    be made goes to ``on_fault``, labelled with the registry (``cleanup`` keeps
+    it apart from ``legacy_unverified``: the registry itself was listed).
+
+    ``withheld`` holds each name withheld for a fault rather than a possible
+    owner: every session when the name can no longer be derived, and a listed
+    name that no longer matches it (each said through ``on_fault``). It gets no
+    command either, but no run-ownership claim: nothing suggests a run owns it."""
+    if not superseded:
+        return {}, [], []
+    from .adapters.multiplexer import MultiplexerError, get_multiplexer
+
+    try:
+        mux = get_multiplexer()
+        root = mux.registry_root()
+        old = mux.session_name_key(runs.superseded_ctl_name(project, root))
+    except (MultiplexerError, runs.StateRootError, OSError, RuntimeError) as exc:
+        # The listing derived it moments ago, so this is a fault, not "no such
+        # session": withhold every command, and keep each name in `withheld`
+        # so the text mode still names it.
+        on_fault(f"could not derive the pre-upgrade control-session name: {exc}")
+        return {}, [], list(superseded)
+    # The exact name `runs.superseded_ctl_sessions` matched, never the shape: a
+    # run's agent session `bmad-loop-ctl-<16 hex>` is spelled the same way.
+    psmux = _is_psmux(mux)
+    commands: dict[str, str | None] = {}
+    ambiguous: list[str] = []
+    withheld: list[str] = []
+    label = root or runs.DEFAULT_REGISTRY_LABEL
+    for name in superseded:
+        if mux.session_name_key(name) != old:
+            # Listed under a name that no longer derives (the root moved in
+            # between): no command, but still named.
+            on_fault(f"{label}: {name} no longer matches the pre-upgrade control-session name")
+            withheld.append(name)
+        elif runs.superseded_ctl_may_be_run(
+            project, name, mux, on_fault=lambda msg: on_fault(f"{label}: {msg}")
+        ):
+            ambiguous.append(name)
+        else:
+            commands[name] = _psmux_command(root, f"kill-session -t '={name}'") if psmux else None
+    return commands, ambiguous, withheld
+
+
+#: Why a pre-upgrade control-session name gets no command (#915), said the
+#: same way by cleanup and attach.
+_MAY_BE_RUN = "a run with that id may own it"
+
+
+def _warn_superseded_ctl(
+    kill_commands: dict[str, str | None],
+    ambiguous: list[str],
+    withheld: list[str],
+    faults: list[str],
+) -> None:
+    for fault in faults:
+        print(f"note: {fault}", file=sys.stderr)
+    for name in ambiguous:
+        print(
+            f"pre-upgrade control session {name} is still running in this project's "
+            f"registry; {_MAY_BE_RUN} and no command is printed for it",
+            file=sys.stderr,
+        )
+    for name in withheld:
+        # A fault, not a possible owner (the note above says which): no
+        # ownership claim, and no command until a cleanup can confirm the name.
+        print(
+            f"pre-upgrade control session {name} is still running in this project's "
+            "registry; its name could not be confirmed (see the note above) and no "
+            "command is printed for it",
+            file=sys.stderr,
+        )
+    for name, command in kill_commands.items():
+        how = f"end it with: {command}" if command else "end it with your multiplexer"
+        print(
+            f"pre-upgrade control session {name} is still running in this project's "
+            "registry, and no bmad-loop command addresses it; once its runs have "
+            "finished and every window in it shows the exit banner (ending it kills "
+            f"what they still run), {how}",
+            file=sys.stderr,
+        )
+
+
+def _warn_legacy_leftovers(
+    project: Path,
+    leftovers: dict[str, list[str]],
+    unverified: list[str] | tuple[str, ...] = (),
+) -> None:
     """Name what each legacy multiplexer registry still holds after the sweep.
 
     Silent on the normal path — the list is empty on every platform without a
@@ -4768,8 +10904,31 @@ def _warn_legacy_leftovers(leftovers: dict[str, list[str]]) -> None:
     where there is room to state it.
 
     Deliberately unconditional on dry-run: a preview that omits the remainder
-    would disagree with the run it is previewing."""
+    would disagree with the run it is previewing.
+
+    ``unverified`` names each legacy registry that could not be asked at all
+    (DW-469): without a line for it, a registry that raised printed exactly what
+    a registry holding nothing prints — nothing.
+
+    A registry shaped like a root bmad-loop derived from another project path
+    (`runs.foreign_registry_root`, #906) gets its own line: its control session
+    and untagged sessions are not a migration remainder but most likely that
+    project's, which is the one thing to say before anyone removes them. A
+    session tagged as ours there is still named, and is still ours."""
+    for line in unverified:
+        print(
+            f"legacy registry not checked for sessions left behind (not migrated): {line}",
+            file=sys.stderr,
+        )
     for registry, names in leftovers.items():
+        if runs.foreign_registry_root(registry, project):
+            print(
+                f"left in {registry} ({runs.FOREIGN_REGISTRY}): "
+                + ", ".join(names)
+                + f" — {runs.FOREIGN_REGISTRY_HINT}",
+                file=sys.stderr,
+            )
+            continue
         print(
             f"left in {registry} (not migrated): "
             + ", ".join(names)
@@ -4790,10 +10949,33 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     # Read AFTER the prune, and by presence: what is still standing in the legacy
     # registry now that the sweep has run. On a dry run nothing was killed, so the
     # ids just announced as would-kills are handed over to be excluded — the plan
-    # this command printed, never a second sample of it. Never raises (observation
-    # degrades to []).
-    leftovers = runs.legacy_registry_leftovers(project, announced=killed if args.dry_run else ())
+    # this command printed, never a second sample of it. Never raises: a registry
+    # that could not be asked lands in `unverified` (DW-469), never in an empty
+    # `leftovers` that reads as "nothing left".
+    # Not `unverified`, which means a legacy registry could not be asked: these
+    # are checks on this project's own registry for a pre-upgrade control
+    # session (#915), its scan or a check that withheld its command.
+    ctl_command_faults: list[str] = []
+    leftovers, unverified, superseded_ctl = runs.legacy_registry_leftovers(
+        project,
+        announced=killed if args.dry_run else (),
+        on_primary_fault=ctl_command_faults.append,
+    )
+    kill_commands, ambiguous_ctl, withheld_ctl = _superseded_ctl_kill_commands(
+        project, superseded_ctl, ctl_command_faults.append
+    )
+    # The listing behind prune_sessions reads an unavailable backend as no
+    # sessions; this names the cases where that is not a clean answer (#864).
+    # A misconfigured process host fails the liveness read behind it: a scan
+    # that could not run, carried like one rather than exiting 1 with stdout
+    # empty and the sessions receipt lost (the ctl-window arm below, same).
+    try:
+        sessions_scan_error = runs.session_scan_error(project)
+    except ProcessHostError as e:
+        sessions_scan_error = str(e)
     if not args.json:
+        if sessions_scan_error is not None:
+            print(f"session prune failed: {sessions_scan_error}", file=sys.stderr)
         for run_id in sorted(unknown):
             # warn-only: unknown never blocks cleanup (same wording as delete/archive).
             # Pruning kills the tmux session, never the engine pid, so the warning
@@ -4813,10 +10995,11 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     scan_error: str | None = None
     try:
         if args.dry_run:
-            windows, survived, unverifiable = launch.prunable_ctl_windows(project), [], []
+            windows, undetermined = launch.prunable_ctl_windows(project)
+            survived, unverifiable = [], []
         else:
-            windows, survived, unverifiable = launch.prune_ctl_windows(project)
-    except (MultiplexerError, UnicodeError) as e:
+            windows, survived, unverifiable, undetermined = launch.prune_ctl_windows(project)
+    except (MultiplexerError, UnicodeError, ProcessHostError) as e:
         # Three empty lists is the honest answer: the raise comes from the
         # candidate scan, so no window was killed or even chosen. But an empty
         # partition alone is also what a clean scan that found nothing emits, so
@@ -4826,9 +11009,19 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         # POSIX handler and do not all normalize a decode fault to the seam type
         # (#380); it is the same scan failure, and letting it reach main()'s
         # backstop would empty stdout of the sessions receipt this arm protects.
+        # ProcessHostError: the evidence gate reads engine liveness (#864).
         print(f"ctl window prune failed: {e}", file=sys.stderr)
-        windows, survived, unverifiable = [], [], []
+        windows, survived, unverifiable, undetermined = [], [], [], []
         scan_error = str(e)
+    # Kept open, not planned or killed: whether their command still runs could
+    # not be read (#876). In JSON mode the document carries them instead.
+    if not args.json:
+        for name, reason in undetermined:
+            print(
+                f"ctl window {name} left open: cannot tell whether its command still "
+                f"runs ({reason})",
+                file=sys.stderr,
+            )
     if args.json:
         machine.emit(
             cleanup_document(
@@ -4840,10 +11033,16 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 windows_survived=survived,
                 windows_unverifiable=unverifiable,
                 scan_error=scan_error,
+                windows_undetermined=[name for name, _reason in undetermined],
                 # Flattened: `sessions.legacy_leftovers` is a documented
                 # list of names and widening it would bump the schema. The
                 # grouping serves the text mode, which has room to say where.
                 legacy_leftovers=sorted({n for names in leftovers.values() for n in names}),
+                legacy_unverified=unverified,
+                legacy_kill_commands=kill_commands,
+                sessions_scan_error=sessions_scan_error,
+                superseded_ctl_sessions=superseded_ctl,
+                superseded_ctl_unverified=ctl_command_faults,
             )
         )
         return 0
@@ -4857,7 +11056,8 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 print(f"would close ctl window {name}")
         if live:
             print(f"leaving {len(live)} live session(s) untouched")
-        _warn_legacy_leftovers(leftovers)
+        _warn_legacy_leftovers(project, leftovers, unverified)
+        _warn_superseded_ctl(kill_commands, ambiguous_ctl, withheld_ctl, ctl_command_faults)
         return 0
     # The count now excludes non-removals, so on stdout alone a smaller number is
     # indistinguishable from a quieter sweep — and `cleanup > log` keeps only
@@ -4875,7 +11075,8 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         # Same wording as the TUI toast: one claim, one phrase, so an operator
         # moving between the two surfaces is reading the same thing.
         print(f"ctl window(s) still open after the kill: {', '.join(survived)}", file=sys.stderr)
-    _warn_legacy_leftovers(leftovers)
+    _warn_legacy_leftovers(project, leftovers, unverified)
+    _warn_superseded_ctl(kill_commands, ambiguous_ctl, withheld_ctl, ctl_command_faults)
     if unverifiable:
         # Not "killed but unverifiable": kill_window is a silent no-op on a
         # transport failure, so whether the kill even reached the server is part
@@ -4911,12 +11112,27 @@ def _human_bytes(n: int) -> str:
     return f"{size:.1f}TB"
 
 
+def _held_closes_reason(e: runs.HeldSweepClosesError) -> str:
+    """`clean`'s one-line skip reason for a run `delete_run` refuses because it
+    holds unlanded sweep ledger closes, or could not be checked."""
+    if e.reason is not None:
+        return (
+            f"could not be checked for sweep ledger closes whose code never landed "
+            f"({e.reason}); repair it and retry, or `bmad-loop resume {e.run_id}` once it "
+            "reads; a run confirmed to hold none can be removed by hand"
+        )
+    return (
+        f"holds sweep ledger closes whose code never landed ({', '.join(e.dw_ids)}); "
+        f"`bmad-loop resume {e.run_id}` lands or reopens them"
+    )
+
+
 def cmd_clean(args: argparse.Namespace) -> int:
     """Reclaim disk from concluded runs: tear down worktrees leaked by a
     mid-flight stop, trim heavy scaffolding from runs kept for history, and
     archive/delete runs past the retention window. Only terminal (finished or
     stopped) runs are touched; running, unknown-host, paused and interrupted
-    runs are always left intact.
+    runs, and sweep runs holding unlanded ledger closes, are always left intact.
 
     Every per-candidate refusal is DATA, never an abort: this is a sweep, so one
     busy run must not cost the operator the report of the runs already reclaimed
@@ -4935,7 +11151,14 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
     reclaimable: list[Path] = []
     protected: list[str] = []
-    for run_dir in runs.list_run_dirs(project):
+    # A run the listing could not read is never a candidate, which only ever keeps
+    # more: it is neither reclaimed nor counted toward the retention window. The
+    # fault is still reported (DW-468) — "nothing to reclaim" over an unreadable
+    # runs dir is not the answer.
+    run_dirs, listing_fault = runs.list_run_dirs(project)
+    if listing_fault is not None and not args.json:
+        print(f"warning: run listing incomplete: {listing_fault}", file=sys.stderr)
+    for run_dir in run_dirs:
         if run_dir.name in keep:
             protected.append(run_dir.name)
         elif runs.reclaimable(run_dir):
@@ -4956,6 +11179,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
     archived: list[str] = []
     deleted: list[str] = []
     unverifiable: list[str] = []
+    worktree_faults: list[str] = []
     for run_dir in reclaimable:
         if runs.live_session_may_be_ours(project, run_dir.name):
             # `reclaimable` is keyed on engine pid liveness, so an orphan — engine
@@ -4972,6 +11196,24 @@ def cmd_clean(args: argparse.Namespace) -> int:
             if not args.json:
                 print(
                     f"run {run_dir.name}: agent session still live — left untouched",
+                    file=sys.stderr,
+                )
+            continue
+        # A sweep run that holds ledger closes whose code never landed (or cannot
+        # be checked) is the only record that can land or reopen them, and its
+        # unit worktree may be where that code still sits. So on every arm it is
+        # left whole: asked once here, ahead of the worktree reconcile, the trim
+        # and the removal, it is reported protected rather than half-reclaimed
+        # (DW-572/DW-573). `delete_run` and `archive_run` still refuse it under
+        # the lock, which the removal's handler below reports.
+        try:
+            runs.refuse_held_sweep_closes(project, run_dir)
+        except runs.HeldSweepClosesError as e:
+            protected.append(run_dir.name)
+            if not args.json:
+                outcome = "not removed" if run_dir.name in past else "left untouched"
+                print(
+                    f"run {run_dir.name}: {_held_closes_reason(e)} — {outcome}",
                     file=sys.stderr,
                 )
             continue
@@ -4993,7 +11235,17 @@ def cmd_clean(args: argparse.Namespace) -> int:
         run_bytes = _dir_size(run_dir)
         # collect, never print-as-you-mutate: the document is emitted once at the
         # end, so every per-item line has to survive the loop as data
-        run_worktrees = runs.reconcile_orphan_worktrees(repo, run_dir, dry_run=dry)
+        run_worktrees, wt_fault = runs.reconcile_orphan_worktrees(repo, run_dir, dry_run=dry)
+        if wt_fault is not None:
+            # DW-470: not "no orphaned worktrees". The passes below still run —
+            # their git admin entries may outlive a trim, which `git worktree
+            # prune` clears once git answers again.
+            worktree_faults.append(f"{run_dir.name}: {wt_fault}")
+            if not args.json:
+                print(
+                    f"warning: run {run_dir.name}: worktree reconcile incomplete: {wt_fault}",
+                    file=sys.stderr,
+                )
         for wt in run_worktrees:
             worktrees.append(str(wt))
             if not args.json:
@@ -5010,7 +11262,12 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     if not dry:
                         runs.archive_run(project, run_dir, wait_for_lock=False)
                     archived.append(run_dir.name)
-            except (runs.LiveEngineError, runs.LiveSessionError, LockUnavailableError) as e:
+            except (
+                runs.LiveEngineError,
+                runs.LiveSessionError,
+                runs.HeldSweepClosesError,
+                LockUnavailableError,
+            ) as e:
                 # A session or engine appeared between the loop-top sample and the
                 # authoritative removal transaction — or the run's state lock is
                 # held, which says the same thing one layer down and is the only
@@ -5036,6 +11293,8 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 if not args.json:
                     if isinstance(e, runs.LiveSessionError):
                         reason = "agent session appeared mid-clean"
+                    elif isinstance(e, runs.HeldSweepClosesError):
+                        reason = _held_closes_reason(e)
                     elif isinstance(e, LockUnavailableError):
                         reason = "run state locked by another process"
                     else:
@@ -5054,7 +11313,12 @@ def cmd_clean(args: argparse.Namespace) -> int:
     # `freed` on purpose: a state dir holds consumed event files and nothing else,
     # so sizing every one of them would buy kilobytes of accuracy for a walk of a
     # second tree. The count is the honest report of what went.
-    swept = len(runs.reconcile_orphan_state_dirs(project, dry_run=dry))
+    swept_dirs, state_dir_fault = runs.reconcile_orphan_state_dirs(project, dry_run=dry)
+    swept = len(swept_dirs)
+    if state_dir_fault is not None and not args.json:
+        # DW-470: a sweep that could not run is not "swept 0" — and not "nothing
+        # to reclaim" either, which the summary below still prints on its own terms.
+        print(f"warning: orphaned state-dir sweep incomplete: {state_dir_fault}", file=sys.stderr)
 
     if args.json:
         machine.emit(
@@ -5070,6 +11334,9 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 protected=protected,
                 unverifiable_pid=unverifiable,
                 state_dirs_swept=swept,
+                listing_fault=listing_fault,
+                worktree_faults=worktree_faults,
+                state_dir_fault=state_dir_fault,
             )
         )
         return 0
@@ -5149,11 +11416,26 @@ def cmd_probe(args: argparse.Namespace) -> int:
             print(f"FAIL: {prefix}{e}", file=sys.stderr)
             return 1
         # Human-facing notice — stderr in JSON mode, where stdout is the document.
-        if not codex_profile_error:
+        # Withheld under --workspace: an unknown profile cannot answer it, and the
+        # FAIL below would contradict an `ok:` printed first.
+        if not codex_profile_error and args.workspace is None:
             print(
                 f"  ok: unknown profile {args.cli!r}; reduced {noun} from --binary {args.binary}",
                 file=sys.stderr if args.json else sys.stdout,
             )
+
+    # --workspace asks a question only a declared [workspace_trust] table can
+    # answer; an unknown profile (reduced --binary report) cannot either (DW-390).
+    if args.workspace is not None and (profile is None or profile.workspace_trust is None):
+        if profile is None:
+            detail = f"no loadable profile for {args.cli!r}"
+        else:
+            detail = f"profile {profile.name!r} declares none"
+        print(
+            f"FAIL: --workspace needs a profile declaring [workspace_trust]; {detail}",
+            file=sys.stderr,
+        )
+        return 1
 
     if profile is not None and profile.hookless:
         print(
@@ -5200,6 +11482,8 @@ def cmd_probe(args: argparse.Namespace) -> int:
         finding = probe_mod.scan(
             cli=args.cli, profile=profile, project=project, hints=hints, pseudo=pseudo
         )
+    if args.workspace is not None and profile is not None:
+        probe_mod.check_workspace_trust(finding, profile, Path(args.workspace))
     if codex_profile_error:
         finding.hook_trust = "unverifiable"
         finding.warnings.append("Codex hook trust unverifiable: profile cannot be loaded")
@@ -5245,7 +11529,10 @@ def cmd_probe(args: argparse.Namespace) -> int:
     # Every `ok:` trailer is human-facing chatter, so in JSON mode it goes to
     # stderr — stdout is the document alone, or empty when --out took it.
     trailers = sys.stderr if args.json else sys.stdout
-    trust_ok = finding.hook_trust is None or finding.hook_trust == "trusted"
+    trust_ok = finding.hook_trust in (None, "trusted") and finding.workspace_trust in (
+        None,
+        "trusted",
+    )
     trailer_prefix = "ok" if trust_ok else "FAIL"
     if args.out:
         out_path = Path(args.out)
@@ -5275,7 +11562,9 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
 
     project = _project(args)
     if args.all:
-        run_dirs = runs.list_run_dirs(project)
+        run_dirs, fault = runs.list_run_dirs(project)
+        if fault is not None:
+            print(f"warning: run listing incomplete: {fault}", file=sys.stderr)
     elif args.run_id:
         try:
             run_dirs = [runs.resolve_run_dir(project, args.run_id)]
@@ -5283,7 +11572,7 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
             print(str(e), file=sys.stderr)
             return 1
     else:
-        latest = runs.latest_run_dir(project)
+        latest = _latest_run_dir(project)
         run_dirs = [latest] if latest is not None else []
     if not run_dirs:
         print("no runs found", file=sys.stderr)
@@ -5424,12 +11713,44 @@ def cmd_relay(args: argparse.Namespace) -> int:
         return ExitCode.OK
 
 
+_python_formatwarning = warnings.formatwarning
+
+
+def _format_warning(
+    message: Warning | str,
+    category: type[Warning],
+    filename: str,
+    lineno: int,
+    line: str | None = None,
+) -> str:
+    """A ``PolicyDeprecationWarning`` reaches a CLI user as one
+    ``bmad-loop: warning: <message>`` line, not Python's ``path:lineno`` plus
+    source-line form, which points into site-packages. Every other category keeps
+    the stdlib format (#835)."""
+    if issubclass(category, policy_mod.PolicyDeprecationWarning):
+        return f"bmad-loop: warning: {message}\n"
+    return _python_formatwarning(message, category, filename, lineno, line)
+
+
 def main(argv: list[str] | None = None) -> int:
+    warnings.formatwarning = _format_warning
     parser = argparse.ArgumentParser(
         prog="bmad-loop",
         description="Deterministic orchestrator for the BMAD implementation phase",
     )
     parser.add_argument("--version", action="version", version=f"bmad-loop {__version__}")
+    # Hidden: composed by the TUI launcher (`tui/launch.py` `start_detached`) for a
+    # detached child, never typed by hand. See the handling after `parse_args`.
+    parser.add_argument("--displaced-registry-root", help=argparse.SUPPRESS)
+    # Hidden, composed the same way: the launcher's own state root and registry
+    # root, handed to a parked engine in its argv because inheritance cannot
+    # deliver them (a stale multiplexer server, #731; `PSMUX_BARE_ENV`, #730).
+    parser.add_argument("--state-root", help=argparse.SUPPRESS)
+    parser.add_argument("--registry-root", help=argparse.SUPPRESS)
+    # Hidden, composed the same way: this process runs in a window the launcher
+    # minted (`_ctl_minted`, `_drive_ctl_launch`, `tui.launch.claim_ctl_window`,
+    # #925).
+    parser.add_argument("--ctl-launch", action="store_true", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, func, help: str, *, aliases=()) -> argparse.ArgumentParser:
@@ -5467,6 +11788,24 @@ def main(argv: list[str] | None = None) -> int:
         help="validate stories mode against this epic spec folder's stories.yaml "
         "(overrides [stories].source; skips the sprint-status gate)",
     )
+    validate_p.add_argument(
+        "--render-probe",
+        action="store_true",
+        help="also execute each dev skill's render command (from its SKILL.md) in a "
+        "throwaway temp copy of _bmad/ + the skill (no coding CLI, project untouched; "
+        "the launcher, typically `uv run --no-cache`, fetches the renderer's deps on "
+        "each probe, so it needs network access)",
+    )
+    validate_p.add_argument(
+        "--probes",
+        action="store_true",
+        help="also execute every [environment] probe from .bmad-loop/policy.toml on this "
+        "host (all of them, not fail-fast; each bounded by probe_timeout_s); a probe "
+        "that fails, times out or cannot be started fails validate. Also launch each "
+        "role's coding CLI once, with no prompt, and fail on a startup dialog its first "
+        "screen shows. In tickets mode, also probe the project's tickets.py for the "
+        "commands bmad-loop needs",
+    )
     machine.add_json_flag(validate_p, "check findings")
 
     mux_p = add(
@@ -5493,6 +11832,23 @@ def main(argv: list[str] | None = None) -> int:
         "backend that only registers on the target machine)",
     )
 
+    plugins_p = add(
+        "plugins",
+        cmd_plugins,
+        "list plugins + trust grants; `plugins enable|accept|revoke <name>` manages a "
+        "project plugin's out-of-tree grant",
+    )
+    plugins_p.add_argument(
+        "action",
+        nargs="?",
+        choices=("list", "enable", "accept", "revoke"),
+        help="list (default); enable: grant a project plugin's current contents; "
+        "accept: re-pin a granted plugin that changed (lists what changed); "
+        "revoke: drop a grant",
+    )
+    plugins_p.add_argument("name", nargs="?", help="plugin name (see the listing)")
+    machine.add_json_flag(plugins_p, "plugin roster and trust grants")
+
     add(
         "adapters",
         cmd_adapters,
@@ -5514,7 +11870,8 @@ def main(argv: list[str] | None = None) -> int:
         "--probe",
         action="store_true",
         help="opt-in LIVE capture: launch one trivial content-free turn in a temp "
-        "workspace and capture real hook payloads (default: zero-launch scan)",
+        "workspace (codex: a stable per-user probe workspace you trust once) and "
+        "capture real hook payloads (default: zero-launch scan)",
     )
     probe_p.add_argument(
         "--transcript", help="exact transcript file to inspect (overrides discovery)"
@@ -5524,6 +11881,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     probe_p.add_argument("--binary", help="binary name for a CLI with no profile yet")
     probe_p.add_argument("--model", help="model passed to the probe turn (probe mode)")
+    probe_p.add_argument(
+        "--workspace",
+        metavar="PATH",
+        help="also report (read-only) whether PATH is in the profile's declared "
+        "workspace-trust list ([workspace_trust]); exit 1 unless trusted",
+    )
     probe_p.add_argument(
         "--timeout", type=float, default=90, help="probe turn timeout (default: 90s)"
     )
@@ -5541,11 +11904,17 @@ def main(argv: list[str] | None = None) -> int:
         help="force stories mode: dispatch the epic spec folder's stories.yaml by "
         "folder+id (overrides [stories].source)",
     )
-    run_p.add_argument("--epic", type=int, help="only stories from this epic (sprint mode)")
+    run_p.add_argument(
+        "--epic",
+        type=_epic_selector,
+        help="only stories from this epic: its number (sprint mode); its id, slug "
+        "or epic-<slug> (tickets mode)",
+    )
     run_p.add_argument(
         "--story",
         help="story: E-S / E.S (split suffix ok, e.g. 2-6a), a slug fragment, "
-        "or full key (sprint mode); a story id (stories mode)",
+        "or full key (sprint mode); a story id (stories mode); a ticket ref "
+        "(tickets mode)",
     )
     run_p.add_argument("--max-stories", type=int, help="stop after N stories")
     run_p.add_argument("--dry-run", action="store_true", help="print the plan, spawn nothing")
@@ -5605,6 +11974,20 @@ def main(argv: list[str] | None = None) -> int:
 
     resume_p = add("resume", cmd_resume, "resume a paused run")
     resume_p.add_argument("run_id")
+    resume_p.add_argument(
+        "--accept-baseline",
+        action="store_true",
+        help="adopt the current HEAD as the new baseline of every in-place story this "
+        "resume restarts, so commits above the old baseline are kept instead of being "
+        "parked on attempt-preserve/* and reset over. It adopts EVERYTHING at HEAD, "
+        "including any commits the interrupted attempt made, and treats every current "
+        "untracked file as pre-existing (never cleaned) — check "
+        "`git log <baseline>..HEAD` first. Uncommitted tracked changes still follow "
+        "the normal rollback. The flag applies to this resume only, but an adopted "
+        "baseline stays adopted if that resume then pauses. Not needed right after "
+        "`resolve`, whose re-arm already advances the baseline; commits made after a "
+        "`resolve --no-resume` re-arm still need it",
+    )
 
     resolve_p = add(
         "resolve", cmd_resolve, "resolve a CRITICAL escalation interactively, then re-arm + resume"
@@ -5615,15 +11998,60 @@ def main(argv: list[str] | None = None) -> int:
         "--no-interactive",
         dest="interactive",
         action="store_false",
-        help="skip the resolve agent (spec already fixed by hand); just re-arm + resume",
+        help="skip the resolve agent (spec already fixed by hand); just re-arm + resume. "
+        "With --abandon, skips its confirm",
     )
-    resolve_p.add_argument(
+    resolve_mode = resolve_p.add_mutually_exclusive_group()
+    resolve_mode.add_argument(
         "--restore-patch",
         metavar="PATH",
         help="intent-gap patch-restore (#2564): re-arm the spec to `in-review` and "
         "re-apply this saved patch before the re-drive, resuming review on the "
         "attempted change instead of re-implementing (hand-driven; the interactive "
         "agent supplies it via resolution.json)",
+    )
+    resolve_mode.add_argument(
+        "--adopt-branch",
+        action="store_true",
+        help="finish the escalated story from its kept worktree branch instead of "
+        "re-driving it: commit and merge the branch as-is, mark the story done, and "
+        "resume. Skips the resolve agent and does NOT re-run review, [verify] commands or "
+        "pre_commit_gate workflows for the story "
+        "(worktree isolation only; not for sweep runs)",
+    )
+    resolve_mode.add_argument(
+        "--adopt-result",
+        action="store_true",
+        help="sweep runs only: for a sweep paused `hook channel silent:` on a triage "
+        "task, show the result.json that attempt left behind (path, mtime, size, "
+        "sha256, plan summary, full document) and, on an explicit `y`, use it as the "
+        "triage plan instead of relaunching triage. The confirm is mandatory: no flag "
+        "skips it, and EOF or any other answer declines. The resumed sweep re-checks the "
+        "document against the live ledger and pauses `adopt rejected:` if it changed or "
+        "no longer fits. No resolve agent runs",
+    )
+    resolve_mode.add_argument(
+        "--reverify",
+        action="store_true",
+        help="keep a DEFERRED (or environment-fault escalated) story's attempt as it "
+        "stands at HEAD — in place, or in its kept worktree unit — plus any uncommitted "
+        "changes, and resume by replaying its verification: the [verify] commands "
+        "re-run on that work and, when they pass, it is reviewed per policy and "
+        "committed (a unit merged) — no dev session and no resolve agent. Fix the "
+        "environment first. Not for sweep runs. With --story, a worktree unit is "
+        "accepted under any pause; on a FINISHED run, --story names a kept deferred "
+        "worktree unit to replay in a new replay run, and the finished run stays "
+        "finished (not for stories-mode runs)",
+    )
+    resolve_mode.add_argument(
+        "--abandon",
+        action="store_true",
+        help="close an escalated REPLAY run (one minted by `resolve <finished-run> "
+        "--reverify`) whose unit is superseded: park uncommitted tracked and untracked "
+        "changes (plus the run's own spec/board/ledger copies) on a "
+        "refs/attempt-preserve-dirty/*-abandon ref, remove the kept worktree (other "
+        "git-ignored files go with it), keep its branch, and record the run finished. Never resumes (not combinable with "
+        "--resume/--no-resume); the sprint board and the replayed run are untouched",
     )
     resolve_p.add_argument(
         "--resume",
@@ -5637,6 +12065,31 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="proceed when engine liveness is unverifiable (unknown); "
         "a provably-live engine still blocks",
+    )
+    resolve_p.add_argument(
+        "--at-reset",
+        action="store_true",
+        help="for a run paused on a usage limit the coding CLI waits out (a session-"
+        "window reset): wait in this terminal until the recorded reset plus "
+        "--margin-min, then re-arm and resume as `--no-interactive --resume` does, "
+        "re-taking every check on the run as it then stands. Prints the wake time and "
+        "journals the wait (at-reset-wait-start / at-reset-wait-end); no wait when that "
+        "time has already passed. Refused with exit 1 before any wait when the run is "
+        "not paused on a usage limit, when the limit is a blocking one (credit "
+        "exhaustion never auto-resumes: add credits, then resolve), when its reset did "
+        "not resolve to a time, or when the reset lies more than [limits] "
+        "quota_wait_max_min minutes away (0 = no cap); resolve's other refusals are "
+        "also taken before the wait. Ctrl-C during the wait leaves the run paused and "
+        "exits 130. Not combinable with --no-resume, --abandon, --restore-patch, "
+        "--adopt-branch, --adopt-result or --reverify (exit 2)",
+    )
+    resolve_p.add_argument(
+        "--margin-min",
+        type=int,
+        metavar="N",
+        help="with --at-reset: minutes to wait past the reset before resuming, an int "
+        f">= 0 (default: {AT_RESET_DEFAULT_MARGIN_MIN}, so the provider's usage window "
+        "has rolled over when the first session starts)",
     )
 
     decisions_p = add(
@@ -5812,6 +12265,25 @@ def main(argv: list[str] | None = None) -> int:
     relay_p.set_defaults(func=cmd_relay)
 
     args = parser.parse_args(argv)
+    # Applied ahead of everything below, the relay branch included, so every later
+    # reader (`runs.state_root`, `_configure_mux`'s registry decision, the env a
+    # coding-CLI window is pinned from) sees what the launcher resolved, exactly as
+    # if inheritance had delivered it. Refused when not absolute: the variable has
+    # the same rule (`runs.state_root` judges it with `os.path.isabs` on the raw
+    # string), and a relative root names a different directory per working
+    # directory. The registry root is set only; `_configure_mux` still decides
+    # whether it is honoured (`runs.resolve_psmux_registry_root`), and judges it
+    # with `Path.is_absolute` for the reason given there.
+    # Both are validated before either is set, so a refused one leaves this
+    # process's environment exactly as it found it.
+    if args.state_root is not None and not os.path.isabs(args.state_root):
+        parser.error(f"--state-root must be absolute: {args.state_root!r}")
+    if args.registry_root is not None and not Path(args.registry_root).is_absolute():
+        parser.error(f"--registry-root must be absolute: {args.registry_root!r}")
+    if args.state_root is not None:
+        os.environ[envvars.STATE_DIR] = args.state_root
+    if args.registry_root is not None:
+        os.environ[runs.PSMUX_DATA_DIR] = args.registry_root
     # `relay` dispatches HERE, ahead of everything below, and the placement is the
     # contract rather than an optimization. A coding CLI runs `bmad-loop relay Stop`
     # inside the session whose completion it reports, and a hook that exits non-zero
@@ -5823,17 +12295,40 @@ def main(argv: list[str] | None = None) -> int:
     # session stopped. `cmd_relay` is total, so nothing is lost by not wrapping it.
     if args.func is cmd_relay:
         return cmd_relay(args)
+    if args.displaced_registry_root:
+        # The launcher's displaced psmux registry, forwarded because its detached
+        # child inherits the derived root and so displaces nothing of its own —
+        # without it a TUI-launched resume or cleanup never sweeps the operator's
+        # pre-#537 registry. Recorded HERE, ahead of `_configure_mux`, because the
+        # record is first-wins (`note_displaced_registry`) and the export inside
+        # `_configure_mux` records what it displaces. The value comes from the launcher's own process record, never
+        # from policy.toml, and every kill in a legacy registry stays tag-proven, so
+        # the option gives a caller no reach beyond setting PSMUX_DATA_DIR itself.
+        # After the relay branch, which ignores it: a hook must never exit 2.
+        if not Path(args.displaced_registry_root).is_absolute():
+            parser.error(
+                f"--displaced-registry-root must be absolute: {args.displaced_registry_root!r}"
+            )
+        from .adapters.psmux_backend import note_displaced_registry
+
+        note_displaced_registry(args.displaced_registry_root)
+    global _ctl_minted
+    _ctl_minted = bool(args.ctl_launch)
     try:
         # Install the policy [mux] backend choice before dispatch: several
         # handlers (probe/diagnose/attach/stop/cleanup/tui) reach the mux
         # without ever loading policy, so this is the one reliable seam.
         _configure_mux(_project(args))
+        if args.ctl_launch and args.func in (cmd_resume, cmd_resolve):
+            return _drive_ctl_launch(args)
         return args.func(args)
     except (
         bmadconfig.BmadConfigError,
         sprintstatus.SprintStatusError,
         policy_mod.PolicyError,
         verify.GitError,
+        worksource.SourceNotRunnable,
+        worksource.UnknownSource,
     ) as e:
         print(f"error: {e}", file=sys.stderr)
         return ExitCode.FAILURE
@@ -5854,6 +12349,8 @@ def main(argv: list[str] | None = None) -> int:
         # die to the parked control pane with a bare traceback.
         print(f"error: {e}", file=sys.stderr)
         return ExitCode.FAILURE
+    finally:
+        _ctl_minted = False
 
 
 if __name__ == "__main__":

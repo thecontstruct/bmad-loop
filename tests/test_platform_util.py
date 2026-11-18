@@ -8,6 +8,7 @@ the legacy ``platform_util`` entry points still delegate, plus the real
 from __future__ import annotations
 
 import errno
+import functools
 import ntpath
 import os
 import stat
@@ -212,6 +213,21 @@ def test_names_win32_alias_leaves_the_root_and_parent_spellings_to_its_siblings(
     # (`..`, `a/..`, `a/./b`) redden alone. `""` and bare `.` can redden under
     # neither: one has no components at all, the other is root-naming whole.
     assert platform_util.names_win32_alias(value) is False
+
+
+@pytest.mark.parametrize(
+    "value", ["~", "~/.agents/skills", "~\\.agents\\skills", "~user/skills", "~/", "~x"]
+)
+def test_names_home_ref_catches_home_spellings(value):
+    # Nothing expands `~`: every row resolves to a literal `<project>/~...` dir.
+    assert platform_util.names_home_ref(value) is True
+
+
+@pytest.mark.parametrize("value", ["PROGRA~1/x", "a/~b", ".claude/skills", "skills~", "x\\~y", ""])
+def test_names_home_ref_accepts_tilde_mid_name(value):
+    # Only the FIRST component counts: a Win32 short name or a `~` deeper in the
+    # path is an ordinary name.
+    assert platform_util.names_home_ref(value) is False
 
 
 # --------------------------------------------------------------- is_wsl_unc_path
@@ -1343,6 +1359,429 @@ def test_retrying_unlink_propagates_missing_file(tmp_path):
         platform_util.retrying_unlink(tmp_path / "gone.md")
 
 
+# --------------------------------------------------------------- retrying_rmtree
+
+
+def _tree(tmp_path: Path) -> Path:
+    root = tmp_path / "run"
+    (root / "logs").mkdir(parents=True)
+    (root / "state.json").write_text("{}", encoding="utf-8")
+    (root / "logs" / "held.log").write_text("x", encoding="utf-8")
+    return root
+
+
+def _flaky_unlink(monkeypatch, target_name: str, failures: int | None, exc: OSError):
+    """Patch ``os.unlink`` (the one ``shutil.rmtree`` calls) to raise ``exc`` for
+    the entry named ``target_name`` — ``failures`` times, or forever when ``None``.
+    Matched by basename: the fd-based walk passes a bare name plus ``dir_fd``, the
+    handler's retry the full path."""
+    calls = {"n": 0}
+    real_unlink = os.unlink
+
+    def fake(path, *args, **kwargs):
+        if os.path.basename(os.fspath(path)) == target_name:
+            calls["n"] += 1
+            if failures is None or calls["n"] <= failures:
+                raise exc
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(platform_util.os, "unlink", fake)
+    return calls
+
+
+def test_retrying_rmtree_retries_then_succeeds(tmp_path, monkeypatch):
+    # A concurrent reader's handle denies the delete on Windows; the backoff clears it
+    # and the walk carries on to remove the rest of the tree.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    calls = _flaky_unlink(monkeypatch, "held.log", 2, PermissionError(13, "in use"))
+
+    platform_util.retrying_rmtree(root)
+
+    assert not root.exists()
+    # the walk's own failing call, one more failure inside the retry, then success
+    assert calls["n"] == 3
+    assert len(sleeps) == 1
+
+
+def test_retrying_rmtree_raises_after_retries_run_out(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    monkeypatch.setattr(platform_util, "_REPLACE_ATTEMPTS", 3)
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    calls = _flaky_unlink(monkeypatch, "held.log", None, PermissionError(32, "in use"))
+
+    with pytest.raises(PermissionError):
+        platform_util.retrying_rmtree(root)
+
+    assert calls["n"] == 1 + 3  # the walk's call, then every retry attempt
+    assert len(sleeps) == 2  # no sleep after the final attempt
+    assert root.exists()  # partial removal, the final failure is not swallowed
+
+
+def test_retrying_rmtree_no_retry_on_posix(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "linux")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    denied = PermissionError(13, "Permission denied")
+    calls = _flaky_unlink(monkeypatch, "held.log", None, denied)
+
+    with pytest.raises(PermissionError) as caught:
+        platform_util.retrying_rmtree(root)
+
+    assert caught.value is denied  # the original error, as a bare rmtree raises it
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+def test_retrying_rmtree_no_retry_on_a_non_sharing_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    eio = OSError(errno.EIO, "I/O error")
+    calls = _flaky_unlink(monkeypatch, "held.log", None, eio)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.retrying_rmtree(root)
+
+    assert caught.value is eio
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+def test_retrying_rmtree_treats_a_vanished_path_as_removed(tmp_path, monkeypatch):
+    # The holder deleted (or moved) the entry between the denial and the retry: the
+    # goal is met, so the walk continues instead of failing on FileNotFoundError.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    monkeypatch.setattr(platform_util.time, "sleep", lambda _s: None)
+    root = _tree(tmp_path)
+    real_unlink = os.unlink
+    calls = {"n": 0}
+
+    def fake(path, *args, **kwargs):
+        if os.path.basename(os.fspath(path)) == "held.log":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise PermissionError(32, "in use")
+            real_unlink(path, *args, **kwargs)  # really remove it ...
+            raise FileNotFoundError(errno.ENOENT, "gone", os.fspath(path))  # ... and say so
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(platform_util.os, "unlink", fake)
+
+    platform_util.retrying_rmtree(root)
+
+    assert calls["n"] == 2
+    assert not root.exists()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" and sys.version_info < (3, 13),
+    reason="win32 rmtree before 3.13 probes via _rmtree_islink, which swallows the "
+    "lstat error, so the denial never reaches the handler",
+)
+def test_retrying_rmtree_never_retries_a_probe(tmp_path, monkeypatch):
+    # rmtree returns early once the handler returns for its top-level lstat probe,
+    # so "retrying" the probe would report a removal that never happened. Only the
+    # removal ops (unlink/rmdir) are retried; a probe's denial surfaces at once.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    real_lstat = os.lstat
+    calls = {"n": 0}
+
+    def flaky_lstat(path, *args, **kwargs):
+        if os.fspath(path) == os.fspath(root) and calls["n"] == 0:
+            calls["n"] += 1
+            raise PermissionError(32, "in use")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(platform_util.os, "lstat", flaky_lstat)
+
+    with pytest.raises(PermissionError):
+        platform_util.retrying_rmtree(root)
+
+    assert calls["n"] == 1
+    assert sleeps == []
+    assert root.exists()
+
+
+def _dir_not_empty() -> OSError:
+    """Win32's ERROR_DIR_NOT_EMPTY, which CPython maps to ENOTEMPTY. On a real
+    host a genuinely non-empty directory reports this same 145; only `.winerror`
+    tells it from a POSIX-shaped ENOTEMPTY."""
+    exc = OSError(errno.ENOTEMPTY, "directory not empty")
+    exc.winerror = 145  # pyright: ignore[reportAttributeAccessIssue]
+    return exc
+
+
+def _flaky_rmdir(monkeypatch, target_name: str, failures: int | None, exc: OSError):
+    """Patch ``os.rmdir`` (the one ``shutil.rmtree`` calls) to raise ``exc`` for
+    the directory named ``target_name`` — ``failures`` times, or forever when
+    ``None``. Matched by basename: the fd-based walk passes a bare name plus
+    ``dir_fd``, the handler's retry the full path."""
+    calls = {"n": 0}
+    real_rmdir = os.rmdir
+
+    def fake(path, *args, **kwargs):
+        if os.path.basename(os.fspath(path)) == target_name:
+            calls["n"] += 1
+            if failures is None or calls["n"] <= failures:
+                raise exc
+        real_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(platform_util.os, "rmdir", fake)
+    return calls
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+def test_retrying_rmtree_retries_a_delete_pending_child(tmp_path, monkeypatch, failures):
+    # A child unlinked under another process's FILE_SHARE_DELETE handle stays
+    # delete-pending, so the parent rmdir sees WinError 145 until the handle closes.
+    # failures=2 makes the 145 repeat INSIDE the backoff loop, which only clears
+    # when the loop itself was handed the rmdir predicate.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    calls = _flaky_rmdir(monkeypatch, "logs", failures, _dir_not_empty())
+
+    platform_util.retrying_rmtree(root)
+
+    assert not root.exists()
+    # the walk's own failing call, the in-loop failures, then success
+    assert calls["n"] == failures + 1
+    assert len(sleeps) == failures - 1  # a backoff only between in-loop attempts
+
+
+def test_retrying_rmtree_raises_when_a_delete_pending_child_never_clears(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    monkeypatch.setattr(platform_util, "_REPLACE_ATTEMPTS", 3)
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    not_empty = _dir_not_empty()
+    calls = _flaky_rmdir(monkeypatch, "logs", None, not_empty)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.retrying_rmtree(root)
+
+    assert caught.value is not_empty
+    assert calls["n"] == 1 + 3  # the walk's call, then every retry attempt
+    assert len(sleeps) == 2  # no sleep after the final attempt
+    assert root.exists()  # partial removal, the final failure is not swallowed
+
+
+def test_retrying_rmtree_no_retry_on_an_errno_only_dir_not_empty(tmp_path, monkeypatch):
+    # The rmdir predicate keys on .winerror, not errno: an ENOTEMPTY with no
+    # winerror attached (a POSIX-shaped error) is not retried and surfaces at once.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    not_empty = OSError(errno.ENOTEMPTY, "directory not empty")
+    calls = _flaky_rmdir(monkeypatch, "logs", None, not_empty)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.retrying_rmtree(root)
+
+    assert caught.value is not_empty
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+def test_retrying_rmtree_retries_a_sharing_violation_on_rmdir(tmp_path, monkeypatch):
+    # rmdir runs under the rmdir predicate, which must still cover the sharing
+    # violation, not only the 145.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    calls = _flaky_rmdir(monkeypatch, "logs", 2, PermissionError(32, "in use"))
+
+    platform_util.retrying_rmtree(root)
+
+    assert not root.exists()
+    assert calls["n"] == 3
+    assert len(sleeps) == 1
+
+
+def test_retrying_rmtree_no_dir_not_empty_retry_on_posix(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "linux")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    not_empty = _dir_not_empty()
+    calls = _flaky_rmdir(monkeypatch, "logs", 1, not_empty)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.retrying_rmtree(root)
+
+    assert caught.value is not_empty  # the original error, as a bare rmtree raises it
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+def test_retrying_rmtree_no_dir_not_empty_retry_on_unlink(tmp_path, monkeypatch):
+    # 145 is retried for the parent rmdir only; on an unlink it is not transient.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    root = _tree(tmp_path)
+    not_empty = _dir_not_empty()
+    calls = _flaky_unlink(monkeypatch, "held.log", None, not_empty)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.retrying_rmtree(root)
+
+    assert caught.value is not_empty
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+def test_dir_not_empty_does_not_widen_atomic_replace(tmp_path, monkeypatch):
+    # The rmdir predicate is rmtree's alone: the shared sharing-violation gate that
+    # atomic_replace runs under still raises a 145 at once.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    not_empty = _dir_not_empty()
+    calls = {"n": 0}
+
+    def replace(src, dst):
+        calls["n"] += 1
+        raise not_empty
+
+    monkeypatch.setattr(platform_util.os, "replace", replace)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.atomic_replace(tmp_path / "s", tmp_path / "d")
+
+    assert caught.value is not_empty
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+def test_dir_not_empty_does_not_widen_retrying_unlink(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+    target = tmp_path / "held.log"
+    target.write_text("x", encoding="utf-8")
+    not_empty = _dir_not_empty()
+    calls = _flaky_unlink(monkeypatch, "held.log", None, not_empty)
+
+    with pytest.raises(OSError) as caught:
+        platform_util.retrying_unlink(target)
+
+    assert caught.value is not_empty
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real Windows open-handle delete denial")
+def test_retrying_rmtree_outlasts_a_real_open_handle(tmp_path):
+    # Real-host evidence: Python's open() grants no FILE_SHARE_DELETE, so the unlink
+    # is denied until the timer closes the handle; the real backoff outlasts it.
+    root = _tree(tmp_path)
+    handle = open(root / "logs" / "held.log", encoding="utf-8")  # noqa: SIM115
+    timer = threading.Timer(0.2, handle.close)
+    timer.start()
+    try:
+        platform_util.retrying_rmtree(root)
+        assert not root.exists()
+    finally:
+        timer.cancel()
+        handle.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real Windows delete-pending child")
+def test_retrying_rmtree_outlasts_a_delete_pending_child(tmp_path, monkeypatch, request):
+    """Real-host characterization of the WinError 145 retry. ``held.log`` is held
+    open WITH ``FILE_SHARE_DELETE``, so its unlink succeeds; under legacy delete
+    semantics the name lingers delete-pending and the parent rmdir fails with 145
+    until the timer closes the handle, while the POSIX delete recent Windows uses
+    on NTFS unlinks it at once. The test passes either way: it exists to show the
+    removal completes on the real host, whichever behavior that host has. How many 145s
+    the parent rmdir saw is recorded as the ``rmdir_winerror_145_count`` JUnit
+    property, so the CI XML shows which delete semantics the runner has."""
+    import ctypes
+    from ctypes import wintypes
+
+    generic_read = 0x80000000
+    share_all = 0x7  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    open_existing = 3
+    file_attribute_normal = 0x80
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    invalid_handle_value = wintypes.HANDLE(-1).value
+
+    root = _tree(tmp_path)
+    handle = kernel32.CreateFileW(
+        str(root / "logs" / "held.log"),
+        generic_read,
+        share_all,
+        None,
+        open_existing,
+        file_attribute_normal,
+        None,
+    )
+    assert handle not in (None, invalid_handle_value), ctypes.get_last_error()  # type: ignore[attr-defined]
+
+    lock = threading.Lock()
+    closed = False
+
+    def close_once() -> None:
+        nonlocal closed
+        with lock:
+            if not closed:
+                closed = True
+                kernel32.CloseHandle(handle)
+
+    seen_145 = {"n": 0}
+    real_rmdir = os.rmdir
+
+    def spy_rmdir(*args, **kwargs):
+        try:
+            real_rmdir(*args, **kwargs)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 145:
+                seen_145["n"] += 1
+            raise
+
+    monkeypatch.setattr(platform_util.os, "rmdir", spy_rmdir)
+
+    timer = threading.Timer(0.2, close_once)
+    timer.start()
+    try:
+        platform_util.retrying_rmtree(root)
+        assert not root.exists()
+    finally:
+        timer.cancel()
+        close_once()
+        # user_properties directly: the record_property fixture warns under xunit2,
+        # but junitxml writes these properties either way — recorded on failure too
+        request.node.user_properties.append(("rmdir_winerror_145_count", seen_145["n"]))
+
+
 # --------------------------------------------------------------------- file_lock
 
 
@@ -1930,6 +2369,331 @@ def test_open_dir_confined_accepts_a_root_behind_a_link(tmp_path):
         os.close(fd)
 
 
+# ------------------------------------------- open_dir_confined root pin (DW-338)
+#
+# `root_identity=` pins a root the orchestrator minted or validated inside the
+# checkout to the `lstat` identity the caller accepted. The threat: a writer that
+# can reach the checkout replaces such a root (`implementation_artifacts`, a run
+# dir) with a link between the caller's predicate and the root open, and every
+# later confined read or write follows it out of the repository.
+
+
+def _swap_root_for_link(root: Path, outside: Path, sub: str) -> None:
+    """Rename ``root`` aside and plant a link at its name to an outside tree
+    carrying the same subpath, so the walk below the root still succeeds."""
+    (outside / sub).mkdir(parents=True, exist_ok=True)
+    root.rename(root.with_name(root.name + "-aside"))
+    root.symlink_to(outside, target_is_directory=True)
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_open_dir_confined_pinned_root_refuses_a_root_swapped_for_a_link(tmp_path):
+    """The DW-338 swap: identity taken by `lstat`, root then replaced by a link to
+    an outside tree with the same subpath — the pinned walk refuses.
+
+    Ablation: remove the identity compare in `open_dir_confined` and this fails —
+    the pinned call returns a descriptor into `outside` exactly as the unpinned
+    control below does."""
+    root = tmp_path / "project" / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    identity = os.lstat(root)
+
+    _swap_root_for_link(root, outside, "specs")
+
+    assert platform_util.open_dir_confined(root, root / "specs", root_identity=identity) is None
+    # Control: the swap really redirects an unpinned walk into `outside`.
+    fd = platform_util.open_dir_confined(root, root / "specs")
+    assert fd is not None
+    try:
+        assert os.fstat(fd).st_ino == (outside / "specs").stat().st_ino
+    finally:
+        os.close(fd)
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_open_dir_confined_pinned_root_refuses_an_ancestor_swapped_for_a_link(tmp_path):
+    """The compare also catches an ANCESTOR of the root swapped between the
+    caller's predicate and the open: root's parent replaced by a link to an
+    outside tree holding the same subpath reaches a different directory, which
+    `O_NOFOLLOW` on the root alone would never notice.
+
+    Ablation: remove the identity compare in `open_dir_confined` and this fails —
+    the walk returns a descriptor into `outside/artifacts/specs`."""
+    project = tmp_path / "project"
+    root = project / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    identity = os.lstat(root)
+    outside = tmp_path / "outside"
+    (outside / "artifacts" / "specs").mkdir(parents=True)
+
+    project.rename(tmp_path / "project-aside")
+    project.symlink_to(outside, target_is_directory=True)
+
+    assert platform_util.open_dir_confined(root, root / "specs", root_identity=identity) is None
+
+
+@ANCHORED
+def test_open_dir_confined_pin_refuses_a_non_directory_identity(tmp_path):
+    """An identity carrying the root's real `(st_dev, st_ino)` but a regular-file
+    mode is refused: only a DIRECTORY identity can pin a directory root.
+
+    Ablation: drop the `S_ISDIR` half of `_same_dir_identity` and this fails —
+    the matching device and inode alone would admit the walk."""
+    root = tmp_path / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    fields = list(os.lstat(root)[:10])
+    fields[0] = stat.S_IFREG | 0o644  # st_mode
+    not_a_dir = os.stat_result(fields)
+
+    assert platform_util.open_dir_confined(root, root / "specs", root_identity=not_a_dir) is None
+
+
+@ANCHORED
+def test_open_dir_confined_pinned_root_unchanged_returns_the_descriptor(tmp_path):
+    """Positive control for the pin: an untouched root whose identity was taken by
+    `lstat` (or `pinned_root_identity`) walks exactly as an unpinned one does."""
+    root = tmp_path / "project" / "artifacts"
+    nested = root / "specs"
+    nested.mkdir(parents=True)
+
+    for identity in (os.lstat(root), platform_util.pinned_root_identity(root)):
+        assert identity is not None
+        fd = platform_util.open_dir_confined(root, nested, root_identity=identity)
+        assert fd is not None
+        try:
+            assert os.fstat(fd).st_ino == nested.stat().st_ino
+        finally:
+            os.close(fd)
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_open_dir_confined_pin_refuses_a_link_lstat_identity(tmp_path):
+    """An identity that is a link's own `lstat` never matches the directory the
+    open reaches through it: the pin refuses rather than degrading to "unpinned".
+
+    Ablation: drop the `S_ISDIR` requirement from `_same_dir_identity` and compare
+    only `(st_dev, st_ino)` — still refused (a link's inode is its own); drop the
+    compare altogether and this fails."""
+    real = tmp_path / "real"
+    (real / "specs").mkdir(parents=True)
+    root = tmp_path / "artifacts"
+    root.symlink_to(real, target_is_directory=True)
+
+    assert (
+        platform_util.open_dir_confined(root, root / "specs", root_identity=os.lstat(root)) is None
+    )
+
+
+@ANCHORED
+def test_open_dir_confined_pin_refuses_a_zero_inode_identity(tmp_path):
+    """A synthetic identity with `st_ino == 0` carries no identity at all; even
+    with a matching `st_dev` and mode it refuses. And the same root with its real
+    inode walks, so the refusal is the zero, not the synthetic stat itself.
+
+    Ablation: drop the nonzero-inode requirement from `_same_dir_identity` and the
+    `_same_dir_identity(zero, zero)` assert fails — two identity-less stats would
+    otherwise "match" each other. (The seam assert alone would still pass on the
+    inode mismatch, which is why the helper is asserted directly.)"""
+    root = tmp_path / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    real = os.lstat(root)
+    fields = list(real[:10])
+    fields[1] = 0  # st_ino
+    zero = os.stat_result(fields)
+
+    assert platform_util.open_dir_confined(root, root / "specs", root_identity=zero) is None
+    assert not platform_util._same_dir_identity(zero, zero)
+    assert platform_util._same_dir_identity(real, real)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("writer", ["text", "bytes", "exclusive"])
+def test_confined_writer_fallback_refuses_a_swapped_pinned_root(tmp_path, monkeypatch, writer):
+    """No-handle fallback (`HANDLE_ANCHORED_WRITES` False): `path_is_confined`
+    checks only components BELOW the root, so a root swapped for a link to a tree
+    with the same subpath passes it — the pin's `lstat` compare is what refuses.
+    Check-then-write; the residual (DW-295) is unchanged otherwise.
+
+    Ablation: delete the `_root_still_pinned` check in `_atomic_write_confined` /
+    `create_exclusive_confined` and this fails `DID NOT RAISE`, with the file
+    landing in `outside/specs/`."""
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    root = tmp_path / "project" / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    identity = platform_util.pinned_root_identity(root)
+    assert identity is not None
+    target = root / "specs" / "record.md"
+
+    def write() -> None:
+        if writer == "text":
+            platform_util.atomic_write_text_confined(
+                target, "x\n", confine_root=root, root_identity=identity
+            )
+        elif writer == "bytes":
+            platform_util.atomic_write_bytes_confined(
+                target, b"x\n", confine_root=root, root_identity=identity
+            )
+        else:
+            os.close(
+                platform_util.create_exclusive_confined(
+                    target, confine_root=root, root_identity=identity
+                )
+            )
+
+    _swap_root_for_link(root, outside, "specs")
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        write()
+    assert list((outside / "specs").iterdir()) == []
+
+    # Positive control: the same fallback writes through the unswapped root.
+    root.unlink()
+    root.with_name(root.name + "-aside").rename(root)
+    write()
+    assert target.exists()
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("writer", ["text", "bytes", "exclusive"])
+def test_confined_writer_anchored_refuses_a_swapped_pinned_root(tmp_path, writer):
+    """The anchored arm forwards `root_identity` to `open_dir_confined`, so a root
+    swapped for a link after the caller accepted it raises and nothing lands
+    outside.
+
+    Ablation: stop forwarding `root_identity` from the writer (or remove the
+    compare in `open_dir_confined`) and this fails `DID NOT RAISE`."""
+    root = tmp_path / "project" / "artifacts"
+    (root / "specs").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    identity = platform_util.pinned_root_identity(root)
+    assert identity is not None
+    target = root / "specs" / "record.md"
+
+    _swap_root_for_link(root, outside, "specs")
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        if writer == "text":
+            platform_util.atomic_write_text_confined(
+                target, "x\n", confine_root=root, root_identity=identity
+            )
+        elif writer == "bytes":
+            platform_util.atomic_write_bytes_confined(
+                target, b"x\n", confine_root=root, root_identity=identity
+            )
+        else:
+            platform_util.create_exclusive_confined(
+                target, confine_root=root, root_identity=identity
+            )
+    assert list((outside / "specs").iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_pinned_root_identity_refuses_links_files_and_missing_roots(tmp_path):
+    """A pinned caller treats None as a refusal, so every root it cannot vouch for
+    must answer None: a symlinked root, a file, a missing path. A real directory
+    answers its own `lstat`."""
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+    a_file = tmp_path / "file"
+    a_file.write_text("x", encoding="utf-8")
+
+    assert platform_util.pinned_root_identity(linked) is None
+    assert platform_util.pinned_root_identity(a_file) is None
+    assert platform_util.pinned_root_identity(tmp_path / "absent") is None
+    identity = platform_util.pinned_root_identity(real)
+    assert identity is not None
+    assert identity.st_ino == os.lstat(real).st_ino
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_root_identity_record_is_the_pinned_dev_and_ino_or_none(tmp_path, monkeypatch):
+    """DW-446: the mint-time record is `pinned_root_identity`'s ``(st_dev, st_ino)``
+    for a real directory, and None for anything a pin could not vouch for — a link,
+    a file, a missing path, or a zero inode (no identity to hold a root to).
+
+    Ablation: drop the ``st_ino == 0`` check and the zero-inode row answers
+    ``(dev, 0)``."""
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+    a_file = tmp_path / "file"
+    a_file.write_text("x", encoding="utf-8")
+
+    own = os.lstat(real)
+    assert platform_util.root_identity_record(real) == (own.st_dev, own.st_ino)
+    for unpinnable in (linked, a_file, tmp_path / "absent"):
+        assert platform_util.root_identity_record(unpinnable) is None
+
+    zero = tmp_path / "zero"
+    zero.mkdir()
+    real_lstat = os.lstat
+    zero_stat = os.stat_result((stat.S_IFDIR, 0, own.st_dev, 1, 0, 0, 0, 0, 0, 0))
+    monkeypatch.setattr(
+        os, "lstat", lambda p, *a, **k: zero_stat if str(p) == str(zero) else real_lstat(p, *a, **k)
+    )
+    assert platform_util.root_identity_record(zero) is None
+
+
+def test_recorded_root_identity_carries_the_record_in_stat_field_order(tmp_path):
+    """DW-446: the synthetic identity built from a record is a DIRECTORY stat whose
+    ``st_dev``/``st_ino`` are the record's (`os.stat_result` takes mode, ino, dev in
+    that order), so it matches the recorded directory's own stat; a None record is
+    the never-matching identity.
+
+    Ablation: swap ``ino``/``dev`` in the tuple `recorded_root_identity` builds and
+    the field and match rows redden."""
+    real = tmp_path / "real"
+    real.mkdir()
+    own = os.lstat(real)
+    identity = platform_util.recorded_root_identity((own.st_dev, own.st_ino))
+
+    assert (identity.st_dev, identity.st_ino) == (own.st_dev, own.st_ino)
+    assert stat.S_ISDIR(identity.st_mode)
+    assert platform_util._same_dir_identity(identity, own)
+    never = platform_util.recorded_root_identity(None)
+    assert never is platform_util.NEVER_MATCHING_IDENTITY
+    assert not platform_util._same_dir_identity(never, own)
+    assert not platform_util._same_dir_identity(never, never)
+
+
+def test_pinned_root_identity_refuses_a_reparse_tagged_dir(tmp_path, monkeypatch):
+    """A win32 junction `lstat`s as a DIRECTORY with a nonzero inode, so only the
+    reparse-tag check stands between it and a pinned identity; drive that
+    Windows-only branch here (the tuple is substituted, as the neighbours do).
+
+    Ablation: delete the `st_reparse_tag` check in `pinned_root_identity` and
+    this fails — the junction's own directory stat is returned as the pin."""
+
+    class _IdentifiedReparseStat(_ReparseStat):
+        st_dev = 1
+        st_ino = 4242
+
+    junction = tmp_path / "junction"
+    junction.mkdir()
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkeypatch.setattr(platform_util, "_LINK_REPARSE_TAGS", (_ReparseStat.st_reparse_tag,))
+    real_lstat = os.lstat
+    monkeypatch.setattr(
+        platform_util.os,
+        "lstat",
+        lambda p, *a, **k: _IdentifiedReparseStat() if str(p) == str(junction) else real_lstat(p),
+    )
+
+    assert platform_util.pinned_root_identity(junction) is None
+    identity = platform_util.pinned_root_identity(plain)
+    assert identity is not None
+    assert identity.st_ino == real_lstat(plain).st_ino
+
+
 @DIR_FD
 def test_open_dir_confined_readable_default_supports_scandir(tmp_path):
     root = tmp_path / "project"
@@ -2205,6 +2969,328 @@ def test_atomic_write_bytes_at_does_not_verify_after_prepublication_failure(tmp_
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+# ------------------------------------------- confined append (run-dir records)
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_open_append_at_creates_the_file_with_a_private_mode(tmp_path):
+    """The append open states its mode rather than inheriting the umask's, as
+    the anchored atomic writers do; the umask is forced for the reason
+    `test_atomic_write_text_at_lands_a_private_mode` gives.
+
+    Ablation: open with mode 0o644 in `open_append_at` and this fails
+    reporting 0o644."""
+    previous = os.umask(0o022)
+    try:
+        with _dir_fd(tmp_path) as dir_fd:
+            os.close(platform_util.open_append_at(dir_fd, "journal.jsonl"))
+    finally:
+        os.umask(previous)
+
+    landed = tmp_path / "journal.jsonl"
+    assert landed.read_bytes() == b""
+    assert stat.S_IMODE(landed.stat().st_mode) == 0o600, oct(landed.stat().st_mode)
+
+
+@ANCHORED
+def test_open_append_at_appends_across_two_descriptors_regardless_of_offset(tmp_path):
+    """Every write lands at the end: after a seek to the start on the same
+    descriptor, and from a second descriptor opened on the existing file (no
+    truncation on re-open)."""
+    with _dir_fd(tmp_path) as dir_fd:
+        first = platform_util.open_append_at(dir_fd, "journal.jsonl")
+        try:
+            os.write(first, b"a\n")
+            second = platform_util.open_append_at(dir_fd, "journal.jsonl")
+            try:
+                os.lseek(second, 0, os.SEEK_SET)
+                os.write(second, b"b\n")
+            finally:
+                os.close(second)
+            os.lseek(first, 0, os.SEEK_SET)
+            os.write(first, b"c\n")
+        finally:
+            os.close(first)
+
+    assert (tmp_path / "journal.jsonl").read_bytes() == b"a\nb\nc\n"
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_open_append_at_refuses_a_link_at_the_name(tmp_path):
+    """`AT_NOFOLLOW` on the final component: a link planted at the record's name
+    fails the open with `ELOOP`, and the file it points at is untouched.
+
+    Ablation: drop `AT_NOFOLLOW` from `open_append_at` and the open follows the
+    link (no `ELOOP`)."""
+    outside = tmp_path / "outside.jsonl"
+    outside.write_bytes(b"kept\n")
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "journal.jsonl").symlink_to(outside)
+
+    with _dir_fd(run) as dir_fd:
+        with pytest.raises(OSError) as refused:
+            platform_util.open_append_at(dir_fd, "journal.jsonl")
+    assert refused.value.errno == errno.ELOOP
+    assert outside.read_bytes() == b"kept\n"
+
+
+@ANCHORED
+@pytest.mark.parametrize(
+    ("content", "terminated"),
+    [(b"", True), (b"x", False), (b"x\n", True), (b"x\r\n", True)],
+    ids=["empty", "fragment", "lf", "crlf"],
+)
+def test_tail_is_terminated_fd_reads_each_tail_shape(tmp_path, content, terminated):
+    """An empty file has no fragment to close; otherwise the last byte decides,
+    so a legacy CRLF tail reads terminated too."""
+    (tmp_path / "journal.jsonl").write_bytes(content)
+    with _dir_fd(tmp_path) as dir_fd:
+        fd = platform_util.open_append_at(dir_fd, "journal.jsonl")
+        try:
+            assert platform_util.tail_is_terminated_fd(fd) is terminated
+        finally:
+            os.close(fd)
+
+
+@ANCHORED
+def test_tail_is_terminated_fd_fails_toward_the_heal_on_a_probe_error(tmp_path, monkeypatch):
+    """A terminated file whose probe faults answers "unterminated" and does not
+    raise: the cost of a wrong False is one blank line, of a wrong True two lost
+    records.
+
+    Ablation: answer True from the `except OSError` arm and this fails."""
+    (tmp_path / "journal.jsonl").write_bytes(b"x\n")
+
+    def faulting_lseek(fd, pos, how):
+        raise OSError(errno.EIO, "Input/output error")
+
+    with _dir_fd(tmp_path) as dir_fd:
+        fd = platform_util.open_append_at(dir_fd, "journal.jsonl")
+        try:
+            monkeypatch.setattr(platform_util.os, "lseek", faulting_lseek)
+            assert platform_util.tail_is_terminated_fd(fd) is False
+        finally:
+            monkeypatch.undo()
+            os.close(fd)
+
+
+@pytest.mark.parametrize(
+    ("observed", "record", "stale"),
+    [
+        ("dir", (7, 42), False),  # the recorded directory itself
+        ("dir", (8, 42), True),  # same inode on a renumbered device
+        ("dir", (8, 43), False),  # another directory
+        ("zero-inode", (8, 0), False),  # an identity that proves nothing
+        ("link", (8, 42), False),  # a link at the root is never stale, it is replaced
+        ("junction", (8, 42), False),  # nor a junction, whose lstat mode is a directory
+        ("missing", (8, 42), False),
+        ("dir", None, False),  # no record to compare
+    ],
+    ids=[
+        "same",
+        "renumbered",
+        "other-inode",
+        "zero-inode",
+        "link",
+        "junction",
+        "missing",
+        "no-record",
+    ],
+)
+def test_stale_device_record_matches_only_a_renumbered_device_on_the_same_directory(
+    tmp_path, monkeypatch, observed, record, stale
+):
+    """The degrade test a pinned writer runs after a refusal: True only for the
+    shape `runs.reconcile_root_identities` re-binds — an intact directory, the
+    recorded nonzero inode, another `st_dev`.
+
+    Ablation: drop the `st_ino == ino` compare and `other-inode` fails; drop the
+    `link_like_stat` test and `junction` fails."""
+
+    class _IdentifiedReparseStat(_ReparseStat):
+        st_dev = 7
+        st_ino = 42
+
+    root = tmp_path / "run"
+    real_lstat = os.lstat
+    monkeypatch.setattr(platform_util, "_LINK_REPARSE_TAGS", (_ReparseStat.st_reparse_tag,))
+
+    def fake_lstat(path, *args, **kwargs):
+        if Path(path) != root:
+            return real_lstat(path, *args, **kwargs)
+        if observed == "missing":
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(path))
+        if observed == "junction":
+            return _IdentifiedReparseStat()
+        mode = stat.S_IFLNK | 0o777 if observed == "link" else stat.S_IFDIR | 0o700
+        ino = 0 if observed == "zero-inode" else 42
+        # os.stat_result field order: mode, ino, dev, nlink, uid, gid, size, atime, mtime, ctime
+        return os.stat_result((mode, ino, 7, 1, 0, 0, 0, 0, 0, 0))
+
+    monkeypatch.setattr(platform_util.os, "lstat", fake_lstat)
+
+    assert platform_util.stale_device_record(root, record) is stale
+
+
+@ANCHORED
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned"])
+def test_append_line_confined_heals_an_unterminated_tail_then_appends(tmp_path, pinned):
+    """A torn record (no trailing newline) gets a newline before the next line,
+    so one fault costs one record; a terminated tail gets nothing extra. A
+    fresh file starts without a blank line.
+
+    Ablation: write `line` without consulting `tail_is_terminated_fd` and the
+    fragment and the record fuse on one line."""
+    root = tmp_path / "run"
+    root.mkdir()
+    identity = platform_util.pinned_root_identity(root) if pinned else None
+
+    platform_util.append_line_confined(root, "fresh.jsonl", b'{"a": 1}\n', root_identity=identity)
+    (root / "journal.jsonl").write_bytes(b'{"torn"')
+    platform_util.append_line_confined(root, "journal.jsonl", b'{"b": 2}\n', root_identity=identity)
+    platform_util.append_line_confined(root, "journal.jsonl", b'{"c": 3}\n', root_identity=identity)
+
+    assert (root / "fresh.jsonl").read_bytes() == b'{"a": 1}\n'
+    assert (root / "journal.jsonl").read_bytes() == b'{"torn"\n{"b": 2}\n{"c": 3}\n'
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_append_line_confined_pinned_refuses_a_swapped_root(tmp_path):
+    """The pinned arm forwards `root_identity` to `open_dir_confined`, so a run
+    dir swapped for a link after its identity was taken raises and nothing
+    lands outside.
+
+    Ablation: open the pinned arm's root without `root_identity` and this fails
+    `DID NOT RAISE`, with the line landing in `outside/`."""
+    root = tmp_path / "runs" / "r1"
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    identity = platform_util.pinned_root_identity(root)
+    assert identity is not None
+
+    _swap_root_for_link(root, outside, "logs")
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        platform_util.append_line_confined(root, "journal.jsonl", b"{}\n", root_identity=identity)
+    assert sorted(p.name for p in outside.iterdir()) == ["logs"]
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_append_line_confined_unpinned_refuses_a_link_at_the_root_but_follows_a_linked_parent(
+    tmp_path,
+):
+    """Unpinned, the run dir is the last component of a walk from its parent, so
+    it is opened `O_NOFOLLOW`: a link AT the run dir refuses. Its ancestors are
+    followed, as `open_dir_confined` follows the root it is given — the control
+    lands through a linked `runs/`.
+
+    Ablation: open the unpinned arm as `open_dir_confined(root, root)` and the
+    first half fails `DID NOT RAISE`, with the line landing in `outside/`."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    runs = tmp_path / "project" / "runs"
+    runs.mkdir(parents=True)
+    (runs / "r1").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        platform_util.append_line_confined(
+            runs / "r1", "journal.jsonl", b"{}\n", root_identity=None
+        )
+    assert list(outside.iterdir()) == []
+
+    real = tmp_path / "real-runs"
+    (real / "r2").mkdir(parents=True)
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+    platform_util.append_line_confined(linked / "r2", "journal.jsonl", b"{}\n", root_identity=None)
+    assert (real / "r2" / "journal.jsonl").read_bytes() == b"{}\n"
+
+
+@ANCHORED
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned"])
+def test_append_line_confined_missing_root_raises_and_creates_nothing(tmp_path, pinned):
+    """An append never mkdirs: a run dir deleted under its writer raises (the
+    composition unwind relies on that) and is not recreated.
+
+    Ablation: `root.mkdir(parents=True, exist_ok=True)` before the confined
+    open and this fails `DID NOT RAISE`."""
+    root = tmp_path / "runs" / "r1"
+    root.mkdir(parents=True)
+    identity = platform_util.pinned_root_identity(root) if pinned else None
+    root.rmdir()
+
+    with pytest.raises(platform_util.UnconfinedWriteError) as refused:
+        platform_util.append_line_confined(root, "journal.jsonl", b"{}\n", root_identity=identity)
+    assert str(root) in str(refused.value)  # the message, not an OSError filename slot
+    assert not root.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("swap", ["link", "directory"])
+def test_append_line_confined_fallback_refuses_a_swapped_pinned_root(tmp_path, monkeypatch, swap):
+    """No-handle fallback (`HANDLE_ANCHORED_WRITES` False): a root swapped for a
+    link refuses at the link test and the pin; a root swapped for another real
+    directory passes the link test, so the pin's `lstat` compare refuses it —
+    before the open, so nothing is created in the replacement.
+
+    Ablation: delete the first `require_root_pinned` in the fallback arm and
+    `directory` fails with an empty `journal.jsonl` created in the
+    replacement; delete it and the `is_link_like` test and `link` fails with
+    the line landing in `outside/`."""
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    root = tmp_path / "runs" / "r1"
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    identity = platform_util.pinned_root_identity(root)
+    assert identity is not None
+
+    if swap == "link":
+        _swap_root_for_link(root, outside, "logs")
+        replacement = outside
+    else:
+        root.rename(root.with_name("r1-aside"))
+        root.mkdir()
+        replacement = root
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        platform_util.append_line_confined(root, "journal.jsonl", b"{}\n", root_identity=identity)
+    assert not (replacement / "journal.jsonl").exists()
+
+    # Positive control: the same fallback appends through the unswapped root.
+    if swap == "link":
+        root.unlink()
+    else:
+        root.rmdir()
+    root.with_name("r1-aside").rename(root)
+    platform_util.append_line_confined(root, "journal.jsonl", b"{}\n", root_identity=identity)
+    assert (root / "journal.jsonl").read_bytes() == b"{}\n"
+
+
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned"])
+def test_append_line_confined_fallback_appends_through_a_plain_root(tmp_path, monkeypatch, pinned):
+    """The fallback arm keeps the anchored arm's contract: the tail heal, an
+    append that keeps existing bytes, and no mkdir for a missing root."""
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    root = tmp_path / "run"
+    root.mkdir()
+    identity = platform_util.pinned_root_identity(root) if pinned else None
+    (root / "journal.jsonl").write_bytes(b'{"torn"')
+
+    platform_util.append_line_confined(root, "journal.jsonl", b'{"b": 2}\n', root_identity=identity)
+    platform_util.append_line_confined(root, "journal.jsonl", b'{"c": 3}\n', root_identity=identity)
+    assert (root / "journal.jsonl").read_bytes() == b'{"torn"\n{"b": 2}\n{"c": 3}\n'
+
+    gone = tmp_path / "gone"
+    with pytest.raises(FileNotFoundError):
+        platform_util.append_line_confined(gone, "journal.jsonl", b"{}\n", root_identity=None)
+    assert not gone.exists()
+
+
 # ------------------------------------------------------- path_is_confined (#593)
 
 
@@ -2330,18 +3416,6 @@ def test_unconfined_write_error_is_an_oserror(tmp_path):
     assert not stray.exists()
 
 
-def test_atomic_write_text_confined_writes_a_clean_tree(tmp_path):
-    """The positive control for the refusals below — without it they pass for a
-    writer that refuses everything."""
-    root = tmp_path / "project"
-    parent = root / ".bmad-loop"
-    parent.mkdir(parents=True)
-
-    platform_util.atomic_write_text_confined(parent / "policy.toml", "x = 1\n", confine_root=root)
-
-    assert (parent / "policy.toml").read_text(encoding="utf-8") == "x = 1\n"
-
-
 def test_atomic_write_text_confined_lands_the_platform_line_ending(tmp_path):
     """The confined TEXT writer keeps `atomic_write_text`'s translating newline
     default on every arm — LF on POSIX, CRLF on Windows — so anchoring the write
@@ -2378,6 +3452,11 @@ def test_atomic_write_confined_refuses_a_parent_ref_below_the_root(tmp_path):
     Matched on ITS message ("climbs back out"), not merely the type, for the
     reason the out-of-root row gives: refusing for a different reason must not
     grade as refusing for this one.
+
+    Positive control for this refusal and those below — without it they pass for a
+    writer that refuses everything:
+    `test_atomic_write_text_confined_lands_the_platform_line_ending` lands a write on
+    the same clean tree.
 
     Ablation: delete the `has_parent_ref` gate and this fails `DID NOT RAISE` —
     the anchored walk opens `specs`, then `..` twice, and publishes the payload
@@ -2510,6 +3589,138 @@ def test_create_exclusive_confined_refuses_a_symlinked_parent(tmp_path, monkeypa
     fd = platform_util.create_exclusive_confined(root / ".bmad-loop" / "ok.json", confine_root=root)
     os.close(fd)
     assert (root / ".bmad-loop" / "ok.json").exists()
+
+
+# ------------------------- confined mkdir / unlink below a root (DW-497)
+
+
+def _both_confined_arms(monkeypatch):
+    """Yield once per arm: the host's anchored arm, then the no-handle fallback."""
+    yield "anchored"
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    yield "fallback"
+
+
+def test_make_dirs_confined_creates_missing_parents_idempotently(tmp_path, monkeypatch):
+    """The positive half on both arms: every missing component is created, an
+    existing chain is accepted, and a pinned intact root binds nothing extra."""
+    for arm in _both_confined_arms(monkeypatch):
+        root = tmp_path / arm
+        root.mkdir()
+        target = root / ".bmad-loop" / "operator"
+        platform_util.make_dirs_confined(target, confine_root=root, root_identity=os.lstat(root))
+        platform_util.make_dirs_confined(target, confine_root=root)
+        assert target.is_dir(), arm
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("link_at", [".bmad-loop", ".bmad-loop/operator"])
+def test_make_dirs_confined_refuses_a_link_below_the_root(tmp_path, monkeypatch, link_at):
+    """A link at any component below the root refuses on both arms before
+    anything is created through it; the link's target stays empty.
+
+    Ablation: replace the body with `target.mkdir(parents=True, exist_ok=True)` and
+    the `.bmad-loop` row grows `outside/operator/` while neither row raises."""
+    for arm in _both_confined_arms(monkeypatch):
+        root = tmp_path / arm
+        (root / link_at).parent.mkdir(parents=True, exist_ok=True)
+        outside = tmp_path / f"outside-{arm}"
+        outside.mkdir()
+        (root / link_at).symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(platform_util.UnconfinedWriteError):
+            platform_util.make_dirs_confined(root / ".bmad-loop" / "operator", confine_root=root)
+        assert list(outside.iterdir()) == [], arm
+
+
+def test_unlink_confined_prunes_only_an_emptied_parent(tmp_path, monkeypatch):
+    """The positive half on both arms: the file goes, a parent still holding
+    another entry stays, the last unlink prunes it, and ``missing_ok`` tolerates a
+    missing file and a missing directory alike — without it, absence raises."""
+    for arm in _both_confined_arms(monkeypatch):
+        root = tmp_path / arm
+        records = root / ".bmad-loop" / "operator"
+        records.mkdir(parents=True)
+        (records / "a.json").write_text("a", encoding="utf-8")
+        (records / "b.json").write_text("b", encoding="utf-8")
+        unlink = functools.partial(
+            platform_util.unlink_confined,
+            confine_root=root,
+            root_identity=os.lstat(root),
+            prune_empty_parent=True,
+        )
+
+        unlink(records / "a.json")
+        assert [p.name for p in records.iterdir()] == ["b.json"], arm
+        unlink(records / "b.json")
+        assert not records.exists(), arm
+        unlink(records / "b.json", missing_ok=True)  # the directory is gone
+        (root / ".bmad-loop").rmdir()
+        unlink(records / "b.json", missing_ok=True)  # and its parent too
+        with pytest.raises(FileNotFoundError):
+            unlink(records / "b.json")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("link_at", [".bmad-loop", ".bmad-loop/operator"])
+def test_unlink_confined_refuses_a_link_below_the_root(tmp_path, monkeypatch, link_at):
+    """A link below the root refuses on both arms — ``missing_ok`` included, since
+    the walk meets the link before anything missing — and the same-named file at
+    its target survives.
+
+    Ablation: replace the body with `path.unlink(missing_ok=missing_ok)` and the
+    outside file is deleted on both arms."""
+    for arm in _both_confined_arms(monkeypatch):
+        root = tmp_path / arm
+        (root / link_at).parent.mkdir(parents=True, exist_ok=True)
+        outside = tmp_path / f"outside-{arm}"
+        victim = outside / Path(".bmad-loop/operator/r.json").relative_to(link_at)
+        victim.parent.mkdir(parents=True)
+        victim.write_text("theirs", encoding="utf-8")
+        (root / link_at).symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(platform_util.UnconfinedWriteError):
+            platform_util.unlink_confined(
+                root / ".bmad-loop" / "operator" / "r.json",
+                confine_root=root,
+                missing_ok=True,
+                prune_empty_parent=True,
+            )
+        assert victim.read_text(encoding="utf-8") == "theirs", arm
+
+
+@pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+def test_unlink_confined_prunes_through_the_walked_descriptor(tmp_path, monkeypatch):
+    """The POSIX prune is relative to the descriptor the walk produced, so an
+    ancestor swapped for a link AFTER the walk — between the unlink and the
+    prune — steers nothing: the real (renamed-aside) directory is pruned and an
+    empty same-named directory at the link's target survives.
+
+    Ablation: prune with `_rmdir_if_empty(parent)` (by path) instead of the
+    `os.rmdir(..., dir_fd=...)` and the outside directory is removed."""
+    root = tmp_path / "project"
+    records = root / ".bmad-loop" / "operator"
+    records.mkdir(parents=True)
+    (records / "r.json").write_text("mine", encoding="utf-8")
+    outside = tmp_path / "outside"
+    (outside / "operator").mkdir(parents=True)
+    real_unlink_at = platform_util.unlink_at
+
+    def unlink_then_swap(dir_fd, name):
+        real_unlink_at(dir_fd, name)
+        (root / ".bmad-loop").rename(root / ".bmad-loop-aside")
+        (root / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(platform_util, "unlink_at", unlink_then_swap)
+
+    platform_util.unlink_confined(records / "r.json", confine_root=root, prune_empty_parent=True)
+
+    assert (outside / "operator").is_dir()
+    assert list((root / ".bmad-loop-aside").iterdir()) == []
 
 
 def test_create_exclusive_confined_refuses_out_of_root_and_parent_refs(tmp_path):
@@ -2740,8 +3951,8 @@ def test_atomic_write_confined_is_anchored_against_an_ancestor_swap(tmp_path, mo
     outside.mkdir()
     real_open = platform_util.open_dir_confined
 
-    def swap_after_the_walk(confine_root: Path, target: Path):
-        fd = real_open(confine_root, target)
+    def swap_after_the_walk(confine_root: Path, target: Path, **kwargs):
+        fd = real_open(confine_root, target, **kwargs)
         # attacker wins: the name now points outside, the fd still points home
         target.rename(tmp_path / "moved-aside")
         target.symlink_to(outside, target_is_directory=True)
@@ -3149,3 +4360,60 @@ def test_confined_writable_target_probe_answers_a_planted_fifo_without_blocking(
     assert failures == []
     assert stat.S_ISREG(target.lstat().st_mode)  # the FIFO name was replaced
     assert target.read_bytes() == b"payload"
+
+
+# ------------------------------------------------------------ filesystem_name
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the non-win32 arm")
+def test_filesystem_name_off_win32_is_unknown_with_the_platform(tmp_path):
+    """DW-444: off win32 the label is `unknown (<platform>)` — no mount-table
+    arm, because the only caller is the path-based fallback no POSIX host takes
+    (every one has `O_DIRECTORY`). Never `""`.
+
+    Ablation: return `""` (or restore a `/proc/self/mounts` arm) and this fails."""
+    assert platform_util.filesystem_name(tmp_path) == f"unknown ({sys.platform})"
+
+
+def test_filesystem_name_reports_a_ctypes_fault_as_unknown(tmp_path, monkeypatch):
+    """Never `""` and never a raise: a fault inside the win32 volume query
+    (here a ctypes failure, on any host) becomes an `unknown (<reason>)` label a
+    reader can tell from a real answer.
+
+    Ablation: drop the `except` in `filesystem_name` and this raises."""
+    import ctypes
+
+    def refuse(*_args, **_kwargs):
+        raise OSError("simulated ctypes fault")
+
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "WinDLL", refuse, raising=False)
+    label = platform_util.filesystem_name(tmp_path)
+    assert label.startswith("unknown (") and "simulated ctypes fault" in label
+    assert platform_util.filesystem_type(label) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("NTFS at C:\\", "NTFS"),
+        ("ReFS at D:\\mnt\\vol\\", "ReFS"),
+        ("unknown (linux)", "unknown"),
+        ("unknown (GetVolumeInformationW failed on C:\\: winerror 5)", "unknown"),
+    ],
+)
+def test_filesystem_type_strips_the_volume_path(label, expected):
+    """DW-444: the diagnostics-safe type of a label — the volume path (and any
+    reason an `unknown` label quotes) never survives."""
+    assert platform_util.filesystem_type(label) == expected
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="win32 volume information")
+def test_filesystem_name_labels_a_win32_volume(tmp_path):
+    """DW-444's host: `GetVolumePathNameW` + `GetVolumeInformationW` name the
+    volume's filesystem (`NTFS at C:\\`, `ReFS at D:\\`, ...)."""
+    label = platform_util.filesystem_name(tmp_path)
+    assert not label.startswith("unknown"), label
+    fs_name, sep, volume = label.partition(" at ")
+    assert sep and fs_name and volume.endswith("\\")
+    assert str(tmp_path).casefold().startswith(volume.casefold().rstrip("\\"))

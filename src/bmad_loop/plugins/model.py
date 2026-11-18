@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .context import HookContext
+    from .grants import Verdict
 
 # The framework's current plugin-API version. A manifest declares the api_version
 # it was written against; the loader compares it against SUPPORTED_API. Bumping
@@ -139,7 +140,9 @@ class WorkflowSpec:
 @dataclass(frozen=True)
 class PythonSpec:
     """Optional in-process module. Its presence makes the plugin trust-gated:
-    the module is never imported unless the plugin is in ``[plugins] enabled``.
+    a builtin's module is imported only when the plugin is in ``[plugins]
+    enabled``; a project plugin's only under an operator content grant, and then
+    compiled from the granted bytes of its verified snapshot (see ``registry``).
 
     ``module`` is a plugin-relative file (resolved against the plugin's script
     dir); ``cls`` is the ``Plugin`` subclass to instantiate (defaults to
@@ -176,6 +179,10 @@ class PluginManifest:
     seed_globs: tuple[str, ...] = ()
     # ordering across plugins at a shared stage: lower runs first, then load order.
     priority: int = 0
+    # the plugin's hooks (declarative and [python]) write nothing a verify pass
+    # reads: a dispatch leaves a `[verify] reuse_unchanged` token intact. False
+    # (the default) voids it on every dispatch (decline `plugin-hook`).
+    read_only: bool = False
     scripts_dir: str = ""
     source: str = "project"
 
@@ -256,10 +263,19 @@ class Plugin:
 class LoadedPlugin:
     """A manifest plus its trust/resolution outcome, as the registry holds it.
 
-    ``instance`` is a constructed ``Plugin`` for an enabled, trusted ``[python]``
-    plugin; ``None`` for a data-only/declarative plugin, an untrusted one (has
-    ``[python]`` but isn't allowlisted), or one whose construction raised.
-    ``disabled`` marks an instance that errored and was isolated out.
+    ``instance`` is a constructed ``Plugin`` for a trusted ``[python]`` plugin
+    (an enabled builtin, or a granted project plugin); ``None`` for a
+    data-only/declarative plugin, an untrusted or refused one, or one whose
+    construction raised. ``disabled`` marks an instance that errored and was
+    isolated out.
+
+    ``verdict`` is the gate's decision (`grants.classify`) for a registry-built
+    plugin; ``None`` only for one constructed in memory (tests), which counts as
+    active. ``live_dir`` is the discovered dir of a granted plugin whose
+    ``manifest.scripts_dir`` now points at its verified snapshot.
+
+    `active` is THE predicate every consumer reads — the bus, workflows, seeds.
+    Consumers never re-derive trust from ``manifest.source``.
     """
 
     manifest: PluginManifest
@@ -271,10 +287,36 @@ class LoadedPlugin:
     # ``[plugins.<name>]`` policy table. The same dict the instance was built
     # with; the bus reads it for the declarative-hook ``BMAD_LOOP_SETTING_*`` env.
     settings: dict[str, Any] = field(default_factory=dict)
+    verdict: Verdict | None = None
+    live_dir: str = ""
 
     @property
     def name(self) -> str:
         return self.manifest.name
+
+    @property
+    def active(self) -> bool:
+        """Whether anything of this plugin may run: its verdict is active and it
+        was not left untrusted (an un-enabled builtin ``[python]`` is wholly
+        inert). A construct error keeps it active — its declarative hooks are
+        out-of-process and independent of the module that failed."""
+        return verdict_admits(self.verdict) and self.trusted
+
+    @property
+    def live_instance_or_declarative(self) -> bool:
+        """Active, and either codeless or with its in-process instance built —
+        the gate for workflows and seeds, which follow the module's fate."""
+        return self.active and (self.manifest.python is None or self.instance is not None)
+
+
+def verdict_admits(verdict: Verdict | None) -> bool:
+    """Whether a trust verdict lets its plugin take part at all: no verdict (a
+    registry built without the gate) or an active one. THE active-set rule —
+    `LoadedPlugin.active` reads it, and so does the static, exec-free walk
+    (`registry.static_workflow_roles`) that only has `preflight` verdicts, so the
+    two cannot drift. A registry-built ``trusted=False`` only ever co-occurs with
+    a REFUSED/UNENABLED verdict, which this already rejects."""
+    return verdict is None or verdict.active
 
 
 # re-exported by manifest.py for parser convenience
@@ -293,4 +335,5 @@ __all__ = [
     "PluginManifest",
     "Plugin",
     "LoadedPlugin",
+    "verdict_admits",
 ]

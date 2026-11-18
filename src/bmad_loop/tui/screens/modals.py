@@ -8,10 +8,13 @@ rich Text, never markup.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from rich.cells import cell_len
 from rich.text import Text
+from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -19,15 +22,35 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, Select, Static
 
-from ... import stories
-from ...escalation import display_pause_reason
+from ... import stories, tickets_source, worksource
+from ...escalation import display_pause_reason, resume_skipped_escalation_keys
 from ...model import RunState
 from .. import data, widgets
+
+
+def source_options() -> list[tuple[str, str]]:
+    """The start-run modal's source picker: one (label, source) per registered
+    source that ``run`` can launch from, in registry order."""
+    return [(t.label, t.name) for t in worksource.TRAITS.values() if t.runnable]
 
 
 def _int_or_none(value: str) -> int | None:
     value = value.strip()
     return int(value) if value else None
+
+
+def epic_selector(source: object, value: str) -> int | str | None:
+    """The start-run modal's ``--epic`` value for ``source``: blank is None; a
+    tickets run takes an epic id or slug as text (``run`` resolves it against the
+    tree); every other source takes only a number, as ``run`` does.
+
+    Raises ValueError on a non-number outside tickets mode."""
+    value = value.strip()
+    if not value:
+        return None
+    if source == worksource.SOURCE_TICKETS:
+        return value
+    return int(value)
 
 
 class BaseDialog(ModalScreen):
@@ -63,6 +86,8 @@ class BaseDialog(ModalScreen):
     BaseDialog .title {
         text-style: bold;
         margin-bottom: 1;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
     }
     BaseDialog .buttons {
         height: auto;
@@ -123,7 +148,8 @@ class BaseDialog(ModalScreen):
     # = 54) still fits a clamped dialog's content region (60 - 2 border
     # - 4 padding = 54). Declaring this here scopes it to dialogs: the App and
     # DashboardScreen leave their breakpoints at the default, so the dashboard
-    # is unaffected.
+    # is unaffected. SpecReviewModal overrides the threshold to 80 columns — see
+    # its own HORIZONTAL_BREAKPOINTS.
     HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (60, "-wide")]
 
     # Same mechanism on the other axis: `-short` means "the terminal is under 20
@@ -135,15 +161,18 @@ class BaseDialog(ModalScreen):
     # #body). The compact layout has to engage before anything clips, not at the
     # moment it does, so the threshold is above 14 rather than on it. It is also
     # below the 24 rows of a default terminal, so an ordinary window still gets
-    # the full chrome. Every figure above is a CHROME measurement, taken with
-    # short titles: a title, header, warning or path is docked outside the
-    # scrolling body, so a long enough one wraps and costs rows this layout
-    # cannot reclaim — the body is already at its 1-row minimum. Nothing bounds
-    # that caller-supplied text, so a long enough value clips the docked controls
-    # at ANY fixed size and those dialogs have no floor to state. That is why
-    # docs/tui-guide.md gives its figures as sizes measured to be sufficient for
-    # the content it exercised rather than as a minimum — 80x24 included
-    # (#628, #629).
+    # the full chrome. A title, header, subtitle or path docked outside the
+    # scrolling body is caller text of unbounded length, so the `.title` rule
+    # above holds each of its lines to one row with an ellipsis (SpecReviewModal
+    # and PauseReasonModal do the same for their subtitles, SpecReviewModal for
+    # its path). Such a block's height is therefore its LINE count, never its
+    # length, and caller text cannot move a dialog's floor off the 39x9 pair
+    # tests/test_tui_app.py pins and docs/tui-guide.md quotes (DW-358). Docked
+    # warnings and hints are module text and are NOT held to one row; each is
+    # sized to fit that pair instead — EscalationModal keeps every #hint arm
+    # within 3 rows at 39 columns (DW-414), and ConfirmResumeModal's `-short`
+    # body yields its rows to the double-drive warning (DW-415). The full caller
+    # text stays in the widget — the ellipsis is render-only.
     VERTICAL_BREAKPOINTS = [(0, "-short"), (20, "-tall")]
 
     BINDINGS = [Binding("escape", "cancel", "cancel")]
@@ -152,14 +181,73 @@ class BaseDialog(ModalScreen):
         self.dismiss(None)
 
 
+def _append_board(text: Text, board: data.TicketsBoard) -> None:
+    """A tickets preview's body under its header: the counts by derived state,
+    then the open tickets that pause a run (hitl, plan and done checkpoints)."""
+    counts: dict[str, int] = {}
+    for row in board.rows:
+        counts[row.state] = counts.get(row.state, 0) + 1
+    if counts:
+        text.append("\n  " + " · ".join(f"{n} {state}" for state, n in counts.items()))
+    flagged = [r for r in board.rows if r.state not in ("done", "dropped")]
+    for label, pick in (
+        ("hitl", lambda r: r.hitl),
+        ("plan checkpoint", lambda r: r.plan_checkpoint),
+        ("done checkpoint", lambda r: r.done_checkpoint),
+    ):
+        refs = [tickets_source.row_label(r) for r in flagged if pick(r)]
+        if refs:
+            text.append(f"\n  {label}: {', '.join(refs)}", style="magenta")
+
+
+def _chain_preview(board: data.TicketsBoard) -> Text:
+    """The tickets preview of a parent initiative (:func:`data.project_tickets_overview`):
+    one line per child in build order with its status, ticket counts, tag and what
+    it waits on, then the board of the first ready child, or why no child can
+    start, or the fault that kept the children or that board from being read."""
+    text = Text()
+    text.append(
+        f"parent initiative {board.parent} · {len(board.children)} children in build order",
+        style="bold",
+    )
+    for position, child in enumerate(board.children, 1):
+        status = child.status
+        if child.total:
+            status += f"; {child.closed} of {child.total} tickets closed"
+        text.append(f"\n  {position}. {child.slug}  ({status})  ")
+        text.append(f"[{child.tag}]", style="cyan" if child.tag == "first ready" else "magenta")
+        if child.waiting_on:
+            waits = ", ".join(f"{w.prerequisite} ({w.status})" for w in child.waiting_on)
+            text.append(f"  waits on: {waits}", style="dim")
+    if board.fault is not None:
+        text.append(f"\n⚠ tickets board unavailable: {board.fault}", style="red")
+        return text
+    if board.chain_end is not None:
+        text.append(f"\nno child can start ({board.chain_end})", style="yellow")
+    else:
+        text.append(f"\nfirst ready: {board.initiative} · {len(board.rows)} tickets", style="bold")
+        _append_board(text, board)
+    text.append(
+        "\n  first ready assumes a run closes every drained child — "
+        "run --dry-run prints the exact chain prediction",
+        style="dim",
+    )
+    return text
+
+
 class StartRunModal(BaseDialog):
     """Options for `bmad-loop run`.
 
-    Dual-flow: a source select (prefilled from ``[stories]``) picks sprint mode
-    vs. stories mode; the spec-folder input feeds a live schedule preview that
-    validates ``stories.yaml`` (parses + rules pass, SPEC.md present) and lists
-    the linear schedule with independent spec/done checkpoint markers — the same
-    projection `run --dry-run` prints. Returns
+    A source select (prefilled from ``[stories]``) picks sprint, stories or
+    tickets mode. In stories mode the spec-folder input feeds a live schedule
+    preview that validates ``stories.yaml`` (parses + rules pass, SPEC.md
+    present) and lists the linear schedule with independent spec/done checkpoint
+    markers — the same projection `run --dry-run` prints. In tickets mode the
+    preview is the active initiative's board (:func:`data.project_tickets_overview`),
+    read on a worker thread because it runs the project's ``tickets.py``; on a
+    parent initiative it lists the children and the first ready one's board
+    (:func:`_chain_preview`). The epic input is a number, or in tickets mode an epic id or slug
+    (:func:`epic_selector`). Returns
     ``{source, spec_folder, epic, story, max_stories, dry_run}``."""
 
     DEFAULT_CSS = """
@@ -182,13 +270,16 @@ class StartRunModal(BaseDialog):
         self,
         project: Path,
         *,
-        default_source: str = "sprint-status",
+        default_source: str = worksource.SOURCE_SPRINT,
         default_spec_folder: str = "",
     ):
         super().__init__()
         self._project = project
         self._default_source = default_source
         self._default_spec_folder = default_spec_folder
+        # bumped by every preview refresh: a tickets read shows only while its
+        # request is still the latest, so a slow read cannot land over a newer one
+        self._preview_seq = 0
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
@@ -197,10 +288,7 @@ class StartRunModal(BaseDialog):
             # in any terminal size (the modal is tall in stories mode).
             with VerticalScroll(id="fields"):
                 yield Select(
-                    [
-                        ("sprint mode — sprint-status.yaml", "sprint-status"),
-                        ("stories mode — folder+id dispatch", "stories"),
-                    ],
+                    source_options(),
                     value=self._default_source,
                     allow_blank=False,
                     id="source",
@@ -211,13 +299,11 @@ class StartRunModal(BaseDialog):
                     id="spec-folder",
                 )
                 yield Input(
-                    placeholder="epic — blank for all (sprint mode)",
-                    type="integer",
-                    valid_empty=True,
+                    placeholder="epic — blank for all; a number, or an epic id/slug (tickets)",
                     id="epic",
                 )
                 yield Input(
-                    placeholder="story — 3-1 / slug / full key (sprint), or story id (stories)",
+                    placeholder="story — 3-1 / slug / key (sprint), story id, or ticket ref",
                     id="story",
                 )
                 yield Input(
@@ -244,13 +330,19 @@ class StartRunModal(BaseDialog):
             self._refresh_preview()
 
     def _refresh_preview(self) -> None:
+        self._preview_seq += 1
         try:
             body = self.query_one("#preview-body", Static)
             source = self.query_one("#source", Select).value
             spec_folder = self.query_one("#spec-folder", Input).value.strip()
         except NoMatches:
             return  # a Changed message during mount, before the tree is built
-        if source != "stories":
+        traits = worksource.TRAITS.get(source) if isinstance(source, str) else None
+        if traits is not None and traits.name == worksource.SOURCE_TICKETS:
+            body.update(Text("tickets mode — reading the active initiative…", style="dim"))
+            self._load_tickets_preview(self._preview_seq)
+            return
+        if traits is None or not traits.has_spec_folder:
             body.update(Text("sprint mode — walks sprint-status.yaml", style="dim"))
             return
         if not spec_folder:
@@ -278,15 +370,52 @@ class StartRunModal(BaseDialog):
             text.append(f"  {r.title}", style="dim")
         body.update(text)
 
+    @work(thread=True, exclusive=True, group="tickets-preview")
+    def _load_tickets_preview(self, seq: int) -> None:
+        # tickets.py is project code and may take seconds: never on the UI thread.
+        board = data.project_tickets_overview(self._project)
+        self.app.call_from_thread(self._show_tickets_preview, board, seq)
+
+    def _show_tickets_preview(self, board: data.TicketsBoard, seq: int) -> None:
+        if seq != self._preview_seq:
+            return  # superseded: a later refresh owns the preview
+        try:
+            body = self.query_one("#preview-body", Static)
+            source = self.query_one("#source", Select).value
+        except NoMatches:
+            return  # dismissed while the read was in flight
+        if source != worksource.SOURCE_TICKETS:
+            return  # the picker moved on; that source's preview stands
+        if board.parent:
+            body.update(_chain_preview(board))
+            return
+        if board.fault is not None:
+            body.update(Text(f"⚠ tickets board unavailable: {board.fault}", style="red"))
+            return
+        text = Text()
+        text.append(f"initiative {board.initiative} · {len(board.rows)} tickets", style="bold")
+        _append_board(text, board)
+        text.append("\n  dry run prints the build order and the first pause", style="dim")
+        body.update(text)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id != "ok":
             self.dismiss(None)
             return
+        source = self.query_one("#source", Select).value
+        try:
+            epic = epic_selector(source, self.query_one("#epic", Input).value)
+        except ValueError:
+            self.notify(
+                "epic must be a number outside tickets mode (tickets mode takes an id or slug)",
+                severity="error",
+            )
+            return
         self.dismiss(
             {
-                "source": self.query_one("#source", Select).value,
+                "source": source,
                 "spec_folder": self.query_one("#spec-folder", Input).value.strip(),
-                "epic": _int_or_none(self.query_one("#epic", Input).value),
+                "epic": epic,
                 "story": self.query_one("#story", Input).value.strip() or None,
                 "max_stories": _int_or_none(self.query_one("#max-stories", Input).value),
                 "dry_run": self.query_one("#dry-run", Checkbox).value,
@@ -381,6 +510,21 @@ class ConfirmResumeModal(ConfirmModal):
     """Resume confirmation with pause details and a double-drive warning when
     the recorded engine pid may still be live."""
 
+    # The warning wraps to three rows at 39 columns, and ConfirmModal's auto
+    # #body keeps its own rows (up to its 60% cap), so on a short terminal the
+    # docked warning and buttons were clipped by #dialog (DW-415). Under
+    # `-short` #body takes only the rows left over, so the auto dialog grows to
+    # BaseDialog's `-short` max-height (the full screen) and a long pause reason
+    # scrolls instead of pushing the warning out. Scoped to `-warned` on
+    # purpose: without the warning this is a bounded-tier confirm that already
+    # fits, and the `1fr` body would balloon it (see BaseDialog's #dialog note).
+    DEFAULT_CSS = """
+    ConfirmResumeModal.-short.-warned #body {
+        height: 1fr;
+        max-height: 100%;
+    }
+    """
+
     def __init__(self, run_id: str, state: RunState, engine_alive: bool):
         body = Text()
         body.append("resume run ")
@@ -392,12 +536,22 @@ class ConfirmResumeModal(ConfirmModal):
                 body.append(f" — {display_pause_reason(state)}", style="yellow")
         else:
             body.append("run is not paused — it looks interrupted", style="dim")
+        # The same fact `bmad-loop resume` warns of: a still-escalated story is
+        # skipped and re-paused on (DW-386); resolve (R) is what clears it.
+        for key in resume_skipped_escalation_keys(state):
+            body.append(
+                f"\nstory '{key}' is still escalated — resume skips it; "
+                f"resolve it with bmad-loop resolve {run_id}",
+                style="yellow",
+            )
         warning = (
             "engine.pid may still be live — resuming could double-drive this run"
             if engine_alive
             else None
         )
         super().__init__("resume run", body, confirm_label="resume", warning=warning)
+        if warning:
+            self.add_class("-warned")
 
 
 class DeferredEntryModal(BaseDialog):
@@ -422,10 +576,12 @@ class DeferredEntryModal(BaseDialog):
         item = self._item
         title = Text()
         title.append(f"{item.id} — {item.title}", style="bold")
+        # Each marker gets its own line: the heading is held to one row and
+        # ellipsized, which would cut anything appended after it (DW-358).
         if item.done:
-            title.append("  ✓ done", style="green")
+            title.append("\n✓ done", style="green")
         if item.legacy:
-            title.append("  · legacy — converted to DW format on next sweep", style="dim")
+            title.append("\n· legacy — converted to DW format on next sweep", style="dim")
         with Vertical(id="dialog"):
             yield Static(title, classes="title")
             with VerticalScroll(id="entry"):
@@ -502,6 +658,26 @@ class DecisionModal(BaseDialog):
             self.dismiss(None)
 
 
+class _TailPath(Static):
+    """A one-row file path that, when too long for its width, drops the HEAD
+    behind a leading "…" rather than the tail. `text-overflow: ellipsis` cuts the
+    end, which for a spec path is the file name — the part that says which spec
+    this is. The full path stays one `copy path` away."""
+
+    def __init__(self, path: str, **kwargs: Any):
+        # the whole path is the widget's content; only render() cuts it
+        super().__init__(path, markup=False, **kwargs)
+
+    def render(self) -> Text:
+        width = self.content_size.width
+        path = str(self.content)
+        if width <= 0 or cell_len(path) <= width:
+            return Text(path)
+        while path and cell_len(path) > width - 1:
+            path = path[1:]
+        return Text("…" + path)
+
+
 class SpecReviewModal(BaseDialog):
     """Read-only story-spec viewer with a configurable action row.
 
@@ -522,11 +698,67 @@ class SpecReviewModal(BaseDialog):
         border: solid $primary-darken-2;
         padding: 0 1;
     }
+    /* The subtitle (a story title from stories.yaml) and the path are caller
+       text docked outside the scrolling #spec, so each is held to one row —
+       see BaseDialog .title (DW-358). The path keeps its tail, see _TailPath. */
+    SpecReviewModal .subtitle, SpecReviewModal .path {
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+        max-height: 1;
+    }
     SpecReviewModal .path {
         color: $text-muted;
         margin-bottom: 1;
     }
+    /* Under -short the #spec frame and the path margin go too — the modal's own
+       share of the chrome BaseDialog.-short collapses. That is what brings this
+       dialog inside the measured 39x9 pair: 2 border + title + subtitle + path
+       + 1 row of body + the 2-row wrapped action grid = 8. The definite 85%
+       height is lifted to 100% alongside it — 85% of 9 rows is 7, one short.
+       Under -narrow too, with BaseDialog's 90% max-height lifted as -short
+       does: the grid's second row of full 3-row buttons makes the chrome 18
+       rows, so at 20-22 rows a shorter dialog clipped `Request replan` and
+       `close` or left no body row at all. */
+    SpecReviewModal.-short #dialog, SpecReviewModal.-narrow #dialog {
+        height: 100%;
+    }
+    SpecReviewModal.-narrow #dialog {
+        max-height: 100%;
+    }
+    SpecReviewModal.-short #spec {
+        border: none;
+    }
+    SpecReviewModal.-short .path {
+        margin-bottom: 0;
+    }
+    /* The action row wraps into two columns instead of clipping (DW-359). Labels
+       stay on one line: a wrapped label would make its grid row taller and push
+       the next row off the dialog, which is the defect again one level down. */
+    SpecReviewModal.-narrow .buttons {
+        layout: grid;
+        grid-size: 2;
+        grid-columns: 1fr;
+        grid-rows: auto;
+        grid-gutter: 0 1;
+    }
+    SpecReviewModal.-narrow .buttons Button {
+        width: 1fr;
+        margin-left: 0;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
     """
+
+    # `-narrow` here means "the action row does not fit on one line", not
+    # BaseDialog's "under 60 columns". The widest row this modal is given — copy
+    # path + Approve & resume + Request replan + close — is 16 + 18 + 16 + 16
+    # columns of button plus 4 * 2 of margin = 74, exactly the content region of
+    # an 80-column terminal (80 - 2 border - 4 padding), so from 79 columns down
+    # the row would clip its right-most buttons (DW-359). Under it the row becomes
+    # a two-column grid. A half-width cell holds an 18-column button from 43
+    # columns up; below that the longest label ellipsizes rather than wrapping —
+    # the button stays whole and operable.
+    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (80, "-wide")]
 
     def __init__(
         self,
@@ -549,13 +781,11 @@ class SpecReviewModal(BaseDialog):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label(self._title, classes="title")
-            yield Static(self._subtitle)
-            path_line = Text()
+            yield Static(self._subtitle, classes="subtitle")
             if self._spec_path is not None:
-                path_line.append(str(self._spec_path))
+                yield _TailPath(str(self._spec_path), classes="path")
             else:
-                path_line.append("(no spec file resolved)", style="dim")
-            yield Static(path_line, classes="path")
+                yield Static(Text("(no spec file resolved)", style="dim"), classes="path")
             with VerticalScroll(id="spec"):
                 body = self._spec_text.strip()
                 if self._unreadable:
@@ -597,22 +827,39 @@ class SpecReviewModal(BaseDialog):
 class PauseReasonModal(BaseDialog):
     """Spec-less gate viewer: a story gate fires before its story is registered
     and an epic boundary has no story at all, so the pause reason IS the payload
-    — it names the blocking entries and the remedy. Dismisses with 'resume', or
-    None on close/escape. Reasons are arbitrary engine text → plain Text, never
-    markup. The modal owns no logic — the caller maps the verb to _do_resume."""
+    — it names the blocking entries and the remedy. Dismisses with 'resume', a
+    verb of the caller's extra `actions` ((verb, label, variant) buttons after
+    Resume, none by default), or None on close/escape. Reasons are arbitrary
+    engine text → plain Text, never markup. The modal owns no logic — the caller
+    maps the verb to _do_resume (or its own handler for an extra verb)."""
 
     DEFAULT_CSS = """
     PauseReasonModal #reason {
         height: auto;
         max-height: 60%;
     }
+    /* The subtitle is the same caller text SpecReviewModal docks (a story
+       title), so it is held to one row the same way (DW-358). */
+    PauseReasonModal #subtitle {
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+        max-height: 1;
+    }
     """
 
-    def __init__(self, *, title: str, subtitle: str | Text, reason: str):
+    def __init__(
+        self,
+        *,
+        title: str,
+        subtitle: str | Text,
+        reason: str,
+        actions: Sequence[tuple[str, str, str]] = (),
+    ):
         super().__init__()
         self._title = title
         self._subtitle = subtitle if isinstance(subtitle, Text) else Text(subtitle)
         self._reason = reason
+        self._actions = tuple(actions)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
@@ -625,6 +872,8 @@ class PauseReasonModal(BaseDialog):
                 )
             with Horizontal(classes="buttons"):
                 yield Button("Resume", variant="primary", id="act-resume")
+                for verb, label, variant in self._actions:
+                    yield Button(label, variant=variant, id=f"act-{verb}")  # type: ignore[arg-type]
                 yield Button("close", id="cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -710,6 +959,13 @@ class EscalationModal(BaseDialog):
         border: solid $primary-darken-2;
         padding: 0 1;
     }
+    /* At 39 columns the row is 9 + 17 + 7 plus three 1-column `-narrow`
+       margins = 36 against 35 content columns, so `close` lost its right edge
+       (DW-414). The row is right-aligned, so the first button's margin is dead
+       space: dropping it makes the row exactly 35. */
+    EscalationModal.-narrow #act-resolve {
+        margin-left: 0;
+    }
     """
 
     def __init__(
@@ -787,16 +1043,23 @@ class EscalationModal(BaseDialog):
                     )
             # The restore-discard branch below gates an enabled Re-arm, so the hint
             # is docked outside #body (never scrolled off) — directly above the buttons.
+            #
+            # Every arm stays within 3 rows at 35 columns, the content width of a
+            # 39-column dialog: 2 border + title + 1 body row + hint + 1-row button
+            # row must fit the 8-row (90%-of-9) dialog at the 39x9 pair (DW-414).
+            # The reasons behind each arm live in the comments below, not in
+            # the hint.
             hint = Text()
             if self._unreadable:
                 # Precedence over both branches below: they explain when Re-arm
                 # unlocks, and neither is true while the evidence cannot be read.
+                # Re-arm would flip the frontmatter, strip the result and re-stamp
+                # the baseline on evidence nobody could read. Resolve stays OPEN: it
+                # is the non-destructive remedy, and a bad anchor is exactly what it
+                # repairs.
                 hint.append(
-                    "re-arm is refused while the spec is unreadable — it flips the "
-                    "frontmatter, strips the result and re-stamps the baseline on "
-                    "evidence nobody could read. Resolve stays OPEN: it is the "
-                    "non-destructive remedy, and a bad anchor is exactly what it "
-                    "repairs — `bmad-loop resolve` does the same from the CLI",
+                    "⚠ spec unreadable — Re-arm is refused; Resolve (or "
+                    "`bmad-loop resolve`) repairs it",
                     style="red",
                 )
             elif self._restore_recorded:
@@ -804,17 +1067,16 @@ class EscalationModal(BaseDialog):
                 # indistinguishable from a fresh one), so Re-arm stays a plain
                 # from-scratch re-drive — but never a silent drop of the decision.
                 hint.append(
-                    "⚠ the resolution records a restore patch — Re-arm here re-drives "
-                    "from scratch and drops it; run `bmad-loop resolve` to honor the "
-                    "restore",
+                    "⚠ restore patch recorded — Re-arm re-drives from scratch and "
+                    "drops it; `bmad-loop resolve` honors it",
                     style="yellow",
                 )
             elif self._resolution_ready:
                 hint.append("resolution recorded — re-arm & resume when ready", style="green")
             else:
                 hint.append(
-                    "resolve opens an interactive agent to fix the frozen spec; "
-                    "re-arm unlocks once it records a resolution",
+                    "Resolve opens an agent to fix the frozen spec; Re-arm unlocks "
+                    "once it records a resolution",
                     style="dim",
                 )
             yield Static(hint, id="hint")
@@ -845,6 +1107,71 @@ class EscalationModal(BaseDialog):
         self.dismiss(bid[len("act-") :] if bid.startswith("act-") else None)
 
 
+class ReverifyModal(BaseDialog):
+    """Pick the story whose kept work `bmad-loop resolve --reverify` should
+    re-verify (DW-524): a DEFERRED one, or the paused story ESCALATED at a
+    replayable environment-fault site (DW-532). Dismisses with the chosen story
+    key, None on cancel/escape.
+
+    Confirms only the TARGET: the binding confirmation of what the replay will
+    claim (HEAD/baseline, the squash-in of changes since the pause) is the CLI's
+    own prompt in the control window this opens, so it is stated once, there,
+    and cannot drift from what the CLI actually does. Story keys are engine
+    text and render as rich Text, never markup."""
+
+    DEFAULT_CSS = """
+    ReverifyModal #body {
+        height: auto;
+        max-height: 60%;
+    }
+    """
+
+    def __init__(self, run_id: str, targets: list[str], paused_story_key: str | None):
+        super().__init__()
+        self._run_id = run_id
+        self._targets = targets
+        self._paused_story_key = paused_story_key
+
+    def _label(self, key: str) -> Text:
+        label = Text(key)
+        marker = "paused story" if key == self._paused_story_key else "worktree unit"
+        label.append(f"  ({marker})", style="dim")
+        return label
+
+    def compose(self) -> ComposeResult:
+        body = Text()
+        body.append(
+            "a deferred story, or one escalated by an environment fault, keeps its work: "
+            "it can be re-verified instead of re-driven.\nopens "
+        )
+        body.append(f"bmad-loop resolve {self._run_id} --reverify", style="bold")
+        body.append(
+            " in a control window, which states HEAD/baseline and that changes since the "
+            "pause are squashed into the story's commit, then asks you to confirm there.\n"
+        )
+        body.append("to move on instead, resume with e.", style="dim")
+        with Vertical(id="dialog"):
+            yield Label("re-verify kept work", classes="title")
+            with VerticalScroll(id="body"):
+                yield Static(body)
+            yield Select(
+                [(self._label(key), key) for key in self._targets],
+                value=self._targets[0],
+                allow_blank=False,
+                id="target",
+            )
+            with Horizontal(classes="buttons"):
+                yield Button("re-verify", variant="warning", id="ok")
+                yield Button("cancel", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "ok":
+            self.dismiss(None)
+            return
+        value = self.query_one("#target", Select).value
+        self.dismiss(value if isinstance(value, str) else None)
+
+
 class ValidateFindingsModal(BaseDialog):
     """`validate --json` rendered structurally: verdict, then one row per finding.
 
@@ -873,6 +1200,14 @@ class ValidateFindingsModal(BaseDialog):
     }
     ValidateFindingsModal #findings {
         height: 1fr;
+    }
+    /* The header is three docked rows (verdict, meta, gates footer), each held
+       to one by BaseDialog .title, and the detail hint is a fourth. With 2 border
+       rows, 1 row of #findings and the 1-row -short button that is 8, and 80% of
+       a 9-row terminal is 7 — so under -short the definite height is lifted to
+       100%, as SpecReviewModal does, to fit the measured 39x9 pair (DW-358). */
+    ValidateFindingsModal.-short #dialog {
+        height: 100%;
     }
     """
 

@@ -1,6 +1,7 @@
 import json
 import re
 import sys
+import warnings
 
 import pytest
 
@@ -57,8 +58,7 @@ def test_review_on_timeout_invalid():
 def test_review_on_status_contradiction_default_parse_and_template():
     import tomllib
 
-    # default is the new behavior: the released retry-until-budget loop is the
-    # defect (#334), "retry" is the compatibility opt-out.
+    # "escalate" is the default and the only legal value (#334, #813).
     assert policy.loads("").review.on_status_contradiction == "escalate"
     for mode in sorted(policy.REVIEW_ON_STATUS_CONTRADICTION_MODES):
         loaded = policy.loads(f'[review]\non_status_contradiction = "{mode}"\n')
@@ -66,6 +66,22 @@ def test_review_on_status_contradiction_default_parse_and_template():
     # the emitted template documents the knob at its dataclass default
     doc = tomllib.loads(policy.POLICY_TEMPLATE)
     assert doc["review"]["on_status_contradiction"] == policy.ReviewPolicy.on_status_contradiction
+
+
+def test_review_on_status_contradiction_retry_is_refused():
+    """The removed `retry` mode is refused with its own migration text, not the
+    generic membership error, and nothing warns first.
+
+    Ablations: delete the inline `retry` refusal in `loads()` → fails (the
+    generic "must be one of ['escalate']" error carries no `was removed`)."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(policy.PolicyError) as exc:
+            policy.loads('[review]\non_status_contradiction = "retry"\n')
+    msg = str(exc.value)
+    assert 'review.on_status_contradiction = "retry" was removed' in msg
+    assert 'set it to "escalate"' in msg
+    assert not caught
 
 
 def test_review_on_status_contradiction_invalid():
@@ -88,6 +104,46 @@ def test_stories_parse_and_folder():
 def test_stories_source_invalid():
     with pytest.raises(policy.PolicyError, match="stories.source"):
         policy.loads('[stories]\nsource = "manifest"\n')
+
+
+def test_stories_source_accepts_tickets():
+    """The ticket-tree source is a known source (its runs land later, but policy
+    must load it so `validate` can check the project). It needs no spec folder."""
+    pol = policy.loads('[stories]\nsource = " tickets "\n')
+    assert pol.stories.source == "tickets"
+    assert pol.stories.spec_folder == ""
+    assert "tickets" in policy.STORIES_SOURCES
+
+
+def test_tickets_policy_defaults_parse_and_template():
+    """`[tickets]` defaults to marking done automatically and thorough-reviewing only
+    high-risk tickets; every mode parses (stripped), and the template ships both
+    keys at their defaults."""
+    assert policy.loads("").tickets == policy.TicketsPolicy("auto", "high-risk")
+    for mode in sorted(policy.TICKETS_MARK_DONE_MODES):
+        assert policy.loads(f'[tickets]\nmark_done = " {mode} "\n').tickets.mark_done == mode
+    for mode in sorted(policy.TICKETS_THOROUGH_REVIEW_MODES):
+        loaded = policy.loads(f'[tickets]\nthorough_review = " {mode} "\n')
+        assert loaded.tickets.thorough_review == mode
+    assert policy.loads(policy.POLICY_TEMPLATE).tickets == policy.TicketsPolicy()
+    assert 'mark_done = "auto"' in policy.POLICY_TEMPLATE
+    assert 'thorough_review = "high-risk"' in policy.POLICY_TEMPLATE
+    assert policy.loads("").to_dict()["tickets"] == {
+        "mark_done": "auto",
+        "thorough_review": "high-risk",
+    }
+
+
+def test_tickets_mark_done_rejects_unknown():
+    """Ablation: drop the `TICKETS_MARK_DONE_MODES` check and this FAILS."""
+    with pytest.raises(policy.PolicyError, match=r"tickets\.mark_done"):
+        policy.loads('[tickets]\nmark_done = "always"\n')
+
+
+def test_tickets_thorough_review_rejects_unknown():
+    """Ablation: drop the `TICKETS_THOROUGH_REVIEW_MODES` check and this FAILS."""
+    with pytest.raises(policy.PolicyError, match=r"tickets\.thorough_review"):
+        policy.loads('[tickets]\nthorough_review = "low-risk"\n')
 
 
 def test_stories_mode_requires_spec_folder():
@@ -175,6 +231,66 @@ name = "codex"
     assert review == policy.ResolvedAdapter("codex", "", None)
 
 
+def test_permission_mode_defaults_to_bypass_for_every_role():
+    pol = policy.loads('[adapter]\nname = "claude"\n')
+    assert pol.adapter.permission_mode == "bypass"
+    for role in (*policy.STAGES, "migration"):
+        assert pol.adapter.resolved(role).permission_mode == "bypass"
+
+
+def test_permission_mode_base_value_reaches_every_role():
+    pol = policy.loads('[adapter]\nname = "claude"\npermission_mode = "sandboxed"\n')
+    for role in (*policy.STAGES, "migration"):
+        assert pol.adapter.resolved(role).permission_mode == "sandboxed"
+
+
+def test_permission_mode_stage_override_wins_over_the_base():
+    pol = policy.loads(
+        '[adapter]\nname = "claude"\npermission_mode = "sandboxed"\n'
+        '[adapter.triage]\npermission_mode = "bypass"\n'
+    )
+    assert pol.adapter.resolved("triage").permission_mode == "bypass"
+    assert pol.adapter.resolved("dev").permission_mode == "sandboxed"
+
+
+def test_permission_mode_survives_a_stage_client_switch():
+    """Unlike model/effort/extra_args, the mode is operator intent rather than a
+    client flag: a stage that switches client keeps it, and the new client's
+    profile maps (or refuses) it."""
+    pol = policy.loads(
+        '[adapter]\nname = "claude"\nmodel = "opus"\npermission_mode = "sandboxed"\n'
+        '[adapter.review]\nname = "codex"\n'
+    )
+    review = pol.adapter.resolved("review")
+    assert review.name == "codex" and review.model == ""  # the switch still resets model
+    assert review.permission_mode == "sandboxed"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '[adapter]\npermission_mode = "yolo"\n',
+        "[adapter]\npermission_mode = 1\n",
+        '[adapter]\n[adapter.dev]\npermission_mode = "auto"\n',
+    ],
+)
+def test_permission_mode_outside_the_enum_is_refused(body):
+    with pytest.raises(policy.PolicyError, match="permission_mode"):
+        policy.loads(body)
+
+
+def test_snapshot_without_permission_mode_rebuilds_as_bypass():
+    """A run stamped before the field existed launched with bypass args."""
+    snap = _roundtrip_snapshot(policy.loads('[adapter]\nname = "claude"\n'))
+    del snap["adapter"]["permission_mode"]
+    for stage in policy.STAGES:
+        del snap["adapter"][stage]["permission_mode"]
+    rebuilt = policy.adapter_policy_from_snapshot(snap)
+    assert rebuilt is not None
+    assert rebuilt.permission_mode == "bypass"
+    assert rebuilt.resolved("dev").permission_mode == "bypass"
+
+
 def test_stage_client_switch_drops_base_effort(tmp_path):
     """Effort is client-specific like `model`: its legal names belong to one
     provider's models, so a stage that switches client must NOT inherit the base
@@ -247,11 +363,11 @@ effort = "high"
 """)
     pol = policy.load(p)
     assert pol.adapter.effort == "high"
-    for role in ("dev", "review", "triage"):
+    for role in ("dev", "review", "triage", "retro"):
         assert pol.adapter.resolved(role).effort == "high"
     # the base-only (unknown role) branch constructs ResolvedAdapter positionally
-    # and must carry effort too
-    assert pol.adapter.resolved("retro").effort == "high"
+    # and must carry effort too. (Not "retro": that became a stage in DW-389.)
+    assert pol.adapter.resolved("no-such-role").effort == "high"
 
 
 def test_stage_effort_overrides_base(tmp_path):
@@ -308,11 +424,6 @@ extra_args = ["--foo"]
     assert pol.adapter.resolved("review") == policy.ResolvedAdapter("claude", "opus", ("--foo",))
 
 
-def test_unknown_role_resolves_to_base(tmp_path):
-    pol = policy.load(None)
-    assert pol.adapter.resolved("retro") == policy.ResolvedAdapter("claude", "", None)
-
-
 def test_adapter_timing_knobs_base_and_per_stage(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text("""
@@ -356,6 +467,10 @@ def _roundtrip_snapshot(pol):
         '[adapter]\nname = "opencode-http"\neffort = "low"\n[adapter.review]\neffort = "max"\n',
         # (f) a stage name override — the client switch resets effort to ""
         '[adapter]\nname = "opencode-http"\neffort = "max"\n[adapter.review]\nname = "claude"\n',
+        # (g) a base permission_mode, plus a stage that switches client and keeps it
+        '[adapter]\nname = "claude"\npermission_mode = "sandboxed"\n[adapter.review]\nname = "codex"\n',
+        # (h) a stage permission_mode override under the default base
+        '[adapter]\nname = "claude"\n[adapter.dev]\npermission_mode = "sandboxed"\n',
     ],
 )
 def test_adapter_policy_from_snapshot_roundtrips_resolved(body):
@@ -364,7 +479,7 @@ def test_adapter_policy_from_snapshot_roundtrips_resolved(body):
     pol = policy.loads(body)
     rebuilt = policy.adapter_policy_from_snapshot(_roundtrip_snapshot(pol))
     assert rebuilt is not None
-    for role in ("dev", "review", "triage"):
+    for role in ("dev", "review", "triage", "retro"):
         assert rebuilt.resolved(role) == pol.adapter.resolved(role)
 
 
@@ -436,13 +551,6 @@ def test_stage_scalar_rejected(tmp_path):
         policy.load(p)
 
 
-def test_invalid_gate_mode(tmp_path):
-    p = tmp_path / "policy.toml"
-    p.write_text('[gates]\nmode = "sometimes"\n')
-    with pytest.raises(policy.PolicyError, match="gates.mode"):
-        policy.load(p)
-
-
 def test_bad_toml(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text("[gates\nmode=")
@@ -462,16 +570,6 @@ def test_non_utf8_file_raises_policy_error(tmp_path):
     p.write_bytes(b'[gates]\nmode = "\xff\xfe"\n')
     with pytest.raises(policy.PolicyError, match="not valid UTF-8"):
         policy.load(p)
-
-
-def test_loads_defaults_and_text():
-    assert policy.loads("").gates.mode == policy.GatesPolicy.mode
-    assert policy.loads('[gates]\nmode = "none"\n').gates.mode == "none"
-
-
-def test_loads_validates():
-    with pytest.raises(policy.PolicyError, match="gates.mode"):
-        policy.loads('[gates]\nmode = "sometimes"\n')
 
 
 def test_load_prefixes_path_in_errors(tmp_path):
@@ -555,6 +653,21 @@ def test_git_timeout_default_parse_and_template():
     assert doc["limits"]["git_timeout_s"] == 120
 
 
+def test_skills_user_roots_default_parse_and_template():
+    import tomllib
+
+    assert policy.loads("").skills == policy.SkillsPolicy()
+    assert policy.loads("").skills.user_roots is False
+    assert policy.loads("[skills]\nuser_roots = true\n").skills.user_roots is True
+    with pytest.raises(policy.PolicyError, match=r"skills\.user_roots must be a boolean"):
+        policy.loads('[skills]\nuser_roots = "yes"\n')
+    # the emitted template documents the knob, commented out at its default
+    assert "\n[skills]\n" in policy.POLICY_TEMPLATE
+    assert "\n# user_roots = false\n" in policy.POLICY_TEMPLATE
+    assert tomllib.loads(policy.POLICY_TEMPLATE)["skills"] == {}
+    assert policy.loads(policy.POLICY_TEMPLATE).skills == policy.SkillsPolicy()
+
+
 def test_artifact_publication_limits_parse_validate_and_render():
     import tomllib
 
@@ -596,6 +709,24 @@ def test_teardown_grace_must_be_nonnegative():
         policy.loads("[limits]\nteardown_grace_s = -1\n")
 
 
+def test_session_start_grace_default_parse_and_template():
+    import tomllib
+
+    assert policy.loads("").limits.session_start_grace_s == 120
+    loaded = policy.loads("[limits]\nsession_start_grace_s = 45\n")
+    assert loaded.limits.session_start_grace_s == 45
+    # 0 is legal: no session-start-missing notice
+    assert policy.loads("[limits]\nsession_start_grace_s = 0\n").limits.session_start_grace_s == 0
+    # the emitted template documents the knob at its dataclass default
+    doc = tomllib.loads(policy.POLICY_TEMPLATE)
+    assert doc["limits"]["session_start_grace_s"] == policy.LimitsPolicy.session_start_grace_s
+
+
+def test_session_start_grace_must_be_nonnegative():
+    with pytest.raises(policy.PolicyError, match=r"limits\.session_start_grace_s must be >= 0"):
+        policy.loads("[limits]\nsession_start_grace_s = -1\n")
+
+
 def test_workflow_stall_nudges_cap_default_parse_and_template():
     import tomllib
 
@@ -622,6 +753,69 @@ def test_dev_stall_nudges_cap_default_parse_and_template():
     assert doc["limits"]["dev_stall_nudges_cap"] == policy.LimitsPolicy.dev_stall_nudges_cap
     with pytest.raises(policy.PolicyError, match="dev_stall_nudges_cap"):
         policy.loads("[limits]\ndev_stall_nudges_cap = -1\n")
+
+
+def test_quota_wait_max_min_default_parse_and_template():
+    import tomllib
+
+    assert policy.loads("").limits.quota_wait_max_min == 300
+    loaded = policy.loads("[limits]\nquota_wait_max_min = 0\n")
+    assert loaded.limits.quota_wait_max_min == 0  # 0 = off
+    # the emitted template documents the knob at its dataclass default
+    doc = tomllib.loads(policy.POLICY_TEMPLATE)
+    assert doc["limits"]["quota_wait_max_min"] == policy.LimitsPolicy.quota_wait_max_min
+    with pytest.raises(policy.PolicyError, match="quota_wait_max_min"):
+        policy.loads("[limits]\nquota_wait_max_min = -1\n")
+
+
+def test_usage_limit_action_default_parse_and_template():
+    import tomllib
+
+    assert policy.loads("").limits.usage_limit_action == "pause"
+    loaded = policy.loads('[limits]\nusage_limit_action = "relaunch"\n')
+    assert loaded.limits.usage_limit_action == "relaunch"
+    # surrounding whitespace is stripped before the membership check
+    padded = policy.loads('[limits]\nusage_limit_action = "  relaunch "\n')
+    assert padded.limits.usage_limit_action == "relaunch"
+    assert policy.USAGE_LIMIT_ACTIONS == frozenset({"pause", "relaunch"})
+    # the emitted template documents the knob at its dataclass default
+    doc = tomllib.loads(policy.POLICY_TEMPLATE)
+    assert doc["limits"]["usage_limit_action"] == policy.LimitsPolicy.usage_limit_action
+    assert policy.loads(policy.POLICY_TEMPLATE).limits.usage_limit_action == "pause"
+    with pytest.raises(policy.PolicyError, match="usage_limit_action"):
+        policy.loads('[limits]\nusage_limit_action = "rotate"\n')
+
+
+def test_max_usage_relaunches_default_parse_and_template():
+    import tomllib
+
+    assert policy.loads("").limits.max_usage_relaunches == 3
+    assert policy.loads("[limits]\nmax_usage_relaunches = 0\n").limits.max_usage_relaunches == 0
+    assert policy.loads("[limits]\nmax_usage_relaunches = 5\n").limits.max_usage_relaunches == 5
+    # the emitted template documents the knob at its dataclass default
+    doc = tomllib.loads(policy.POLICY_TEMPLATE)
+    assert doc["limits"]["max_usage_relaunches"] == policy.LimitsPolicy.max_usage_relaunches
+    with pytest.raises(policy.PolicyError, match="max_usage_relaunches"):
+        policy.loads("[limits]\nmax_usage_relaunches = -1\n")
+
+
+def test_session_start_exit_default_parse_and_template():
+    import tomllib
+
+    # defaults off (opt-in); overridable to true
+    assert policy.loads("").limits.session_start_exit is False
+    loaded = policy.loads("[limits]\nsession_start_exit = true\n")
+    assert loaded.limits.session_start_exit is True
+    # the emitted template documents the knob at its dataclass default
+    doc = tomllib.loads(policy.POLICY_TEMPLATE)
+    assert doc["limits"]["session_start_exit"] == policy.LimitsPolicy.session_start_exit
+
+
+def test_session_start_exit_rejects_non_boolean():
+    """Ablation: parse the key with a bare `limits_d.get` instead of
+    `_typed_bool`; this test fails because the string is accepted."""
+    with pytest.raises(policy.PolicyError, match=r"limits\.session_start_exit must be a boolean"):
+        policy.loads('[limits]\nsession_start_exit = "true"\n')
 
 
 def test_dev_contract_nudge_default_parse_and_template():
@@ -657,6 +851,7 @@ def test_dev_contract_nudge_rejects_non_boolean():
         "teardown_grace_s",
         "stop_without_result_nudges",
         "dev_stall_grace_s",
+        "session_start_grace_s",
         "dev_stall_nudges",
         "dev_stall_nudges_cap",
         "workflow_stall_nudges_cap",
@@ -678,6 +873,8 @@ def test_limits_integer_fields_reject_non_integer(key, bad):
     ("section", "key"),
     [
         ("verify", "stream_capture_kb"),
+        ("verify", "env_fault_rc"),
+        ("environment", "probe_timeout_s"),
         ("sweep", "max_bundles"),
         ("sweep", "max_triage_attempts"),
         ("sweep", "max_migration_attempts"),
@@ -740,6 +937,7 @@ def test_usage_grace_s_accepts_a_toml_integer(table):
     ("table", "key"),
     [
         ("verify", "commands"),
+        ("environment", "probes"),
         ("adapter", "extra_args"),
         ("adapter.dev", "extra_args"),
     ],
@@ -793,6 +991,8 @@ _BOOLEAN_POLICY_FIELDS = [
     ("cleanup", "clean_tmp"),
     ("tui", "low_frame_rate"),
     ("operator", "enabled"),
+    ("mux", "honor_ambient_psmux_data_dir"),
+    ("skills", "user_roots"),
 ]
 
 
@@ -847,6 +1047,7 @@ def test_boolean_policy_fields_accept_a_real_toml_false(section, key):
         ("scm", "target_branch"),
         ("scm", "merge_strategy"),
         ("scm", "commit_message_template"),
+        ("operator", "on_review_demotion"),
         ("mux", "backend"),
     ],
 )
@@ -880,18 +1081,32 @@ def test_plugins_enabled_entries_reject_non_strings(bad):
         policy.loads(f"[plugins]\nenabled = [{bad}]\n")
 
 
-@pytest.mark.parametrize("bad", ["5", "true"])
-def test_deprecated_engine_name_rejects_non_string(bad):
-    """The deprecated `[engine]` fold reads `name` to decide which plugin to enable,
-    so a wrong-typed one stringified into a bogus plugin name on the way out of a
-    block that is already warning the user it is going away. The DeprecationWarning
-    still fires: the type check runs after it, not instead of it.
+def test_policy_deprecation_warning_is_shown_to_end_users():
+    """A policy.toml deprecation must reach the person running bmad-loop (#835).
+    Python's default filters hide ``DeprecationWarning`` outside ``__main__`` and
+    show ``FutureWarning``, and policy loads run in library code.
 
-    Ablation: delete `_typed_str`'s conditional and raise; both rows fail because the
-    name is stringified and enables a plugin named "5"/"True"."""
-    with pytest.warns(DeprecationWarning):
-        with pytest.raises(policy.PolicyError, match=r"engine\.name must be a string"):
+    Ablation: revert the base to ``DeprecationWarning`` → both asserts fail."""
+    assert issubclass(policy.PolicyDeprecationWarning, FutureWarning)
+    assert not issubclass(policy.PolicyDeprecationWarning, DeprecationWarning)
+
+
+@pytest.mark.parametrize(("bad", "shown"), [("5", "5"), ("true", "True")])
+def test_engine_name_of_wrong_type_is_refused(bad, shown):
+    """A wrong-typed `[engine] name` is not an empty one: it cannot be read as the
+    inert leftover that only warns, so it is refused with the `[plugins]`
+    migration and the bad value, and nothing warns first.
+
+    Ablations: read a wrong-typed name as empty in `_refuse_removed_engine` instead
+    of refusing it → both rows fail (the block warns and loads)."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(policy.PolicyError) as exc:
             policy.loads(f"[engine]\nname = {bad}\n")
+    msg = str(exc.value)
+    assert '[plugins] enabled = ["<name>"]' in msg
+    assert f"engine.name must be a string: got {shown}" in msg
+    assert not [w for w in caught if issubclass(w.category, policy.PolicyDeprecationWarning)]
 
 
 @pytest.mark.parametrize("bad", ["true", '"0.5"'])
@@ -946,13 +1161,6 @@ def test_max_tokens_per_story_must_be_positive(bad):
         policy.loads(f"[limits]\nmax_tokens_per_story = {bad}\n")
 
 
-@pytest.mark.parametrize("bad", ["true", "2.5", '"2M"'])
-def test_max_tokens_per_story_rejects_non_integers(bad):
-    """Same rule as the per-session cap: `true` coerced to a 1-token story cap."""
-    with pytest.raises(policy.PolicyError, match=r"limits\.max_tokens_per_story"):
-        policy.loads(f"[limits]\nmax_tokens_per_story = {bad}\n")
-
-
 def test_max_tokens_per_session_default_parse_and_template():
     import tomllib
 
@@ -968,20 +1176,6 @@ def test_max_tokens_per_session_default_parse_and_template():
 def test_max_tokens_per_session_must_be_positive(bad):
     with pytest.raises(policy.PolicyError, match=r"limits\.max_tokens_per_session"):
         policy.loads(f"[limits]\nmax_tokens_per_session = {bad}\n")
-
-
-@pytest.mark.parametrize("bad", ["true", "2.5", '"4M"'])
-def test_max_tokens_per_session_rejects_non_integers(bad):
-    """Bools/floats/strings raise PolicyError, never coerce (true would become
-    1 token and terminate every enforce-mode session at its first sample)."""
-    with pytest.raises(policy.PolicyError, match=r"limits\.max_tokens_per_session"):
-        policy.loads(f"[limits]\nmax_tokens_per_session = {bad}\n")
-
-
-@pytest.mark.parametrize("bad", ["true", "2.5", '"30s"'])
-def test_session_budget_grace_rejects_non_integers(bad):
-    with pytest.raises(policy.PolicyError, match=r"limits\.session_budget_grace_s"):
-        policy.loads(f"[limits]\nsession_budget_grace_s = {bad}\n")
 
 
 def test_session_budget_grace_default_parse_and_template():
@@ -1078,11 +1272,32 @@ def test_triage_client_switch_uses_profile_defaults(tmp_path):
     assert pol.adapter.resolved("dev") == policy.ResolvedAdapter("claude", "opus", ("--foo",))
 
 
-def test_review_enabled_default_and_override(tmp_path):
-    assert policy.load(None).review.enabled is True
-    p = tmp_path / "policy.toml"
-    p.write_text("[review]\nenabled = false\n")
-    assert policy.load(p).review.enabled is False
+def test_retro_stage_adapter_parses_resolves_and_roundtrips():
+    """`[adapter.retro]` (DW-389) is a stage like `[adapter.triage]`: it parses,
+    resolves with the same client-switch rule, and survives the snapshot rebuild.
+
+    Ablation: drop `retro=_stage_adapter(adapter_d, "retro")` from `loads` and the
+    first assert fails (the stage falls back to the base `claude`); drop it from
+    `adapter_policy_from_snapshot` and the round-trip assert fails."""
+    pol = policy.loads(
+        '[adapter]\nmodel = "opus"\nextra_args = ["--foo"]\n'
+        '[adapter.retro]\nname = "codex"\nmodel = "gpt-5-codex"\n'
+    )
+    assert pol.adapter.resolved("retro").name == "codex"
+    assert pol.adapter.resolved("retro") == policy.ResolvedAdapter("codex", "gpt-5-codex", None)
+    # the other stages are untouched
+    assert pol.adapter.resolved("dev") == policy.ResolvedAdapter("claude", "opus", ("--foo",))
+    rebuilt = policy.adapter_policy_from_snapshot(_roundtrip_snapshot(pol))
+    assert rebuilt is not None
+    assert rebuilt.retro == pol.adapter.retro
+    assert rebuilt.resolved("retro") == pol.adapter.resolved("retro")
+    # without a stage table, retro inherits the base
+    assert policy.load(None).adapter.resolved("retro") == policy.ResolvedAdapter("claude", "", None)
+
+
+def test_retro_stage_adapter_must_be_a_table():
+    with pytest.raises(policy.PolicyError, match=r"\[adapter\.retro\] must be a table"):
+        policy.loads('[adapter]\nretro = "codex"\n')
 
 
 def test_scm_defaults_reproduce_today(tmp_path):
@@ -1322,6 +1537,105 @@ def test_verify_stream_capture_kb(tmp_path):
         policy.load(p)
 
 
+def test_environment_policy_parses_and_defaults():
+    """`[environment]` (DW-523): absent, nothing is probed and the timeout is 60s;
+    present, the probes keep their order (they run fail-fast in sequence)."""
+    default = policy.loads("")
+    assert default.environment == policy.EnvironmentPolicy()
+    assert default.environment.probes == () and default.environment.probe_timeout_s == 60
+    assert default.verify.env_fault_rc == 0
+
+    parsed = policy.loads(
+        '[environment]\nprobes = ["pg_isready", "curl -fsS http://x"]\nprobe_timeout_s = 5\n'
+    )
+    assert parsed.environment.probes == ("pg_isready", "curl -fsS http://x")
+    assert parsed.environment.probe_timeout_s == 5
+    # a partial table keeps the other default
+    assert policy.loads("[environment]\nprobe_timeout_s = 9\n").environment.probes == ()
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_environment_probe_timeout_must_be_positive(bad):
+    """A 0s bound would fail every probe before it could answer. Ablation: drop
+    the `probe_timeout_s < 1` check and both rows parse."""
+    with pytest.raises(policy.PolicyError, match=r"environment\.probe_timeout_s must be >= 1"):
+        policy.loads(f"[environment]\nprobe_timeout_s = {bad}\n")
+
+
+def test_verify_command_timeout_default_parse_and_template():
+    import tomllib
+
+    assert policy.loads("").verify.command_timeout_min == 30
+    assert policy.loads("[verify]\ncommand_timeout_min = 60\n").verify.command_timeout_min == 60
+    # a partial table keeps the default
+    assert policy.loads('[verify]\ncommands = ["pytest -q"]\n').verify.command_timeout_min == 30
+    # the emitted template documents the knob at its dataclass default
+    doc = tomllib.loads(policy.POLICY_TEMPLATE)
+    assert doc["verify"]["command_timeout_min"] == policy.VerifyPolicy.command_timeout_min
+
+
+@pytest.mark.parametrize("bad", [0, -5])
+def test_verify_command_timeout_must_be_positive(bad):
+    """A 0-minute bound would kill every verify command before it could answer,
+    and core.toml's `minimum = 1` is not enforced at load. Ablation: drop the
+    `command_timeout_min < 1` check and both rows parse."""
+    with pytest.raises(policy.PolicyError, match=r"verify\.command_timeout_min must be >= 1"):
+        policy.loads(f"[verify]\ncommand_timeout_min = {bad}\n")
+
+
+@pytest.mark.parametrize("bad", ["true", "2.5", '"60"'])
+def test_verify_command_timeout_rejects_non_integers(bad):
+    """`true` would read as a 1-minute bound and a string as a type error mid-run.
+    Ablation: read the value with `.get` instead of `_typed_int` and every row
+    loads or fails with something other than a PolicyError naming the key."""
+    with pytest.raises(policy.PolicyError, match=r"verify\.command_timeout_min"):
+        policy.loads(f"[verify]\ncommand_timeout_min = {bad}\n")
+
+
+@pytest.mark.parametrize("bad", ['[""]', '["   "]', '["pg_isready", "\\t"]'])
+def test_environment_probes_reject_blank_entries(bad):
+    """A blank probe is `sh -c ""`, which exits 0 — a check of nothing that reads
+    as a healthy environment. Ablation: drop the blank-entry check and every row
+    parses."""
+    with pytest.raises(policy.PolicyError, match=r"environment\.probes entries must be non-blank"):
+        policy.loads(f"[environment]\nprobes = {bad}\n")
+
+
+@pytest.mark.parametrize("value", [0, 75, 255])
+def test_verify_env_fault_rc_bounds_accept(value):
+    assert policy.loads(f"[verify]\nenv_fault_rc = {value}\n").verify.env_fault_rc == value
+
+
+@pytest.mark.parametrize(
+    ("bad", "match"),
+    [
+        ("-1", r"verify\.env_fault_rc must be 0 \(disabled\) or an exit status 1-255: got -1"),
+        ("256", r"verify\.env_fault_rc must be 0 \(disabled\) or an exit status 1-255: got 256"),
+        ("true", r"verify\.env_fault_rc must be an integer"),
+    ],
+)
+def test_verify_env_fault_rc_bounds(bad, match):
+    """0 disables; an exit status is 1-255, so anything else could never match a
+    real exit and would read as configured while doing nothing. Ablation: drop the
+    range check and the -1/256 rows parse."""
+    with pytest.raises(policy.PolicyError, match=match):
+        policy.loads(f"[verify]\nenv_fault_rc = {bad}\n")
+
+
+def test_verify_reuse_unchanged_defaults_off_and_parses():
+    """Opt-in (#1002): off unless the operator sets it, and the template agrees."""
+    assert policy.loads("").verify.reuse_unchanged is False
+    assert policy.loads("[verify]\nreuse_unchanged = true\n").verify.reuse_unchanged is True
+    assert policy.loads(policy.POLICY_TEMPLATE).verify.reuse_unchanged is False
+
+
+@pytest.mark.parametrize("bad", ['"true"', "1", "0"])
+def test_verify_reuse_unchanged_rejects_non_bool(bad):
+    """Ablation: parse the key with a bare `bool(...)`; every row is accepted."""
+    with pytest.raises(policy.PolicyError, match=r"verify\.reuse_unchanged must be a boolean"):
+        policy.loads(f"[verify]\nreuse_unchanged = {bad}\n")
+
+
 def test_scm_invalid_values(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text('[scm]\nisolation = "vm"\n')
@@ -1335,10 +1649,10 @@ def test_scm_invalid_values(tmp_path):
         policy.load(p)
 
 
-# The game-engine layer is now the "unity" plugin. A legacy [engine] block still
-# loads — with a deprecation warning — by folding onto [plugins] + [plugins.unity].
-# The editor_mode↔scm.isolation coupling moved to the plugin (UnityPlugin.validate,
-# exercised in test_engine_plugin.py); policy.loads no longer enforces it.
+# The game-engine layer is the "unity" plugin. A named [engine] block is refused
+# with the [plugins] migration; an empty-name one is ignored with a warning. The
+# editor_mode↔scm.isolation coupling lives in the plugin (UnityPlugin.validate,
+# exercised in test_engine_plugin.py); policy.loads does not enforce it.
 
 
 def test_no_engine_block_by_default():
@@ -1347,43 +1661,57 @@ def test_no_engine_block_by_default():
     assert pol.plugins.settings == {}
 
 
-def test_deprecated_engine_folds_to_unity_plugin(tmp_path):
+def test_engine_block_with_a_name_is_refused(tmp_path):
+    """`loads` never rejects unknown sections, so ignoring a named `[engine]` block
+    would silently disable the plugin it names. It is refused with the migration
+    instead, and the refusal is not preceded by a deprecation warning.
+
+    Ablations: delete the named-block refusal in `_refuse_removed_engine` → the
+    test fails (the block warns and loads with no plugin enabled)."""
     p = tmp_path / "policy.toml"
     p.write_text("""
 [engine]
 name = "unity"
 editor_mode = "shared"
 mcp = "coplaydev"
-unity_path = "/opt/Unity/Editor/Unity"
-ready_timeout_sec = 120
-ready_grace_sec = 90
 """)
-    with pytest.warns(DeprecationWarning):
-        pol = policy.load(p)
-    assert "unity" in pol.plugins.enabled
-    assert pol.plugin_setting("unity", "mcp") == "coplaydev"
-    assert pol.plugin_setting("unity", "unity_path") == "/opt/Unity/Editor/Unity"
-    assert pol.plugin_setting("unity", "ready_timeout_sec") == 120
-    assert pol.plugin_setting("unity", "ready_grace_sec") == 90
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(policy.PolicyError, match=r'enabled = \["unity"\]') as exc:
+            policy.load(p)
+    assert "[plugins.unity]" in str(exc.value)
+    assert "editor_mode, mcp" in str(exc.value)
+    assert not [w for w in caught if issubclass(w.category, policy.PolicyDeprecationWarning)]
 
 
-def test_deprecated_engine_disabled_when_name_empty(tmp_path):
-    # name = "" was the old "disabled" state: warn, but enable nothing.
+@pytest.mark.parametrize(
+    "engine_block",
+    [
+        '[engine]\nname = ""\neditor_mode = "shared"\n',
+        '[engine]\nname = "  "\neditor_mode = "shared"\n',
+        '[engine]\neditor_mode = "shared"\n',
+        "[engine]\n",
+    ],
+    ids=["empty-name", "whitespace-name", "no-name", "bare-table"],
+)
+def test_engine_block_without_a_name_is_ignored_with_a_warning(tmp_path, engine_block):
+    """An empty-name `[engine]` block (what the v0.4.3/v0.4.4 init templates wrote)
+    never enabled anything: it loads, enables nothing, leaves `scm.isolation` alone,
+    and warns once to delete the section. A bare `[engine]` table warns too —
+    presence, not content, is what is checked.
+
+    Ablations: delete the `warnings.warn` → every row fails; key the tombstone on
+    `engine_d` truthiness instead of `"engine" in doc` → the bare-table row fails."""
     p = tmp_path / "policy.toml"
-    p.write_text('[engine]\neditor_mode = "shared"\n[scm]\nisolation = "worktree"\n')
-    with pytest.warns(DeprecationWarning):
+    p.write_text(engine_block + '[scm]\nisolation = "worktree"\n')
+    with pytest.warns(policy.PolicyDeprecationWarning) as caught:
         pol = policy.load(p)
     assert pol.plugins.enabled == ()
-
-
-def test_explicit_plugin_settings_win_over_folded_engine(tmp_path):
-    p = tmp_path / "policy.toml"
-    p.write_text(
-        '[engine]\nname = "unity"\nmcp = "ivanmurzak"\n' '[plugins.unity]\nmcp = "coplaydev"\n'
-    )
-    with pytest.warns(DeprecationWarning):
-        pol = policy.load(p)
-    assert pol.plugin_setting("unity", "mcp") == "coplaydev"
+    assert pol.plugins.settings == {}
+    assert pol.scm.isolation == "worktree"
+    (msg,) = [str(w.message) for w in caught]
+    assert "remove the [engine] section" in msg
+    assert "unity" not in msg
 
 
 def test_template_parses():
@@ -1415,10 +1743,6 @@ def test_operator_park_defaults_on():
     assert policy.loads("").operator.enabled is True
 
 
-def test_operator_park_can_be_turned_off():
-    assert policy.loads("[operator]\nenabled = false\n").operator.enabled is False
-
-
 def test_operator_scalar_section_rejected():
     with pytest.raises(policy.PolicyError, match=r"\[operator\] must be a table"):
         policy.loads('operator = "on"\n')
@@ -1428,6 +1752,24 @@ def test_template_operator_block_parses_to_the_default():
     # unlike [mux]'s commented anchor, this key ships uncommented — the template
     # must therefore agree with the dataclass, not merely parse
     assert policy.loads(policy.POLICY_TEMPLATE).operator.enabled is True
+
+
+def test_operator_on_review_demotion_default_parse_and_template():
+    """Default "escalate" is today's behavior byte-for-byte (DW-383); "park" is the
+    opt-in. The template ships the key commented at its default, so the template
+    must still parse to the dataclass default."""
+    assert policy.loads("").operator.on_review_demotion == "escalate"
+    assert policy.OperatorPolicy().on_review_demotion == "escalate"
+    for mode in sorted(policy.OPERATOR_ON_REVIEW_DEMOTION_MODES):
+        loaded = policy.loads(f'[operator]\non_review_demotion = " {mode} "\n')
+        assert loaded.operator.on_review_demotion == mode
+    assert policy.loads(policy.POLICY_TEMPLATE).operator.on_review_demotion == "escalate"
+    assert '# on_review_demotion = "escalate"' in policy.POLICY_TEMPLATE
+
+
+def test_operator_on_review_demotion_invalid():
+    with pytest.raises(policy.PolicyError, match=r"operator\.on_review_demotion"):
+        policy.loads('[operator]\non_review_demotion = "defer"\n')
 
 
 # ---------------------------------------------------------------------------
@@ -1442,6 +1784,12 @@ def test_mux_defaults_to_auto():
 def test_mux_backend_parses_and_strips():
     pol = policy.loads('[mux]\nbackend = " psmux "\n')
     assert pol.mux.backend == "psmux"
+
+
+def test_mux_honor_ambient_psmux_data_dir_defaults_off_and_parses():
+    assert policy.loads("").mux.honor_ambient_psmux_data_dir is False
+    pol = policy.loads("[mux]\nhonor_ambient_psmux_data_dir = true\n")
+    assert pol.mux.honor_ambient_psmux_data_dir is True
 
 
 def test_mux_backend_rejects_junk():

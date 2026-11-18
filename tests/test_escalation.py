@@ -1,6 +1,9 @@
 """Unit tests for the dev/review retry-budget decisions — specifically the
 resolved-escalation guard that re-escalates instead of silently deferring."""
 
+import dataclasses
+import os
+
 import pytest
 
 from bmad_loop import escalation
@@ -11,12 +14,17 @@ from bmad_loop.escalation import (
     critical_escalations,
     critical_session_reason,
     decide_dev,
+    decide_reverify,
     decide_review_session,
     display_critical_reason,
+    display_pause_reason,
+    pause_title,
     preference_escalations,
     review_retry_or_exhaust,
+    session_failure_reason,
+    unresolved_escalation_keys,
 )
-from bmad_loop.model import StoryTask
+from bmad_loop.model import PAUSE_ESCALATION, PAUSE_STORY_GATE, Phase, RunState, StoryTask
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy, ReviewPolicy
 from bmad_loop.verify import VerifyOutcome
 
@@ -222,12 +230,16 @@ def test_dev_produced_work_default_keeps_todays_routing():
     """`produced_work` defaults True — "unknown never blocks" — so every positional
     construction (the engine's hand-built results, opencode-http, every fixture)
     keeps RETRY-with-budget / DEFER-without. Pinned on both arms so the default
-    cannot silently flip."""
-    plain = SessionResult(status="timeout")
+    cannot silently flip. Guard pin too: a NON-env-fault timeout with budget left
+    still RETRYs — the env-fault branch must not swallow ordinary transient
+    failures."""
+    plain = SessionResult(status="timeout")  # env_fault defaults False
     assert plain.produced_work is True
-    assert decide_dev(_task(attempt=1), plain, None, POLICY).action == Action.RETRY
+    retried = decide_dev(_task(attempt=1), plain, None, POLICY)
+    assert retried.action == Action.RETRY
     assert decide_dev(_task(attempt=2), plain, None, POLICY).action == Action.DEFER
-    assert "no work produced" not in decide_dev(_task(attempt=1), plain, None, POLICY).reason
+    assert "no work produced" not in retried.reason
+    assert "environment fault" not in retried.reason
 
 
 def test_dev_env_fault_outranks_no_work():
@@ -257,19 +269,373 @@ def test_no_work_reason_keeps_the_lost_session_suffix():
     assert decision.action == Action.PAUSE
     assert decision.reason.startswith("no work produced: dev session crashed:")
     assert "multiplexer no longer reports the session" in decision.reason
-    # the review decider does not carry the arm (a named follow-up, not this wave)
+    # the review decider carries the same arm, and the same suffix
     review = decide_review_session(task, both, POLICY)
-    assert "no work produced" not in review.reason
+    assert review.action == Action.PAUSE
+    assert review.reason.startswith("no work produced: review session crashed:")
+    assert "multiplexer no longer reports the session" in review.reason
 
 
-def test_dev_plain_noncompleted_still_retries_with_budget():
-    """Guard pin: a NON-env-fault timeout with budget left still RETRYs — the
-    env-fault branch must not swallow ordinary transient failures."""
-    task = _task(attempt=1)
-    plain = SessionResult(status="timeout")  # env_fault defaults False
-    decision = decide_dev(task, plain, None, POLICY)
-    assert decision.action == Action.RETRY
-    assert "environment fault" not in decision.reason
+_PARKED_EVIDENCE = "Notification(permission_prompt) -> PermissionPrompt"
+
+
+@pytest.mark.parametrize("attempt", [1, 2])  # budget left, then spent
+def test_dev_parked_session_pauses_whatever_the_budget(attempt):
+    """DW-348/DW-350: a session the adapter ended parked (the CLI was waiting on a
+    human, so the stall nudge was withheld) PAUSEs instead of RETRYing into the
+    same prompt — with budget left, and ahead of exhaustion.
+
+    ABLATION: delete the `parked` arm in `decide_dev` and the budget-left row
+    RETRYs, the spent row DEFERs."""
+    parked = SessionResult(status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE)
+    decision = decide_dev(_task(attempt=attempt), parked, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: dev session stalled (")
+    assert _PARKED_EVIDENCE in decision.reason
+    assert "the stall nudge was withheld" in decision.reason
+
+
+def test_dev_stop_failure_account_pause_names_the_error():
+    """#865: a session the adapter parked on an account `StopFailure` (the
+    classifier skipped its log tail) PAUSEs uncharged, and both the reason and
+    the notification title name it as a parked stop, carrying the error."""
+    evidence = "StopFailure(billing_error): Credit balance is too low"
+    parked = SessionResult(
+        status="stalled", parked=True, parked_evidence=evidence, stop_failure="billing_error"
+    )
+    decision = decide_dev(_task(attempt=1), parked, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: dev session stalled (StopFailure(billing_error)")
+    assert evidence in decision.reason
+    assert pause_title(decision.reason, "1-1") == "Paused (parked prompt): 1-1"
+
+
+def test_dev_env_fault_outranks_parked():
+    both = SessionResult(
+        status="stalled",
+        env_fault=True,
+        env_fault_evidence="API Error: ETIMEDOUT",
+        parked=True,
+        parked_evidence=_PARKED_EVIDENCE,
+    )
+    decision = decide_dev(_task(attempt=1), both, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("environment fault: dev session stalled")
+
+
+def test_dev_parked_outranks_no_work():
+    """A named prompt explains the silence better than the silence does: the
+    parked arm is tested before the #727 `produced_work=False` arm."""
+    both = SessionResult(
+        status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE, produced_work=False
+    )
+    decision = decide_dev(_task(attempt=1), both, None, POLICY)
+    assert decision.reason.startswith("parked: dev session stalled")
+    assert "no work produced" not in decision.reason
+
+
+def test_parked_reason_keeps_the_lost_session_suffix_and_has_a_fallback():
+    """Composed over `session_failure_reason` (#489), and never an empty
+    parenthetical when the adapter kept no evidence string."""
+    result = SessionResult(status="stalled", parked=True)
+    assert escalation.parked_pause_reason("fix", result) == (
+        "parked: fix session stalled (parked-session signal; the CLI was waiting on "
+        "a human — the stall nudge was withheld so it could not answer the prompt)"
+    )
+    vanished = SessionResult(status="crashed", parked=True, session_vanished=True)
+    assert "multiplexer no longer reports the session" in escalation.parked_pause_reason(
+        "dev", vanished
+    )
+
+
+def test_review_parked_session_pauses_instead_of_charging_a_cycle():
+    """ABLATION: delete the `parked` arm in `decide_review_session` and this
+    RETRYs a review cycle."""
+    parked = SessionResult(status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE)
+    decision = decide_review_session(_task(attempt=1), parked, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: review session stalled")
+
+
+def test_review_env_fault_outranks_parked():
+    both = SessionResult(
+        status="stalled", env_fault=True, parked=True, parked_evidence=_PARKED_EVIDENCE
+    )
+    decision = decide_review_session(_task(attempt=1), both, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("environment fault: review session stalled")
+
+
+@pytest.mark.parametrize("on_timeout", ["retry", "defer", "salvage-if-done"])
+def test_review_no_work_session_pauses_whatever_the_timeout_mode(on_timeout):
+    """#727: a review session that never did anything pauses with budget left,
+    ahead of the `review.on_timeout` routing — retrying, deferring or salvaging a
+    review that sat at a prompt changes nothing.
+
+    ABLATION: delete the `produced_work` arm in `decide_review_session` and this
+    RETRYs, DEFERs or SALVAGEs per mode."""
+    idle = SessionResult(status="timeout", produced_work=False)
+    decision = decide_review_session(_task(review_cycle=1), idle, _policy(on_timeout))
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("no work produced: review session timeout (")
+    assert not decision.budget_exhausted
+
+
+def test_review_parked_outranks_no_work():
+    both = SessionResult(
+        status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE, produced_work=False
+    )
+    decision = decide_review_session(_task(attempt=1), both, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: review session stalled")
+
+
+def test_review_env_fault_outranks_parked_and_no_work():
+    every = SessionResult(
+        status="stalled",
+        env_fault=True,
+        parked=True,
+        parked_evidence=_PARKED_EVIDENCE,
+        produced_work=False,
+    )
+    decision = decide_review_session(_task(attempt=1), every, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("environment fault: review session stalled")
+
+
+@pytest.mark.parametrize(
+    ("reason", "env_fault_site", "title"),
+    [
+        ("parked: dev session stalled (x)", None, "Paused (parked prompt): 1-1"),
+        ("no work produced: fix session timeout (x)", None, "Paused (no work): 1-1"),
+        ("usage limit: dev session stalled (x)", None, "Paused (usage limit): 1-1"),
+        (
+            "hook channel silent: triage session timeout (x)",
+            None,
+            "Paused (hook channel silent): 1-1",
+        ),
+        (
+            "session failed: triage session timeout after 2 attempt(s)",
+            None,
+            "Paused (session failed): 1-1",
+        ),
+        ("adopt rejected: result.json changed (x)", None, "Paused (adopt rejected): 1-1"),
+        ("environment fault: dev session crashed (x)", None, "Paused (environment fault): 1-1"),
+        # a verify-detected fault carries no prefix: the recorded site classifies it
+        ("verify command exited 127", "verify:dev", "Paused (environment fault): 1-1"),
+        ("CRITICAL escalation from dev session: x", None, "CRITICAL escalation: 1-1"),
+        ("review session crashed", None, "CRITICAL escalation: 1-1"),
+        # a prefix only counts at the start of the reason
+        ("dev said: parked: nope", None, "CRITICAL escalation: 1-1"),
+        # the prefix outranks the site: a parked pause keeps its own title
+        ("parked: dev session stalled (x)", "verify:dev", "Paused (parked prompt): 1-1"),
+    ],
+)
+def test_pause_title_classifies_by_reason_prefix(reason, env_fault_site, title):
+    assert pause_title(reason, "1-1", env_fault_site=env_fault_site) == title
+
+
+def test_hook_channel_silent_reason_names_validate_not_init():
+    """#752: the silent-channel reason points at `validate` and the commit-before-resume
+    step, never at `init` — the same signature covers untrusted Codex hooks and a
+    CLI on a shared daemon, where re-running init is the wrong fix."""
+    result = SessionResult(status="timeout", hook_channel_silent=True)
+    reason = escalation.hook_channel_silent_pause_reason("triage", result)
+    assert reason.startswith("hook channel silent: triage session timeout (")
+    assert "no hook event of any kind arrived" in reason
+    assert "`bmad-loop validate`" in reason
+    assert "before `bmad-loop resume`" in reason
+    assert "the attempt is not charged" in reason
+    assert "init" not in reason
+    assert pause_title(reason, "1-1") == "Paused (hook channel silent): 1-1"
+
+
+def test_hook_channel_silent_reason_keeps_lost_session_suffix():
+    """Composed over `session_failure_reason`: the #489 lost-session note survives."""
+    result = SessionResult(status="stalled", hook_channel_silent=True, session_vanished=True)
+    reason = escalation.hook_channel_silent_pause_reason("dev", result)
+    assert reason.startswith(
+        f"hook channel silent: {escalation.session_failure_reason('dev', result)} ("
+    )
+
+
+def test_hook_channel_silent_defaults_false():
+    """The #752 flag is appended last and defaults off, so every existing
+    construction keeps its routing."""
+    assert SessionResult(status="timeout").hook_channel_silent is False
+    assert dataclasses.fields(SessionResult)[-1].name == "hook_channel_silent"
+
+
+def test_dev_hook_channel_silent_pauses_even_with_budget_left():
+    """#752: a dev session no hook event of any kind reached PAUSEs uncharged
+    instead of RETRYing into the same silent relay — and outranks budget
+    exhaustion too, so a spent budget cannot file a relay fault as deferred work.
+
+    ABLATION: delete the `hook_channel_silent` arm in `decide_dev` and this
+    RETRYs (budget left) / DEFERs (budget spent)."""
+    silent = SessionResult(status="timeout", hook_channel_silent=True)
+    for attempt in (1, 2):  # budget left, budget spent
+        decision = decide_dev(_task(attempt=attempt), silent, None, POLICY)
+        assert decision.action == Action.PAUSE
+        assert decision.reason.startswith("hook channel silent: dev session timeout (")
+        assert "the attempt is not charged" in decision.reason
+        assert not decision.budget_exhausted
+        assert not decision.uncharged  # a pause, not an uncharged relaunch
+
+
+def test_dev_hook_channel_silent_default_keeps_todays_routing():
+    """The flag defaults False, so a plain timeout keeps RETRY-with-budget /
+    DEFER-without; and a COMPLETED session never reaches the arm — the pause only
+    routes a non-completed session, it is no completion path."""
+    plain = SessionResult(status="timeout")
+    assert plain.hook_channel_silent is False
+    retried = decide_dev(_task(attempt=1), plain, None, POLICY)
+    assert retried.action == Action.RETRY
+    assert "hook channel silent" not in retried.reason
+    assert decide_dev(_task(attempt=2), plain, None, POLICY).action == Action.DEFER
+    completed = SessionResult(status="completed", hook_channel_silent=True)
+    assert (
+        decide_dev(_task(attempt=1), completed, VerifyOutcome.passed(), POLICY).action
+        == Action.PROCEED
+    )
+
+
+def test_dev_no_work_outranks_hook_channel_silent():
+    """The fixed arm order is usage_relaunch, env_fault, parked, no_work,
+    hook_channel_silent: a session that never did anything at all is the stronger
+    verdict, and every earlier arm keeps its reason when the flag rides along."""
+    both = SessionResult(status="timeout", produced_work=False, hook_channel_silent=True)
+    decision = decide_dev(_task(attempt=1), both, None, POLICY)
+    assert decision.reason.startswith("no work produced: dev session timeout")
+    parked = SessionResult(
+        status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE, hook_channel_silent=True
+    )
+    assert decide_dev(_task(attempt=1), parked, None, POLICY).reason.startswith("parked: ")
+    env = SessionResult(status="timeout", env_fault=True, hook_channel_silent=True)
+    assert decide_dev(_task(attempt=1), env, None, POLICY).reason.startswith("environment fault: ")
+
+
+@pytest.mark.parametrize("on_timeout", ["retry", "defer", "salvage-if-done"])
+def test_review_hook_channel_silent_pauses_whatever_the_timeout_mode(on_timeout):
+    """#752: a silent-channel review timeout pauses ahead of the
+    `review.on_timeout` routing — salvaging, deferring or retrying a review whose
+    relay never spoke blames the review for the relay.
+
+    ABLATION: delete the `hook_channel_silent` arm in `decide_review_session` and
+    this RETRYs, DEFERs or SALVAGEs per mode."""
+    silent = SessionResult(status="timeout", hook_channel_silent=True)
+    decision = decide_review_session(_task(review_cycle=1), silent, _policy(on_timeout))
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("hook channel silent: review session timeout (")
+    assert not decision.budget_exhausted
+    both = SessionResult(status="timeout", produced_work=False, hook_channel_silent=True)
+    assert decide_review_session(
+        _task(review_cycle=1), both, _policy(on_timeout)
+    ).reason.startswith("no work produced: ")
+
+
+# The #610 credit-exhaustion pane line, split so this file carries no line the
+# shipped claude usage patterns match (test_pane_capture_patterns_do_not_match_this_repo).
+_USAGE_EVIDENCE = (
+    "pane matched 'usage-pattern': You're out of usage credit"
+    + "s. Run /usage-credits to keep using Fable 5.1 or /model to switch models."
+)
+
+
+def _usage_limited_results(status):
+    """The two shapes a live usage-limit sighting reaches a decider in: the
+    adapter's stalled + parked exit, and that result after `_classify_env_fault`
+    stamped it (env_fault with the pane evidence)."""
+    parked = SessionResult(
+        status=status, parked=True, parked_evidence=_USAGE_EVIDENCE, usage_limited=_USAGE_EVIDENCE
+    )
+    return [parked, dataclasses.replace(parked, env_fault=True, env_fault_evidence=_USAGE_EVIDENCE)]
+
+
+@pytest.mark.parametrize("attempt", [1, 2])  # budget left, then spent
+@pytest.mark.parametrize("status", ["stalled", "timeout"])
+def test_dev_usage_limited_pauses_with_usage_reason(attempt, status):
+    """A dev session seen live behind a usage limit (#610) PAUSEs with the
+    usage-limit reason — through either the env-fault or the parked arm, with
+    or without budget left — naming the evidence and the operator's ways out.
+    ABLATION: drop the `usage_limited` delegation from `env_fault_pause_reason`
+    / `parked_pause_reason` and the reason reads `environment fault:` /
+    `parked:` instead."""
+    for result in _usage_limited_results(status):
+        decision = decide_dev(_task(attempt=attempt), result, None, POLICY)
+        assert decision.action == Action.PAUSE
+        assert decision.reason.startswith(f"usage limit: dev session {status} (")
+        assert _USAGE_EVIDENCE in decision.reason
+        assert "bmad-loop resolve" in decision.reason
+
+
+@pytest.mark.parametrize("status", ["stalled", "timeout"])
+def test_review_usage_limited_pauses_with_usage_reason(status):
+    """The review-side twin: no review cycle is charged for a usage limit."""
+    for result in _usage_limited_results(status):
+        decision = decide_review_session(_task(attempt=1), result, POLICY)
+        assert decision.action == Action.PAUSE
+        assert decision.reason.startswith(f"usage limit: review session {status} (")
+        assert _USAGE_EVIDENCE in decision.reason
+
+
+@pytest.mark.parametrize(
+    "resets", ["2026-10-25T19:20:00+07:00", "7:20pm (Mars/Olympus_Mons)"], ids=["iso", "raw"]
+)
+def test_usage_reason_names_the_reset(resets):
+    """#610: a parsed reset rides the reason as `; resets <value>` right after
+    the evidence — ISO-8601, or the raw clause when it did not resolve, read as
+    given (no clock here). Without one the reason is unchanged.
+    ABLATION: drop the `resets` suffix from `usage_limit_pause_reason` and the
+    first assertion fails."""
+    for result in _usage_limited_results("stalled"):
+        with_reset = dataclasses.replace(result, usage_limit_resets=resets)
+        reason = decide_dev(_task(attempt=1), with_reset, None, POLICY).reason
+        assert f"{_USAGE_EVIDENCE}; resets {resets}; the coding CLI" in reason
+        plain = decide_dev(_task(attempt=1), result, None, POLICY).reason
+        assert "resets" not in plain.replace(_USAGE_EVIDENCE, "")
+
+
+def test_usage_limited_decisions_carry_the_pause_facts():
+    """DW-591: each decider arm that gives the usage-limit reason carries the
+    facts the engine records with the pause — the reset only when it resolved,
+    the limit class always. ABLATION: drop `usage_limit=` from one arm and its
+    assertion fails."""
+    for result in _usage_limited_results("stalled"):
+        resolved = dataclasses.replace(
+            result, usage_limit_resets="2026-10-25T19:20:00+07:00", usage_limit_class="wait"
+        )
+        for decision in (
+            decide_dev(_task(attempt=1), resolved, None, POLICY),
+            decide_review_session(_task(attempt=1), resolved, POLICY),
+        ):
+            assert decision.usage_limit == escalation.UsageLimitPause(
+                reset_at="2026-10-25T19:20:00+07:00", limit_class="wait"
+            )
+        raw = dataclasses.replace(
+            result, usage_limit_resets="7:20pm (Mars/Olympus_Mons)", usage_limit_class="blocked"
+        )
+        decision = decide_dev(_task(attempt=1), raw, None, POLICY)
+        assert decision.usage_limit == escalation.UsageLimitPause(None, "blocked")
+        assert "resets 7:20pm (Mars/Olympus_Mons)" in decision.reason
+
+
+def test_non_usage_pauses_carry_no_usage_facts():
+    """A plain env-fault or parked pause carries no usage-limit facts."""
+    env = SessionResult(status="timeout", env_fault=True, env_fault_evidence="ECONNRESET")
+    parked = SessionResult(status="stalled", parked=True, parked_evidence="permission")
+    for result in (env, parked):
+        dev = decide_dev(_task(attempt=1), result, None, POLICY)
+        review = decide_review_session(_task(attempt=1), result, POLICY)
+        assert dev.action == review.action == Action.PAUSE
+        assert dev.usage_limit is None and review.usage_limit is None
+
+
+def test_usage_limit_reason_keeps_the_lost_session_suffix():
+    """Composed over `session_failure_reason` (#489), like its siblings."""
+    vanished = SessionResult(status="stalled", usage_limited="x", session_vanished=True)
+    reason = escalation.usage_limit_pause_reason("dev", vanished)
+    assert reason.startswith("usage limit: dev session stalled: the multiplexer no longer")
 
 
 def test_vanished_session_says_so_without_changing_the_routing():
@@ -290,6 +656,46 @@ def test_vanished_session_says_so_without_changing_the_routing():
     # and the review side reads the same signal
     review = decide_review_session(task, vanished, POLICY)
     assert "multiplexer no longer reports the session" in review.reason
+
+
+_OVERRULED_SUFFIX = "; a provider error in its log tail was overruled: the session consumed tokens"
+
+
+def test_session_failure_reason_names_an_overruled_env_fault():
+    """#764: a log-tail provider error that measured usage overruled is named in
+    the reason, so the operator sees why it did not pause. The bare reason stays
+    byte-identical when the field is unset."""
+    overruled = SessionResult(status="timeout", env_fault_overruled="provider 529 (overloaded)")
+    assert session_failure_reason("dev", overruled) == f"dev session timeout{_OVERRULED_SUFFIX}"
+    assert session_failure_reason("dev", SessionResult(status="timeout")) == "dev session timeout"
+
+
+def test_session_failure_reason_overruled_composes_after_lost_session():
+    """The #764 note follows the #489 lost-session text rather than replacing it."""
+    both = SessionResult(status="crashed", session_vanished=True, env_fault_overruled="x")
+    reason = session_failure_reason("dev", both)
+    assert reason.startswith("dev session crashed: the multiplexer no longer reports")
+    assert reason.endswith(_OVERRULED_SUFFIX)
+
+
+def test_dev_overruled_timeout_retries_with_budget_left():
+    """An overruled session is a plain timeout to routing (#764): it is charged
+    and retried while budget lasts, and the reason names the overrule."""
+    overruled = SessionResult(status="timeout", env_fault_overruled="provider 529 (overloaded)")
+    decision = decide_dev(_task(attempt=1), overruled, None, POLICY)
+    assert decision.action == Action.RETRY
+    assert decision.reason.endswith(_OVERRULED_SUFFIX)
+    assert "environment fault" not in decision.reason
+
+
+def test_dev_overruled_timeout_takes_the_exhausted_action_when_spent():
+    """No pause special case on exhaustion (#764): a spent budget DEFERs, the
+    same as a plain timeout."""
+    overruled = SessionResult(status="timeout", env_fault_overruled="provider 529 (overloaded)")
+    decision = decide_dev(_task(attempt=2), overruled, None, POLICY)
+    plain = decide_dev(_task(attempt=2), SessionResult(status="timeout"), None, POLICY)
+    assert decision.action == plain.action == Action.DEFER
+    assert decision.budget_exhausted is True
 
 
 def test_env_fault_and_lost_session_compose_instead_of_cancelling():
@@ -327,24 +733,70 @@ def test_review_env_fault_session_pauses():
     assert "ETIMEDOUT" in decision.reason
 
 
-def test_review_plain_noncompleted_still_retries_with_budget():
-    task = _task(review_cycle=1)
-    plain = SessionResult(status="crashed")
-    assert decide_review_session(task, plain, POLICY).action == Action.RETRY
-
-
-def test_review_exhausted_defers_normal_story():
-    task = _task(review_cycle=2)  # 2 == max_review_cycles
-    crashed = SessionResult(status="crashed")
-    assert decide_review_session(task, crashed, POLICY).action == Action.DEFER
-
-
 def test_review_exhausted_reescalates_resolved_redrive():
     task = _task(review_cycle=2, resolved_redrive=True)
     crashed = SessionResult(status="crashed")
     decision = decide_review_session(task, crashed, POLICY)
     assert decision.action == Action.PAUSE
     assert "re-escalating instead of deferring" in decision.reason
+
+
+def test_exhausted_decisions_carry_budget_exhausted():
+    """Every action `_exhausted_action` drives is marked `budget_exhausted`
+    (DW-523), so the engine's environment seam re-probes before it lands; a RETRY
+    and a non-budget PAUSE stay unmarked. Ablate any one `budget_exhausted=True`
+    and its row reddens."""
+    crashed = SessionResult(status="crashed")
+    exhausted = {
+        "dev verify defer": decide_dev(_task(attempt=2), COMPLETED, FAILING, POLICY),
+        "dev session defer": decide_dev(_task(attempt=2), crashed, None, POLICY),
+        "dev resolved-redrive pause": decide_dev(
+            _task(attempt=2, resolved_redrive=True), COMPLETED, FAILING, POLICY
+        ),
+        "review_exhausted": escalation.review_exhausted(_task(), "harvest unreadable"),
+        "review budget spent": decide_review_session(_task(review_cycle=2), crashed, POLICY),
+        "on_timeout=defer": decide_review_session(
+            _task(review_cycle=1), SessionResult(status="timeout"), _policy("defer")
+        ),
+    }
+    for name, decision in exhausted.items():
+        assert decision.action in (Action.DEFER, Action.PAUSE), name
+        assert decision.budget_exhausted is True, name
+        assert decision.env_site is None, name  # only the engine seam sets it
+    assert exhausted["dev resolved-redrive pause"].action == Action.PAUSE
+
+    charged_retries = (
+        decide_dev(_task(attempt=1), COMPLETED, FAILING, POLICY),
+        decide_dev(_task(attempt=1), crashed, None, POLICY),
+        decide_review_session(_task(review_cycle=1), crashed, POLICY),
+    )
+    for decision in charged_retries:
+        assert decision.action == Action.RETRY
+        assert decision.budget_exhausted is False
+    critical = VerifyOutcome.escalate("rc=127", env_fault=True)
+    assert decide_dev(_task(attempt=2), COMPLETED, critical, POLICY).budget_exhausted is False
+
+
+def test_env_fault_claim_reader_is_total():
+    """Only a mapping's non-blank ``env_fault_claim`` string is a claim —
+    stripped and bounded; anything else (a non-mapping document, a missing,
+    non-string or blank value) reads as no claim and never raises."""
+    for document in (
+        None,
+        {},
+        [],
+        "Environment fault: db down",
+        7,
+        {"env_fault_claim": None},
+        {"env_fault_claim": 7},
+        {"env_fault_claim": ["db down"]},
+        {"env_fault_claim": ""},
+        {"env_fault_claim": " \n\t "},
+    ):
+        assert escalation.env_fault_claim(document) is None
+    assert escalation.env_fault_claim({"env_fault_claim": "  db down \n"}) == "db down"
+    bounded = escalation.env_fault_claim({"env_fault_claim": "x" * 2000})
+    assert bounded == "x" * escalation.ENV_FAULT_CLAIM_LIMIT
 
 
 # ------------------------------- review.on_timeout routing (#271)
@@ -434,3 +886,455 @@ def test_review_retry_or_exhaust_helper_matches_budget_semantics():
     assert review_retry_or_exhaust(_task(review_cycle=2), POLICY, "r").action == Action.DEFER
     latched = review_retry_or_exhaust(_task(review_cycle=2, resolved_redrive=True), POLICY, "r")
     assert latched.action == Action.PAUSE
+
+
+# ------------------------------------------ pause reasons shaped at display (DW-491)
+
+# A multi-line reason carrying an ESC byte, e.g. a `({error})` a RunPaused builder
+# interpolated raw: displayed, its second line must not land as a loose line.
+_MULTILINE_REASON = "ledger refused (fatal: x\x1b[31m\nhint: y)"
+_SHAPED_REASON = "ledger refused (fatal: x\\x1b[31m ⏎ hint: y)"
+
+
+def _paused_state(reason: str, stage: str, task: StoryTask | None = None) -> RunState:
+    state = RunState(run_id="r1", project="/p", started_at="now")
+    state.paused_reason = reason
+    state.paused_stage = stage
+    if task is not None:
+        state.tasks[task.story_key] = task
+        state.paused_story_key = task.story_key
+    return state
+
+
+@pytest.mark.parametrize("stage", [PAUSE_STORY_GATE, PAUSE_ESCALATION])
+def test_display_pause_reason_shapes_an_esc_and_newline_reason(stage):
+    """`display_pause_reason` folds a reason's line breaks into `` ⏎ `` segments and
+    escapes its control characters, so `status` and the TUI print one line; the
+    persisted reason stays raw (DW-491).
+
+    Ablation: drop the `notice_line` around the reason and the raw ESC and line
+    break come back."""
+    state = _paused_state(_MULTILINE_REASON, stage)
+
+    assert display_pause_reason(state) == _SHAPED_REASON
+    assert state.paused_reason == _MULTILINE_REASON
+
+
+def test_display_pause_reason_shapes_the_recovery_trail():
+    """The escalation recovery trail is a path, shaped like the reason (DW-491).
+
+    Ablation: drop the `notice_line` around the source and the raw line break
+    lands in the trail."""
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file="/p/spec\nx\x1b.md")
+    state = _paused_state("CRITICAL escalation from dev session: d", PAUSE_ESCALATION, task)
+
+    # `task_spec_path` renders the trail with the platform separator.
+    trail = f"{os.sep}p{os.sep}spec ⏎ x\\x1b.md"
+    assert display_pause_reason(state) == (
+        f"CRITICAL escalation from dev session: d [recovery trail: {trail}]"
+    )
+
+
+@pytest.mark.parametrize("stage", [PAUSE_STORY_GATE, PAUSE_ESCALATION])
+def test_display_pause_reason_keeps_a_plain_reason_unchanged(stage):
+    reason = "CRITICAL escalation from dev session: needs a human — resolve it"
+    assert display_pause_reason(_paused_state(reason, stage)) == reason
+
+
+# ---------------------------------------------------------- decide_reverify (DW-522)
+
+
+def _reverify_task(origin: str = "deferred", *, resolved_redrive: bool = False) -> StoryTask:
+    return StoryTask(
+        story_key="1-1-a", epic=1, reverify_from=origin, resolved_redrive=resolved_redrive
+    )
+
+
+def test_decide_reverify_proceeds_on_ok():
+    for origin in ("deferred", "escalated"):
+        decision = decide_reverify(_reverify_task(origin), VerifyOutcome.passed())
+        assert decision.action == Action.PROCEED
+        assert decision.reason == ""
+
+
+def test_decide_reverify_pauses_on_env_fault():
+    """A still-broken environment re-pauses even a deferred origin — deferring it
+    again would charge the story for the environment once more.
+
+    Ablation, performed: drop the `outcome.env_fault` conjunct in `decide_reverify`
+    and this reddens (the deferred origin DEFERs)."""
+    outcome = VerifyOutcome.escalate("verify environment fault (rc=75): e2e", env_fault=True)
+    # `escalate` carries a severity, which would PAUSE on its own; strip it so the
+    # env-fault conjunct is the only thing that can pause here
+    outcome = dataclasses.replace(outcome, severity="")
+    decision = decide_reverify(_reverify_task("deferred"), outcome)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("reverify failed: verify environment fault")
+
+
+def test_decide_reverify_pauses_on_a_non_retryable_failure():
+    outcome = VerifyOutcome.escalate("contract violated")
+    decision = decide_reverify(_reverify_task("deferred"), outcome)
+    assert decision.action == Action.PAUSE
+
+
+def test_decide_reverify_defers_a_deferred_origin():
+    decision = decide_reverify(
+        _reverify_task("deferred"), VerifyOutcome.retry("e2e failed", fixable=True)
+    )
+    assert decision.action == Action.DEFER
+    assert decision.reason == "reverify failed: e2e failed"
+    assert decision.budget_exhausted is False  # nothing was charged
+
+
+def test_decide_reverify_reescalates_an_escalated_origin():
+    decision = decide_reverify(_reverify_task("escalated"), VerifyOutcome.retry("e2e failed"))
+    assert decision.action == Action.PAUSE
+    assert decision.reason == "reverify failed: e2e failed"
+
+
+def test_decide_reverify_reescalates_a_resolved_redrive():
+    """A resolved-escalation re-drive must never downgrade to deferred work, the
+    `_exhausted_action` rule.
+
+    Ablation, performed: drop the `not task.resolved_redrive` conjunct and this
+    reddens."""
+    decision = decide_reverify(
+        _reverify_task("deferred", resolved_redrive=True), VerifyOutcome.retry("e2e failed")
+    )
+    assert decision.action == Action.PAUSE
+
+
+def test_decide_reverify_never_retries():
+    for origin in ("deferred", "escalated", "unknown-future-value"):
+        for outcome in (
+            VerifyOutcome.retry("x"),
+            VerifyOutcome.retry("x", fixable=True),
+            VerifyOutcome.escalate("x"),
+        ):
+            assert decide_reverify(_reverify_task(origin), outcome).action != Action.RETRY
+
+
+# ----------------------------------------------------------- unresolved_escalation_keys
+
+
+def _escalation_state(source: str, *tasks: tuple[str, Phase, int]) -> RunState:
+    state = RunState(run_id="r1", project="/p", started_at="now", source=source)
+    for key, phase, attempt in tasks:
+        state.tasks[key] = StoryTask(story_key=key, epic=1, phase=phase, attempt=attempt)
+    return state
+
+
+def test_unresolved_escalation_keys_sprint_counts_every_escalated_task_in_order():
+    """A sprint run's run-end re-pause (DW-386) counts any ESCALATED task, including
+    one at attempt 0, and resolve's admission reads the keys in task order."""
+    state = _escalation_state(
+        "sprint-status",
+        ("b", Phase.ESCALATED, 0),
+        ("a", Phase.DONE, 1),
+        ("c", Phase.ESCALATED, 2),
+        ("d", Phase.DEFERRED, 1),
+    )
+    assert unresolved_escalation_keys(state) == ["b", "c"]
+
+
+@pytest.mark.parametrize("source", ["stories", "tickets"])
+def test_unresolved_escalation_keys_checkpoint_flow_skips_attempt0_wedges(source):
+    """Stories and tickets runs re-classify a pick-time wedge (attempt 0) from disk
+    every pick, so only an in-run escalation (attempt > 0) is unresolved.
+
+    Ablation: drop the attempt narrowing and the wedge key comes back."""
+    state = _escalation_state(
+        source,
+        ("w", Phase.ESCALATED, 0),
+        ("x", Phase.ESCALATED, 1),
+        ("y", Phase.PENDING, 1),
+        ("z", Phase.ESCALATED, 3),
+    )
+    assert unresolved_escalation_keys(state) == ["x", "z"]
+
+
+def test_unresolved_escalation_keys_empty_without_an_escalated_task():
+    state = _escalation_state("sprint-status", ("a", Phase.DONE, 1), ("b", Phase.PENDING, 0))
+    assert unresolved_escalation_keys(state) == []
+
+
+# --- #959: opt-in uncharged usage relaunch -------------------------------------
+
+RELAUNCH = dataclasses.replace(
+    POLICY, limits=dataclasses.replace(POLICY.limits, usage_limit_action="relaunch")
+)
+_ACCOUNT_EVIDENCE = "StopFailure(authentication_failed): account suspended"
+
+
+def _account_stop_failure() -> SessionResult:
+    """A dead window after an account StopFailure, as S1 relabels it."""
+    return SessionResult(
+        status="crashed",
+        parked=True,
+        parked_evidence=_ACCOUNT_EVIDENCE,
+        stop_failure="authentication_failed",
+        stop_failure_action="account",
+    )
+
+
+@pytest.mark.parametrize("attempt", range(1, POLICY.limits.max_dev_attempts + 1))
+@pytest.mark.parametrize("status", ["stalled", "timeout", "crashed"])
+def test_dev_usage_limited_relaunches_uncharged_in_relaunch_mode(attempt, status):
+    """Relaunch mode turns a usage-limited dev session into an uncharged RETRY,
+    even on the last attempt, ahead of the env_fault and parked pause arms.
+    ABLATION: drop `uncharged=True` from `usage_relaunch`'s Decision and the
+    uncharged assertion fails."""
+    for result in _usage_limited_results(status):
+        decision = decide_dev(_task(attempt=attempt), result, None, RELAUNCH)
+        assert decision.action == Action.RETRY
+        assert decision.uncharged is True
+        assert not decision.budget_exhausted
+        assert decision.reason.startswith("usage relaunch (1/3): ")
+        assert _USAGE_EVIDENCE in decision.reason
+
+
+def test_dev_account_stop_failure_relaunches():
+    """An account StopFailure qualifies with no usage-limit sighting at all; the
+    reason names the StopFailure evidence."""
+    result = _account_stop_failure()
+    assert result.usage_limited is None
+    decision = decide_dev(_task(attempt=2), result, None, RELAUNCH)
+    assert decision.action == Action.RETRY
+    assert decision.uncharged is True
+    assert decision.reason == f"usage relaunch (1/3): {_ACCOUNT_EVIDENCE}"
+    # a parked result with no account action and no usage sighting does not qualify
+    permission = SessionResult(status="stalled", parked=True, parked_evidence="permission")
+    assert escalation.usage_relaunch(_task(attempt=1), permission, RELAUNCH) is None
+
+
+_ACCOUNT_FATAL_EVIDENCE = "StopFailure(model_not_found): model claude-nope does not exist"
+
+
+def _account_fatal_stop_failure(status: str = "stalled") -> SessionResult:
+    """A session the adapter parked on an `account-fatal` StopFailure (DW-613):
+    the same parked shape as `account`, with the action the profile mapped."""
+    return SessionResult(
+        status=status,
+        parked=True,
+        parked_evidence=_ACCOUNT_FATAL_EVIDENCE,
+        stop_failure="model_not_found",
+        stop_failure_action="account-fatal",
+    )
+
+
+@pytest.mark.parametrize("status", ["stalled", "crashed"])
+def test_account_fatal_stop_failure_never_relaunches(status):
+    """DW-613: relaunch mode never relaunches an `account-fatal` StopFailure (a
+    wrong model, a broken cloud credential): dev and review both take the
+    parked PAUSE, charged nothing and not marked uncharged, with budget left.
+    ABLATION: widen `usage_relaunch`'s qualifier to
+    `stop_failure_action not in ("account", "account-fatal")` and the RETRY
+    comes back, failing every assertion below."""
+    result = _account_fatal_stop_failure(status)
+    task = _task(attempt=1, review_cycle=1)
+    assert task.usage_relaunches < RELAUNCH.limits.max_usage_relaunches
+    assert escalation.usage_relaunch(task, result, RELAUNCH) is None
+    decision = decide_dev(task, result, None, RELAUNCH)
+    assert decision.action == Action.PAUSE
+    assert decision.uncharged is False
+    assert decision.reason.startswith("parked: dev session ")
+    assert _ACCOUNT_FATAL_EVIDENCE in decision.reason
+    review = decide_review_session(task, result, RELAUNCH)
+    assert review.action == Action.PAUSE
+    assert review.uncharged is False
+    assert review.reason.startswith("parked: ")
+
+
+def test_account_fatal_pauses_exactly_like_account_in_pause_mode():
+    """DW-613: in pause mode an `account-fatal` result decides identically to
+    the same result mapped to `account` — the action only matters to the
+    relaunch qualifier."""
+    fatal = _account_fatal_stop_failure()
+    account = dataclasses.replace(fatal, stop_failure_action="account")
+    assert decide_dev(_task(attempt=1), fatal, None, POLICY) == decide_dev(
+        _task(attempt=1), account, None, POLICY
+    )
+    assert decide_review_session(_task(review_cycle=1), fatal, POLICY) == (
+        decide_review_session(_task(review_cycle=1), account, POLICY)
+    )
+    assert decide_dev(_task(attempt=1), fatal, None, POLICY).action == Action.PAUSE
+
+
+def test_relaunch_cap_falls_back_to_the_usage_pause():
+    """At the per-story cap (dev and review refunds together) the result gets
+    the same uncharged usage-limit PAUSE it gets in pause mode. ABLATION: skip
+    the cap check in `usage_relaunch` and the PAUSE assertions fail."""
+    at_cap = _task(attempt=3, review_cycle=1, dev_usage_relaunches=2, review_usage_relaunches=1)
+    assert at_cap.usage_relaunches == RELAUNCH.limits.max_usage_relaunches
+    for result in [*_usage_limited_results("stalled"), _account_stop_failure()]:
+        expected = decide_dev(at_cap, result, None, POLICY)
+        assert expected.action == Action.PAUSE
+        decision = decide_dev(at_cap, result, None, RELAUNCH)
+        assert decision == expected
+        assert decision.uncharged is False
+        review = decide_review_session(at_cap, result, RELAUNCH)
+        assert review == decide_review_session(at_cap, result, POLICY)
+        assert review.action == Action.PAUSE and review.uncharged is False
+    # a cap of 0: relaunch mode never relaunches
+    zero = dataclasses.replace(
+        RELAUNCH, limits=dataclasses.replace(RELAUNCH.limits, max_usage_relaunches=0)
+    )
+    for result in _usage_limited_results("stalled"):
+        decision = decide_dev(_task(attempt=1), result, None, zero)
+        assert decision.action == Action.PAUSE
+        assert decision.uncharged is False
+        assert escalation.usage_relaunch(_task(attempt=1), result, zero) is None
+
+
+def test_pause_mode_never_relaunches():
+    """The default `usage_limit_action = "pause"` keeps today's pause."""
+    assert POLICY.limits.usage_limit_action == "pause"
+    for result in [*_usage_limited_results("stalled"), _account_stop_failure()]:
+        assert escalation.usage_relaunch(_task(attempt=1), result, POLICY) is None
+        decision = decide_dev(_task(attempt=1), result, None, POLICY)
+        assert decision.action == Action.PAUSE
+        assert decision.uncharged is False
+
+
+def test_completed_session_never_relaunches():
+    """A completed session is judged on its work, never relaunched, even when it
+    carries a usage-limit sighting."""
+    completed = dataclasses.replace(COMPLETED, usage_limited=_USAGE_EVIDENCE)
+    assert escalation.usage_relaunch(_task(attempt=1), completed, RELAUNCH) is None
+    account = dataclasses.replace(COMPLETED, stop_failure_action="account")
+    assert escalation.usage_relaunch(_task(attempt=1), account, RELAUNCH) is None
+    decision = decide_dev(_task(attempt=1), completed, FAILING, RELAUNCH)
+    assert decision.action == Action.RETRY
+    assert decision.uncharged is False
+
+
+@pytest.mark.parametrize("review_cycle", [1, POLICY.limits.max_review_cycles])
+def test_review_usage_limited_relaunches(review_cycle):
+    """The review-side twin, ahead of the pause arms and the on_timeout routing,
+    and even on the last review cycle."""
+    for result in [*_usage_limited_results("timeout"), _account_stop_failure()]:
+        decision = decide_review_session(_task(review_cycle=review_cycle), result, RELAUNCH)
+        assert decision.action == Action.RETRY
+        assert decision.uncharged is True
+        assert decision.reason.startswith("usage relaunch (1/3): ")
+
+
+def test_relaunch_reason_never_reads_as_a_usage_pause():
+    """`pause_title` keys on the `usage limit: ` prefix; a relaunch reason must not
+    carry it, and its count names the next relaunch out of the cap."""
+    for result in [*_usage_limited_results("stalled"), _account_stop_failure()]:
+        task = _task(attempt=1, dev_usage_relaunches=1, review_usage_relaunches=1)
+        decision = decide_dev(task, result, None, RELAUNCH)
+        assert decision.reason.startswith("usage relaunch (3/3): ")
+        assert not decision.reason.startswith("usage limit: ")
+        assert pause_title(decision.reason, "9-0-x") != "Paused (usage limit): 9-0-x"
+
+
+def test_charged_attempts_subtract_refunds():
+    """The budget checks count charged sessions only. ABLATION: revert
+    `decide_dev`'s `budget_left` to `task.attempt` and the dev RETRY becomes a
+    DEFER."""
+    crashed = SessionResult(status="crashed")
+    dev_task = _task(attempt=POLICY.limits.max_dev_attempts, dev_usage_relaunches=1)
+    decision = decide_dev(dev_task, crashed, None, POLICY)
+    assert decision.action == Action.RETRY
+    assert decision.uncharged is False  # a plain crash is charged
+    # without the refund the same attempt count exhausts the budget
+    spent = decide_dev(_task(attempt=POLICY.limits.max_dev_attempts), crashed, None, POLICY)
+    assert spent.action == Action.DEFER
+    review_task = _task(review_cycle=POLICY.limits.max_review_cycles, review_usage_relaunches=1)
+    assert review_retry_or_exhaust(review_task, POLICY, "r").action == Action.RETRY
+    full = _task(review_cycle=POLICY.limits.max_review_cycles)
+    assert review_retry_or_exhaust(full, POLICY, "r").action == Action.DEFER
+
+
+# --- noncompletion_verdict (DW-644) ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kw", "verdict", "needles"),
+    [
+        (
+            {"env_fault": True, "env_fault_evidence": "ECONNRESET"},
+            "env-fault",
+            ("environment fault: ECONNRESET",),
+        ),
+        (
+            {"env_fault": True},
+            "env-fault",
+            ("environment fault: transport-failure pattern in session log",),
+        ),
+        (
+            {"parked": True, "parked_evidence": "PermissionPrompt"},
+            "parked",
+            ("parked: PermissionPrompt", "waiting on a human"),
+        ),
+        ({"parked": True}, "parked", ("parked: parked-session signal",)),
+        ({"produced_work": False}, "no-work", ("no work produced: ", "permission prompt")),
+        (
+            {"hook_channel_silent": True},
+            "hook-channel-silent",
+            ("hook channel silent: ", "bmad-loop validate"),
+        ),
+        # precedence mirrors the engine's pause arms
+        ({"env_fault": True, "hook_channel_silent": True}, "env-fault", ("environment fault",)),
+        ({"parked": True, "produced_work": False}, "parked", ("parked: ",)),
+        (
+            {"produced_work": False, "hook_channel_silent": True},
+            "no-work",
+            ("no work produced",),
+        ),
+        (
+            {"env_fault": True, "parked": True, "produced_work": False},
+            "env-fault",
+            ("environment fault",),
+        ),
+    ],
+)
+def test_noncompletion_verdict_classifies_in_pause_arm_order(kw, verdict, needles):
+    got = escalation.noncompletion_verdict(SessionResult(status="timeout", **kw))
+    assert got is not None
+    assert got[0] == verdict
+    note = got[1]
+    for needle in needles:
+        assert needle in note
+    # one line, and nothing pause-shaped: the retro never pauses
+    assert "\n" not in note and "—" not in note
+    assert "resume" not in note and "resolve" not in note and "not charged" not in note
+
+
+@pytest.mark.parametrize(
+    ("kw", "verdict"), [({"env_fault": True}, "env-fault"), ({"parked": True}, "parked")]
+)
+def test_noncompletion_verdict_usage_limit_keeps_verdict_and_names_the_limit(kw, verdict):
+    result = SessionResult(
+        status="stalled",
+        usage_limited="You've hit your limit",
+        usage_limit_resets="2026-11-13T18:00:00+00:00",
+        **kw,
+    )
+    assert escalation.noncompletion_verdict(result) == (
+        verdict,
+        "usage limit: You've hit your limit; resets 2026-11-13T18:00:00+00:00",
+    )
+    no_reset = dataclasses.replace(result, usage_limit_resets=None)
+    assert escalation.noncompletion_verdict(no_reset) == (
+        verdict,
+        "usage limit: You've hit your limit",
+    )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        SessionResult(status="completed"),
+        # a completed session's flags are not a non-completion cause
+        SessionResult(status="completed", hook_channel_silent=True, produced_work=False),
+        SessionResult(status="stalled"),
+        SessionResult(status="crashed"),
+    ],
+    ids=["completed", "completed-flagged", "stalled", "crashed"],
+)
+def test_noncompletion_verdict_none_without_a_classified_cause(result):
+    assert escalation.noncompletion_verdict(result) is None

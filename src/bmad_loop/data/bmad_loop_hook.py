@@ -8,29 +8,48 @@ orchestrator only ever sees canonical events. Payload keys vary too: snake_case
 (claude/codex), conversation_id (cursor), or camelCase (copilot's sessionId/
 transcriptPath, agy's conversationId/transcriptPath — protojson encoding); the
 field extraction below tries each. agy alone carries no cwd, sending the
-workspacePaths list instead. Reads the hook payload
-from stdin and writes one event file
-into the orchestrator's events directory. No-ops (exit 0) unless the session was
+workspacePaths list instead, and alone sends `fullyIdle`, forwarded as
+`fully_idle` only when it is a boolean. Claude Code's StopFailure payload
+carries the API error that ended the turn: its `error`, `error_details` and
+`last_assistant_message` are forwarded as `stop_error`, `stop_error_details` and
+`stop_message`, each only when it is a string and cut to RELAY_TEXT_MAX
+characters. A payload's `model` (Claude's SessionStart, Codex on every hook) is
+forwarded the same way, only when it is a non-empty string; agy's Stop names it
+`modelName`, forwarded as `model` when there is no `model`. Reads the hook
+payload from stdin and writes one event file into the orchestrator's events
+directory. No-ops (exit 0) unless the session was
 spawned by bmad-loop (detected via env vars set on the tmux window), so
 normal interactive sessions are unaffected.
 
 Where that directory is: $BMAD_LOOP_EVENTS_DIR when the orchestrator names one,
 else the legacy $BMAD_LOOP_RUN_DIR/events. The channel moved out of the project
 tree in #494 so a branch switch or a worktree mount cannot take a live run's
-control plane away, and this script is COPIED into the target project at init
-time — so an upgraded orchestrator regularly drives sessions whose installed
-copy is this file's older self, which knows only the legacy path. That pairing
-is what the orchestrator's own dual poll (signals.SignalWatcher) covers.
+control plane away, and older inits COPIED this script into the target project
+(init now registers `bmad-loop relay <Event>` and recognizes a copied-script
+registration only as legacy) — so an upgraded orchestrator can still drive
+sessions whose installed copy is this file's older self, which knows only the
+legacy path. That pairing is what the orchestrator's own dual poll
+(signals.SignalWatcher) covers.
 
 $BMAD_LOOP_EVENTS_DIR is deliberately NOT part of the no-op detector above: the
 mirror-image skew — an older orchestrator that sets only RUN_DIR/TASK_ID driving
 a session whose installed relay is this newer file — must still write its
 events, and requiring the new variable would silently stall every one of those
 runs instead.
+
+Every event also carries a `lineage` tag (DW-507): "match" when the CLI bmad-loop
+launched (the tmux launch records its pid, or its forking shell's, in
+$BMAD_LOOP_LAUNCH_PID) fired the hook itself, "mismatch" when something else
+in between did — a nested coding CLI started from inside the session inherits
+this whole environment, so its hooks reach here too — and "unknown" when that
+cannot be read (no /proc, an older orchestrator that sets no launch pid). It
+only tags: the event is written either way, and the orchestrator decides what
+a mismatch means.
 """
 
 import json
 import os
+import re
 import stat
 import sys
 import time
@@ -56,6 +75,210 @@ def _first_workspace(payload):
     if isinstance(paths, list) and paths and isinstance(paths[0], str):
         return paths[0]
     return None
+
+
+def _notification_type(payload):
+    # A Notification payload's subtype (DW-348), snake_case (claude) or camelCase.
+    # Only a string is forwarded: anything else would reach the orchestrator as a
+    # value no profile table can key on.
+    value = payload.get("notification_type") or payload.get("notificationType")
+    return value if isinstance(value, str) else None
+
+
+def _source(payload):
+    # A SessionStart payload's `source` (#767): claude/gemini send
+    # startup|resume|clear|compact; codex/copilot send their own values. Only a
+    # string is forwarded, like the notification subtype above.
+    value = payload.get("source")
+    return value if isinstance(value, str) else None
+
+
+def _fully_idle(payload):
+    # An agy Stop payload's `fullyIdle` (DW-548): false when the parent only
+    # yielded to a foreground subagent, true at the real turn end. Only a JSON
+    # boolean is forwarded, and the key is written only then, so every other
+    # CLI's event stays unchanged.
+    value = payload.get("fullyIdle")
+    return value if isinstance(value, bool) else None
+
+
+# Longest string a relay forwards from a free-text payload field (#865): enough
+# for an API error's rendered text, small enough that a runaway value cannot
+# bloat every event file the orchestrator reads.
+RELAY_TEXT_MAX = 2000
+
+
+def _bounded_text(payload, key):
+    # A free-text payload field, forwarded only when it is a string and cut to
+    # RELAY_TEXT_MAX characters; anything else reads as absent (None), so the
+    # caller writes the key only when there is text to carry.
+    value = payload.get(key)
+    return value[:RELAY_TEXT_MAX] if isinstance(value, str) else None
+
+
+# A StopFailure payload's free-text fields (#865), as (event key, payload key):
+# Claude Code sends `error` (the failure class the profile maps onto an action),
+# optional `error_details` and `last_assistant_message` (the rendered API error).
+# Each is written only when present, so every other event stays unchanged.
+_STOP_FAILURE_FIELDS = (
+    ("stop_error", "error"),
+    ("stop_error_details", "error_details"),
+    ("stop_message", "last_assistant_message"),
+)
+
+
+# How long after the launched CLI the rest of its launch chain may start
+# (DW-507): a forking default-shell starts the CLI and a node shim starts the
+# real binary at once. Limitation: anything the CLI itself starts at launch (an
+# MCP server, a project SessionStart hook running another CLI) also falls inside
+# the window and reads "match", so only the #767 rules apply to it; only what an
+# agent starts after a model turn is reliably outside it.
+_LAUNCH_SHIM_WINDOW_S = 5
+
+
+def _proc_stat(pid):
+    """`(ppid, starttime in clock ticks)` from `/proc/<pid>/stat`, or None when
+    the process is gone or there is no `/proc` (Windows, macOS).
+
+    The comm field is parenthesized and may itself hold spaces or ")", so the
+    fields are split after the LAST ")": state is index 0 there, ppid index 1,
+    and starttime index 19 (fields 4 and 22 of proc(5))."""
+    path = f"/proc/{pid}/stat"  # portability: Linux-only; absent elsewhere -> None
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except (OSError, ValueError):
+        return None
+    fields = data[data.rfind(b")") + 1 :].split()
+    try:
+        return int(fields[1]), int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def _cmdline(pid):
+    # The process's argv; [] when it cannot be read.
+    path = f"/proc/{pid}/cmdline"  # portability: Linux-only; absent elsewhere -> []
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except (OSError, ValueError):
+        return []
+    if not data:
+        return []
+    return [arg.decode("utf-8", "replace") for arg in data.rstrip(b"\0").split(b"\0")]
+
+
+# Shells a hook host runs a registered hook command under (`<shell> -c <command>`),
+# by basename; a login shell's argv[0] carries a leading "-".
+_HOOK_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "fish"})
+
+
+def _runs_relay(words, event_name, invocation):
+    # Whether `words` hold `invocation` then `event_name` as consecutive words:
+    # its program by basename (`/opt/bin/bmad-loop`), the rest literally.
+    program, rest = invocation[0], [*invocation[1:], event_name]
+    for index, word in enumerate(words):
+        if word.rsplit("/", 1)[-1] == program and words[index + 1 : index + 1 + len(rest)] == rest:
+            return True
+    return False
+
+
+def _is_hook_wrapper(argv, event_name, invocation):
+    """Whether a process between the relay and the launched CLI only runs the
+    registered hook command (DW-507), read structurally from its argv:
+      - a process whose argv ENDS in the relay invocation and the event name
+        (`uv run --no-project python .../bmad_loop_hook.py Stop`), or
+      - a shell (`_HOOK_SHELLS`) whose `-c` command string holds them as
+        consecutive words, split on whitespace, quotes and shell operators (so
+        `sh -c '.../bmad-loop relay Stop && true'` counts).
+    Nothing else in the argv is read: a nested CLI whose prompt, or whose
+    launching shell's command, merely names the relay is not a wrapper — the
+    nested CLI itself is never a shell running a `-c` string."""
+    tail = argv[-len(invocation) - 1 :]
+    if len(tail) == len(invocation) + 1 and _runs_relay(tail, event_name, invocation):
+        return True
+    if not argv or argv[0].rsplit("/", 1)[-1].lstrip("-") not in _HOOK_SHELLS:
+        return False
+    args = iter(argv[1:])
+    for arg in args:
+        if not arg.startswith(("-", "+")) or arg == "--":
+            return False  # an operand before -c: a script file, not a command string
+        if arg.startswith("-") and not arg.startswith("--") and "c" in arg[1:]:
+            break
+    else:
+        return False
+    for arg in args:
+        if not arg.startswith(("-", "+")):
+            words = [word for word in re.split(r"[\s;&|()<>'\"`]+", arg) if word]
+            return _runs_relay(words, event_name, invocation)
+    return False
+
+
+def _lineage(event_name, invocation):
+    """Whether the process that fired this hook is the CLI bmad-loop launched
+    (DW-507): "match", "mismatch", or "unknown".
+
+    A nested coding CLI started from inside the session inherits the relay
+    environment, so its hooks land in the parent's event stream. The tmux
+    launch records the launched pid in $BMAD_LOOP_LAUNCH_PID; this walks the
+    relay's own parent chain toward it. Being a descendant is not enough — a
+    CLI started from the launched CLI's Bash tool is one — so the walk skips
+    only what a hook invocation legitimately puts in between:
+      - the launch chain: any process started within _LAUNCH_SHIM_WINDOW_S of
+        the launched pid. A forking default-shell (fish, dash) is the launched pid
+        and the CLI its child; a node shim's real binary is a child again.
+        Whatever the CLI starts at launch (MCP servers, a SessionStart hook
+        running another CLI) is inside the window too and reads "match".
+      - a hook-command wrapper running this relay's `invocation` (its program's
+        basename, then its literal words) for this event: see
+        `_is_hook_wrapper`.
+    Any other process on the way is a nested CLI or its shell: "mismatch". So
+    is reaching pid 1 or below without meeting the launched pid while it is
+    alive: a process from another tree.
+
+    "unknown" whenever the answer cannot be read: the variable unset or not a
+    pid, no `/proc` (Windows, macOS), the launched process gone, a process
+    vanishing mid-walk, more than 64 hops, or any unexpected fault. The tag
+    only informs the orchestrator; it never stops the event from being written.
+    """
+    try:
+        try:
+            launch_pid = int(os.environ.get("BMAD_LOOP_LAUNCH_PID") or "")
+        except ValueError:
+            return "unknown"
+        if launch_pid <= 1:
+            return "unknown"
+        launch = _proc_stat(launch_pid)
+        if launch is None:
+            return "unknown"
+        try:
+            ticks = getattr(os, "sysconf")("SC_CLK_TCK")  # POSIX-only
+        except (AttributeError, OSError, ValueError):
+            return "unknown"
+        if ticks <= 0:
+            return "unknown"
+        chain_window = _LAUNCH_SHIM_WINDOW_S * ticks
+        pid = os.getppid()
+        for _hop in range(64):
+            if pid == launch_pid:
+                return "match"
+            if pid <= 1:
+                return "mismatch"
+            current = _proc_stat(pid)
+            if current is None:
+                return "unknown"
+            parent, started = current
+            if 0 <= started - launch[1] <= chain_window:
+                pid = parent
+                continue
+            if _is_hook_wrapper(_cmdline(pid), event_name, invocation):
+                pid = parent
+                continue
+            return "mismatch"
+        return "unknown"
+    except Exception:
+        return "unknown"
 
 
 def _is_link_like(path):
@@ -178,18 +401,53 @@ def _write_event(events_dir, name, event):
     os.replace(tmp_path, os.path.join(events_dir, name))
 
 
+def _read_payload(stdin):
+    """The hook payload and why it is unusable: ``(payload, None)`` on success,
+    else ``({}, tag)``.
+
+    A hook that fires with nothing on stdin, half a JSON document, undecodable
+    bytes, or a bare list is not an error the operator can act on — the event still
+    has to be written, because the run's completion signal rides on it. Every
+    non-dict outcome collapses to ``{}`` and the shaped event carries nulls plus a
+    ``payload_error`` tag (the exception's class name, or ``not-an-object``) the
+    orchestrator crumbs, so the degrade stays visible.
+
+    The bytes are read when the stream has a buffer: ``json.loads`` detects
+    UTF-8/16/32 itself, where a text stdin would decode with the locale code page
+    (cp1252 on Windows) and garble or reject a non-ASCII transcript path. A
+    text-only stream (no ``buffer``) is read as text. ``UnicodeDecodeError`` and
+    ``json.JSONDecodeError`` are both ``ValueError`` subclasses and ride the same
+    arm; ``OSError`` covers a closed or unreadable descriptor.
+
+    Windows capture (codex 0.166.0, Windows 11, cp1252 locale, project at a
+    non-ASCII path, home ASCII): SessionStart and Stop both carry a non-null
+    ``transcript_path``, and Stop's stdin is complete JSON (no openai/codex#23784
+    truncation). Codex writes non-ASCII as raw UTF-8, not ``\\u`` escapes, so a
+    cp1252 text read garbles every non-ASCII character (UTF-8 C3 BC reads as two) and
+    rejects one whose UTF-8 bytes include a byte cp1252 leaves undefined (0x81,
+    0x8D, 0x8F, 0x90, 0x9D; U+00C1 is C3 81), which collapses the payload to ``{}``.
+    Of the three suspected causes of null codex tokens on Windows, only the code
+    page decode matches the capture: it bites when the transcript path is
+    non-ASCII (a non-ASCII user home or ``CODEX_HOME``). This byte read decodes
+    the captured payloads intact.
+    """
+    buffer = getattr(stdin, "buffer", None)
+    try:
+        payload = json.loads(buffer.read()) if buffer is not None else json.load(stdin)
+    except (ValueError, OSError) as e:
+        return {}, type(e).__name__
+    if not isinstance(payload, dict):
+        return {}, "not-an-object"
+    return payload, None
+
+
 def main() -> int:
     run_dir = os.environ.get("BMAD_LOOP_RUN_DIR")
     task_id = os.environ.get("BMAD_LOOP_TASK_ID")
     if not run_dir or not task_id:
         return 0
     event_name = sys.argv[1] if len(sys.argv) > 1 else "Unknown"
-    try:
-        payload = json.load(sys.stdin)
-    except (json.JSONDecodeError, ValueError):
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
+    payload, payload_error = _read_payload(sys.stdin)
 
     ts = time.time_ns()
     event = {
@@ -208,7 +466,38 @@ def main() -> int:
         "transcript_path": payload.get("transcript_path") or payload.get("transcriptPath"),
         # agy sends no cwd — it sends workspacePaths, a list of workspace roots.
         "cwd": payload.get("cwd") or _first_workspace(payload),
+        # A Notification payload's subtype (DW-348): claude sends
+        # `notification_type` (e.g. "permission_prompt"); the profile maps it onto
+        # a parked kind. Kept only when it is a string; absent everywhere else.
+        "notification_type": _notification_type(payload),
+        # Why a SessionStart fired (#767): a "clear"/"compact" start with a new id
+        # is still the launched session, so attribution rebinds instead of
+        # reading it as a nested CLI. Kept only when it is a string.
+        "source": _source(payload),
+        # Whether the launched CLI itself fired this hook (DW-507): a tag, never
+        # a filter — the orchestrator decides what a "mismatch" means.
+        "lineage": _lineage(event_name, ("bmad_loop_hook.py",)),
     }
+    # Only when the payload carries a boolean `fullyIdle` (agy, DW-548): a Stop
+    # with false is a subagent yield, not a turn end. Absent for every other CLI.
+    fully_idle = _fully_idle(payload)
+    if fully_idle is not None:
+        event["fully_idle"] = fully_idle
+    for event_key, payload_key in _STOP_FAILURE_FIELDS:
+        text = _bounded_text(payload, payload_key)
+        if text is not None:
+            event[event_key] = text
+    # The model the CLI reports on its hook payload (#859): Claude's SessionStart
+    # (startup and compact only, not resume, clear or -p; bmad-loop launches only
+    # interactive startups), Codex on every hook, and agy's Stop as `modelName`
+    # (DW-634; `model` wins when both are set). Only when it is a non-empty
+    # string, so every other event stays unchanged.
+    model = _bounded_text(payload, "model") or _bounded_text(payload, "modelName")
+    if model:
+        event["model"] = model
+    # Only when set, so a readable payload's event is unchanged.
+    if payload_error:
+        event["payload_error"] = payload_error
     # The orchestrator's own events dir when it named one, else the legacy
     # in-tree location this file's older selves are still installed at (see the
     # module docstring). `or`, not a presence test: an exported-but-empty value

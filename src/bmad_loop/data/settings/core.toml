@@ -28,6 +28,11 @@ key = "retrospective"
 kind = "select"
 options_ref = "RETRO_MODES"
 default_ref = "GatesPolicy.retrospective"
+description = "at each epic boundary, and at run end for a finished last epic: never, notify (suggest /bmad-retrospective), or auto (run a headless /bmad-retrospective session on [adapter.retro] and commit its doc + board)"
+# `on_escalation` is reserved and deliberately has no field here (HIDDEN in
+# tests/test_settings_schema.py): `pause` is its only documented value and the
+# default. policy.py parses it, but nothing reads it — CRITICAL escalations
+# always pause, whatever it is set to (DW-376).
 
 [[section]]
 name = "review"
@@ -52,13 +57,10 @@ options_ref = "REVIEW_ON_TIMEOUT_MODES"
 default_ref = "ReviewPolicy.on_timeout"
 label = "review timeout policy"
 description = "retry: burn a review cycle per timeout (default) · salvage-if-done: commit the verified dev product and refile the follow-up · defer: give up on the first timeout"
-[[section.field]]
-key = "on_status_contradiction"
-kind = "select"
-options_ref = "REVIEW_ON_STATUS_CONTRADICTION_MODES"
-default_ref = "ReviewPolicy.on_status_contradiction"
-label = "review revokes sprint sign-off"
-description = "escalate: pause naming both sides when a review writes sprint-status back off done (default) · retry: legacy — burn review cycles, then defer + roll back"
+# `on_status_contradiction` is reserved and deliberately has no field here (HIDDEN
+# in tests/test_settings_schema.py): `escalate` is its only value and the default.
+# policy.py parses it, but a review that revokes the sign-off always pauses,
+# naming both sides.
 
 [[section]]
 name = "stories"
@@ -69,13 +71,31 @@ kind = "select"
 options_ref = "STORIES_SOURCES"
 default_ref = "StoriesPolicy.source"
 label = "story source"
-description = "sprint-status: walk sprint-status.yaml · stories: folder+id dispatch off a typed stories.yaml (needs spec_folder)"
+description = "sprint-status: walk sprint-status.yaml · stories: folder+id dispatch off a typed stories.yaml (needs spec_folder) · tickets: the BMAD v7 ticket tree of core.active_initiative, via _bmad/method/scripts/tickets.py (experimental)"
 [[section.field]]
 key = "spec_folder"
 kind = "str"
 default_ref = "StoriesPolicy.spec_folder"
 label = "spec folder"
 description = "stories mode only: project-relative path to the epic spec folder (holds stories.yaml + SPEC.md)"
+
+[[section]]
+name = "tickets"
+description = "BMAD v7 ticket-tree runs (stories.source = tickets)"
+[[section.field]]
+key = "mark_done"
+kind = "select"
+options_ref = "TICKETS_MARK_DONE_MODES"
+default_ref = "TicketsPolicy.mark_done"
+label = "mark done"
+description = "auto: bmad-loop marks a ticket done once its build passes verify and review · never: leave the plan at built for a human"
+[[section.field]]
+key = "thorough_review"
+kind = "select"
+options_ref = "TICKETS_THOROUGH_REVIEW_MODES"
+default_ref = "TicketsPolicy.thorough_review"
+label = "thorough review"
+description = "when a ticket gets the thorough review: high-risk (its risk is high), always, or never"
 
 [[section]]
 name = "limits"
@@ -139,6 +159,18 @@ minimum = 0
 default_ref = "LimitsPolicy.dev_stall_grace_s"
 description = "silence grace for a dev/review session, armed at launch and re-armed by transport activity or fresh Stop/idle evidence, before bounded nudges/stalled classification · also the transcript-idle notice threshold (journal session-idle/session-active, TUI idle age) · 0 = no launch timer (and no idle notice), but a result-less turn end still fails fast"
 [[section.field]]
+key = "session_start_grace_s"
+kind = "int"
+minimum = 0
+default_ref = "LimitsPolicy.session_start_grace_s"
+description = "seconds a session whose CLI maps SessionStart may run without one before a session-start-missing journal notice (and, with the session start exit switch on, the early exit) · 0 = off"
+[[section.field]]
+key = "session_start_exit"
+kind = "switch"
+default_ref = "LimitsPolicy.session_start_exit"
+label = "session start exit"
+description = "ON: a session whose CLI maps SessionStart and that has delivered no hook event of any kind by the session start grace ends there non-completed instead of waiting out the session timeout, taking the existing uncharged pauses (hook channel silent, or parked / no work produced when the pane shows a parked prompt or never changed) · OFF: the session-start-missing notice stays observation only"
+[[section.field]]
 key = "dev_stall_nudges"
 kind = "int"
 minimum = 0
@@ -156,6 +188,12 @@ kind = "int"
 minimum = 0
 default_ref = "LimitsPolicy.workflow_stall_nudges_cap"
 description = "total (never-restored) stall nudges for an injected plugin-workflow session before it is called stalled; bounds a session that finished its work but never wrote its completion marker · 0 = stall on first grace expiry"
+[[section.field]]
+key = "quota_wait_max_min"
+kind = "int"
+minimum = 0
+default_ref = "LimitsPolicy.quota_wait_max_min"
+description = "cumulative minutes one session may sit in a usage-limit wait (the visible pane shows the coding CLI waiting out a usage-window reset it continues from by itself, and the transcript is idle) with its session timeout frozen and its stall nudge held · past the cap the session ends parked with usage-limit evidence · 0 = off (the timeout keeps counting through the wait)"
 [[section.field]]
 key = "dev_contract_nudge"
 kind = "switch"
@@ -195,6 +233,19 @@ kind = "int"
 minimum = 0
 default_ref = "LimitsPolicy.session_budget_grace_s"
 description = "enforce mode: seconds a tripped session gets to wrap up after the nudge before it is terminated over_budget · 0 = terminate at trip, no nudge"
+[[section.field]]
+key = "usage_limit_action"
+kind = "select"
+options_ref = "USAGE_LIMIT_ACTIONS"
+default_ref = "LimitsPolicy.usage_limit_action"
+label = "usage limit action"
+description = "what a session that ends on a usage limit or an account StopFailure does · pause: the uncharged usage-limit pause `resolve` clears · relaunch: relaunch it at once as an uncharged retry (BMAD_LOOP_USAGE_RELAUNCH=<n> in the session env, for account rotation), capped by max_usage_relaunches; an account-fatal StopFailure is never relaunched and always pauses"
+[[section.field]]
+key = "max_usage_relaunches"
+kind = "int"
+minimum = 0
+default_ref = "LimitsPolicy.max_usage_relaunches"
+description = "relaunch mode: uncharged usage relaunches per story (dev, fix and review together) · at the cap the session takes the usage-limit pause instead · 0 = always pause"
 
 [[section]]
 name = "verify"
@@ -203,12 +254,48 @@ description = "post-implementation verification commands"
 key = "commands"
 kind = "lines"
 [[section.field]]
+key = "command_timeout_min"
+kind = "int"
+minimum = 1
+default_ref = "VerifyPolicy.command_timeout_min"
+label = "command timeout (min)"
+description = "per-command wall-clock bound; a command running past it is killed and counts as an ordinary (fixable) verify failure · a graceful stop waits for the running command"
+[[section.field]]
 key = "stream_capture_kb"
 kind = "int"
 minimum = 0
 default_ref = "VerifyPolicy.stream_capture_kb"
 label = "verifier stream capture (KiB)"
 description = "per-stream cap on the verifier stdout/stderr retained under the run's verify/ directory (the tail is kept; the journal records the full size and a truncation flag) · 0 = capture nothing"
+[[section.field]]
+key = "env_fault_rc"
+kind = "int"
+minimum = 0
+maximum = 255
+default_ref = "VerifyPolicy.env_fault_rc"
+label = "environment-fault exit status"
+description = "exit status a verify command uses to declare an environment fault (pause, attempt not charged) instead of a code failure · 0 = disabled; 75 (EX_TEMPFAIL) is a good choice"
+[[section.field]]
+key = "reuse_unchanged"
+kind = "switch"
+default_ref = "VerifyPolicy.reuse_unchanged"
+label = "reuse unchanged verify pass"
+description = "ON: a skip-review gate reuses the green dev/fix verify pass instead of re-running the commands when HEAD and the git-visible state of the whole repository are unchanged since it (status checks and environment probes still run) · reuse trusts that nothing outside git-visible state changed: untracked ignored files, files under .bmad-loop/, staged-only index changes, changes git's clean filters normalise away (CRLF conversion, LFS pointers), a tracked file rewritten in place at the same size with its mtime restored (git status reads it clean too), and non-git state are blind spots · a sweep leaves its deferred-work ledger out of the fingerprint and reuses only when the ledger is unchanged or changed by the bundle's own close alone · checked-out submodules and nested repositories are fingerprinted recursively (ignored files inside them are blind spots); one git cannot read refuses reuse, and any session, pause or hook from a plugin not declared read_only in between forces a real run · leave OFF for suites that depend on external state · OFF: the gate always re-runs the commands"
+
+[[section]]
+name = "environment"
+description = "environment health probes (run before verify, session launches, and charging a failed attempt)"
+[[section.field]]
+key = "probes"
+kind = "lines"
+description = "health-check commands run in the project root; a failing probe (nonzero exit, timeout, unrunnable) is an environment fault: the run pauses and the attempt is not charged"
+[[section.field]]
+key = "probe_timeout_s"
+kind = "int"
+minimum = 1
+default_ref = "EnvironmentPolicy.probe_timeout_s"
+label = "probe timeout (s)"
+description = "per-probe wall-clock bound; a probe running past it counts as failed"
 
 [[section]]
 name = "notify"
@@ -224,7 +311,7 @@ default_ref = "NotifyPolicy.file"
 
 [[section]]
 name = "adapter"
-description = "CLI client, model & bypass flags (base for all stages)"
+description = "CLI client, model & permission flags (base for all stages)"
 [[section.field]]
 key = "name"
 kind = "str"
@@ -237,10 +324,18 @@ placeholder = "CLI default model"
 key = "effort"
 kind = "str"
 placeholder = "provider default"
-description = "reasoning effort, free-form (provider/model-specific, e.g. high, max); sent by opencode-http as the per-prompt variant, ignored by the tmux CLIs"
+description = "reasoning effort, free-form (provider/model-specific, e.g. high, max); sent by opencode-http as the model variant (on 2.x it must be one of the model's variants), ignored by the tmux CLIs"
 [[section.field]]
 key = "extra_args"
 kind = "args"
+description = "when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) or unattended sessions may stall on permission prompts · under a sandboxed permission_mode it also drops the mode's linked-worktree gitdir grant, so a sandboxed codex session under worktree isolation cannot commit"
+[[section.field]]
+key = "permission_mode"
+kind = "select"
+options_ref = "PERMISSION_MODES"
+default_ref = "AdapterPolicy.permission_mode"
+label = "permission mode"
+description = "bypass (default): launch the CLI profile's permission-bypass flags (its bypass_args) · sandboxed: launch the profile's non-blocking sandboxed flags instead — a denied action returns to the agent as an error rather than a prompt (claude and codex on linux/macOS; other profiles refuse it) · extra_args, when set, still replaces either · stages inherit it even when they switch client"
 [[section.field]]
 key = "cleanup_session_on_finish"
 kind = "switch"
@@ -260,7 +355,7 @@ default_ref = "AdapterPolicy.stop_without_result_nudges"
 placeholder = "inherit (copilot profile ships 5)"
 description = "result-less Stop signals tolerated before a session is called stalled; overrides the global limits value for this CLI"
 
-# Per-stage adapter overrides. One section per [adapter.dev|review|triage] table,
+# Per-stage adapter overrides. One section per [adapter.dev|review|triage|retro] table,
 # expanded from this single template by the STAGES loop so they never drift.
 [[section]]
 name = "adapter.{stage}"
@@ -281,6 +376,14 @@ placeholder = "inherit / provider default"
 [[section.field]]
 key = "extra_args"
 kind = "args"
+description = "inherits from [adapter] only when the client matches (a stage that switches client falls back to that client's bypass flags); when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions)"
+[[section.field]]
+key = "permission_mode"
+kind = "select"
+options_ref = "PERMISSION_MODES"
+default_ref = "StageAdapterPolicy.permission_mode"
+label = "permission mode"
+description = "leave blank to inherit [adapter] permission_mode — inherited even when this stage switches client, whose profile must then map the mode"
 [[section.field]]
 key = "usage_grace_s"
 kind = "float"
@@ -370,7 +473,7 @@ kind = "int"
 minimum = 0
 default_ref = "ScmPolicy.preserve_keep"
 label = "preserve-ref retention"
-description = "attempt-preserve/* recovery branches and attempt-preserve-dirty/* worktree snapshots kept at each run start (per family) · the newest by committer date survive and the tail is deleted (0 = never prune)"
+description = "attempt-preserve/* recovery branches, attempt-preserve-dirty/* rollback snapshots and merge-preflight-preserve/* merge pre-flight snapshots kept at each run start (per family) · the newest by committer date survive and the tail is deleted (0 = never prune)"
 [[section.field]]
 key = "seed_adapter_defaults"
 kind = "switch"
@@ -467,6 +570,23 @@ kind = "switch"
 default_ref = "OperatorPolicy.enabled"
 label = "allow awaiting-operator parks"
 description = "let a session finish + commit a story whose acceptance criteria need a human action (buy a domain, publish a DNS record) and park it as awaiting-operator instead of forcing done or blocked · what is owed is recorded in the story spec's operator_actions: frontmatter, and `bmad-loop confirm <story-key>` completes the story once you have done it"
+[[section.field]]
+key = "on_review_demotion"
+kind = "select"
+options_ref = "OPERATOR_ON_REVIEW_DEMOTION_MODES"
+default_ref = "OperatorPolicy.on_review_demotion"
+label = "review may park a done story"
+description = "escalate: a review pass is never offered the park, and one that finalizes a done story at awaiting-operator is not accepted (default) · park: the review may demote it — the board moves done -> awaiting-operator, the story commits and parks · sprint mode with parks enabled only"
+
+[[section]]
+name = "skills"
+description = "where skills are resolved from"
+[[section.field]]
+key = "user_roots"
+kind = "switch"
+default_ref = "SkillsPolicy.user_roots"
+label = "user-level skill folders"
+description = "ON: a skill missing from the project's skill trees may resolve from the user-level folders the coding CLI loads on its own (its profile's [user_skills] roots, e.g. ~/.agents/skills after `npx skills add -g`); when both hold a copy, the profile's precedence picks, so a precedence = \"user\" CLI (claude) runs the user copy over the project's · OFF (default): the project's skill trees only"
 
 [[section]]
 name = "mux"
@@ -479,3 +599,9 @@ kind = "select"
 default_ref = "MuxPolicy.backend"
 label = "backend"
 description = "force a registered transport backend by name (see `bmad-loop mux`); leave blank to auto-select — BMAD_LOOP_MUX_BACKEND outranks it · takes effect on the next bmad-loop invocation"
+[[section.field]]
+key = "honor_ambient_psmux_data_dir"
+kind = "switch"
+default_ref = "MuxPolicy.honor_ambient_psmux_data_dir"
+label = "honour your own PSMUX_DATA_DIR"
+description = "psmux only: on — an absolute PSMUX_DATA_DIR your profile exports into every shell is used as the registry instead of bmad-loop's derived per-project one · off (default) — it is overridden · leave off for a value typed into one shell · takes effect on the next bmad-loop invocation; a running TUI refuses launches until restarted"

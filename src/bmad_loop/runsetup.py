@@ -41,13 +41,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from . import bmadconfig
+from . import bmadconfig, install
 from . import policy as policy_mod
-from . import runs
+from . import runs, ticketstore, worksource
 from .checks import Finding
 from .journal import Journal, save_state, state_lock
 from .model import RunState
 from .platform_util import atomic_replace, is_link_like, is_wsl_unc_path
+from .plugins.grants import GrantSet
 from .runs import RUNS_DIR
 
 if TYPE_CHECKING:
@@ -59,6 +60,7 @@ if TYPE_CHECKING:
     from .policy import Policy
     from .stories_engine import StoriesEngine
     from .sweep import SweepEngine
+    from .tickets_engine import TicketsEngine
 
     class MakeAdapters(Protocol):
         """Call shape of :func:`make_adapters`, which ``compose_*`` takes injected.
@@ -78,10 +80,12 @@ if TYPE_CHECKING:
         ) -> dict[str, CodingCLIAdapter]: ...
 
 
-# The three adapter roles a run wires. Defined here (the composition layer that
+# The adapter roles a run wires. Defined here (the composition layer that
 # actually builds them) and re-exported as ``cli.ROLES``, which `cmd_validate`
-# and the test suite resolve.
-ROLES = ("dev", "review", "triage")
+# and the test suite resolve. ``retro`` drives the headless epic-boundary
+# retrospective (`gates.retrospective = "auto"`, DW-389); like ``triage`` it is a
+# plain adapter that reads the session's own result.json.
+ROLES = ("dev", "review", "triage", "retro")
 SWEEP_OPTIONS_VERSION = 2
 _MAX_SWEEP_OPTIONS_BYTES = 64 * 1024
 
@@ -120,7 +124,7 @@ def resolve_profiles(policy: Policy, project: Path) -> dict[str, CLIProfile]:
     and the composition. Profiles were the only surface read twice.
 
     Deduplicated by profile name, so the common single-CLI policy touches disk
-    once rather than three times. ``ProfileError`` propagates.
+    once rather than once per role. ``ProfileError`` propagates.
     """
     from .adapters.profile import get_profile
 
@@ -151,16 +155,28 @@ def config_digest(
     the exec-reachable surface:
 
     * ``verify.commands`` — order-preserved; they run in sequence.
+    * ``environment.probes`` — order-preserved like ``verify.commands`` and run
+      the same way (``shell=True``, DW-523), so they are the same host-exec
+      surface. Hashed only when non-empty, for the ``session_id_flag`` reason
+      below: an unset list runs nothing, and leaving the key out keeps the payload
+      byte-identical to a digest stamped before the field existed.
+      ``verify.env_fault_rc``, ``verify.command_timeout_min`` and
+      ``environment.probe_timeout_s`` are not: they classify or bound a
+      command's run, and none can name a program.
     * ``sorted(plugins.enabled)`` — set semantics, so order is not meaningful.
     * per :data:`ROLES`, every field that decides **which program runs and with
       what flags and environment**. That rule, not a hand-picked list, is what
       keeps this complete: walk ``GenericAdapter.interactive_argv`` and
       ``interactive_env`` and every token there traces back to one of
-      ``binary`` / ``launch_args`` / ``bypass_args`` / ``model_flag`` /
+      ``binary`` / ``launch_args`` / ``bypass_args`` / ``linked_worktree_args``
+      (hashed as the UNFILLED template, placeholders and all, so a resumed run's
+      digest does not depend on its worktree's path) / ``model_flag`` /
       ``prompt_template`` / ``env`` on the *resolved* profile, or to
-      ``extra_args`` on the resolved adapter. The opencode-http builder reads a
-      strict SUBSET of those — ``_serve_argv`` takes ``binary`` and the adapter's
-      ``extra_args`` and nothing else, and ``_session_env`` layers
+      ``extra_args`` on the resolved adapter — plus ``session_id_flag``, which
+      ``build_command`` appends (with a minted id) to the launched argv only.
+      The opencode-http builder reads a strict SUBSET of those — ``_serve_argv``
+      takes ``binary``, ``launch_args`` and the adapter's ``extra_args`` and
+      nothing else, and ``_session_env`` layers
       ``profile.env`` plus one *generated* variable, which the ``skill_tree``
       bullet below accounts for. See the union paragraph on why the subset does
       not narrow what is hashed.
@@ -195,12 +211,14 @@ def config_digest(
     the argument for ``adapter``, since ``hookless`` selected the builder only
     until the registry took that job over: *a hard-coded argv token is not the
     same thing as a safe one.* Flipping ``hooks.dialect`` to ``"none"``
-    does not add a token — it swaps the whole builder, dropping ``launch_args``,
-    the prompt and the ``bypass_args`` fallback and putting the literal ``"serve"``
-    at argv[1], which ``_spawn_server`` then runs with ``cwd`` at the workspace
-    root. To a CLI that is a subcommand and a bad one dies in the health poll. To
-    an *interpreter* — a profile whose ``binary`` is ``python``/``sh``/``node``
-    with the real program in ``launch_args``, which nothing forbids — argv[1] is a
+    does not add a token — it swaps the whole builder, dropping the prompt and
+    the ``bypass_args`` fallback and putting the literal ``"serve"`` right after
+    ``binary`` + ``launch_args``, which ``_spawn_server`` then runs with ``cwd`` at
+    the workspace root. To a CLI that is a subcommand and a bad one dies in the
+    health poll. To an *interpreter* ``binary`` (``python``/``sh``/``node``) with
+    an empty or options-only ``launch_args`` (e.g. ``python3 -u``) — which nothing
+    forbids; validate only warns (``adapter.launch-args-unservable``) —
+    ``"serve"`` lands in the script slot as a
     **script path resolved against the agent-writable tree**, and the exec happens
     before the health poll it fails (three times: ``SPAWN_ATTEMPTS``). ``binary``
     being pinned does not save it: the attacker inherits whichever binary the
@@ -214,8 +232,9 @@ def config_digest(
     ``adapter.extra_args`` REPLACES ``bypass_args`` rather than extending it, so
     for a role that sets it the hashed ``bypass_args`` is dead, and rewriting the
     dead field alone moves this digest without moving one token of the launched
-    argv. Under ``hookless``, ``bypass_args`` / ``launch_args`` / ``model_flag``
-    are dead the same way. Hashing the effective projection instead means
+    argv. Under ``hookless``, ``bypass_args`` / ``model_flag`` are dead the same
+    way (``launch_args`` is not: the opencode builder places it before
+    ``serve``). Hashing the effective projection instead means
     restating two builders' precedence rules inside the control that polices
     them, where drift is silent and lands in the UNDER-covering direction — the
     failure this function has already made four times by reasoning from one
@@ -267,7 +286,7 @@ def config_digest(
       ``seed_files``) all reject absolute and parent refs.
 
       NOT excluded on "the parent execs it too" — that defence is false for the
-      ``triage`` role. Base ``Engine`` wires only dev+review; ``sweep.py`` holds
+      ``triage`` role. Base ``Engine`` wires only dev+review+retro; ``sweep.py`` holds
       the only ``adapters["triage"]`` assignment and the only two ``role="triage"``
       dispatches, so a ``[adapter.triage]`` profile override's target is exec'd by
       a sweep and by nothing else. ``sweep.auto = "run-end"`` and worktree
@@ -323,6 +342,15 @@ def config_digest(
 
       Skill-content integrity is a real question and not one a config hash can
       answer.
+
+      The same holds for the rest of the skill-location surface:
+      ``extra_skill_trees`` (more project trees planted beside ``skill_tree`` in
+      ``OPENCODE_CONFIG_CONTENT``), ``user_skills`` (which home folders a skill
+      may resolve from) and the ``[skills] user_roots`` switch (whether they
+      are read at all, which also widens opencode 2.x's skill allow-list to
+      the BMAD ids located there). Each moves only a pointer to instructions,
+      never a program, flag or variable, and a user root is writable without
+      any config change at all.
     * ``usage_parser`` — and with it the rest of the token-budget surface. It
       selects a read-only tally over a transcript the orchestrator opens anyway
       and decides no program, flag, or variable. Rewriting it to ``"none"`` DOES
@@ -337,29 +365,27 @@ def config_digest(
       main door is held open on purpose. Admitting it also widens the rule from
       the launch surface to the launch surface *plus safety knobs*, which is
       ``[limits]`` — the whole-file hash the second paragraph exists to reject.
-    * ``[plugins.<name>]`` settings — an enabled plugin's resolved settings do
+    * ``[plugins.<name>]`` settings — a running plugin's resolved settings do
       reach exec (``bus.py`` exports each as ``BMAD_LOOP_SETTING_*`` into a
       ``shell=True`` hook, and the Unity plugin turns one into an ``--editor-path``
       argv token), but the TUI settings screen writes those same tables, so
       pinning them would refuse an auto-sweep after a supported human edit. They
-      are inside an *already-enabled* plugin's blast radius — the trust boundary
-      the gap below is about — rather than a way past the allowlist.
+      steer only a plugin that is already trusted — a builtin named in
+      ``enabled``, or a project plugin whose exact bytes an operator granted — so
+      they act inside that plugin's blast radius rather than as a way past the
+      trust gate. A residual, documented as one, not a gap this digest closes.
 
-    Known gaps, tracked separately (#496, #497). This pins the plugin allowlist by
-    NAME only, and the allowlist is not the whole plugin exec surface:
-
-    * A project-origin ``.bmad-loop/plugins/<name>/`` overrides a same-named
-      builtin (``plugins/loader.py`` overlay precedence) and
-      ``trust.require_enabled`` gates on the name, so a session can swap the module
-      behind an *already* enabled plugin without moving this digest.
-    * Adding a plugin is caught only for one that declares ``[python]``. A
-      *declarative* manifest (no ``[python]``) loads on folder-drop by design
-      (``plugins/trust.py``) and ``registry.hooks_for`` hands its ``[hooks.<stage>]
-      cmd`` to the bus, which runs it with ``shell=True`` — with no ``enabled``
-      entry, and from a directory this digest never reads.
-
-    Closing either is a plugin-trust-model change rather than a wider hash, so
-    neither belongs here.
+    The plugin allowlist is pinned by NAME only, and on purpose. Names were never
+    the whole plugin exec surface — a project ``.bmad-loop/plugins/<name>/`` could
+    shadow an enabled builtin, and a declarative manifest's hooks ran from a dir
+    this digest never reads (#496, #497) — but those are closed by the plugin
+    trust model, not by a wider hash: a project plugin with any executable surface
+    runs only under an operator content grant kept out of the tree, read ONCE at
+    the human-present launch and held frozen by the auto-sweep child's factory
+    (``cli._sweep_factory``), and it executes from a verified out-of-tree snapshot
+    of the bytes that grant hashed (``plugins/registry.py``). So the payload below
+    is deliberately unchanged: every pin stamped before grants existed stays
+    byte-identical, and a grant never moves a digest.
 
     Tuples are normalized to lists before ``json.dumps(sort_keys=True)`` for the
     same reason ``cli._resume_paused_run``'s ``policy_changed`` compare does it:
@@ -380,7 +406,12 @@ def config_digest(
     launch: dict[str, dict[str, object]] = {}
     for role in ROLES:
         cfg = policy.adapter.resolved(role)
-        prof = profiles[role]
+        # The mode-resolved profile: under a non-bypass permission_mode its
+        # bypass_args ARE that mode's launch args, so the field below pins what
+        # is launched. "bypass" returns the profile itself (same bytes as before
+        # the field existed). An unmapped mode raises ProfileError, like an
+        # unknown profile name.
+        prof = profiles[role].for_permission_mode(cfg.permission_mode)
         launch[role] = {
             "binary": prof.binary,
             "launch_args": list(prof.launch_args),
@@ -397,20 +428,41 @@ def config_digest(
             "adapter": prof.adapter,
             # The transport. It no longer selects the builder (`adapter` does),
             # but it still rewrites what the opencode builder emits WHOLESALE
-            # rather than adding a token: hookless drops launch_args/prompt/
-            # bypass_args and substitutes `serve --port … --print-logs`, whose
-            # literal "serve" an interpreter binary reads as a cwd-relative
-            # script path.
+            # rather than adding a token: hookless drops prompt/bypass_args and
+            # appends `serve --port … --print-logs` after binary + launch_args,
+            # whose literal "serve" an interpreter binary with an empty or
+            # options-only launch_args (e.g. `python3 -u`) reads as a
+            # cwd-relative script path.
             "hookless": prof.hookless,
             # None (inherit profile.bypass_args) is NOT the same state as () (an
             # explicit override to no flags at all); json.dumps keeps them apart.
             "extra_args": None if cfg.extra_args is None else list(cfg.extra_args),
         }
+        # An argv FLAG `build_command` appends to the launched command with a
+        # minted session id (DW-505); not in interactive_argv, still launched.
+        # Hashed only when set: an unset flag adds no token, so leaving the key
+        # out keeps the payload byte-identical to a digest stamped before the
+        # field existed — a paused run resumed across the upgrade must not report
+        # a host-exec change its argv never had.
+        if prof.session_id_flag:
+            launch[role]["session_id_flag"] = prof.session_id_flag
+        # Same byte-identity rule: the default mode adds no key. A non-default
+        # mode already moved `bypass_args`; the name is hashed beside it so the
+        # pin also records which mapping those args came from.
+        if cfg.permission_mode != "bypass":
+            launch[role]["permission_mode"] = cfg.permission_mode
+        # Argv tokens `interactive_argv` appends after the mode's args in a linked
+        # worktree (DW-599), placeholders unfilled; same byte-identity rule.
+        if prof.linked_worktree_args:
+            launch[role]["linked_worktree_args"] = list(prof.linked_worktree_args)
     payload = {
         "verify_commands": list(policy.verify.commands),
         "plugins_enabled": sorted(policy.plugins.enabled),
         "profiles": launch,
     }
+    # Same byte-identity rule as `session_id_flag` above: no probes, no key.
+    if policy.environment.probes:
+        payload["environment_probes"] = list(policy.environment.probes)
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -436,7 +488,9 @@ def make_adapters(
     # synthesizes the result from the spec, and so needs the project paths to
     # find that spec — rebasing onto the active worktree's implementation-
     # artifacts dir under isolation, not just the main checkout's.
-    paths = bmadconfig.load_paths(project)
+    paths = bmadconfig.load_paths(
+        project, want_tickets=policy.stories.source == worksource.SOURCE_TICKETS
+    )
     mux = None
     adapters: dict[str, CodingCLIAdapter] = {}
     by_cfg: dict = {}
@@ -462,6 +516,15 @@ def make_adapters(
                     profile = get_profile(cfg.name, project)
                 except ProfileError as e:
                     raise SystemExit(f"error: {e}") from e
+            # `adapter.permission_mode` resolved INTO the profile (its bypass_args
+            # become the mode's args) rather than handed to the adapter as a new
+            # keyword: out-of-tree classes are built with `cls(**common)` below and
+            # would refuse a keyword they predate (#569). `config_digest` applies
+            # the same resolution, so the pin and the launch agree.
+            try:
+                profile = profile.for_permission_mode(cfg.permission_mode)
+            except ProfileError as e:
+                raise SystemExit(f"error: adapter {role} session: {e}") from e
             # Which adapter class drives this CLI is pure data — `profile.adapter`
             # resolved against the registry. No adapter-name branching lives here;
             # a new family plugs in with zero edits to this function. Note this
@@ -692,6 +755,20 @@ def platform_preflight(project: Path) -> list[Finding]:
                 },
             )
         )
+    # Not gated on the backend count like the listing above: an "(unavailable)"
+    # that a raising probe forced is a fold, not the host's answer, and a lone
+    # backend is the one an operator most needs told about (DW-464). A warning —
+    # selection already degraded past it, as for a failed external.
+    for i in infos:
+        if i.probe_error:
+            found.append(
+                Finding(
+                    "mux.backend-probe",
+                    "warning",
+                    f"mux backend {i.name} probe failed: {i.probe_error}",
+                    {"backend": i.name, "error": i.probe_error},
+                )
+            )
     chosen = next((i for i in infos if i.selected), None)
     if chosen:
         # Emitted for EVERY reason, not just the forced ones (#332): the reason that
@@ -782,15 +859,22 @@ def build_run_state(
     epic_filter: int | None,
     story_filter: str | None,
     max_stories: int | None,
-    stories_on: bool,
+    source: str,
     spec_folder: str,
     trusted_config_digest: str,
+    run_dir_identity: tuple[int, int] | None,
+    initiative: str = "",
+    initiative_folder: str = "",
+    store_topology: dict[str, str | None] | None = None,
+    ticket_epic_filter: str = "",
+    parent_initiative: str | None = None,
 ) -> RunState:
     """Assemble the launch-time :class:`RunState` for a fresh run.
 
     ``policy_snapshot`` freezes ``policy`` at launch so every later display reads
     the weights the run actually launched under; ``source`` / ``spec_folder``
-    record which queue the run dispatches (a stories manifest vs sprint-status).
+    record which queue the run dispatches (a stories manifest vs sprint-status);
+    ``spec_folder`` is dropped for a source without one.
 
     ``trusted_config_digest`` is carried here **as well as** stamped out of the
     tree by :func:`compose_run` (#498). The out-of-tree file is the one resume
@@ -801,20 +885,93 @@ def build_run_state(
     ``repo_root`` records the git root code work happens in (``paths.repo_root``),
     which equals ``project`` unless the BMAD config sets a `repo_root:` override.
     ``runs.rearm_escalation`` runs out of process and reads it back to advance the
-    attempt baseline in the tree the proof-of-work gate actually measures."""
+    attempt baseline in the tree the proof-of-work gate actually measures.
+
+    ``run_dir_identity`` is the run dir's mint-time identity
+    (:func:`_claim_identity` of the composer's claim, DW-446) — what the verify
+    stream's pin compares the run dir it opens against.
+
+    ``initiative`` / ``initiative_folder`` are the v7 active initiative and its
+    folder (``ProjectPaths.active_initiative`` / ``initiative_folder``), pinned only
+    for a tickets run, whose tree reads refuse once the live initiative differs;
+    every other source records them empty. ``store_topology`` is the classified
+    ticket store (``ticketstore.StoreTopology.to_dict``), and ``ticket_epic_filter``
+    the ``--epic`` selector resolved to an epic slug, likewise tickets only.
+    ``parent_initiative`` is a chained child run's parent (``initiative`` then
+    names the child), likewise tickets only."""
+    tickets = source == worksource.SOURCE_TICKETS
     return RunState(
         run_id=run_id,
         project=str(project),
         repo_root=str(repo_root),
+        run_dir_identity=run_dir_identity,
         started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         policy_snapshot=policy.to_dict(),
         epic_filter=epic_filter,
         story_filter=story_filter,
         max_stories=max_stories,
-        source="stories" if stories_on else "sprint-status",
-        spec_folder=spec_folder if stories_on else "",
+        source=source,
+        spec_folder=spec_folder if worksource.traits_for(source).has_spec_folder else "",
+        initiative=initiative if tickets else "",
+        initiative_folder=initiative_folder if tickets else "",
+        store_topology=dict(store_topology or {}) if tickets else {},
+        ticket_epic_filter=ticket_epic_filter if tickets else "",
+        parent_initiative=parent_initiative if tickets else None,
         trusted_config_digest=trusted_config_digest,
     )
+
+
+def _run_store_topology(
+    paths: bmadconfig.ProjectPaths, policy: Policy, source: str, *, chained: bool = False
+) -> dict[str, str | None]:
+    """The ticket-store topology a tickets run records at its start (``{}`` for any
+    other source, and when there is no initiative folder to classify — the
+    preflight's ``tickets.initiative-*`` checks own that refusal). The run preflight
+    refused every unrunnable store already, so a store refused here changed in
+    between; that raises :class:`ticketstore.TicketStoreError` rather than starting
+    unrecorded. ``chained``: ``paths`` are a chained run's, re-rooted on its child
+    (:func:`ticketstore.assess_store`)."""
+    if source != worksource.SOURCE_TICKETS:
+        return {}
+    result = ticketstore.assess_store(paths, policy.scm.isolation, chained=chained)
+    if result is None:
+        return {}
+    if isinstance(result, ticketstore.StoreRefusal):
+        raise ticketstore.TicketStoreError(
+            "the ticket store no longer classifies at run start (it changed after the "
+            "preflight) — run `bmad-loop validate` and start the run again"
+        )
+    return result.to_dict()
+
+
+def _engine_cls_for(
+    source: str,
+    spec_folder: str,
+    *,
+    engine_cls: type[Engine],
+    stories_engine_cls: type[StoriesEngine],
+    tickets_engine_cls: type[TicketsEngine] | None = None,
+) -> tuple[type[Engine], dict[str, str]]:
+    """The engine class a story run from ``source`` is built with, and the extra
+    constructor kwargs that class takes beyond the shared ones.
+
+    A source the registry does not carry (a run state persisted by a newer
+    version) raises :class:`worksource.UnknownSource`, and a registered source
+    that cannot run yet raises :class:`worksource.SourceNotRunnable` — neither is
+    rebuilt as a sprint run. The classes are injected so ``cli``'s module-level
+    names — and the tests' monkeypatches of them — stay the ones built.
+    ``tickets_engine_cls`` None is :class:`~bmad_loop.tickets_engine.TicketsEngine`."""
+    if not worksource.resumable_traits_for(source).runnable:
+        worksource.refuse_unrunnable(source)
+    if source == worksource.SOURCE_STORIES:
+        return stories_engine_cls, {"spec_folder": spec_folder}
+    if source == worksource.SOURCE_TICKETS:
+        if tickets_engine_cls is None:
+            from .tickets_engine import TicketsEngine
+
+            tickets_engine_cls = TicketsEngine
+        return tickets_engine_cls, {}
+    return engine_cls, {}
 
 
 @dataclass
@@ -836,6 +993,91 @@ class ComposedRun:
 
 class SweepOptionsError(ValueError):
     """Persisted selector-bearing sweep options are unsafe to resume."""
+
+
+class SweepPinError(ValueError):
+    """A sweep would resume under another BMAD v7 initiative than it started on."""
+
+
+def sweep_initiative_conflict(
+    state: RunState, paths: bmadconfig.ProjectPaths, *, rerooted: bool = False
+) -> str | None:
+    """The refusal text when a sweep would resume on another initiative than the
+    one it pinned at launch (``RunState.initiative``), else None. Every story run
+    is None here: a tickets run checks its pin on each tree read instead.
+
+    On v7 the ledger and the pre-answer store both belong to one initiative
+    (``ProjectPaths.deferred_work``, ``decisions.store_scope``), and a sweep's
+    triage, bundles and run-local decisions name that ledger's DW ids, so a
+    resume under a switched initiative would apply them to a different ledger
+    whose ids mean other entries. The live side is ``paths.active_initiative``
+    (``""`` off v7). A sweep that started with no initiative active pins
+    ``""``; one written before the pin existed reads the same, which on a v7
+    project with an initiative active is refused rather than guessed.
+
+    A chained child's run-end sweep (``state.parent_initiative`` set) works the
+    child's ledger but is pinned to the PARENT, as the chained run is
+    (:func:`runs.paths_for_state`). ``rerooted`` names which paths the caller
+    passes, and is never inferred from their values — a live config naming the
+    child loads paths that look re-rooted:
+
+    - ``rerooted=False`` (default): ``bmadconfig.load_paths`` output. Passes only
+      while the live ``active_initiative`` names ``state.parent_initiative``.
+    - ``rerooted=True``: :func:`runs.paths_for_state` output, which raised
+      unless the live config named the parent. Passes only when the paths are
+      rooted on the child (``active_initiative`` and the initiative folder's name
+      are ``state.initiative``).
+
+    An unchained sweep is judged the same either way (``paths_for_state``
+    returns its loaded paths unchanged)."""
+    if state.run_type != "sweep":
+        return None
+    if state.parent_initiative is not None:
+        return _chained_sweep_conflict(state, paths, rerooted=rerooted)
+    pinned = state.initiative
+    live = paths.active_initiative if paths.era == "v7" else ""
+    if pinned == live:
+        return None
+    started = f"initiative {pinned!r}" if pinned else "no active initiative"
+    now = repr(live) if live else "unset"
+    fix = (
+        f"set `[core] active_initiative` back to {pinned!r}"
+        if pinned
+        else "unset `[core] active_initiative`"
+    )
+    return (
+        f"sweep {state.run_id} started on {started}, but the active initiative is now "
+        f"{now}; its ledger and pre-answers belong to the initiative it started on. "
+        f"To resume it, {fix} (_bmad/custom/config.user.toml); otherwise start a new sweep"
+    )
+
+
+def _chained_sweep_conflict(
+    state: RunState, paths: bmadconfig.ProjectPaths, *, rerooted: bool
+) -> str | None:
+    """:func:`sweep_initiative_conflict` for a chained child's sweep."""
+    parent = state.parent_initiative
+    child = state.initiative
+    live = paths.active_initiative if paths.era == "v7" else ""
+    folder = paths.initiative_folder if paths.era == "v7" else None
+    if rerooted:
+        if live == child and folder is not None and folder.name == child:
+            return None
+        found = (
+            f"its paths are rooted on initiative {live!r} ({folder})"
+            if live
+            else "its paths are rooted on no initiative"
+        )
+    else:
+        if live == parent:
+            return None
+        found = f"the active initiative is now {repr(live) if live else 'unset'}"
+    return (
+        f"sweep {state.run_id} works child initiative {child!r} of parent initiative "
+        f"{parent!r}, but {found}; its ledger and pre-answers belong to that child. "
+        f"To resume it, set `[core] active_initiative` back to {parent!r} "
+        "(_bmad/custom/config.user.toml); otherwise start a new sweep"
+    )
 
 
 @dataclass(frozen=True)
@@ -983,6 +1225,22 @@ def validate_sweep_options_binding(
         raise SweepOptionsError("sweep.json no longer matches the options bound at launch")
 
 
+def _claim_identity(claim: os.stat_result) -> tuple[int, int] | None:
+    """The run dir's mint-time identity record (DW-446) from the composer's claim —
+    the ``lstat`` of the directory this process just created, before any session
+    can reach it — or None for a zero inode, which carries no identity, so every
+    pin compared against it refuses. On the dir-fd verify-stream arm and for the
+    mount writers that is no change (a zero inode never matched), but the win32
+    verify-stream arm, which before DW-446 wrote through a zero-inode run dir, now
+    REFUSES it (accepted 2026-09-27): each lost log tail is journaled as the
+    verify record's ``capture_error`` and verification proceeds without it. The
+    run journal and ``state.json`` do not refuse: they write unpinned and the
+    journal records one ``journal-unpinned`` row (``reason="no-record"``)."""
+    if claim.st_ino == 0:
+        return None
+    return (claim.st_dev, claim.st_ino)
+
+
 def _claim_run_dir(run_dir: Path) -> os.stat_result:
     """Take exclusive ownership of a fresh run directory, refusing an id that
     already names a run.
@@ -1114,9 +1372,9 @@ def _unwind_composition(
         # leaves one behind — the guard refusing, or a failed `rmtree` — which is
         # also the only case where a ghost run is what the operator will find. When
         # `_discard_state_dir` is instead what failed the dir is already gone, and
-        # `Journal.append` opens with "a" WITHOUT a mkdir, so it raises rather than
-        # resurrecting the run it just removed. Suppressed, and the stderr line
-        # above still carries the report.
+        # `Journal.append` opens the run dir confined, without a mkdir, so it raises
+        # OSError rather than resurrecting the run it just removed. Suppressed, and the
+        # stderr line above still carries the report.
         #
         # ``journal`` is None when the composer aborted between claiming the run dir
         # and building the Journal — a window only a signal can realistically land
@@ -1129,6 +1387,40 @@ def _unwind_composition(
                 journal.append("composition-unwind-failed", run_id=run_dir.name, error=detail)
 
 
+def _chained_child_refusal(paths: bmadconfig.ProjectPaths, parent: str) -> str | None:
+    """Why ``paths`` are not rooted on a child initiative of ``parent``, or None.
+    The child must be listed in the parent's ``[[initiative]]`` table, read as the
+    tickets preflight reads it (``install._initiative_children``) from the
+    parent's folder: the child folder's sibling named ``parent``, the sibling
+    :meth:`~bmadconfig.ProjectPaths.with_initiative` derives the child from."""
+    child, folder = paths.active_initiative, paths.initiative_folder
+    if paths.era != "v7" or folder is None or not child or child == parent:
+        rooted = repr(child) if child else "no initiative"
+        return (
+            f"a chained run of parent initiative {parent!r} needs paths rooted on one "
+            f"of its child initiatives, not on {rooted} ({paths.era})"
+        )
+    children, breakdown, fault = install._initiative_children(folder.parent / parent)
+    if fault:
+        return (
+            f"a chained run of parent initiative {parent!r} cannot confirm {child!r} is "
+            f"one of its child initiatives: reading {breakdown} failed: {fault}"
+        )
+    if children is None:
+        return (
+            f"a chained run of parent initiative {parent!r} needs paths rooted on one "
+            f"of its child initiatives, not on {child!r}: {breakdown} lists no "
+            "`[[initiative]]` children"
+        )
+    if child not in children:
+        listed = ", ".join(children) or "none"
+        return (
+            f"a chained run of parent initiative {parent!r} needs paths rooted on one "
+            f"of its child initiatives, not on {child!r}: {breakdown} lists {listed}"
+        )
+    return None
+
+
 def compose_run(
     *,
     project: Path,
@@ -1138,14 +1430,18 @@ def compose_run(
     epic_filter: int | None,
     story_filter: str | None,
     max_stories: int | None,
-    stories_on: bool,
+    source: str,
     spec_folder: str,
     sweep_factory: SweepFactory,
     make_adapters: MakeAdapters,
     engine_cls: type[Engine],
     stories_engine_cls: type[StoriesEngine],
     trusted_config_digest: str,
+    tickets_engine_cls: type[TicketsEngine] | None = None,
     profiles: dict[str, CLIProfile] | None = None,
+    plugin_grants: GrantSet = GrantSet.empty(),
+    ticket_epic_filter: str = "",
+    parent_initiative: str | None = None,
 ) -> ComposedRun:
     """Stand up a run: allocate the run dir, persist state + pid, build the
     adapters, and wire the engine — everything ``cmd_run`` did inline between its
@@ -1166,9 +1462,37 @@ def compose_run(
     ``make_adapters`` and the engine classes are injected (rather than imported
     here) so ``cli`` supplies its own module-level names — keeping the test
     suite's ``monkeypatch.setattr(cli, "Engine"/"_make_adapters", ...)`` effective.
+
+    ``plugin_grants`` is the launch's frozen plugin grant set (#496/#497), read
+    once by the caller and handed to the engine's registry build. The default is
+    no grants (fail closed), never "read the store" — this layer does not read it.
+    A fatal plugin verdict raises out of the engine build and unwinds the run.
+
+    ``ticket_epic_filter`` is a tickets run's ``--epic`` selector, already resolved
+    to an epic slug by the caller (``epic_filter`` stays None for such a run, and
+    ``story_filter`` carries the resolved ticket ref).
+
+    ``parent_initiative`` is set only for a chained child run: ``paths`` are then
+    that child's (``ProjectPaths.with_initiative``), so the run pins the child as
+    its ``initiative`` and folder, and records the parent
+    (``RunState.parent_initiative``, which :func:`runs.paths_for_state` re-roots
+    on). Paths not rooted on a child of it raise ValueError before anything is
+    published (:func:`_chained_child_refusal`): off v7, with no active initiative
+    folder, naming the parent itself, or naming an initiative the parent's
+    ``[[initiative]]`` table does not list — or a parent with no such table, or
+    whose table cannot be read. The caller arms ``sweep_factory`` with the same
+    parent.
     """
+    if parent_initiative is not None and (
+        refusal := _chained_child_refusal(paths, parent_initiative)
+    ):
+        raise ValueError(refusal)
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
+    # Before the claim: a store that changed since the preflight leaves nothing behind.
+    store_topology = _run_store_topology(
+        paths, policy, source, chained=parent_initiative is not None
+    )
     # Outside the try below, and it must stay there: a collision refusal that
     # reached `_unwind_composition` would delete the run it exists to protect.
     composer_claim = _claim_run_dir(run_dir)
@@ -1178,13 +1502,14 @@ def compose_run(
     # The guard opens on the statement immediately after the claim, because the
     # claim is what publishes that first artifact — the run DIRECTORY itself, which
     # is what a later `--run-id` collides with. Neither statement below can
-    # realistically fail (`Journal` mkdirs `exist_ok=True` over a directory this
-    # frame just created, and `build_run_state` is a pure constructor), but a
+    # realistically fail (`build_run_state` is a pure constructor, and `Journal`
+    # mkdirs `exist_ok=True` over a directory this frame just created), but a
     # signal can land between any two statements, and the arm is `BaseException`
-    # exactly so that case unwinds instead of stranding an empty run dir.
+    # exactly so that case unwinds instead of stranding an empty run dir. The state
+    # is built FIRST so the journal can be pinned to it: the constructor writes no
+    # row, and `run-start` below stays the run's first.
     journal: Journal | None = None
     try:
-        journal = Journal(run_dir)
         state = build_run_state(
             run_id=run_id,
             project=project,
@@ -1193,16 +1518,25 @@ def compose_run(
             epic_filter=epic_filter,
             story_filter=story_filter,
             max_stories=max_stories,
-            stories_on=stories_on,
+            source=source,
             spec_folder=spec_folder,
             trusted_config_digest=trusted_config_digest,
+            run_dir_identity=_claim_identity(composer_claim),
+            initiative=paths.active_initiative,
+            initiative_folder=(
+                str(paths.initiative_folder) if paths.initiative_folder is not None else ""
+            ),
+            store_topology=store_topology,
+            ticket_epic_filter=ticket_epic_filter,
+            parent_initiative=parent_initiative,
         )
+        journal = Journal(run_dir, pin=state)
         # State becoming resumable and the pid making this process live are one
         # publication.  An explicit-id resume waits for the pid rather than entering
         # between these writes and double-driving the freshly composed run.
         with state_lock(run_dir):
             save_state(run_dir, state)
-            # After the run dir exists (Journal mkdir'd it above) and before the pid
+            # After the run dir exists (the claim created it above) and before the pid
             # lands: the ordering `reconcile_orphan_state_dirs` reads runs in, and a
             # stamp that cannot be written fails the launch before an observer can
             # see a live run.
@@ -1221,6 +1555,7 @@ def compose_run(
             policy=policy,
             adapter=adapters["dev"],
             review_adapter=adapters["review"],
+            retro_adapter=adapters["retro"],
             run_dir=run_dir,
             journal=journal,
             state=state,
@@ -1228,13 +1563,17 @@ def compose_run(
             epic_filter=epic_filter,
             story_filter=story_filter,
             sweep_factory=sweep_factory,
+            plugin_grants=plugin_grants,
+        )
+        cls, extra = _engine_cls_for(
+            source,
+            spec_folder,
+            engine_cls=engine_cls,
+            stories_engine_cls=stories_engine_cls,
+            tickets_engine_cls=tickets_engine_cls,
         )
         # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
-        engine: Engine = (
-            stories_engine_cls(**common, spec_folder=spec_folder)
-            if stories_on
-            else engine_cls(**common)  # pyright: ignore[reportArgumentType]
-        )
+        engine: Engine = cls(**common, **extra)  # pyright: ignore[reportArgumentType]
     except BaseException:
         _unwind_composition(project, run_dir, journal, composer_claim)
         raise
@@ -1260,6 +1599,8 @@ def compose_sweep(
     min_severity: str | None = None,
     profiles: dict[str, CLIProfile] | None = None,
     on_started: Callable[[], None] | None = None,
+    plugin_grants: GrantSet = GrantSet.empty(),
+    parent_initiative: str | None = None,
 ) -> ComposedRun:
     """Stand up a sweep run: allocate the run dir, persist state + pid, record the
     sweep options, build the adapters, and wire the ``SweepEngine`` — everything
@@ -1277,6 +1618,19 @@ def compose_sweep(
     injected so ``cli`` supplies its own module-level names — keeping the test
     suite's ``monkeypatch.setattr(cli, "SweepEngine"/"_make_adapters", ...)``
     effective.
+
+    ``parent_initiative`` is set only for the run-end sweep of a chained child
+    (``RunState.parent_initiative`` of the run that triggered it): ``paths`` are
+    then that child's (:func:`runs.paths_for_state`), so the sweep works the
+    child's ledger and pins the child as its ``initiative``, and it records the
+    parent, which a resume finds still active (:func:`sweep_initiative_conflict`).
+    Recorded on v7 only.
+
+    ``plugin_grants`` is the launch's frozen grant set, as in :func:`compose_run`.
+    For the auto-sweep child it is the set the PARENT's launch read, held by the
+    factory closure: a plugin changed or granted since then is judged against the
+    launch's grants, and a fatal verdict raises from the engine build — before
+    ``on_started`` — so the parent records ``sweep-auto-not-started``.
 
     ``on_started`` is the auto-sweep parent's latch (``engine.SweepFactory``'s
     ``started`` thunk, threaded through ``cli._start_sweep``): a parent run spends
@@ -1324,6 +1678,7 @@ def compose_sweep(
     from .sweep import select_entries
 
     select_entries((), only_ids=only_ids, min_severity=min_severity)
+    v7 = paths.era == "v7"
     options = {
         "prompting": prompting,
         "decisions_only": decisions_only,
@@ -1342,6 +1697,11 @@ def compose_sweep(
 
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
+    # v7: the ledger and the bundle plans live in the ticket store, so a sweep
+    # records its topology as a tickets run does (before the claim, for the same
+    # reason): `SweepEngine` shares a store no checkout carries and publishes an
+    # accepted plan in a store's own repository, and a resume refuses a changed one.
+    store_topology = _run_store_topology(paths, policy, worksource.SOURCE_TICKETS) if v7 else {}
     # Same claim, same reason, same placement outside the try as in `compose_run`.
     composer_claim = _claim_run_dir(run_dir)
     # Atomic from the first published artifact onward, exactly as in `compose_run`
@@ -1349,18 +1709,28 @@ def compose_sweep(
     # artifact to unwind (`sweep.json`).
     journal: Journal | None = None
     try:
-        journal = Journal(run_dir)
         state = RunState(
             run_id=run_id,
             project=str(project),
             repo_root=str(paths.repo_root),
+            run_dir_identity=_claim_identity(composer_claim),
             started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
             policy_snapshot=policy.to_dict(),
             run_type="sweep",
             sweep_options_version=SWEEP_OPTIONS_VERSION,
             sweep_options_digest=options_digest,
             trusted_config_digest=trusted_config_digest,
+            # v7: the initiative whose ledger this sweep works, which a resume
+            # must find unchanged (`sweep_initiative_conflict`).
+            initiative=paths.active_initiative if v7 else "",
+            initiative_folder=(
+                str(paths.initiative_folder) if v7 and paths.initiative_folder is not None else ""
+            ),
+            # a chained child's sweep: the parent its pin names (above: the child)
+            parent_initiative=parent_initiative if v7 else None,
+            store_topology=store_topology,
         )
+        journal = Journal(run_dir, pin=state)
         # Persist the sweep options atomically (tmp + os.replace), the way save_state
         # writes state.json: a resume reads this back to rebuild the SweepEngine, so a
         # crash mid-write must not leave a torn file the recovery path then chokes on.
@@ -1395,6 +1765,7 @@ def compose_sweep(
             max_cycles=max_cycles,
             only_ids=only_ids,
             min_severity=min_severity,
+            plugin_grants=plugin_grants,
         )
         if on_started is not None:
             on_started()
@@ -1417,8 +1788,10 @@ def compose_resume(
     engine_cls: type[Engine],
     stories_engine_cls: type[StoriesEngine],
     sweep_engine_cls: type[SweepEngine],
+    tickets_engine_cls: type[TicketsEngine] | None = None,
     profiles: dict[str, CLIProfile] | None = None,
     sweep_options: SweepResumeOptions | None = None,
+    plugin_grants: GrantSet = GrantSet.empty(),
 ) -> ComposedRun:
     """Rebuild the engine for a paused/interrupted run and return it ready to
     :meth:`run` — the adapter build + engine selection ``cli._resume_paused_run``
@@ -1438,9 +1811,33 @@ def compose_resume(
     the one the re-stamped ``state.trusted_config_digest`` was computed from — so
     the new baseline describes the bytes these adapters are built from rather than
     a second read of an agent-writable file (#461 point 4). ``None`` resolves
-    fresh."""
+    fresh.
+
+    ``plugin_grants`` is the resume's frozen grant set, as in :func:`compose_run`.
+    Unlike the two launches this has no unwind, so the caller preflights the
+    grants before its first side effect (``cli._prepare_resume_locked``); the
+    engine build stays the gate.
+
+    A story run whose persisted ``source`` this version cannot drive — unknown to
+    the registry, or registered but not runnable yet — raises before any side
+    effect (:func:`_engine_cls_for`)."""
     if state.run_type == "sweep":
         validate_sweep_options_version(state.sweep_options_version)
+        # `paths` are the run's own: re-rooted on a chained sweep's child
+        if (conflict := sweep_initiative_conflict(state, paths, rerooted=True)) is not None:
+            raise SweepPinError(conflict)
+        story_engine = None
+    else:
+        # stories mode is pinned in run state at launch, so resume rebuilds the
+        # same picker (StoriesEngine) without any flag. An unrecognised persisted
+        # source is refused here, ahead of the session kills below.
+        story_engine = _engine_cls_for(
+            state.source,
+            state.spec_folder,
+            engine_cls=engine_cls,
+            stories_engine_cls=stories_engine_cls,
+            tickets_engine_cls=tickets_engine_cls,
+        )
     resolved_sweep_options = (
         sweep_options
         if sweep_options is not None
@@ -1466,8 +1863,18 @@ def compose_resume(
             resolved_sweep_options,
         )
     # drop any stale agent session so the run spins up a fresh one (a stopped or
-    # interrupted run can leave a lingering bmad-loop-<id> session behind).
+    # interrupted run can leave a lingering bmad-loop-<id> session behind) — in
+    # this registry, and, tag-proven, in any registry the session predates: a
+    # same-named one left there blocks the new session's create.
     runs.kill_session(run_dir.name)
+    for blocker in runs.kill_displaced_session(project, run_dir.name):
+        journal.append("displaced-session-not-cleared", detail=blocker)
+        print(
+            f"warning: run {run_dir.name}: a stale agent session in an older "
+            f"registry may block this resume — {blocker}; if the resume fails to "
+            "create its session, check it with `bmad-loop cleanup`",
+            file=sys.stderr,
+        )
     adapters = make_adapters(project, run_dir, policy, profiles=profiles)
     if state.run_type == "sweep":
         assert resolved_sweep_options is not None
@@ -1488,6 +1895,7 @@ def compose_resume(
             max_cycles=opts.get("max_cycles"),
             only_ids=resolved_sweep_options.only_ids,
             min_severity=resolved_sweep_options.min_severity,
+            plugin_grants=plugin_grants,
         )
     else:
         story_common = dict(
@@ -1495,6 +1903,7 @@ def compose_resume(
             policy=policy,
             adapter=adapters["dev"],
             review_adapter=adapters["review"],
+            retro_adapter=adapters["retro"],
             run_dir=run_dir,
             journal=journal,
             state=state,
@@ -1504,15 +1913,12 @@ def compose_resume(
             story_filter=state.story_filter,
             max_stories=state.max_stories,
             sweep_factory=sweep_factory,
+            plugin_grants=plugin_grants,
         )
-        # stories mode is pinned in run state at launch, so resume rebuilds the
-        # same picker (StoriesEngine) without any flag.
+        assert story_engine is not None
+        cls, extra = story_engine
         # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
-        engine = (
-            stories_engine_cls(**story_common, spec_folder=state.spec_folder)
-            if state.source == "stories"
-            else engine_cls(**story_common)  # pyright: ignore[reportArgumentType]
-        )
+        engine = cls(**story_common, **extra)  # pyright: ignore[reportArgumentType]
     return ComposedRun(
         engine=engine, run_id=run_dir.name, run_dir=run_dir, state=state, journal=journal
     )

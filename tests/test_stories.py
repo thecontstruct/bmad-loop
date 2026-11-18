@@ -96,21 +96,18 @@ def test_id_unquoted_composite_is_string(tmp_path):
     assert s.entries[0].id == "3-2"
 
 
-def test_id_float_rejected(tmp_path):
-    # `id: 3.5` -> float -> str "3.5"; the `.` fails the charset (fail loud).
-    write_stories(tmp_path, "- id: 3.5\n  title: t\n  description: d\n")
-    with pytest.raises(stories.StoriesError, match="invalid id"):
-        stories.load_stories(tmp_path)
-
-
-def test_id_bad_charset_rejected(tmp_path):
-    write_stories(tmp_path, '- id: "a_b"\n  title: t\n  description: d\n')
-    with pytest.raises(stories.StoriesError, match="invalid id"):
-        stories.load_stories(tmp_path)
-
-
-def test_id_leading_dash_rejected(tmp_path):
-    write_stories(tmp_path, '- id: "-1"\n  title: t\n  description: d\n')
+@pytest.mark.parametrize(
+    "raw_id",
+    [
+        # `id: 3.5` -> float -> str "3.5"; the `.` fails the charset (fail loud).
+        # Unquoted on purpose, so YAML parses it as a float.
+        pytest.param("3.5", id="float"),
+        pytest.param('"a_b"', id="charset"),
+        pytest.param('"-1"', id="leading-dash"),
+    ],
+)
+def test_invalid_id_rejected(tmp_path, raw_id):
+    write_stories(tmp_path, f"- id: {raw_id}\n  title: t\n  description: d\n")
     with pytest.raises(stories.StoriesError, match="invalid id"):
         stories.load_stories(tmp_path)
 
@@ -695,8 +692,9 @@ def _symlinked_project_root(tmp_path: Path) -> Path:
     The two rows above cannot see a mixed-spelling message on their own: measured
     here, `tmp_path.resolve() == tmp_path`, so a raw operand and a dereferenced one
     are the same text and every spelling assertion passes either way.
-    Follows `test_bmadconfig.py`'s `worktree_isolation_conflict` symlink row,
-    including its skip for a Windows host without SeCreateSymbolicLink."""
+    Follows `test_bmadconfig.py`'s symlink row for `worktree_isolation_conflict`
+    (the disjoint-layout refusal's raw-equality fast path), including its skip for a
+    Windows host without SeCreateSymbolicLink."""
     target = tmp_path / "target"
     target.mkdir()
     root = tmp_path / "p"

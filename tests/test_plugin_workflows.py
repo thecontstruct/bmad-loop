@@ -20,9 +20,17 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from conftest import committing_crash_state, dev_effect, git, review_effect, write_sprint
+import pytest
+from conftest import (
+    committing_crash_state,
+    dev_effect,
+    git,
+    grant_plugin,
+    review_effect,
+    write_sprint,
+)
 
-from bmad_loop.adapters.base import SessionResult
+from bmad_loop.adapters.base import USAGE_LIMIT_WAIT, SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
 from bmad_loop.journal import Journal, load_state
@@ -105,6 +113,7 @@ def workflow_effect(captured: list, status: str = "completed"):
 
 
 def test_workflow_stages_and_lookup():
+    # no [python] -> declarative tier -> always active (like a declarative hook)
     reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest())])
     assert reg.workflow_stages() == frozenset({"post_dev_phase"})
     found = reg.workflows_for("post_dev_phase")
@@ -112,19 +121,14 @@ def test_workflow_stages_and_lookup():
     assert reg.workflows_for("post_review_result") == []
 
 
-def test_data_only_workflow_is_active():
-    # no [python] -> declarative tier -> always active (like a declarative hook)
-    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest())])
-    assert reg.workflows_for("post_dev_phase")
-
-
 def test_unenabled_python_workflow_is_inert():
     # a [python] plugin that wasn't enabled has instance=None: its module never
     # ran, so its workflow must not inject a session either.
     m = wf_manifest("gated", python=True)
     reg = PluginRegistry([LoadedPlugin(manifest=m, trusted=False)])
-    assert reg.workflow_stages() == frozenset({"post_dev_phase"})  # declared...
-    assert reg.workflows_for("post_dev_phase") == []  # ...but not active
+    assert m.workflows_for("post_dev_phase")  # declared...
+    assert reg.workflow_stages() == frozenset()  # ...but no stage guard (#496/#497)
+    assert reg.workflows_for("post_dev_phase") == []  # ...and not active
 
 
 def test_provided_workflows_names():
@@ -222,6 +226,13 @@ def test_workflow_injects_a_session_at_post_dev_phase(project):
     assert "workflow-start" in kinds and "workflow-end" in kinds
     starts = [e for e in engine.journal.entries() if e["kind"] == "workflow-start"]
     assert starts[0]["plugin"] == "wf" and starts[0]["workflow"] == "doc"
+    # a session that did its work leaves the no-work flag off the record (#727)
+    ends = [e for e in engine.journal.entries() if e["kind"] == "workflow-end"]
+    assert "produced_work" not in ends[0]
+    # the record names its workflow, so attempt-result lookups (DW-522) skip it;
+    # the primary sessions stay unlabeled
+    labels = {s.task_id: s.label for s in engine.state.tasks["1-1-a"].sessions}
+    assert labels == {"1-1-a-dev-1": "", "1-1-a-wf.doc-1": "wf.doc", "1-1-a-review-1": ""}
 
 
 def test_dev_and_review_sessions_carry_no_workflow_contract(project):
@@ -290,6 +301,118 @@ def test_blocking_workflow_env_fault_escalates_instead_of_deferring(project):
     end = [e for e in engine.journal.entries() if e["kind"] == "workflow-end"][-1]
     assert end["env_fault"] is True
     assert end["env_fault_evidence"] == evidence
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-deferred" not in kinds  # escalated, not deferred
+
+
+@pytest.mark.parametrize("env_fault", [True, False], ids=["env-fault-arm", "parked-arm"])
+def test_blocking_workflow_usage_limit_pause_records_reset_and_class(project, env_fault):
+    """DW-591: a blocking workflow's usage-limit pause records the resolved reset
+    and limit class on the run state.
+    ABLATION: escalate the workflow site's arm with `self._escalate` and this
+    fails."""
+    setup_story(project)
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf", blocking=True))])
+    evidence = "pane matched 'usage-pattern': session limi" + "t · resets 7:20pm"
+    reset = "2026-10-25T19:20:00+00:00"
+    limited = SessionResult(
+        status="stalled",
+        parked=True,
+        parked_evidence=evidence,
+        usage_limited=evidence,
+        env_fault=env_fault,
+        env_fault_evidence=evidence if env_fault else None,
+        usage_limit_resets=reset,
+        usage_limit_class=USAGE_LIMIT_WAIT,
+    )
+    engine, _ = make_engine(project, [dev_effect(project, "1-1-a"), limited], reg)
+    assert engine.run().paused
+
+    assert engine.state.paused_reason.startswith("usage limit: blocking workflow")
+    assert engine.state.paused_reset_at == reset
+    assert engine.state.paused_limit_class == USAGE_LIMIT_WAIT
+
+
+def test_blocking_workflow_parked_escalates_instead_of_deferring(project):
+    """DW-348/DW-350: a blocking workflow session the adapter ended parked (the CLI
+    was waiting on a human, so the stall nudge was withheld) escalates the run
+    (re-arm restores the budget) instead of deferring the story; the workflow-end
+    entry carries parked + evidence.
+
+    ABLATION: delete the blocking-workflow `parked` escalate arm in
+    `Engine._run_workflows` and the story is deferred instead — `summary.paused`
+    is False and a `story-deferred` entry lands."""
+    setup_story(project)
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf", blocking=True))])
+    evidence = "Notification(permission_prompt) -> PermissionPrompt"
+    script = [
+        dev_effect(project, "1-1-a"),
+        SessionResult(status="stalled", parked=True, parked_evidence=evidence),
+    ]
+    engine, _ = make_engine(project, script, reg)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert engine.state.paused_reason.startswith("parked: blocking workflow")
+    assert evidence in engine.state.paused_reason
+    end = [e for e in engine.journal.entries() if e["kind"] == "workflow-end"][-1]
+    assert end["parked"] is True
+    assert end["parked_evidence"] == evidence
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-deferred" not in kinds  # escalated, not deferred
+
+
+def test_blocking_workflow_no_work_escalates_instead_of_deferring(project):
+    """#727: a blocking workflow session that never did anything (a plain-adapter
+    session waiting out its timeout at a human-only prompt, `parked` unset)
+    escalates the run (re-arm restores the budget) instead of deferring the story;
+    the workflow-end entry carries `produced_work: False`.
+
+    ABLATION: delete the blocking-workflow no-work escalate arm in
+    `Engine._run_workflows` and the story is deferred instead — `summary.paused`
+    is False and a `story-deferred` entry lands."""
+    setup_story(project)
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf", blocking=True))])
+    script = [
+        dev_effect(project, "1-1-a"),
+        SessionResult(status="timeout", produced_work=False),
+    ]
+    engine, adapter = make_engine(project, script, reg)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert engine.state.paused_reason.startswith("no work produced: blocking workflow 'doc'")
+    assert len(adapter.sessions) == 2  # dev + the one workflow session, no relaunch
+    end = [e for e in engine.journal.entries() if e["kind"] == "workflow-end"][-1]
+    assert end["produced_work"] is False
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-deferred" not in kinds  # escalated, not deferred
+
+
+def test_blocking_workflow_silent_hook_channel_escalates_instead_of_deferring(project):
+    """#752: a blocking workflow session no hook event reached escalates the run
+    (re-arm restores the budget) instead of deferring the story for a relay
+    fault; the workflow-end entry carries `hook_channel_silent: True`.
+
+    ABLATION: delete the blocking-workflow silent-channel escalate arm in
+    `Engine._run_workflows` and the story is deferred instead."""
+    setup_story(project)
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf", blocking=True))])
+    script = [
+        dev_effect(project, "1-1-a"),
+        SessionResult(status="timeout", hook_channel_silent=True),
+    ]
+    engine, adapter = make_engine(project, script, reg)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert engine.state.paused_reason.startswith("hook channel silent: blocking workflow 'doc'")
+    assert len(adapter.sessions) == 2  # dev + the one workflow session, no relaunch
+    end = [e for e in engine.journal.entries() if e["kind"] == "workflow-end"][-1]
+    assert end["hook_channel_silent"] is True
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "story-deferred" not in kinds  # escalated, not deferred
 
@@ -445,6 +568,23 @@ def test_no_workflow_no_extra_session(project):
     # only the dev + review sessions ran (no injected third session)
     assert len(adapter.sessions) == 2
     assert not any(e["kind"].startswith("workflow") for e in engine.journal.entries())
+
+
+def test_ungranted_project_workflow_never_injects(project):
+    # #497: a dropped-in project plugin providing a workflow would inject an
+    # agent session into every story. Without a grant it is inert.
+    pdir = project.project / ".bmad-loop" / "plugins" / "rogue"
+    pdir.mkdir(parents=True)
+    (pdir / "plugin.toml").write_text(
+        '[plugin]\nname = "rogue"\napi_version = 1\n'
+        '[workflows.doc]\nstage = "post_dev_phase"\nrole = "review"\nprompt = "/doc {story_key}"\n'
+    )
+    engine, adapter = make_engine(project, one_story(project))  # the engine builds, no grants
+    summary = engine.run()
+    assert summary.done == 1
+    assert len(adapter.sessions) == 2  # dev + review only: nothing injected
+    assert not any(e["kind"].startswith("workflow") for e in engine.journal.entries())
+    assert [r.name for r in engine._registry.refusals] == ["rogue"]
 
 
 # ============================================= board ownership (#437, phase 3)
@@ -616,7 +756,9 @@ def test_example_plugin_full_cycle(project):
     install_example(project)
     setup_story(project)
     policy = example_policy(trailer="Automated-by: guardrails", forbid_epic=0)
-    reg = PluginRegistry.build(project.project, policy)
+    # a project plugin named in `enabled` runs only under an operator grant
+    grants = grant_plugin(project.project, "guardrails")
+    reg = PluginRegistry.build(project.project, policy, grants=grants)
     # the in-process module was trusted (enabled) and constructed
     assert reg.get("guardrails").instance is not None
 
@@ -644,8 +786,9 @@ def test_example_plugin_veto_gate_skips_parked_epic(project):
     setup_story(project)
     # park epic 1 -> the pre_dev_phase gate skips story 1-1-a before any session
     policy = example_policy(forbid_epic=1)
-    reg = PluginRegistry.build(project.project, policy)
-    engine, adapter = make_engine(project, [], reg, policy)  # empty script: no session launches
+    grants = grant_plugin(project.project, "guardrails")
+    # the engine builds the registry itself from the launch's grants
+    engine, adapter = make_engine(project, [], None, policy, plugin_grants=grants)  # no session
     summary = engine.run()
     assert summary.deferred == 1 and summary.done == 0
     assert not adapter.sessions  # vetoed before the dev session

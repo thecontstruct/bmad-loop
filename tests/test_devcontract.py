@@ -427,12 +427,6 @@ def test_synth_dw_ids_included(tmp_path):
     assert out.result_json["story_key"] is None
 
 
-def test_synth_baseline_commit_field_also_accepted(tmp_path):
-    sp = _spec(tmp_path / "s.md", baseline_field="baseline_commit", auto_run="done")
-    out = devcontract.synthesize_result(sp, story_key="1-1-a")
-    assert out.result_json["baseline_commit"].startswith("abc123")
-
-
 def test_synth_followup_review_recommended_true(tmp_path):
     sp = _spec(tmp_path / "s.md", status="done", auto_run="done", followup=True)
     out = devcontract.synthesize_result(sp, story_key="1-1-a")
@@ -482,14 +476,33 @@ def test_synth_awaiting_operator_synthesizes_no_escalation(tmp_path):
     """The distinction the whole state exists for: `blocked` means the session
     could not proceed and the run must halt; a park means it finished everything
     an agent could. A CRITICAL here would collapse the two into the pause
-    channel. `followup_review_recommended` is likewise absent — a parked story
-    does not route into the review loop at all."""
+    channel."""
     sp = _spec(tmp_path / "s.md", status="awaiting-operator", auto_run=None, actions="['do it']")
     out = devcontract.synthesize_result(sp, story_key="1-1-a")
 
     assert out.result_json["escalations"] == []
-    assert "followup_review_recommended" not in out.result_json
     assert out.result_json["park_asserted"] is False
+
+
+@pytest.mark.parametrize("followup", [True, False, None])
+def test_synth_awaiting_operator_carries_the_followup_recommendation(tmp_path, followup):
+    """A park skips the review loop, but its record keeps the session's follow-up
+    review recommendation for the operator, so the synthesis carries the
+    frontmatter flag on a park as it does on a success (an absent key reads
+    False, as on `done`). The engine's park record reads this key.
+
+    Ablation: drop the AWAITING_OPERATOR arm of the followup carry and the key is
+    absent, so every case fails."""
+    sp = _spec(
+        tmp_path / "s.md",
+        status="awaiting-operator",
+        auto_run="awaiting-operator",
+        followup=followup,
+        actions="['do it']",
+    )
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None and rj["followup_review_recommended"] is bool(followup)
 
 
 def test_synth_park_assertion_uses_only_the_last_real_marker(tmp_path):
@@ -564,6 +577,7 @@ def _artifact_only_spec(tmp_path, *, line: str | None = "Artifact only: true", e
         "**Artifact only: true**",
         "Artifact only: **true**",
         "Artifact only:\u00a0true",  # a non-ASCII horizontal space, as `Status:` tolerates
+        "Artifact  only: true",
     ],
     ids=[
         "prose",
@@ -574,15 +588,21 @@ def _artifact_only_spec(tmp_path, *, line: str | None = "Artifact only: true", e
         "bold-whole-line",
         "bold-value",
         "nbsp",
+        "separator-run",
     ],
 )
 def test_synth_mints_artifact_only_from_a_genuine_session_authored_marker(tmp_path, line):
     """The four-part shape `park_asserted` uses: a present, genuine (no synth
     note), session-authored marker carrying the line. The line tolerates the
-    same bullet/bold spellings `STATUS_LINE_RE` does.
+    same bullet/bold spellings `STATUS_LINE_RE` does, including the Status-like
+    bold shapes with a closing delimiter after the value ([balanced-bold],
+    [bold-whole-line]): the regex consumes it before the end-of-line anchor, so
+    the value is still `true` alone on the line.
 
     Ablation: drop the `"artifact_only"` key from the result and every parameter
-    fails on the `is True`."""
+    fails on the `is True`. Ablation: drop the trailing `(?:\\*\\*)?` from
+    `ARTIFACT_ONLY_LINE_RE` and [balanced-bold], [bold-whole-line] and
+    [bold-value] fall to the `$` anchor."""
     sp = _artifact_only_spec(tmp_path, line=line)
 
     rj = devcontract.synthesize_result(
@@ -592,42 +612,6 @@ def test_synth_mints_artifact_only_from_a_genuine_session_authored_marker(tmp_pa
     assert rj is not None and rj["status"] == "done"
     assert rj["artifact_only"] is True
     assert rj["park_asserted"] is False  # a done marker is no park
-
-
-def test_synth_artifact_only_missing_separator_fails_closed(tmp_path):
-    """The public grammar requires a separator between ``Artifact`` and ``only``.
-
-    Ablation: restore ``[ _-]*`` in ``ARTIFACT_ONLY_LINE_RE`` and both assertions
-    fail because the concatenated label mints an artifact-only receipt again.
-    """
-    sp = _artifact_only_spec(tmp_path, line="Artifactonly: true")
-
-    rj = devcontract.synthesize_result(
-        sp, story_key="dw-bundle", park_marker_session_authored=True
-    ).result_json
-
-    assert devcontract._artifact_only_asserted("Artifactonly: true") is False
-    assert rj is not None and rj["artifact_only"] is False
-
-
-def test_synth_artifact_only_balanced_bold_shapes_mint(tmp_path):
-    """The advertised Status-like bold shapes include a closing delimiter after
-    the value (`**Artifact only:** **true**`, `- **Artifact only: true**`); the
-    regex consumes it before the end-of-line anchor, so the value is still
-    `true` alone on the line.
-
-    Ablation: drop the trailing `(?:\\*\\*)?` from `ARTIFACT_ONLY_LINE_RE` and
-    both shapes fall to the `$` anchor."""
-    sp = _artifact_only_spec(tmp_path, line="**Artifact only:** **true**")
-    assert "- **Artifact only:** **true**\n" in sp.read_text(encoding="utf-8")
-
-    rj = devcontract.synthesize_result(
-        sp, story_key="dw-bundle", park_marker_session_authored=True
-    ).result_json
-
-    assert rj["artifact_only"] is True
-    assert devcontract._artifact_only_asserted("**Artifact only:** **true**") is True
-    assert devcontract._artifact_only_asserted("- **Artifact only: true**") is True
 
 
 def test_synth_artifact_only_newline_separated_value_fails_closed(tmp_path):
@@ -698,16 +682,6 @@ def test_synth_artifact_only_fenced_example_inside_the_marker_fails_closed(tmp_p
     ).result_json
 
     assert rj["artifact_only"] is False
-
-
-def test_synth_artifact_only_tolerates_a_run_of_separators(tmp_path):
-    sp = _artifact_only_spec(tmp_path, line="Artifact  only: true")
-
-    rj = devcontract.synthesize_result(
-        sp, story_key="dw-bundle", park_marker_session_authored=True
-    ).result_json
-
-    assert rj["artifact_only"] is True
 
 
 def test_synth_artifact_only_absent_line_fails_closed(tmp_path):
@@ -1002,6 +976,36 @@ def test_every_dev_primitive_has_a_fallback_result_prefix():
     assert not missing, f"dev primitives whose completion marker cannot be read back: {missing}"
 
 
+def test_find_result_artifact_ignores_ledger_in_initiative_folder(tmp_path):
+    """On v7 the scan root is the initiative folder, which also holds the
+    deferred-work ledger, the initiative file and the ticket breakdown. Each of
+    those is rewritten during a session, so each is fresher than the launch
+    floor, yet none carries a result marker: qualification stays marker-based
+    and the plan the bundle wrote is the only hit. With the plan gone nothing
+    qualifies, and the scan never falls back to the newest ``*.md``."""
+    import os
+
+    folder = tmp_path / "_bmad-output" / "initiative-checkout"
+    folder.mkdir(parents=True)
+    plan = _spec(folder / "plan-dw-bundle-1-retry-guard.md", status="built", auto_run="done")
+    os.utime(plan, ns=(2_000_000_000, 2_000_000_000))
+    for name, text in (
+        (
+            "deferred-work.md",
+            "# Deferred Work\n\n## DW-1: retry guard\n\n- status: done 2026-10-15\n"
+            "- source_spec: epic-auth/story-login-plan.md\n- summary: guard the retry\n",
+        ),
+        ("initiative-checkout.md", "---\nstatus: active\n---\n\n# Checkout\n"),
+    ):
+        (folder / name).write_text(text, encoding="utf-8")
+        os.utime(folder / name, ns=(3_000_000_000, 3_000_000_000))
+    (folder / "tickets.toml").write_text("[[epics]]\n", encoding="utf-8")
+
+    assert devcontract.find_result_artifact(folder, since_ns=1_000_000_000) == plan
+    plan.unlink()
+    assert devcontract.find_result_artifact(folder, since_ns=1_000_000_000) is None
+
+
 def test_find_artifact_ignores_fence_quoted_heading(tmp_path):
     """A spec whose only `## Auto Run Result` is a fenced example must not
     qualify as a terminal artifact, even with a fresh mtime — otherwise the
@@ -1026,6 +1030,193 @@ def test_find_artifact_ignores_heading_in_longer_outer_fence(tmp_path):
         encoding="utf-8",
     )
     assert devcontract.find_result_artifact(tmp_path, since_ns=0) is None
+
+
+# ------------------------------------------------------- find_nested_result_hints
+
+
+def _deep_spec(path: Path, **kwargs) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return _spec(path, **kwargs)
+
+
+def test_nested_hints_names_marker_and_frontmatter_specs_one_level_down(tmp_path):
+    marked = _deep_spec(tmp_path / "a" / "spec-1-1-x.md", auto_run="done")
+    bare = _deep_spec(tmp_path / "b" / "spec-1-2-y.md", auto_run=None)
+    _deep_spec(tmp_path / "spec-flat.md")  # directly in the dir: the flat scan's job, not a hint
+    _deep_spec(tmp_path / "a" / "deeper" / "spec-1-3-z.md")  # two levels down: never probed
+    assert devcontract.find_nested_result_hints(tmp_path, since_ns=0) == ([marked, bare], None)
+
+
+def test_nested_hints_keep_the_launch_floor(tmp_path):
+    old = _deep_spec(tmp_path / "stories" / "spec-1-1-x.md")
+    os.utime(old, ns=(1_000_000_000, 1_000_000_000))
+    assert devcontract.find_nested_result_hints(tmp_path, since_ns=5_000_000_000) == ([], None)
+
+
+def test_nested_hints_cap_at_limit(tmp_path):
+    for i in range(5):
+        _deep_spec(tmp_path / f"d{i}" / f"spec-1-{i}-x.md")
+    hits, fault = devcontract.find_nested_result_hints(tmp_path, since_ns=0, limit=2)
+    assert fault is None
+    assert hits == [tmp_path / "d0" / "spec-1-0-x.md", tmp_path / "d1" / "spec-1-1-x.md"]
+
+
+def test_nested_hints_dedupe_preserving_order(tmp_path, monkeypatch):
+    """The two finders never overlap today (a marker excludes a spec from the
+    frontmatter scan), so overlap is forced: a later finder repeating a path must
+    neither duplicate it nor spend the limit on it."""
+    (tmp_path / "stories").mkdir()
+    a, b = tmp_path / "stories" / "a.md", tmp_path / "stories" / "b.md"
+    monkeypatch.setattr(devcontract, "find_result_artifact", lambda d, *, since_ns: a)
+    monkeypatch.setattr(devcontract, "find_frontmatter_candidates", lambda d, *, since_ns: [a, b])
+    assert devcontract.find_nested_result_hints(tmp_path, since_ns=0) == ([a, b], None)
+
+
+def test_nested_hints_non_dir_input_is_not_a_fault(tmp_path):
+    assert devcontract.find_nested_result_hints(tmp_path / "ghost", since_ns=0) == ([], None)
+    (tmp_path / "file.md").write_text("x", encoding="utf-8")
+    assert devcontract.find_nested_result_hints(tmp_path / "file.md", since_ns=0) == ([], None)
+
+
+def test_nested_hints_skip_symlinked_subdirs(tmp_path):
+    outside = tmp_path / "outside"
+    _deep_spec(outside / "spec-1-1-x.md")
+    impl = tmp_path / "impl"
+    impl.mkdir()
+    try:
+        (impl / "stories").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    assert devcontract.find_nested_result_hints(impl, since_ns=0) == ([], None)
+
+
+def test_nested_hints_listing_fault_is_reported_not_empty(tmp_path, monkeypatch):
+    _deep_spec(tmp_path / "stories" / "spec-1-1-x.md")
+
+    def boom(self):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "iterdir", boom)
+    assert devcontract.find_nested_result_hints(tmp_path, since_ns=0) == (
+        [],
+        "PermissionError: denied",
+    )
+
+
+def _deny_open_of(monkeypatch, denied: Path) -> None:
+    real_open = Path.open
+
+    def guarded(self, *args, **kwargs):
+        if self == denied:
+            raise PermissionError(13, "denied", str(self))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded)
+
+
+def test_nested_hints_report_an_unreadable_file_beside_a_hit(tmp_path, monkeypatch):
+    """A nested `*.md` that cannot be opened is a fault, not "no match" — it may be
+    the very spec the layout hides. Its readable sibling is still named. The denied
+    file is non-terminal, so the finders pass over it on every Python whether or not
+    their reads route through `Path.open`.
+
+    Ablation: drop the `_unreadable` probe loop and the fault is None."""
+    hit = _deep_spec(tmp_path / "stories" / "spec-1-1-x.md")
+    bad = _deep_spec(tmp_path / "stories" / "spec-1-2-y.md", status="in-progress", auto_run=None)
+    _deny_open_of(monkeypatch, bad)
+
+    hits, fault = devcontract.find_nested_result_hints(tmp_path, since_ns=0)
+
+    assert hits == [hit]
+    assert fault is not None
+    assert f"could not read {bad}: PermissionError" in fault
+
+
+def test_nested_hints_ignore_an_unreadable_file_below_the_launch_floor(tmp_path, monkeypatch):
+    """A file older than the launch floor could not have been this session's spec,
+    so failing to open it is not worth a fault."""
+    old = _deep_spec(tmp_path / "stories" / "spec-1-1-x.md", status="in-progress", auto_run=None)
+    os.utime(old, ns=(1_000_000_000, 1_000_000_000))
+    _deny_open_of(monkeypatch, old)
+
+    assert devcontract.find_nested_result_hints(tmp_path, since_ns=5_000_000_000) == ([], None)
+
+
+def test_nested_hints_report_a_read_fault_after_a_successful_open(tmp_path, monkeypatch):
+    """The finders fail on the read, not just the open (EIO on a flaky mount), so
+    the probe must read too: a file that opens but cannot be read is a fault.
+
+    Ablation: open without reading and the fault is None."""
+    bad = _deep_spec(tmp_path / "stories" / "spec-1-1-x.md", status="in-progress", auto_run=None)
+    real_open = Path.open
+
+    class _EioReader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, *args):
+            raise OSError(5, "Input/output error")
+
+    def guarded(self, *args, **kwargs):
+        return _EioReader() if self == bad else real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded)
+
+    hits, fault = devcontract.find_nested_result_hints(tmp_path, since_ns=0)
+
+    assert hits == []
+    assert fault is not None
+    assert f"could not read {bad}: OSError" in fault
+
+
+def test_nested_hints_keep_earlier_hits_when_a_later_subdir_faults(tmp_path, monkeypatch):
+    """A fault probing one subdirectory is reported beside the hits already found
+    in others — never trades the named nested spec for a bare fault.
+
+    Ablation: let the per-child OSError escape the loop and the hits are lost."""
+    hit = _deep_spec(tmp_path / "a" / "spec-1-1-x.md")
+    (tmp_path / "b").mkdir()
+    real_find = devcontract.find_result_artifact
+
+    def find(d, *, since_ns):
+        if d.name == "b":
+            raise PermissionError(13, "denied", str(d))
+        return real_find(d, since_ns=since_ns)
+
+    monkeypatch.setattr(devcontract, "find_result_artifact", find)
+
+    hits, fault = devcontract.find_nested_result_hints(tmp_path, since_ns=0)
+
+    assert hits == [hit]
+    assert fault is not None
+    assert f"could not probe {tmp_path / 'b'}: PermissionError" in fault
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions; root bypasses them"
+)
+def test_nested_hints_report_an_unlistable_subdir(tmp_path):
+    """`Path.glob` swallows a listing fault and yields nothing, so a subdirectory
+    that cannot be listed would read as "nothing nested". It is a fault instead,
+    and a readable sibling's hit is still named.
+
+    Ablation: drop the explicit `os.listdir(child)` and the fault is None."""
+    hit = _deep_spec(tmp_path / "a" / "spec-1-1-x.md")
+    locked = tmp_path / "b"
+    _deep_spec(locked / "spec-1-2-y.md")
+    locked.chmod(0o000)
+    try:
+        hits, fault = devcontract.find_nested_result_hints(tmp_path, since_ns=0)
+    finally:
+        locked.chmod(0o755)
+
+    assert hits == [hit]
+    assert fault is not None
+    assert f"could not probe {locked}: PermissionError" in fault
 
 
 # The read-back decodes artifacts as UTF-8. A spec truncated mid-write (the CLI
@@ -1444,47 +1635,47 @@ def test_strip_auto_run_result_no_ops_on_a_cr_only_spec(tmp_path):
     assert sp.read_bytes() == original.encode("utf-8")
 
 
-def test_strip_auto_run_result_ignores_heading_quoted_in_code_fence(tmp_path):
+@pytest.mark.parametrize(
+    "fenced",
+    [
+        pytest.param("```md\n## Auto Run Result\n\nStatus: done\n```\n", id="code-fence"),
+        pytest.param("  ```md\n## Auto Run Result\n\nStatus: done\n  ```\n", id="indented-fence"),
+        pytest.param(
+            "- outer bullet\n  - inner bullet, fenced example:\n"
+            "    ```md\n    ## Auto Run Result\n\n    Status: done\n    ```\n",
+            id="list-indented-fence",
+        ),
+        pytest.param(
+            "````\n```\n## Auto Run Result\n\nStatus: done\n````\n", id="longer-outer-fence"
+        ),
+        pytest.param(
+            "~~~\n```\n## Auto Run Result\n\nStatus: done\n~~~\n", id="mismatched-fence-char"
+        ),
+    ],
+)
+def test_strip_auto_run_result_ignores_a_fenced_heading(tmp_path, fenced):
     """A spec whose frozen intent quotes the heading inside a fenced example must
     not lose that content — stripping is destructive, so fenced pseudo-headings
-    are not sections."""
+    are not sections, and the strip no-ops.
+
+    - code-fence: the plain fenced example.
+    - indented-fence: fences may be indented up to three spaces (CommonMark) — a
+      heading quoted inside one is still fenced content, not a section.
+    - list-indented-fence: reviewer guard (#53): a heading quoted inside a fence
+      nested under list indentation (4+ absolute leading spaces) is co-indented
+      with the fence. `_FENCE_LINE_RE` only recognizes 0-3-space fences, so this
+      fence is not tracked — but the heading is likewise indented and can never
+      match the column-0-anchored `AUTO_RUN_HEADING_RE`, so there is nothing to
+      strip. Locks that symmetry: giving the heading regex any leading-space
+      tolerance would reopen this as a destructive false-positive on quoted spec
+      prose.
+    - longer-outer-fence: a 4-backtick block that contains a lone inner ``` line
+      must be preserved. Line parity would flip on the inner ``` and strip the
+      fenced documentation.
+    - mismatched-fence-char: a ``` line inside a ~~~ fence is content, not a
+      close — the fenced heading after it is documentation and must survive."""
     sp = tmp_path / "spec.md"
-    original = (
-        "---\nstatus: draft\n---\n\n## Intent\n\n"
-        "```md\n## Auto Run Result\n\nStatus: done\n```\n\nmore body\n"
-    )
-    sp.write_text(original, encoding="utf-8")
-    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
-    assert sp.read_text() == original
-
-
-def test_strip_auto_run_result_ignores_heading_in_indented_fence(tmp_path):
-    """Fences may be indented up to three spaces (CommonMark) — a heading quoted
-    inside one is still fenced content, not a section."""
-    sp = tmp_path / "spec.md"
-    original = (
-        "---\nstatus: draft\n---\n\n## Intent\n\n"
-        "  ```md\n## Auto Run Result\n\nStatus: done\n  ```\n\nmore body\n"
-    )
-    sp.write_text(original, encoding="utf-8")
-    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
-    assert sp.read_text() == original
-
-
-def test_strip_auto_run_result_ignores_list_indented_fence(tmp_path):
-    """Reviewer guard (#53): a `## Auto Run Result` quoted inside a fence nested
-    under list indentation (4+ absolute leading spaces) is co-indented with the
-    fence. `_FENCE_LINE_RE` only recognizes 0-3-space fences, so this fence is not
-    tracked — but the heading is likewise indented and can never match the
-    column-0-anchored `AUTO_RUN_HEADING_RE`, so there is nothing to strip. Locks
-    that symmetry: giving the heading regex any leading-space tolerance would
-    reopen this as a destructive false-positive on quoted spec prose."""
-    sp = tmp_path / "spec.md"
-    original = (
-        "---\nstatus: draft\n---\n\n## Intent\n\n"
-        "- outer bullet\n  - inner bullet, fenced example:\n"
-        "    ```md\n    ## Auto Run Result\n\n    Status: done\n    ```\n\nmore body\n"
-    )
+    original = "---\nstatus: draft\n---\n\n## Intent\n\n" + fenced + "\nmore body\n"
     sp.write_text(original, encoding="utf-8")
     assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
     assert sp.read_text() == original
@@ -1602,33 +1793,6 @@ def test_reset_spec_for_replan_restores_when_strip_finds_spec_missing(tmp_path, 
     with pytest.raises(FileNotFoundError, match="vanished during result strip"):
         devcontract.reset_spec_for_replan(sp, confine_root=tmp_path)
     assert sp.read_bytes() == original
-
-
-def test_strip_auto_run_result_ignores_heading_in_longer_outer_fence(tmp_path):
-    """Destructive-op guard: a `## Auto Run Result` fenced inside a 4-backtick
-    block that contains a lone inner ``` line must be preserved (no-op). Line
-    parity would flip on the inner ``` and strip the fenced documentation."""
-    sp = tmp_path / "spec.md"
-    original = (
-        "---\nstatus: draft\n---\n\n## Intent\n\n"
-        "````\n```\n## Auto Run Result\n\nStatus: done\n````\n\nmore body\n"
-    )
-    sp.write_text(original, encoding="utf-8")
-    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
-    assert sp.read_text() == original
-
-
-def test_strip_auto_run_result_ignores_heading_in_mismatched_fence_char(tmp_path):
-    """A ``` line inside a ~~~ fence is content, not a close — the fenced
-    `## Auto Run Result` after it is documentation and must survive."""
-    sp = tmp_path / "spec.md"
-    original = (
-        "---\nstatus: draft\n---\n\n## Intent\n\n"
-        "~~~\n```\n## Auto Run Result\n\nStatus: done\n~~~\n\nmore body\n"
-    )
-    sp.write_text(original, encoding="utf-8")
-    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
-    assert sp.read_text() == original
 
 
 # ------------------------------- find_frontmatter_candidates (#224)
@@ -1873,7 +2037,7 @@ def test_repair_write_failure_never_truncates_spec(tmp_path, monkeypatch, writer
     simply never fire, a silent false green. `pytest.raises` is what catches it."""
     sp = _write(tmp_path, "spec-a.md", original)
 
-    def boom(path, data, *, confine_root, require_writable_target=False):
+    def boom(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         raise OSError("no space left on device")
 
     monkeypatch.setattr(devcontract, "atomic_write_bytes_confined", boom)
@@ -1906,7 +2070,7 @@ def test_atomic_write_spec_hands_the_helper_bytes_not_text(tmp_path, monkeypatch
     seen: list[bytes | str] = []
     real = devcontract.atomic_write_bytes_confined
 
-    def record(path, data, *, confine_root, require_writable_target=False):
+    def record(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         seen.append(data)
         blob = data if isinstance(data, bytes) else data.encode("utf-8")
         real(
@@ -1914,6 +2078,7 @@ def test_atomic_write_spec_hands_the_helper_bytes_not_text(tmp_path, monkeypatch
             blob,
             confine_root=confine_root,
             require_writable_target=require_writable_target,
+            root_identity=root_identity,
         )
 
     # the CONFINED binding (#593) — the arm an in-tree spec takes. Patching
@@ -2085,7 +2250,7 @@ def test_operator_confirmation_write_failure_raises_and_keeps_the_spec(tmp_path,
     never made."""
     sp = _write(tmp_path, "spec-a.md", _PARKED)
 
-    def boom(path, data, *, confine_root, require_writable_target=False):
+    def boom(path, data, *, confine_root, require_writable_target=False, root_identity=None):
         raise OSError("no space left on device")
 
     # the CONFINED binding: `sp` is under `tmp_path`, so the chokepoint takes that
@@ -2380,7 +2545,7 @@ def test_parse_deferred_findings_defaults_optional_fields_and_coerces_scalars():
     ]
 
 
-@pytest.mark.parametrize("field", ["summary", "evidence", "location"])
+@pytest.mark.parametrize("field", ["summary", "evidence", "location", "severity"])
 @pytest.mark.parametrize("collection", [["nested", "values"], {"nested": "value"}])
 def test_parse_deferred_findings_rejects_collection_valued_text_fields(field, collection):
     """A malformed optional field costs its whole item too: silently dropping
@@ -2396,7 +2561,7 @@ def test_parse_deferred_findings_rejects_collection_valued_text_fields(field, co
     assert malformed == [f"item 1: `{field}` is not a scalar (got {type(collection).__name__})"]
 
 
-@pytest.mark.parametrize("field", ["summary", "evidence", "location"])
+@pytest.mark.parametrize("field", ["summary", "evidence", "location", "severity"])
 @pytest.mark.parametrize("value", ["before\0after", "x" * 1001 + "\0"])
 def test_parse_deferred_findings_rejects_embedded_nul_in_text_fields(field, value):
     """Reject before clamping too, so a late NUL cannot evade the stated schema."""
@@ -2409,7 +2574,11 @@ def test_parse_deferred_findings_rejects_embedded_nul_in_text_fields(field, valu
     assert malformed == [f"item 1: `{field}` contains a NUL character"]
 
 
-def test_parse_deferred_findings_normalizes_known_severity_and_drops_unknown(tmp_path):
+def test_parse_deferred_findings_normalizes_known_severity_and_keeps_unknown_as_declared(
+    tmp_path,
+):
+    """An unrecognized severity leaves `severity` empty but is never discarded:
+    the declared text rides along so the harvest can file and journal it (#913)."""
     fm = _deferred_spec(
         tmp_path / "spec.md",
         [
@@ -2420,7 +2589,29 @@ def test_parse_deferred_findings_normalizes_known_severity_and_drops_unknown(tmp
     )
     findings, malformed = devcontract.parse_deferred_findings(fm)
     assert malformed == []
-    assert [finding.severity for finding in findings] == ["critical", "high", ""]
+    assert [(f.severity, f.declared_severity) for f in findings] == [
+        ("critical", ""),
+        ("high", ""),
+        ("", "spicy"),
+    ]
+
+
+def test_parse_deferred_findings_keeps_qualified_severity_level_and_text(tmp_path):
+    """The leading word carries the level; the qualifier is kept as declared
+    text, while a bare alias in any case or padding says nothing more (#913)."""
+    fm = _deferred_spec(
+        tmp_path / "spec.md",
+        [
+            {"summary": "a", "severity": "high (unverified)"},
+            {"summary": "b", "severity": " HIGH "},
+        ],
+    )
+    findings, malformed = devcontract.parse_deferred_findings(fm)
+    assert malformed == []
+    assert [(f.severity, f.declared_severity) for f in findings] == [
+        ("high", "high (unverified)"),
+        ("high", ""),
+    ]
 
 
 def test_parse_deferred_findings_isolates_each_malformed_item(tmp_path):
@@ -2538,3 +2729,494 @@ def test_harvest_fingerprint_marks_sha1_as_non_security_use(monkeypatch):
     monkeypatch.setattr(devcontract.hashlib, "sha1", recording_sha1)
     assert devcontract.harvest_fingerprint("a", "b") == "4a3dec2d1f82"
     assert seen == [False]
+
+
+# --------------------------------------------- worktree-mount pin (DW-423)
+#
+# `root_identity=` threads through `_atomic_write_spec` for the writers a
+# `live_spec_root` caller reaches. The swap: the mount renamed aside and a link
+# planted at its name to an outside tree carrying the same spec subpath.
+
+requires_symlinked_mount_swap = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES or sys.platform == "win32",
+    reason="dir-fd anchoring and POSIX symlinks",
+)
+
+_MOUNT_SPEC = "---\nstatus: done\n---\n\n## Intent\n\nbody\n\n## Auto Run Result\n\nStatus: done\n"
+
+
+def _mount_swap_pair(tmp_path: Path) -> tuple[Path, Path, os.stat_result]:
+    """(mount, outside spec, the mount's accepted identity), the swap already made."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_MOUNT_SPEC, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    (outside / "specs" / "6-4.md").write_text(_MOUNT_SPEC, encoding="utf-8")
+    mount.rename(mount.with_name("1-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    return mount, outside / "specs" / "6-4.md", identity
+
+
+@requires_symlinked_mount_swap
+def test_strip_auto_run_result_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """The pinned strip refuses a swapped mount; outside bytes unchanged. The unpinned
+    control shows the same swap really strips the outside copy.
+
+    Ablation: drop the `root_identity=` forward in `strip_auto_run_result` (or in
+    `_atomic_write_spec`) and the pinned call strips the outside copy instead."""
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.strip_auto_run_result(spec, confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == _MOUNT_SPEC
+
+    assert devcontract.strip_auto_run_result(spec, confine_root=mount)  # control
+    assert "## Auto Run Result" not in outside_spec.read_text(encoding="utf-8")
+
+
+@requires_symlinked_mount_swap
+def test_reset_spec_for_replan_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """The pinned replan refuses a swapped mount at its first write; outside bytes
+    unchanged. The unpinned control shows the same swap really replans the outside
+    copy.
+
+    Ablation: drop the `root_identity=` forward from `reset_spec_for_replan` to
+    `reset_spec_status` and the pinned call resets the outside copy to draft."""
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.reset_spec_for_replan(spec, confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == _MOUNT_SPEC
+
+    assert devcontract.reset_spec_for_replan(spec, confine_root=mount)  # control
+    replanned = outside_spec.read_text(encoding="utf-8")
+    assert "status: draft" in replanned and "## Auto Run Result" not in replanned
+
+
+@requires_symlinked_mount_swap
+def test_reset_spec_for_replan_pinned_restore_refuses_a_mount_swapped_mid_replan(
+    tmp_path, monkeypatch
+):
+    """The replan's RESTORE is pinned too: a mount swapped after the reset landed
+    fails the strip, and the undo then refuses to write through the link rather
+    than landing the preimage outside.
+
+    Ablation: drop the `root_identity=` forward on the restore `_atomic_write_spec`
+    call and the undo writes the preimage into the outside copy."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    spec = mount / "specs" / "6-4.md"
+    spec.write_text(_MOUNT_SPEC, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    outside_spec = outside / "specs" / "6-4.md"
+    real_strip = devcontract.strip_auto_run_result
+
+    def swap_then_strip(path, **kwargs):
+        # The reset has landed in the real mount; swap the mount for a link to a
+        # copy of what is there now, so the strip and the undo both hit the link.
+        outside_spec.write_bytes(spec.read_bytes())
+        mount.rename(mount.with_name("1-aside"))
+        mount.symlink_to(outside, target_is_directory=True)
+        return real_strip(path, **kwargs)
+
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", swap_then_strip)
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.reset_spec_for_replan(spec, confine_root=mount, root_identity=identity)
+    swapped_in = outside_spec.read_text(encoding="utf-8")
+    assert "status: draft" in swapped_in  # the reset's bytes, never the undo's preimage
+    assert swapped_in != _MOUNT_SPEC
+
+
+_MARKERLESS_SPEC = "---\nstatus: done\n---\n\n## Intent\n\nbody\n"
+
+
+@requires_symlinked_mount_swap
+def test_append_auto_run_result_pinned_mount_refuses_a_mount_swapped_for_a_link(tmp_path):
+    """DW-445: the marker-repair append is pinned like the DW-423 writers — a mount
+    swapped for a link refuses and the outside copy is unchanged. The unpinned
+    control shows the same swap really appends to the outside copy.
+
+    Ablation: drop the `root_identity=` forward from `append_auto_run_result` to
+    `_atomic_write_spec` and the pinned call appends the marker outside."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    (mount / "specs").mkdir(parents=True)
+    (mount / "specs" / "6-4.md").write_text(_MARKERLESS_SPEC, encoding="utf-8")
+    identity = os.lstat(mount)
+    outside = tmp_path / "outside"
+    (outside / "specs").mkdir(parents=True)
+    outside_spec = outside / "specs" / "6-4.md"
+    outside_spec.write_text(_MARKERLESS_SPEC, encoding="utf-8")
+    mount.rename(mount.with_name("1-aside"))
+    mount.symlink_to(outside, target_is_directory=True)
+    spec = mount / "specs" / "6-4.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.append_auto_run_result(spec, "done", confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == _MARKERLESS_SPEC
+
+    assert devcontract.append_auto_run_result(spec, "done", confine_root=mount)  # control
+    assert "## Auto Run Result" in outside_spec.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("writer", ["reset_spec_status", "append_auto_run_result"])
+def test_pinned_writers_keep_the_missing_spec_no_op_for_a_gone_mount(tmp_path, writer):
+    """DW-445 "mount gone" row: the engine takes the identity of a mount that no
+    longer exists — `runs.mount_root_identity` answers never-matching, not a raise —
+    and the pinned writer still answers its missing-spec ``False`` before any open,
+    so a gone mount stays the no-op it was rather than becoming a refusal."""
+    from bmad_loop import runs
+
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    mount.mkdir(parents=True)
+    record = (os.lstat(mount).st_dev, os.lstat(mount).st_ino)  # recorded at the mint
+    mount.rmdir()  # gone since
+    identity = runs.mount_root_identity(mount, mount=mount, recorded=record)
+    spec = mount / "specs" / "6-4.md"
+
+    if writer == "reset_spec_status":
+        wrote = devcontract.reset_spec_status(
+            spec, "in-progress", confine_root=mount, root_identity=identity
+        )
+    else:
+        wrote = devcontract.append_auto_run_result(
+            spec, "done", confine_root=mount, root_identity=identity
+        )
+
+    assert wrote is False
+    assert not mount.exists()
+
+
+@requires_symlinked_mount_swap
+@pytest.mark.parametrize("writer", ["reset_spec_status", "append_auto_run_result"])
+def test_atomic_write_spec_external_arm_refuses_a_swapped_pinned_root(tmp_path, writer):
+    """DW-445: `_atomic_write_spec`'s external arm pre-checks a given pin. The spec's
+    RESOLVED spelling after a mount swap lies outside ``confine_root`` — what the
+    engine's resets write — so the pinned write refuses and the outside bytes are
+    unchanged; the unpinned control writes them as before.
+
+    Ablation: drop the `require_root_pinned` pre-check from `_atomic_write_spec`'s
+    external arm and the pinned call rewrites the outside copy."""
+    text = _MARKERLESS_SPEC if writer == "append_auto_run_result" else _MOUNT_SPEC
+    mount, outside_spec, identity = _mount_swap_pair(tmp_path)
+    outside_spec = outside_spec.resolve()
+    outside_spec.write_text(text, encoding="utf-8")
+
+    def write(**kw):
+        if writer == "reset_spec_status":
+            return devcontract.reset_spec_status(outside_spec, "in-progress", **kw)
+        return devcontract.append_auto_run_result(outside_spec, "done", **kw)
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="pinned to"):
+        write(confine_root=mount, root_identity=identity)
+    assert outside_spec.read_text(encoding="utf-8") == text
+
+    assert write(confine_root=mount)  # control: unpinned, unchanged behaviour
+    assert outside_spec.read_text(encoding="utf-8") != text
+
+
+@requires_symlinked_mount_swap
+def test_atomic_write_spec_external_arm_writes_through_an_intact_pinned_root(tmp_path):
+    """An intact pinned mount whose `_bmad-output` is a link resolving outside it:
+    the pre-check passes and the write lands exactly as unpinned."""
+    mount = tmp_path / "project" / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    mount.mkdir(parents=True)
+    shared = tmp_path / "shared-output"
+    (shared / "specs").mkdir(parents=True)
+    spec = (shared / "specs" / "6-4.md").resolve()
+    spec.write_text(_MOUNT_SPEC, encoding="utf-8")
+    (mount / "_bmad-output").symlink_to(shared, target_is_directory=True)
+
+    assert devcontract.reset_spec_status(
+        spec, "in-progress", confine_root=mount, root_identity=os.lstat(mount)
+    )
+    assert "status: in-progress" in spec.read_text(encoding="utf-8")
+
+
+# ---------------------------------- the session's environment-fault claim (DW-523)
+
+
+def _env_fault_spec(tmp_path, *, line: str | None, extra: str = ""):
+    """A done spec whose genuine marker carries (or omits) an environment-fault line."""
+    marker = "\n## Auto Run Result\n\n- Status: done\n"
+    if line is not None:
+        marker += f"{line}\n"
+    marker += extra
+    return _spec(tmp_path / "s.md", status="done", auto_run=None, body_extra=marker)
+
+
+@pytest.mark.parametrize(
+    ("line", "claim"),
+    [
+        ("Environment fault: postgres container is down", "postgres container is down"),
+        ("- Environment fault: postgres container is down", "postgres container is down"),
+        ("- **Environment fault:** postgres down", "postgres down"),
+        ("**Environment fault: postgres down**", "postgres down"),
+        ("environment_fault: postgres down", "postgres down"),
+        ("Environment fault: postgres down  ", "postgres down"),
+    ],
+    ids=["prose", "bullet", "bold-label", "bold-line", "snake", "nbsp-trailing-space"],
+)
+def test_environment_fault_line_synthesizes_claim(tmp_path, line, claim):
+    """A genuine marker's `Environment fault:` line becomes ``env_fault_claim``
+    — bullet/bold tolerant like the artifact-only line — and the claim changes
+    nothing else in the result: status and escalations stay the session's own.
+    No authorship proof is needed (the claim only triggers a probe).
+
+    Ablation: drop the ``env_fault_claim`` write in ``synthesize_result`` and
+    every parameter fails."""
+    sp = _env_fault_spec(tmp_path, line=line)
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None
+    assert rj["env_fault_claim"] == claim
+    assert rj["status"] == "done"
+    assert rj["escalations"] == []
+
+
+def test_environment_fault_claim_is_bounded(tmp_path):
+    sp = _env_fault_spec(tmp_path, line="Environment fault: " + "x" * 2000)
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None
+    assert rj["env_fault_claim"] == "x" * devcontract.ENV_FAULT_CLAIM_LIMIT
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "\n```\nEnvironment fault: postgres down\n```\n",
+        f"Environment fault: postgres down\n\n{devcontract.ORCHESTRATOR_SYNTH_NOTE}\n",
+    ],
+    ids=["fenced", "orchestrator-synth"],
+)
+def test_fenced_or_orchestrator_env_fault_line_is_not_a_claim(tmp_path, extra):
+    """A fenced example inside the marker is documentation, and a marker the
+    orchestrator synthesized speaks for no session — neither is a claim.
+
+    Ablation: drop the ``_fenced`` skip in ``_env_fault_claim_of`` (fenced) or
+    the ``ORCHESTRATOR_SYNTH_NOTE`` guard in ``synthesize_result``
+    (orchestrator-synth) and that parameter fails."""
+    sp = _env_fault_spec(tmp_path, line=None, extra=extra)
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None
+    assert "env_fault_claim" not in rj
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Environment fault:",
+        "Environment fault:   ",
+        "- **Environment fault:** ****",
+        "Environment fault:\npostgres down",
+        "Environment fault:\x0bpostgres down",
+    ],
+    ids=["bare", "spaces", "bold-only", "next-line", "vertical-tab"],
+)
+def test_blank_env_fault_line_is_not_a_claim(tmp_path, line):
+    """A label with no text on its own line claims nothing — the text is never
+    borrowed from the following line.
+
+    Ablation: drop the ``if text`` check in ``_env_fault_claim_of`` and the
+    blank parameters fail."""
+    sp = _env_fault_spec(tmp_path, line=line)
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None
+    assert "env_fault_claim" not in rj
+
+
+def test_env_fault_claim_reads_only_the_last_real_marker(tmp_path):
+    """A claim in an earlier marker is a previous session's word, not this one's."""
+    body = (
+        "\n## Auto Run Result\n\nStatus: blocked\nEnvironment fault: db down\n"
+        "\n## Auto Run Result\n\nStatus: done\n"
+    )
+    sp = _spec(tmp_path / "s.md", status="done", auto_run=None, body_extra=body)
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None
+    assert "env_fault_claim" not in rj
+
+
+# ------------------------------------- BMAD v7 ticket terminals (built / dropped)
+#
+# A ticket session passes `success_statuses`: ("built",) for dev, ("built",
+# "done") for review. Every v6 caller passes nothing and must keep today's
+# answers byte for byte.
+
+_TICKET_DEV = (devcontract.BUILT,)
+_TICKET_REVIEW = (devcontract.BUILT, devcontract.DONE)
+
+
+def test_terminal_statuses_default_is_the_v6_set():
+    assert devcontract.terminal_statuses() == devcontract.DEFAULT_TERMINAL
+    assert devcontract.DEFAULT_TERMINAL == {"done", "blocked", "awaiting-operator"}
+    assert devcontract.terminal_statuses(plan_halt=True) == {
+        "done",
+        "blocked",
+        "awaiting-operator",
+        "ready-for-dev",
+    }
+
+
+def test_terminal_statuses_ticket_contract_adds_dropped():
+    assert devcontract.terminal_statuses(_TICKET_DEV) == {
+        "built",
+        "blocked",
+        "awaiting-operator",
+        "dropped",
+    }
+    assert devcontract.terminal_statuses(_TICKET_REVIEW) == {
+        "built",
+        "done",
+        "blocked",
+        "awaiting-operator",
+        "dropped",
+    }
+
+
+@pytest.mark.parametrize("success", [_TICKET_DEV, _TICKET_REVIEW])
+def test_synthesize_built_is_terminal_only_when_in_success_statuses(tmp_path, success):
+    sp = _spec(tmp_path / "plan.md", status="built", auto_run=None)
+
+    assert devcontract.synthesize_result(sp, story_key="1.1").result_json is None
+    out = devcontract.synthesize_result(sp, story_key="1.1", success_statuses=success)
+    rj = out.result_json
+    assert rj is not None and rj["status"] == "built"
+    assert rj["escalations"] == []
+    assert out.status_consistent
+
+
+def test_built_carries_followup_review_recommended(tmp_path):
+    sp = _spec(tmp_path / "plan.md", status="built", auto_run="built", followup=True)
+    rj = devcontract.synthesize_result(
+        sp, story_key="1.1", success_statuses=_TICKET_DEV
+    ).result_json
+    assert rj is not None and rj["followup_review_recommended"] is True
+
+
+def test_ticket_contract_done_from_dev_is_not_a_success(tmp_path):
+    """A dev leg's only success is `built`. A marker-carrying `done` still
+    synthesizes (the marker is terminal) so verify can refuse it, but without the
+    followup flag a successful exit carries; a marker-less `done` is no terminal."""
+    marked = _spec(tmp_path / "a.md", status="done", auto_run="done", followup=True)
+    rj = devcontract.synthesize_result(
+        marked, story_key="1.1", success_statuses=_TICKET_DEV
+    ).result_json
+    assert rj is not None and rj["status"] == "done"
+    assert "followup_review_recommended" not in rj
+
+    bare = _spec(tmp_path / "b.md", status="done", auto_run=None)
+    out = devcontract.synthesize_result(bare, story_key="1.1", success_statuses=_TICKET_DEV)
+    assert out.result_json is None
+
+
+@pytest.mark.parametrize("auto_run", [None, "dropped"])
+def test_dropped_synthesizes_critical_in_tickets_mode(tmp_path, auto_run):
+    """Ablation: deleting the DROPPED arm in `synthesize_result` leaves the
+    escalation list empty, and this fails."""
+    sp = _spec(tmp_path / "plan.md", status="dropped", auto_run=auto_run)
+    rj = devcontract.synthesize_result(
+        sp, story_key="1.1", success_statuses=_TICKET_DEV
+    ).result_json
+    assert rj is not None and rj["status"] == "dropped"
+    (esc,) = rj["escalations"]
+    assert esc["type"] == "dropped" and esc["severity"] == "CRITICAL"
+    assert esc["spec_file"] == str(sp)
+    assert "followup_review_recommended" not in rj
+
+
+def test_dropped_prose_only_escalates_in_tickets_mode(tmp_path):
+    sp = _spec(tmp_path / "plan.md", status="in-progress", auto_run="dropped")
+    rj = devcontract.synthesize_result(
+        sp, story_key="1.1", success_statuses=_TICKET_DEV
+    ).result_json
+    assert rj is not None
+    assert [e["type"] for e in rj["escalations"]] == ["dropped"]
+
+
+@pytest.mark.parametrize("status", ["built", "dropped"])
+def test_sprint_defaults_unchanged_for_built_status(tmp_path, status):
+    """The v6 contract has no `built` or `dropped`: under the default arguments a
+    marker-less spec at either is still not terminal, and a marker-carrying one
+    synthesizes exactly as before — no escalation, no followup flag.
+
+    Ablation: making the default `success_statuses` include `built` (or adding
+    DROPPED to the terminal set unconditionally) turns the first assertion into
+    a result and fails this test."""
+    bare = _spec(tmp_path / "a.md", status=status, auto_run=None)
+    assert devcontract.synthesize_result(bare, story_key="1-1-a").result_json is None
+    assert not devcontract.is_frontmatter_candidate(bare, since_ns=0)
+    assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == []
+
+    marked = _spec(tmp_path / "b.md", status=status, auto_run=status, followup=True)
+    rj = devcontract.synthesize_result(marked, story_key="1-1-a").result_json
+    assert rj is not None and rj["status"] == status
+    assert rj["escalations"] == []
+    assert "followup_review_recommended" not in rj
+
+
+def test_sprint_synthesis_is_identical_with_explicit_default(tmp_path):
+    """Passing the default explicitly is the same call: the v6 synthesis of every
+    v6 terminal is unchanged by the new parameter."""
+    for status in ("done", "blocked", "awaiting-operator"):
+        sp = _spec(
+            tmp_path / f"{status}.md",
+            status=status,
+            auto_run=status,
+            followup=True,
+            actions="['call the bank']",
+        )
+        implicit = devcontract.synthesize_result(sp, story_key="1-1-a")
+        explicit = devcontract.synthesize_result(sp, story_key="1-1-a", success_statuses=("done",))
+        assert implicit == explicit
+
+
+def test_frontmatter_candidate_terminal_param(tmp_path):
+    built = _write(tmp_path, "plan-a.md", "---\nstatus: built\n---\n\nbody\n", 2_000)
+    dropped = _write(tmp_path, "plan-b.md", "---\nstatus: dropped\n---\n\nbody\n", 3_000)
+    terminal = devcontract.terminal_statuses(_TICKET_DEV)
+
+    assert devcontract.is_frontmatter_candidate(built, since_ns=0, terminal=terminal)
+    assert devcontract.is_frontmatter_candidate(dropped, since_ns=0, terminal=terminal)
+    assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0, terminal=terminal) == [
+        dropped,
+        built,
+    ]
+    assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == []
+
+
+def test_find_fallback_result_artifact_matches_prefixed_names_only(tmp_path):
+    """Only the skill's no-spec fallback qualifies: a marker-carrying spec in the
+    same folder belongs to someone else (#261) and is never returned, nor is a
+    fallback older than the launch floor."""
+    _write(
+        tmp_path,
+        "spec-other.md",
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n",
+        5_000,
+    )
+    assert devcontract.find_fallback_result_artifact(tmp_path, since_ns=1_000) is None
+
+    _write(tmp_path, "bmad-dev-auto-result-old.md", "---\nstatus: blocked\n---\n", 500)
+    assert devcontract.find_fallback_result_artifact(tmp_path, since_ns=1_000) is None
+
+    a = _write(tmp_path, "bmad-dev-auto-result-a.md", "---\nstatus: blocked\n---\n", 2_000)
+    b = _write(tmp_path, "bmad-build-auto-result-b.md", "---\nstatus: blocked\n---\n", 3_000)
+    assert devcontract.find_fallback_result_artifact(tmp_path, since_ns=1_000) == b
+    b.unlink()
+    assert devcontract.find_fallback_result_artifact(tmp_path, since_ns=1_000) == a
+    assert devcontract.find_fallback_result_artifact(tmp_path / "ghost", since_ns=0) is None
