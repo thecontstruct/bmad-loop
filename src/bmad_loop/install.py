@@ -2801,18 +2801,21 @@ def _commands_in_handler(handler: object) -> Iterator[str]:
         yield handler["command"]
 
 
-def _executed_commands_in_handler(handler: object) -> Iterator[str]:
+def _executed_commands_in_handler(handler: object, dialect: str) -> Iterator[str]:
     """Like `_commands_in_handler`, but only commands a CLI actually runs.
 
     A `type: prompt` (or any non-`command`) handler carrying a relay `command`
     never executes it, so it must not count as a registration. Nested
-    (claude/codex/gemini) and flat (copilot/agy/cursor) shapes alike. A flat handler
-    with no `type` counts as a command: Cursor's bare `{"command": …}` entries carry
-    none and run as commands. Stripping keeps the any-shape `_commands_in_handler`: a
-    managed command is removed wherever it sits.
+    (claude/codex/gemini) and flat (copilot/agy/cursor) shapes alike. Only for
+    `cursor-hooks-json` does a flat handler with no `type` count as a command: Cursor's
+    bare `{"command": …}` entries carry none and run as commands. Every other dialect
+    writes `type: command` itself, so a typeless entry there is not a registration.
+    Stripping keeps the any-shape `_commands_in_handler`: a managed command is removed
+    wherever it sits.
     """
     if not isinstance(handler, dict):
         return
+    default_type = "command" if dialect == "cursor-hooks-json" else None
     nested = handler.get("hooks")
     if isinstance(nested, list):
         for item in nested:
@@ -2822,7 +2825,7 @@ def _executed_commands_in_handler(handler: object) -> Iterator[str]:
                 and isinstance(item.get("command"), str)
             ):
                 yield item["command"]
-    elif handler.get("type", "command") == "command" and isinstance(handler.get("command"), str):
+    elif handler.get("type", default_type) == "command" and isinstance(handler.get("command"), str):
         yield handler["command"]
 
 
@@ -2865,18 +2868,18 @@ def hook_event_container(config: dict, dialect: str) -> dict:
     return container if isinstance(container, dict) else {}
 
 
-def _relay_in_handlers(handlers) -> bool:
+def _relay_in_handlers(handlers, dialect: str) -> bool:
     """True if any handler in a native-event list executes the relay command."""
     return isinstance(handlers, list) and any(
         _relay_command(command)
         for handler in handlers
-        for command in _executed_commands_in_handler(handler)
+        for command in _executed_commands_in_handler(handler, dialect)
     )
 
 
-def _managed_hook_in_handlers(handlers) -> bool:
+def _managed_hook_in_handlers(handlers, dialect: str) -> bool:
     """merge_hooks' dedup: a relay OR probe-capture command is already present."""
-    return _relay_in_handlers(handlers) or PROBE_MARKER in json.dumps(handlers)
+    return _relay_in_handlers(handlers, dialect) or PROBE_MARKER in json.dumps(handlers)
 
 
 def strip_relay_hooks(config: dict, dialect: str) -> bool:
@@ -3003,7 +3006,7 @@ def relay_registered(config: dict, dialect: str, events: Mapping[str, str]) -> b
         if not isinstance(handlers, list):
             continue
         for handler in handlers:
-            for command in _executed_commands_in_handler(handler):
+            for command in _executed_commands_in_handler(handler, dialect):
                 reported = _relay_canonical_event(command)
                 if reported is None:
                     continue
@@ -3015,7 +3018,7 @@ def relay_registered(config: dict, dialect: str, events: Mapping[str, str]) -> b
         if native in events or not isinstance(handlers, list):
             continue
         for handler in handlers:
-            for command in _executed_commands_in_handler(handler):
+            for command in _executed_commands_in_handler(handler, dialect):
                 if _relay_canonical_event(command) in hazardous:
                     return False
     if foreign_group_relay_hazards(config, dialect, events):
@@ -3105,7 +3108,7 @@ def missing_relay_events(config: dict, dialect: str, events: Mapping[str, str]) 
         present = isinstance(handlers, list) and any(
             _relay_canonical_event(command) == canonical
             for handler in handlers
-            for command in _executed_commands_in_handler(handler)
+            for command in _executed_commands_in_handler(handler, dialect)
         )
         if not present:
             missing.append(native)
@@ -3139,7 +3142,7 @@ def foreign_group_relay_hazards(
             if not isinstance(handlers, list):
                 continue
             expected = events.get(native)
-            for command in (c for h in handlers for c in _executed_commands_in_handler(h)):
+            for command in (c for h in handlers for c in _executed_commands_in_handler(h, dialect)):
                 reported = _relay_canonical_event(command)
                 if reported is None:
                     continue
@@ -3170,7 +3173,7 @@ def registered_relay_paths(
         if not isinstance(handlers, list):
             continue
         for handler in handlers:
-            for command in _executed_commands_in_handler(handler):
+            for command in _executed_commands_in_handler(handler, dialect):
                 executable = relay_executable_text(command)
                 if executable is not None:
                     paths.append((Path(executable), executable))
@@ -3195,7 +3198,7 @@ def registered_relay_interpreters(config: dict, dialect: str, events: Iterable[s
         if not isinstance(handlers, list):
             continue
         for handler in handlers:
-            for command in _executed_commands_in_handler(handler):
+            for command in _executed_commands_in_handler(handler, dialect):
                 legacy = _legacy_relay_parts(command)
                 if legacy is not None:
                     interpreters.append(legacy[2])
@@ -3234,7 +3237,7 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
                 else:
                     del group[native_event]
                 handlers = group.setdefault(native_event, [])
-            if not _managed_hook_in_handlers(handlers):
+            if not _managed_hook_in_handlers(handlers, dialect):
                 handlers.append(_hook_entry(dialect, command))
                 changed = True
         changed |= _strip_hazardous_unmapped_relays(group, registrations)
@@ -3271,7 +3274,7 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
         # claude/codex/gemini nest handlers under "hooks"; copilot and cursor store
         # the handler dict directly in the event list — the serialized scan covers
         # both shapes so a re-run stays idempotent for every dialect.
-        if not _managed_hook_in_handlers(matchers):
+        if not _managed_hook_in_handlers(matchers, dialect):
             matchers.append(_hook_entry(dialect, command))
             changed = True
     changed |= _strip_hazardous_unmapped_relays(hooks, registrations)

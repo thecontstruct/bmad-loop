@@ -126,14 +126,14 @@ def test_builtin_profiles_load():
     # of a captured Claude Code error: the "Unable to connect to API" connection
     # failure and the provider 5xx pair; still no quota cause, since no captured
     # Claude Code usage-limit line exists) and opencode-http (the serve process's
-    # `error.error="AI_APICallError: …"` field). The other four stay inert on
+    # `error.error="AI_APICallError: …"` field). The other five stay inert on
     # purpose: patterns for them could only be written from strings scraped off
     # public issue trackers, and an unverified pattern that fires on a healthy
     # session pauses the whole run. Precision is asserted in
     # tests/test_env_fault_patterns.py; here we only pin which profiles are seeded.
     for name in ("claude", "opencode-http"):
         assert profiles[name].env_fault_patterns, f"{name} ships no env_fault_patterns"
-    for name in ("codex", "gemini", "copilot", "antigravity"):
+    for name in ("codex", "gemini", "copilot", "cursor", "antigravity"):
         assert profiles[name].env_fault_patterns == ()
     # opencode-http is hookless (HTTP/SSE transport): no hook dialect surfaces,
     # skills read from the claude tree, usage comes over HTTP (no transcript parser)
@@ -768,7 +768,7 @@ def test_shipped_sandboxed_mappings_parse_and_resolve():
             get_profile(name).for_permission_mode("sandboxed", platform="win32")
 
 
-@pytest.mark.parametrize("name", ["gemini", "copilot", "antigravity", "opencode-http"])
+@pytest.mark.parametrize("name", ["gemini", "copilot", "cursor", "antigravity", "opencode-http"])
 def test_for_permission_mode_refuses_an_unmapped_profile(name):
     with pytest.raises(ProfileError, match="no permission_mode 'sandboxed' mapping"):
         get_profile(name).for_permission_mode("sandboxed", platform="linux")

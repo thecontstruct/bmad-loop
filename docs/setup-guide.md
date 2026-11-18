@@ -151,8 +151,8 @@ invoke — are present before a run starts.
 ### Project skills and user-level skill roots
 
 By default bmad-loop resolves BMAD skills only from the project's own skill trees
-(`.claude/skills`, `.agents/skills`). A Claude Code plugin install is never used. A global
-install (`npx skills add -g`) is used only when you opt in:
+(`.claude/skills`, `.agents/skills`, `.cursor/skills`). A Claude Code plugin install is never
+used. A global install (`npx skills add -g`) is used only when you opt in:
 
 ```toml
 # .bmad-loop/policy.toml
@@ -459,7 +459,7 @@ them to whoever owns the machine:
   session. The model that actually ran shows in session-end `models` once a turn has
   finished; a session that ends before its first turn completes records no model.
 - **cursor** — authenticate once with `cursor-agent login` (or set `CURSOR_API_KEY`).
-  Verified against Cursor CLI 2026.08.04. Two things to know:
+  Verified against Cursor CLI 2026.08.04 and 2026.09.02. Two things to know:
   - **`--trust` is what makes unattended runs work.** An interactive `cursor-agent` in a
     directory it has not been told to trust blocks on a "Workspace Trust Required" dialog,
     and `-f`/`--force` alone does **not** clear it — measured, along with the fact that
@@ -468,8 +468,9 @@ them to whoever owns the machine:
     `[adapter] extra_args`, it **replaces** the profile's bypass flags, so keep `--trust` in
     it or every session will hang until `session_timeout_min`. Because the flag applies per
     launch, `isolation = "worktree"` works here — unlike antigravity.
-  - **Token usage is not recorded yet** (`usage_parser = "none"`). The Stop payload carries a
-    `transcript_path`, but its token schema has not been read, so the columns stay empty.
+  - **Token usage is not recorded** (`usage_parser = "none"`, by design). Cursor puts the
+    token counts on the Stop hook payload and none in the transcript, and the shared relay
+    drops them, so the token columns stay empty and `session_budget_mode` has no effect.
 - **antigravity** — run `agy` once in the project, authenticate, and answer
   **"Yes, I trust this folder"** before `bmad-loop run`; spawned sessions can't answer that
   dialog, and a pending one reads as a session timeout. Requires Antigravity CLI
@@ -590,9 +591,9 @@ By default, Codex attaches to a shared background app-server daemon, which may h
 
 ### Skill location
 
-`claude` reads skills from `.claude/skills/`; `cursor` reads from `.cursor/skills/`; `codex`,
-`gemini`, `copilot`, and `antigravity` read from `.agents/skills/`; opencode reads both. For skills installed in your home folder,
-see [Project skills and user-level skill roots](#project-skills-and-user-level-skill-roots).
+`claude` reads skills from `.claude/skills/`, `cursor` from `.cursor/skills/`, and `codex`,
+`gemini`, `copilot` and `antigravity` from `.agents/skills/`; opencode reads both
+`.claude/skills/` and `.agents/skills/`. For skills installed in your home folder, see [Project skills and user-level skill roots](#project-skills-and-user-level-skill-roots).
 `init` installs the bundled `bmad-loop-*` skills into the right tree
 for each CLI you pass via `--cli`, so selecting any of the `.agents/skills/` CLIs populates it automatically. It skips skill
 dirs that already exist — pass `--force-skills` to overwrite a stale copy, or `--no-skills` to
@@ -678,12 +679,13 @@ rm -rf "${BMAD_LOOP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/bmad-loop}"
 the standard BMAD skills alone**; install never touched them.
 
 ```bash
-# claude reads from .claude/skills/ ; codex/gemini read from .agents/skills/
+# claude reads from .claude/skills/ ; cursor from .cursor/skills/ ; codex/gemini from .agents/skills/
 rm -rf .claude/skills/bmad-loop-{dev,review,resolve,sweep,setup}
+rm -rf .cursor/skills/bmad-loop-{dev,review,resolve,sweep,setup}
 rm -rf .agents/skills/bmad-loop-{dev,review,resolve,sweep,setup}
 ```
 
-(Run only the line for the skill tree your CLIs use — drop the other. The `dev` and `review`
+(Run only the lines for the skill trees your CLIs use — drop the others. The `dev` and `review`
 names are retired — current `init` never lays them down — but listing them is a harmless no-op
 that also cleans up a pre-0.7.0 install.)
 

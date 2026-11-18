@@ -18,8 +18,9 @@ breaking changes may land in a minor release.
   interactive launch in an untrusted directory blocks on a workspace-trust dialog no
   unattended session can answer, and `--force` alone does not clear it. Setting
   `[adapter] extra_args` replaces the bypass flags, so it must keep `--trust`. Trust is
-  granted per launch, so `isolation = "worktree"` works. `usage_parser = "none"` pending a
-  transcript-schema probe, so no token usage is recorded. Supported and E2E-verified on
+  granted per launch, so `isolation = "worktree"` works. `usage_parser = "none"` by design:
+  Cursor puts token counts on the Stop hook payload and none in the transcript, and the shared
+  relay drops them, so no token usage is recorded and `session_budget_mode` is inert. Supported and E2E-verified on
   cursor-agent 2026.09.02: `probe-adapter cursor --probe` captured both events with 0
   warnings, and a one-story dev loop completed with a real commit.
 - Add the experimental `tickets` work source for BMAD v7 initiative ticket trees

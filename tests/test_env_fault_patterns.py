@@ -76,7 +76,7 @@ PANE_CAPTURE_PROFILES = ("claude",)
 # An unverified pattern is not a neutral bet — one that fires on a healthy session
 # pauses the whole run, which is worse than the fault it was meant to catch.
 # Seeding nothing costs only the status quo. See test_unseeded_profiles_stay_inert.
-UNSEEDED_PROFILES = ("codex", "gemini", "copilot", "antigravity")
+UNSEEDED_PROFILES = ("codex", "gemini", "copilot", "cursor", "antigravity")
 ALL_PROFILES = SEEDED_PROFILES + UNSEEDED_PROFILES
 # The pane pattern fields this module holds to the corpus. Every BAIT-style
 # assertion below is made against the UNION of them: a usage-limit hit on a

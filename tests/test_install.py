@@ -445,11 +445,11 @@ def test_registered_relay_paths_reads_installed_relay_from_either_os(
 
 
 _RELAY_EXE = "/opt/bmad/bin/bmad-loop"
-_FLAT_DIALECTS = {"copilot-settings-json", "antigravity-hooks-json"}
+_FLAT_DIALECTS = {"copilot-settings-json", "cursor-hooks-json", "antigravity-hooks-json"}
 
 
 def _relay_handler(profile, command, handler_type="command"):
-    """One handler in the profile's own shape: flat for copilot/agy, nested otherwise."""
+    """One handler in the profile's own shape: flat for copilot/cursor/agy, nested otherwise."""
     item = {"type": handler_type, "command": command}
     return item if profile.hooks.dialect in _FLAT_DIALECTS else {"hooks": [item]}
 
@@ -471,7 +471,7 @@ def _registered(profile, config):
     return relay_registered(config, profile.hooks.dialect, profile.hooks.events)
 
 
-@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "antigravity"])
+@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "cursor", "antigravity"])
 def test_relay_registered_after_fresh_init(tmp_path, name):
     profile = get_profile(name)
     assert install_into(tmp_path, clis=(name,), skills=False) == 0
@@ -479,7 +479,7 @@ def test_relay_registered_after_fresh_init(tmp_path, name):
     assert _registered(profile, config)
 
 
-@pytest.mark.parametrize("name", ["claude", "copilot", "antigravity"])
+@pytest.mark.parametrize("name", ["claude", "copilot", "cursor", "antigravity"])
 def test_relay_registered_accepts_command_stop(name):
     profile = get_profile(name)
     stop = _native_for(profile, "Stop")
@@ -509,7 +509,7 @@ def test_relay_registered_without_the_notification_relay(tmp_path):
     assert _registered(profile, config)
 
 
-@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "antigravity"])
+@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "cursor", "antigravity"])
 def test_missing_relay_events_is_empty_after_fresh_init(tmp_path, name):
     profile = get_profile(name)
     assert install_into(tmp_path, clis=(name,), skills=False) == 0
@@ -547,7 +547,7 @@ def test_parked_kind_relay_commands_are_managed(kind):
     assert install_mod._relay_command(f"{_RELAY_EXE} relay {kind}")
 
 
-@pytest.mark.parametrize("name", ["claude", "copilot"])
+@pytest.mark.parametrize("name", ["claude", "copilot", "cursor"])
 def test_relay_registered_refuses_session_start_only(name):
     profile = get_profile(name)
     start = _native_for(profile, "SessionStart")
@@ -557,7 +557,7 @@ def test_relay_registered_refuses_session_start_only(name):
     assert not _registered(profile, config)
 
 
-@pytest.mark.parametrize("name", ["claude", "copilot", "antigravity"])
+@pytest.mark.parametrize("name", ["claude", "copilot", "cursor", "antigravity"])
 def test_relay_registered_refuses_wrong_canonical_on_stop(name):
     profile = get_profile(name)
     stop = _native_for(profile, "Stop")
@@ -567,7 +567,7 @@ def test_relay_registered_refuses_wrong_canonical_on_stop(name):
     assert not _registered(profile, config)
 
 
-@pytest.mark.parametrize("name", ["claude", "copilot"])
+@pytest.mark.parametrize("name", ["claude", "copilot", "cursor"])
 def test_relay_registered_refuses_wrong_canonical_elsewhere(name):
     # A SessionStart firing `relay Stop` completes every session at launch.
     profile = get_profile(name)
@@ -582,7 +582,52 @@ def test_relay_registered_refuses_wrong_canonical_elsewhere(name):
     assert not _registered(profile, config)
 
 
-@pytest.mark.parametrize("name", ["claude", "copilot", "antigravity"])
+_BARE_NAMES = ["claude", "codex", "gemini", "copilot", "antigravity"]
+
+
+@pytest.mark.parametrize("name", _BARE_NAMES)
+@pytest.mark.parametrize("shape", ["flat", "nested"])
+def test_typeless_relay_entry_is_unregistered_outside_cursor(name, shape):
+    """Only Cursor writes handlers with no `type`; for every other CLI a typeless
+    entry is not an executed handler, so it must not read as registered and
+    `merge_hooks` must still write the correct entry beside it.
+
+    Ablation: defaulting a missing `type` to "command" for every dialect (the
+    pre-review `_executed_commands_in_handler`) fails the registered assertion and
+    leaves `merge_hooks` reporting no change.
+    """
+    profile = get_profile(name)
+    registrations = _registrations(profile, f"{_RELAY_EXE} relay {{event}}")
+    bare = {"command": f"{_RELAY_EXE} relay Stop"}
+    entry = bare if shape == "flat" else {"hooks": [bare]}
+    stop = _native_for(profile, "Stop")
+    config = _hook_config(profile, {stop: [entry]})
+    assert not _registered(profile, config)
+
+    config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    assert changed
+    handlers = install_mod.hook_event_container(config, profile.hooks.dialect)[stop]
+    assert entry in handlers
+    assert _registered(profile, config)
+
+
+def test_typeless_relay_entry_is_registered_for_cursor():
+    """Cursor's bare `{"command": ...}` entry runs as a command, so it counts."""
+    profile = get_profile("cursor")
+    stop = _native_for(profile, "Stop")
+    start = _native_for(profile, "SessionStart")
+    config = {
+        "version": 1,
+        "hooks": {
+            stop: [{"command": f"{_RELAY_EXE} relay Stop"}],
+            start: [{"command": f"{_RELAY_EXE} relay SessionStart"}],
+        },
+    }
+    assert _registered(profile, config)
+    assert install_mod.missing_relay_events(config, profile.hooks.dialect, profile.hooks.events) == []
+
+
+@pytest.mark.parametrize("name", ["claude", "copilot", "cursor", "antigravity"])
 def test_non_command_stop_relay_is_unregistered_and_merge_adds_command(name):
     profile = get_profile(name)
     stop = _native_for(profile, "Stop")
@@ -598,11 +643,12 @@ def test_non_command_stop_relay_is_unregistered_and_merge_adds_command(name):
     assert changed
     handlers = install_mod.hook_event_container(config, profile.hooks.dialect)[stop]
     assert prompt in handlers
+    untyped = "command" if profile.hooks.dialect == "cursor-hooks-json" else None
     executed = [
         item
         for handler in handlers
         for item in (handler["hooks"] if "hooks" in handler else [handler])
-        if item["type"] == "command"
+        if item.get("type", untyped) == "command"
     ]
     assert [item["command"] for item in executed] == [registrations[stop]]
     assert _registered(profile, config)
